@@ -1,0 +1,30 @@
+[project]
+name = "airdrop"
+version = "2.3.0"
+requires-python = ">=3.14"
+dependencies = [
+    "imageio-ffmpeg",
+    "mavsdk",
+    "opencv-python",
+    "pillow",
+    "pyproj",
+    "pyyaml",
+    "rapidocr",
+    "scipy",
+    "torch",
+    "torchvision>=0.28.0",
+    "ultralytics>=8.4.120",
+    "vgamepad",
+]
+
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }

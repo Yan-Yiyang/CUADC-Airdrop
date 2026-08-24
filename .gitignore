@@ -1,0 +1,55 @@
+# Python、测试与构建缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# 环境、编辑器与本地记录
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.codex/
+.local/
+.DS_Store
+Thumbs.db
+*.swp
+*.log
+logs/
+log/
+plan/
+.*-tmp/
+.handeye-verify/
+pytest-cache-files-*/
+
+# 任务输入与运行产物由操作者自行准备
+flights/
+*.plan
+output/
+simulation-output/
+_cropdiag/
+_e2e/
+models/**/*.pt
+models/**/*.pth
+models/**/*.onnx
+!models/**/.gitkeep
+docs/api_reference.md
+
+# 第三方参考源码和归档
+PX4-Autopilot-1.17.0/
+qgroundcontrol-master/
+px4.tar.gz
+qgc.tar.gz
