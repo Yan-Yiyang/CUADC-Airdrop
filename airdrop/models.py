@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 @dataclass
@@ -20,45 +20,45 @@ class TelemetrySnapshot:
     timestamp: float = field(default_factory=time.time)
 
     # 世界/全局坐标
-    latitude_deg: Optional[float] = None
-    longitude_deg: Optional[float] = None
-    absolute_altitude_m: Optional[float] = None
-    relative_altitude_m: Optional[float] = None
+    latitude_deg: float | None = None
+    longitude_deg: float | None = None
+    absolute_altitude_m: float | None = None
+    relative_altitude_m: float | None = None
 
     # 本地坐标（NED，单位：米）
-    north_m: Optional[float] = None
-    east_m: Optional[float] = None
-    down_m: Optional[float] = None
+    north_m: float | None = None
+    east_m: float | None = None
+    down_m: float | None = None
 
     # 速度（NED，单位：米/秒）
-    vx_m_s: Optional[float] = None
-    vy_m_s: Optional[float] = None
-    vz_m_s: Optional[float] = None
+    vx_m_s: float | None = None
+    vy_m_s: float | None = None
+    vz_m_s: float | None = None
 
     # 姿态（欧拉角，单位：度）
-    roll_deg: Optional[float] = None
-    pitch_deg: Optional[float] = None
-    yaw_deg: Optional[float] = None
+    roll_deg: float | None = None
+    pitch_deg: float | None = None
+    yaw_deg: float | None = None
 
     # 姿态（四元数）
-    quaternion_w: Optional[float] = None
-    quaternion_x: Optional[float] = None
-    quaternion_y: Optional[float] = None
-    quaternion_z: Optional[float] = None
+    quaternion_w: float | None = None
+    quaternion_x: float | None = None
+    quaternion_y: float | None = None
+    quaternion_z: float | None = None
 
     # HOME 点 GPS 坐标（不一定等于 NED 原点）
-    home_latitude_deg: Optional[float] = None
-    home_longitude_deg: Optional[float] = None
-    home_absolute_altitude_m: Optional[float] = None
-    home_relative_altitude_m: Optional[float] = None
+    home_latitude_deg: float | None = None
+    home_longitude_deg: float | None = None
+    home_absolute_altitude_m: float | None = None
+    home_relative_altitude_m: float | None = None
 
     # 本地 NED 坐标系原点（GPS_GLOBAL_ORIGIN / ref_lat, ref_lon, ref_alt）
-    origin_latitude_deg: Optional[float] = None
-    origin_longitude_deg: Optional[float] = None
-    origin_altitude_m: Optional[float] = None
+    origin_latitude_deg: float | None = None
+    origin_longitude_deg: float | None = None
+    origin_altitude_m: float | None = None
 
     # MAVSDK 时间戳（系统启动后的微秒数），仅在可用时填充
-    attitude_timestamp_us: Optional[int] = None
+    attitude_timestamp_us: int | None = None
 
     def update_global_position(self, position: Any) -> None:
         """从 MAVSDK ``Telemetry.Position`` 对象复制字段。"""
@@ -118,7 +118,7 @@ class TelemetrySnapshot:
             )
         )
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -131,18 +131,18 @@ class Command:
     """
 
     name: str
-    params: Dict[str, Any] = field(default_factory=dict)
+    params: dict[str, Any] = field(default_factory=dict)
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Command":
+    def from_dict(cls, data: dict[str, Any]) -> Command:
         return cls(
             name=str(data["name"]),
             params=dict(data.get("params") or {}),
             id=str(data.get("id") or uuid.uuid4().hex),
         )
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -153,15 +153,15 @@ class CommandResult:
     id: str
     name: str
     success: bool
-    error: Optional[str] = None
-    data: Optional[Dict[str, Any]] = None
+    error: str | None = None
+    data: dict[str, Any] | None = None
     timestamp: float = field(default_factory=time.time)
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "CommandResult":
+    def from_dict(cls, data: dict[str, Any]) -> CommandResult:
         return cls(
             id=str(data["id"]),
             name=str(data["name"]),

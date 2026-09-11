@@ -1,11 +1,11 @@
-"""线程安全的内部遥测代理（“内推”模块）。
+"""线程安全的进程内遥测代理。
 
-该代理是同进程内飞机最新状态的唯一数据源。MAVSDK 工作线程会把部分遥测
-更新发布到这里，同进程的其他线程可以：
+官方示例中每条遥测流都是独立的 ``async for``；本代理把这些分散的更新
+合并成一份"最新快照"，作为同进程内飞机状态的唯一数据源。其他线程可以：
 
-* 通过 :meth:`TelemetryBroker.get_snapshot` 读取最新的同步快照，或
-* 通过 :meth:`TelemetryBroker.subscribe` 订阅推送回调，
-* 通过 :meth:`TelemetryBroker.get_snapshot_at` 按时间戳查询历史/内插外推结果。
+* 通过 :meth:`TelemetryBroker.get_snapshot` 读取最新快照的副本；
+* 通过 :meth:`TelemetryBroker.subscribe` 订阅推送回调；
+* 通过 :meth:`TelemetryBroker.get_snapshot_at` 按时间戳查询历史（内插/外推）。
 """
 
 from __future__ import annotations
@@ -13,11 +13,13 @@ from __future__ import annotations
 import bisect
 import copy
 import logging
+import math
+import operator
 import threading
 import time
 from collections import deque
 from dataclasses import fields
-from typing import Any, Callable, Deque, List, Optional
+from typing import Any, Callable
 
 from .models import TelemetrySnapshot
 
@@ -25,38 +27,112 @@ LOGGER = logging.getLogger(__name__)
 
 SnapshotCallback = Callable[[TelemetrySnapshot], None]
 
-# 插值时不需要线性内插的时间类字段
+# get_snapshot_at 支持的查询模式
+SUPPORTED_QUERY_MODES = frozenset({"interpolate", "nearest"})
+
+# 时间估计时不参与数值内插的时间类字段
 _SKIP_INTERP_FIELDS = {"timestamp", "attitude_timestamp_us"}
+
+# 欧拉角字段：混合时必须走"最短弧"，否则 179° → -179° 会错误地经过 0°
+_ANGULAR_FIELDS = frozenset({"roll_deg", "pitch_deg", "yaw_deg"})
+
+# 四元数字段：线性混合会破坏单位模长，必须用球面插值（slerp）
+_QUATERNION_FIELDS = (
+    "quaternion_w",
+    "quaternion_x",
+    "quaternion_y",
+    "quaternion_z",
+)
+_QUATERNION_FIELD_SET = frozenset(_QUATERNION_FIELDS)
+
+# bisect 的 key：让二分查找直接作用在历史 deque 上，避免每次查询
+# 都重建整张时间列表（n=1200 时是每次查询一次 O(n) 分配）。
+_snapshot_timestamp = operator.attrgetter("timestamp")
+
+
+def _lerp_angle_deg(a: float, b: float, ratio: float) -> float:
+    """角度按最短弧混合（单位：度），结果归一化到 (-180, 180]。
+
+    解决 ±180° 环绕：179° 与 -179° 的中点是 ±180°，而不是 0°。
+    ``ratio`` 超出 [0, 1] 时沿同一方向外推。
+    """
+    delta = (b - a + 180.0) % 360.0 - 180.0
+    value = (a + delta * ratio + 180.0) % 360.0 - 180.0
+    return 180.0 if value == -180.0 else value
+
+
+def _slerp_fields(
+    left: TelemetrySnapshot,
+    right: TelemetrySnapshot,
+    ratio: float,
+) -> tuple[float, float, float, float] | None:
+    """对两条快照的四元数做球面插值（slerp）；任一端缺失时返回 None。
+
+    自动处理符号翻转（q 与 -q 表示同一姿态）；``ratio`` 超出 [0, 1]
+    时沿同一圆弧外推。
+    """
+    q0 = [getattr(left, name) for name in _QUATERNION_FIELDS]
+    q1 = [getattr(right, name) for name in _QUATERNION_FIELDS]
+    if any(value is None for value in q0 + q1):
+        return None
+
+    dot = sum(a * b for a, b in zip(q0, q1))
+    if dot < 0.0:  # 取反其中一端，保证走最短路径
+        q1 = [-value for value in q1]
+        dot = -dot
+
+    if dot > 0.9995:  # 夹角极小：线性混合后重新归一化即可
+        blended = [a + (b - a) * ratio for a, b in zip(q0, q1)]
+        norm = math.sqrt(sum(value * value for value in blended))
+        return tuple(value / norm for value in blended)
+
+    theta = math.acos(min(1.0, dot))
+    sin_theta = math.sin(theta)
+    scale0 = math.sin((1.0 - ratio) * theta) / sin_theta
+    scale1 = math.sin(ratio * theta) / sin_theta
+    return tuple(scale0 * a + scale1 * b for a, b in zip(q0, q1))
 
 
 class TelemetryBroker:
     """线程安全的最新遥测快照仓库。
 
-    所有公开方法都可在任意线程中调用。快照更新通过可重入锁串行化，
-    订阅者会在共享快照更新完成后被调用。
-    内部会保存最近 ``history_maxlen`` 条快照，用于按时间戳查询。
+    快照更新通过可重入锁串行化，订阅者在快照更新完成后被调用。
+
+    历史按固定采样率写入（``history_interval``，默认 0.1 秒）：多条高频
+    遥测流在这里被合并成均匀的快照序列，默认 1200 条历史约覆盖 2 分钟；
+    设为 0 表示每次遥测更新都写入历史。最新快照与订阅推送不受采样率
+    限制，总是实时的。
+
+    ``TelemetrySnapshot`` 的字段全部是标量，因此传递副本时浅拷贝就足够：
+    调用方修改副本不会影响仓库内容，开销也远小于深拷贝。
     """
 
-    def __init__(self, history_maxlen: int = 1200) -> None:
+    def __init__(
+        self,
+        history_maxlen: int = 1200,
+        history_interval: float = 0.1,
+    ) -> None:
         self._lock = threading.RLock()
-        self._latest = TelemetrySnapshot()
-        self._history: Deque[TelemetrySnapshot] = deque(maxlen=history_maxlen)
-        self._subscribers: List[SnapshotCallback] = []
         self._condition = threading.Condition(self._lock)
+        self._latest = TelemetrySnapshot()
+        self._history: deque[TelemetrySnapshot] = deque(maxlen=history_maxlen)
+        self._history_interval = max(history_interval, 0.0)
+        self._last_history_timestamp = 0.0
+        self._subscribers: list[SnapshotCallback] = []
 
     # ------------------------------------------------------------------
     # 读取接口
     # ------------------------------------------------------------------
     def get_snapshot(self) -> TelemetrySnapshot:
-        """返回最新快照的深拷贝（可安全修改）。"""
+        """返回最新快照的副本（可安全修改）。"""
         with self._lock:
-            return copy.deepcopy(self._latest)
+            return copy.copy(self._latest)
 
     def get_snapshot_at(
         self,
         timestamp: float,
         mode: str = "interpolate",
-    ) -> Optional[TelemetrySnapshot]:
+    ) -> TelemetrySnapshot | None:
         """按时间戳获取飞机状态。
 
         参数
@@ -77,27 +153,30 @@ class TelemetryBroker:
                 return None
 
             if mode == "nearest":
-                return copy.deepcopy(self._nearest_snapshot_locked(timestamp))
+                return copy.copy(self._nearest_snapshot_locked(timestamp))
 
             if mode != "interpolate":
-                raise ValueError(f"不支持的查询模式: {mode}")
+                raise ValueError(
+                    f"不支持的查询模式: {mode}，可选 "
+                    f"{sorted(SUPPORTED_QUERY_MODES)}"
+                )
 
-            return copy.deepcopy(self._evaluate_snapshot_locked(timestamp))
+            return copy.copy(self._evaluate_snapshot_locked(timestamp))
 
     def wait_next_snapshot(
         self,
-        timeout: Optional[float] = None,
-        predicate: Optional[Callable[[TelemetrySnapshot], bool]] = None,
-    ) -> Optional[TelemetrySnapshot]:
-        """阻塞直到新快照满足 ``predicate``。
+        timeout: float | None = None,
+        predicate: Callable[[TelemetrySnapshot], bool] | None = None,
+    ) -> TelemetrySnapshot | None:
+        """阻塞直到快照满足 ``predicate``。
 
-        如果 ``predicate`` 为 None，则任何新快照都会被接受。
-        返回快照；超时返回 None。
+        如果 ``predicate`` 为 None，则任何快照都会被接受。
+        返回快照副本；超时返回 None。
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
             while True:
-                snapshot = copy.deepcopy(self._latest)
+                snapshot = copy.copy(self._latest)
                 if predicate is None or predicate(snapshot):
                     return snapshot
                 remaining = None
@@ -114,6 +193,7 @@ class TelemetryBroker:
         """注册一个回调，每次有新快照时都会被调用。
 
         回调运行在发布（MAVSDK 工作）线程中，因此不能长时间阻塞，也不能抛异常。
+        每个订阅者拿到的是独立副本，可以随意修改。
         """
         with self._lock:
             if callback not in self._subscribers:
@@ -132,6 +212,7 @@ class TelemetryBroker:
         with self._condition:
             self._latest = TelemetrySnapshot()
             self._history.clear()
+            self._last_history_timestamp = 0.0
             self._condition.notify_all()
 
     def update_global_position(self, position: Any) -> TelemetrySnapshot:
@@ -170,18 +251,24 @@ class TelemetryBroker:
         mutator: Callable[[TelemetrySnapshot], None],
     ) -> TelemetrySnapshot:
         with self._condition:
-            snapshot = copy.deepcopy(self._latest)
+            snapshot = copy.copy(self._latest)
             mutator(snapshot)
             snapshot.timestamp = time.time()
-
-            # 保存独立副本，避免订阅者/历史被外部修改影响最新状态。
-            self._latest = copy.deepcopy(snapshot)
-            self._history.append(copy.deepcopy(snapshot))
+            self._latest = snapshot
+            # 历史按固定采样率写入：各条高频遥测流在此合并成均匀序列
+            if (
+                snapshot.timestamp - self._last_history_timestamp
+                >= self._history_interval
+            ):
+                self._history.append(snapshot)
+                self._last_history_timestamp = snapshot.timestamp
+            # 锁内复制订阅者列表，避免遍历时与 subscribe/unsubscribe 竞态。
+            subscribers = tuple(self._subscribers)
             self._condition.notify_all()
 
-        for callback in self._subscribers:
+        for callback in subscribers:
             try:
-                callback(snapshot)
+                callback(copy.copy(snapshot))
             except Exception:  # noqa: BLE001 - 订阅者异常不能影响代理继续工作
                 LOGGER.exception("遥测订阅回调执行失败")
 
@@ -190,93 +277,95 @@ class TelemetryBroker:
     # ------------------------------------------------------------------
     # 内部：按时间戳查询
     # ------------------------------------------------------------------
-    def _history_times_locked(self) -> List[float]:
-        return [item.timestamp for item in self._history]
-
     def _nearest_snapshot_locked(self, timestamp: float) -> TelemetrySnapshot:
-        times = self._history_times_locked()
-        idx = bisect.bisect_left(times, timestamp)
+        history = self._history
+        idx = bisect.bisect_left(history, timestamp, key=_snapshot_timestamp)
         if idx == 0:
-            return self._history[0]
-        if idx >= len(self._history):
-            return self._history[-1]
-        left = self._history[idx - 1]
-        right = self._history[idx]
+            return history[0]
+        if idx >= len(history):
+            return history[-1]
+        left = history[idx - 1]
+        right = history[idx]
         if abs(timestamp - left.timestamp) <= abs(right.timestamp - timestamp):
             return left
         return right
 
     def _evaluate_snapshot_locked(self, timestamp: float) -> TelemetrySnapshot:
-        times = self._history_times_locked()
-        first = self._history[0]
-        last = self._history[-1]
+        history = self._history
+        first = history[0]
+        last = history[-1]
 
-        # 早于最早历史：向后外推
+        # 早于最早历史：用最早两条向后外推
         if timestamp <= first.timestamp:
-            if len(self._history) < 2:
-                return copy.deepcopy(first)
-            return self._extrapolate_locked(
-                self._history[0], self._history[1], timestamp
+            if len(history) < 2:
+                return copy.copy(first)
+            return self._blend_locked(
+                history[0],
+                history[1],
+                timestamp,
+                copy_from=history[1],
             )
 
-        # 晚于最新历史：向前外推
+        # 晚于最新历史：用最新两条向前外推
         if timestamp >= last.timestamp:
-            if len(self._history) < 2:
-                return copy.deepcopy(last)
-            return self._extrapolate_locked(
-                self._history[-2], self._history[-1], timestamp
+            if len(history) < 2:
+                return copy.copy(last)
+            return self._blend_locked(
+                history[-2],
+                history[-1],
+                timestamp,
+                copy_from=history[-1],
             )
 
-        # 在历史范围内：线性内插
-        idx = bisect.bisect_right(times, timestamp)
-        left = self._history[idx - 1]
-        right = self._history[idx]
-        if left.timestamp == right.timestamp:
-            return copy.deepcopy(left)
-        return self._interpolate_locked(left, right, timestamp)
+        # 在历史范围内：内插。bisect 的 key 参数直接探测快照时间戳，
+        # 只有这个分支才需要二分，两个外推分支连查找都不用做。
+        idx = bisect.bisect_right(history, timestamp, key=_snapshot_timestamp)
+        left = history[idx - 1]
+        right = history[idx]
+        return self._blend_locked(left, right, timestamp, copy_from=left)
 
     @staticmethod
-    def _interpolate_locked(
+    def _blend_locked(
         left: TelemetrySnapshot,
         right: TelemetrySnapshot,
         timestamp: float,
+        *,
+        copy_from: TelemetrySnapshot,
     ) -> TelemetrySnapshot:
-        result = copy.deepcopy(left)
-        result.timestamp = timestamp
-        ratio = (timestamp - left.timestamp) / (right.timestamp - left.timestamp)
-        for field in fields(TelemetrySnapshot):
-            name = field.name
-            if name in _SKIP_INTERP_FIELDS:
-                continue
-            a = getattr(left, name)
-            b = getattr(right, name)
-            if a is None or b is None:
-                continue
-            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-                setattr(result, name, a + (b - a) * ratio)
-        return result
+        """按时间戳混合两条相邻快照。
 
-    @staticmethod
-    def _extrapolate_locked(
-        left: TelemetrySnapshot,
-        right: TelemetrySnapshot,
-        timestamp: float,
-    ) -> TelemetrySnapshot:
-        result = copy.deepcopy(right)
+        数值字段线性混合；欧拉角走最短弧；四元数做 slerp。
+        ``copy_from`` 决定只有一端有值的字段取自哪条快照（内插取 left、
+        外推取 right）；混合比例落在 [0, 1] 之外时即为外推。
+        """
+        result = copy.copy(copy_from)
         result.timestamp = timestamp
         dt = right.timestamp - left.timestamp
         if dt == 0:
             return result
-
         ratio = (timestamp - left.timestamp) / dt
-        for field in fields(TelemetrySnapshot):
-            name = field.name
-            if name in _SKIP_INTERP_FIELDS:
+
+        for f in fields(TelemetrySnapshot):
+            name = f.name
+            if name in _SKIP_INTERP_FIELDS or name in _QUATERNION_FIELD_SET:
                 continue
             a = getattr(left, name)
             b = getattr(right, name)
             if a is None or b is None:
                 continue
-            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+                continue
+            if name in _ANGULAR_FIELDS:
+                setattr(result, name, _lerp_angle_deg(a, b, ratio))
+            else:
                 setattr(result, name, a + (b - a) * ratio)
+
+        quaternion = _slerp_fields(left, right, ratio)
+        if quaternion is not None:
+            (
+                result.quaternion_w,
+                result.quaternion_x,
+                result.quaternion_y,
+                result.quaternion_z,
+            ) = quaternion
         return result

@@ -3,9 +3,10 @@
 当前阶段实现 MAVSDK 的三个基础能力：
 
 1. **独立线程运行 MAVSDK**：MAVSDK 的 asyncio/gRPC 协程全部运行在专用后台线程的独立事件循环中，避免污染主线程或其他协程。
-2. **实时遥测 + 内外推模块**：
-   - *内推*：同进程内通过线程安全的 `TelemetryBroker` 读取最新快照或订阅推送。
-   - *外推*：通过 `ExternalBridge` 把快照共享给其他进程（`multiprocessing.Manager` dict），并让其他进程通过队列向 MAVSDK 线程发指令。
+2. **实时遥测 + 跨进程桥接**：
+    - *进程内访问*：同一进程内通过线程安全的 `TelemetryBroker` 读取最新快照或订阅推送。
+    - *跨进程访问*：通过 `ExternalBridge` 把快照共享给其他进程（`multiprocessing.Manager` dict），并让其他进程通过队列向 MAVSDK 线程发指令。
+    - *时间估计*：根据已有离散遥测快照计算任意时间戳的估计值；历史范围内使用**内插**，超出历史范围使用**外推**。
 3. **跨线程/跨进程指令**：任何线程/进程都可以发送 `Command`，由 MAVSDK 线程串行执行。
 
 ## 目录结构
@@ -14,9 +15,9 @@
 airdrop/
     __init__.py
     models.py           # TelemetrySnapshot / Command / CommandResult
-    broker.py           # 内推：线程安全遥测仓库与订阅
+    broker.py           # 进程内：线程安全遥测仓库与订阅
     mavsdk_thread.py    # MAVSDK 专用线程 + 遥测采集 + 指令分发
-    external_bridge.py  # 外推：跨进程快照共享 + 指令队列
+    external_bridge.py  # 跨进程：快照共享 + 指令队列
 examples/
     basic_usage.py      # 线程内读取/订阅 + 指令示例
     external_process.py # 子进程读取共享快照 + 发指令示例
@@ -32,17 +33,17 @@ uv sync
 
 ## 快速开始
 
-连接 SITL 或真机（默认 UDP 入站 `udp://:14540`）：
+连接 SITL 或真机（默认 UDP 入站 `udpin://0.0.0.0:14540`，兼容旧写法 `udp://:14540`）：
 
 ```bash
 # 仅查看遥测
-python -m examples.basic_usage --address udp://:14540
+python -m examples.basic_usage --address udpin://0.0.0.0:14540
 
 # 演示 arm -> takeoff -> land（仅在安全环境使用）
-python -m examples.basic_usage --address udp://:14540 --demo-commands
+python -m examples.basic_usage --address udpin://0.0.0.0:14540 --demo-commands
 
 # 演示跨进程读取共享快照和发送指令
-python -m examples.external_process --address udp://:14540
+python -m examples.external_process --address udpin://0.0.0.0:14540
 ```
 
 ## 核心用法
@@ -51,7 +52,7 @@ python -m examples.external_process --address udp://:14540
 from airdrop import Command, MavsdkThread, TelemetryBroker
 
 broker = TelemetryBroker()
-mavsdk = MavsdkThread(broker=broker, system_address="udp://:14540")
+mavsdk = MavsdkThread(broker=broker, system_address="udpin://0.0.0.0:14540")
 mavsdk.connect()
 
 # 同进程其他线程读取
@@ -69,9 +70,37 @@ result = mavsdk.send_command(Command("arm"))
 print(result.success, result.error)
 ```
 
+## 连接流程与选项
+
+`MavsdkThread.connect()` 遵循 MAVSDK 官方 Python 用法，按顺序执行：
+
+1. `System.connect(system_address=...)` 建立 gRPC 连接；
+2. 等待 `core.connection_state().is_connected` 确认飞控上线；
+3. 可选等待 `telemetry.health()`（`is_global_position_ok` / `is_home_position_ok`）就绪；
+4. 查询 NED 原点（`GPS_GLOBAL_ORIGIN`）并写入快照；
+5. 启动各遥测流与 NED 原点后台刷新任务。
+
+任一遥测流异常/结束时，会按配置自动重连。常用参数：
+
+```python
+mavsdk = MavsdkThread(
+    broker=broker,
+    system_address="udpin://0.0.0.0:14540",
+    connect_timeout=30.0,        # System.connect 与等待连接状态的超时
+    wait_for_health=False,       # 连接后是否等待 health 就绪（默认关）
+    health_timeout=30.0,
+    require_health_for_actions=False,  # arm/takeoff 前是否强制等 health
+    origin_refresh_interval=5.0, # NED 原点刷新周期（秒）
+    reconnect=True,              # 遥测流断开后自动重连
+    reconnect_delay=5.0,
+)
+mavsdk.connect()
+print(mavsdk.connected)          # 是否已连接并就绪
+```
+
 ## 按时间戳查询
 
-代理会保存最近一段历史快照（默认 `TelemetryBroker(history_maxlen=1200)` 条）。其他模块给出一个时间戳时，可以获取“那一刻”的状态：
+代理会保存最近一段历史快照（默认 `TelemetryBroker(history_maxlen=1200, history_interval=0.1)`，即按 10 Hz 采样、约覆盖 2 分钟；`history_interval=0` 表示每次遥测更新都写入历史）。历史写入是节流的，但最新快照与订阅推送始终实时。其他模块给出一个时间戳时，可以获取“那一刻”的状态：
 
 ```python
 # 默认：历史范围内线性内插，超出范围线性外推
@@ -95,6 +124,10 @@ print(result.success, result.data["snapshot"])
 ```
 
 注意：时间戳单位是秒，并与 `TelemetrySnapshot.timestamp` 使用同一时间轴（默认是 `time.time()` 本地墙钟时间）。
+
+`mode` 只接受 `"interpolate"`（默认）或 `"nearest"`，其余取值会抛出 `ValueError`，
+错误信息会列出可选值。该校验在 `broker` 层与 `get_snapshot_at` 指令入口两处生效，
+因此跨进程发指令时非法 `mode` 也会得到明确提示。
 
 跨进程：
 

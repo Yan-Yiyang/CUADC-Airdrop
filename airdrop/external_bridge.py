@@ -1,4 +1,4 @@
-"""跨进程桥接（“外推”模块）。
+"""跨进程遥测与指令桥接。
 
 外部桥接通过 ``multiprocessing.Manager`` dict 与其他进程共享最新遥测快照，
 并通过 manager 队列接受来自其他进程的指令。桥接在所属进程中运行两个小型
@@ -14,8 +14,8 @@ import logging
 import multiprocessing
 import queue
 import threading
-import time
-from typing import Any, Dict, Optional
+from multiprocessing.managers import SyncManager
+from typing import Any
 
 from .broker import TelemetryBroker
 from .mavsdk_thread import MavsdkThread
@@ -30,16 +30,16 @@ class ExternalBridge:
     def __init__(
         self,
         mavsdk_thread: MavsdkThread,
-        broker: Optional[TelemetryBroker] = None,
+        broker: TelemetryBroker | None = None,
         publish_hz: float = 20.0,
     ) -> None:
         self.mavsdk_thread = mavsdk_thread
         self.broker = broker or mavsdk_thread.broker
         self.publish_hz = publish_hz
-        self._manager: Optional[multiprocessing.managers.SyncManager] = None
-        self._snapshot: Optional[Dict[str, Any]] = None
-        self._command_queue: Optional[Any] = None
-        self._result_queue: Optional[Any] = None
+        self._manager: SyncManager | None = None
+        self._snapshot: dict[str, Any] | None = None
+        self._command_queue: Any = None
+        self._result_queue: Any = None
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -81,7 +81,7 @@ class ExternalBridge:
         if self._command_queue is not None:
             try:
                 self._command_queue.put(None, timeout=1.0)
-            except Exception:
+            except Exception:  # noqa: BLE001 - 哨兵发送失败也继续退出
                 pass
 
         for thread in self._threads:
@@ -99,7 +99,7 @@ class ExternalBridge:
     # 供子进程使用的属性
     # ------------------------------------------------------------------
     @property
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self) -> dict[str, Any]:
         """共享 dict 代理；子进程可读取 ``snapshot["north_m"]`` 等字段。"""
         if self._snapshot is None:
             raise RuntimeError("ExternalBridge 尚未启动")
@@ -126,22 +126,23 @@ class ExternalBridge:
         interval = 1.0 / max(self.publish_hz, 0.1)
         while not self._stop.is_set():
             try:
-                snapshot = self.broker.get_snapshot()
                 if self._snapshot is not None:
-                    self._snapshot.update(snapshot.as_dict())
-            except Exception:
+                    self._snapshot.update(self.broker.get_snapshot().as_dict())
+            except Exception:  # noqa: BLE001 - 单次发布失败不影响后续发布
                 LOGGER.exception("发布外部快照失败")
-            time.sleep(interval)
+            # 用事件等待代替 sleep，stop() 时立即退出
+            self._stop.wait(interval)
 
     def _command_loop(self) -> None:
         while not self._stop.is_set():
+            command_queue = self._command_queue
+            if command_queue is None:
+                break
             try:
-                if self._command_queue is None:
-                    break
-                raw = self._command_queue.get(timeout=0.2)
+                raw = command_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
-            except Exception:
+            except Exception:  # noqa: BLE001
                 if self._stop.is_set():
                     break
                 LOGGER.exception("读取外部指令队列失败")
@@ -155,5 +156,5 @@ class ExternalBridge:
                 result = self.mavsdk_thread.send_command(command)
                 if self._result_queue is not None:
                     self._result_queue.put(result.as_dict())
-            except Exception:
+            except Exception:  # noqa: BLE001 - 单条指令失败不影响后续指令
                 LOGGER.exception("处理外部指令失败")

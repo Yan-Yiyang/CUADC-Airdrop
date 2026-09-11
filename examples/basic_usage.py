@@ -2,8 +2,8 @@
 
 连接 SITL 或真实飞控（UDP）：
 
-    python -m examples.basic_usage --address udp://:14540
-    python -m examples.basic_usage --address udp://:14540 --demo-commands
+    python -m examples.basic_usage --address udpin://0.0.0.0:14540
+    python -m examples.basic_usage --address udpin://0.0.0.0:14540 --demo-commands
 """
 
 from __future__ import annotations
@@ -13,13 +13,19 @@ import logging
 import threading
 import time
 
-from airdrop import Command, ExternalBridge, MavsdkThread, TelemetryBroker
+from airdrop import (
+    Command,
+    ExternalBridge,
+    MavsdkThread,
+    TelemetryBroker,
+    TelemetrySnapshot,
+)
 
 LOGGER = logging.getLogger("basic_usage")
 
 
-def on_snapshot(snapshot) -> None:
-    """内推回调：运行在 MAVSDK 工作线程中。"""
+def on_snapshot(snapshot: TelemetrySnapshot) -> None:
+    """遥测订阅回调：运行在 MAVSDK 工作线程中。"""
     if snapshot.is_valid() and snapshot.latitude_deg is not None:
         LOGGER.info(
             "推送  纬度=%.7f 经度=%.7f 相对高度=%.2f 偏航=%.1f",
@@ -49,7 +55,9 @@ def reader_loop(broker: TelemetryBroker, stop_event: threading.Event) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--address", default="udp://:14540", help="MAVSDK 系统地址")
+    parser.add_argument(
+        "--address", default="udpin://0.0.0.0:14540", help="MAVSDK 系统地址"
+    )
     parser.add_argument(
         "--demo-commands",
         action="store_true",
@@ -57,7 +65,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     broker = TelemetryBroker()
     broker.subscribe(on_snapshot)
@@ -80,7 +91,9 @@ def main() -> None:
     LOGGER.info("按时间戳查询结果：%s", historical.as_dict())
 
     stop_event = threading.Event()
-    reader = threading.Thread(target=reader_loop, args=(broker, stop_event), daemon=True)
+    reader = threading.Thread(
+        target=reader_loop, args=(broker, stop_event), daemon=True
+    )
     reader.start()
 
     if args.demo_commands:
@@ -96,7 +109,7 @@ def main() -> None:
                 break
             time.sleep(2.0)
 
-    # 跨进程共享（“外推”）：连接成功后启动，共享 dict 立即可用。
+    # 跨进程共享：连接成功后启动，共享 dict 立即可用。
     bridge = ExternalBridge(mavsdk, broker=broker, publish_hz=20.0)
     bridge.start()
     LOGGER.info(
