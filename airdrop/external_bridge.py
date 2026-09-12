@@ -14,7 +14,7 @@ import logging
 import multiprocessing
 import queue
 import threading
-from multiprocessing.managers import SyncManager
+from multiprocessing.managers import DictProxy, SyncManager
 from typing import Any
 
 from .broker import TelemetryBroker
@@ -37,7 +37,7 @@ class ExternalBridge:
         self.broker = broker or mavsdk_thread.broker
         self.publish_hz = publish_hz
         self._manager: SyncManager | None = None
-        self._snapshot: dict[str, Any] | None = None
+        self._snapshot: DictProxy | None = None
         self._command_queue: Any = None
         self._result_queue: Any = None
         self._stop = threading.Event()
@@ -99,7 +99,7 @@ class ExternalBridge:
     # 供子进程使用的属性
     # ------------------------------------------------------------------
     @property
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self) -> DictProxy:
         """共享 dict 代理；子进程可读取 ``snapshot["north_m"]`` 等字段。"""
         if self._snapshot is None:
             raise RuntimeError("ExternalBridge 尚未启动")
