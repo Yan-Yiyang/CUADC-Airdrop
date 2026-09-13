@@ -1,33 +1,17 @@
-'思翼 HM30 图传拉流。\n\nHM30 的地面端并不"推"视频给上位机，而是把机载以太网（``192.168.144.0/24``）\n**透明桥接**到 LAN 口 / 内置 WiFi / USB WiFi 上：地面端 LAN 口插到电脑，电脑\n配一个同网段地址，就能直接访问机载 IP 相机。官方 FAQ 明确写着\n"As long as the IP camera outputs RTSP video stream and can connect the\nEthernet port, it will work with HM30"。\n\n因此这里的"拉流"就是一条 RTSP：默认 ``rtsp://192.168.144.25:8554/main.264``\n（SIYI 云台/相机系列的约定地址）。若用的是 HDMI-Ethernet 输入转换模块或第三方\nIP 相机，地址不同，请用 :func:`probe_stream` 或用本模块的候选探测先确认。\n\n两条后端\n--------\n``ffmpeg``（**默认**，走 imageio-ffmpeg 自带的二进制）\n    ``subprocess`` 拉起 ffmpeg，从管道读 ``rawvideo/bgr24`` 裸帧。能压掉\n    FFmpeg 的探测与缓冲（``-fflags nobuffer -flags low_delay``），断流能被\n    ``-rw_timeout`` 及时判定，子进程还能被父进程直接杀掉，因此拉流线程永远\n    停得下来。\n``opencv``\n    ``cv2.VideoCapture`` + OpenCV 自带的 FFmpeg。零额外进程、代码最短，\n    但**延迟不可控**：OpenCV 5.0 已移除 ``OPENCV_FFMPEG_CAPTURE_OPTIONS``\n    （实测 cv2.pyd 里连这个字符串都不存在，设置它毫无效果），也没有其它受支持\n    的途径传入 ``nobuffer``/``low_delay``。\n\n语义与 :class:`~airdrop.broker.TelemetryBroker` 一致：后台线程**只保留最新一帧**。\n图传引导必须基于"当前画面"，慢消费者应该丢掉旧帧而不是积压——积压等于给无人机\n看历史照片。因此 :meth:`Hm30VideoSource.read` 返回的是"下一帧新画面"，\n:meth:`Hm30VideoSource.latest` 返回"此刻最新画面"，二者都不排队。'
+'思翼 HM30 图传拉流（ffmpeg 子进程，唯一后端）。\n\n接线与地址\n----------\nHM30 的地面端不"推"视频给上位机，而是把机载以太网（``192.168.144.0/24``）\n**透明桥接**到 LAN 口 / 内置 WiFi / USB WiFi 上：地面端 LAN 口插到电脑、电脑\n配一个同网段地址，就能直接访问机载 IP 相机。官方 FAQ 的说法是：只要 IP 相机\n输出 RTSP、能接以太网，就能配合 HM30 工作。\n\n所以"拉流"就是打开一条 RTSP，默认 ``rtsp://192.168.144.25:8554/main.264``\n（SIYI 云台/相机系列的约定地址）。**地址写错时本模块不探测、不猜测**：直接\n失败并在拉流源上给出明确错误（``stats.last_error`` + 错误日志），由使用方自己\n核对地址。想手动确认，用 ffmpeg 命令行试一次即可::\n\n    ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264         -frames:v 1 -f null -\n\n同理，输出尺寸也不自动探测：默认按 720p（1280x720）切帧，要换分辨率就在\n:class:`VideoConfig` 里显式改，而不是先猜一个再跑出错误的画面比例。\n\nffmpeg 后端（用 imageio-ffmpeg 自带的二进制，不需要另外安装）：\n``subprocess`` 拉起 ffmpeg，从管道读 ``rawvideo/bgr24`` 裸帧；``-fflags nobuffer\n-flags low_delay`` 压掉 FFmpeg 的探测与缓冲；``-timeout``（微秒）让断流能被\n及时判定；子进程还能被父进程直接杀掉，所以拉流线程永远停得下来。\n本模块只依赖 numpy 与标准库（不再 import cv2）。\n\n每一帧都不丢：sink\n------------------\n采集线程读出的**每一帧都会先交给注册的 sink**（:meth:`Hm30VideoSource.add_sink`），\n一帧都不会被跳过。这是本项目的硬要求：目标出现的时间可能极短，漏一帧就可能漏掉\n目标；而"先侦查后空投"的模式允许一定的处理延时，不允许丢帧。把\n:class:`~airdrop.buffer.AlignmentWriter` 挂上去，每帧就会连同它拍摄时刻的遥测\n一起写进环形缓冲，之后随便什么时候回看都在。\n\nsink 在采集线程里**同步**执行，所以它必须快（缓冲写入只做一次 JPEG 编码，几毫秒）。\nsink 抛出的异常只记日志，不会打断拉流。\n\n:meth:`Hm30VideoSource.read` / :meth:`latest` 面向**实时**消费者（预览、即时引导）：\n它们只关心"现在这一帧"，慢消费者会丢掉中间帧并计入 :attr:`VideoStats.dropped`。\n那是实时路径自己的取舍，与 sink/缓冲那条"每帧都留存"的路径互不影响——历史在\n缓冲里，不会因为某个实时消费者掉队而缺失。\n\n注意 ``VideoFrame.image`` 是**复用管道缓冲区的视图**，下一帧读入会覆盖它；\n跨帧持有画面必须先 :meth:`VideoFrame.copy`。'
 
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Iterator
+from typing import Callable, Iterator
 
-# OPENCV_FFMPEG_CAPTURE_OPTIONS 必须尽量早地写进环境：OpenCV 的 FFmpeg 后端在
-# 首次打开串流时读取它。放在 import cv2 之前，是唯一 100% 生效的位置。
-_DEFAULT_OPENCV_FFMPEG_OPTIONS = (
-    "rtsp_transport;udp"
-    "|fflags;nobuffer"
-    "|flags;low_delay"
-    "|probesize;500000"
-    "|analyzeduration;0"
-    "|max_delay;500000"
-    "|reorder_queue_size;0"
-    "|rw_timeout;3000000"
-)
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", _DEFAULT_OPENCV_FFMPEG_OPTIONS)
-
-import cv2  # noqa: E402 - 必须在设置捕获选项之后导入
-import numpy as np  # noqa: E402
+import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,16 +21,13 @@ HM30_GROUND_IP = "192.168.144.12"
 # SIYI 相机/云台默认 RTSP 主码流
 HM30_DEFAULT_RTSP = f"rtsp://{HM30_CAMERA_IP}:8554/main.264"
 
-SUPPORTED_BACKENDS = frozenset({"auto", "opencv", "ffmpeg"})
 SUPPORTED_TRANSPORTS = frozenset({"udp", "tcp"})
 
 # 图传链路固定延时的默认估计（秒）：从"机载相机曝光"到"本进程从管道里切出
 # 一帧"之间的处理时间，含 H.264 编码、无线传输、解码与管道缓冲。本机在
-# ffmpeg 后端实测 ≈0.15s（见模块开头的实测数据）。
+# ffmpeg 后端实测 ≈0.15s。
 # 拿到一帧后用它反推该画面真正的拍摄时刻（VideoFrame.capture_timestamp），
 # 再按那一刻取遥测，见 :mod:`airdrop.alignment`。
-# 注意：改用 OpenCV 后端做对照时链路延时约 0.57s，这个值要同步调大，否则
-# 对齐结果会系统地偏向"未来"。
 DEFAULT_TELEMETRY_LAG = 0.15
 
 
@@ -57,27 +38,21 @@ DEFAULT_TELEMETRY_LAG = 0.15
 class VideoConfig:
     """拉流配置。
 
-    ``backend="auto"`` 表示优先 ffmpeg（延迟可控），找不到 ffmpeg 才退回 opencv。
-    ``width``/``height`` 为 0 时使用源分辨率；ffmpeg 后端必须先知道输出尺寸才能
-    从管道切帧，因此为 0 时会在启动前用 OpenCV 探测一次。
+    ``width``/``height`` 是输出尺寸（默认 720p）。本模块**不探测**流分辨率：
+    ffmpeg 后端要按固定尺寸从管道切帧，所以要换分辨率必须在这里显式改。
     """
 
     url: str = HM30_DEFAULT_RTSP
-    backend: str = "auto"
+    # RTSP 传输层：udp 延迟更低，tcp 更耐丢包
     transport: str = "udp"
-    width: int = 0
-    height: int = 0
-    open_timeout: float = 5.0
+    width: int = 1280
+    height: int = 720
+    # 断流判定超时（秒），对应 ffmpeg 的 -timeout
     read_timeout: float = 3.0
-    # 图传链路的固定延时（秒），会被写进每一帧（VideoFrame.lag）。默认
-    # DEFAULT_TELEMETRY_LAG=0.15；用 OpenCV 后端做对照时链路延时约 0.57s，
-    # 需同步调大。0 表示不做延时补偿（帧的拍摄时刻 = 收到时刻）。
+    # 图传链路的固定延时（秒），会被写进每一帧（VideoFrame.lag）
     telemetry_lag: float = DEFAULT_TELEMETRY_LAG
     reconnect_delay: float = 1.0
     max_reconnect_delay: float = 10.0
-    # 覆盖 OPENCV_FFMPEG_CAPTURE_OPTIONS。注意：OpenCV 5.0 已移除该环境变量，
-    # 本机实测设了等于没设；保留只为兼容还在 OpenCV 4.x 的环境。
-    opencv_ffmpeg_options: str | None = None
     # ffmpeg 可执行文件；None 表示用 imageio-ffmpeg 自带的那份
     ffmpeg_executable: str | None = None
     # 指定解码器，例如 "h264_cuvid" / "hevc_cuvid"（NVDEC 硬解）
@@ -88,14 +63,15 @@ class VideoConfig:
     extra_output_args: tuple[str, ...] = ()
 
     def validated(self) -> "VideoConfig":
-        if self.backend not in SUPPORTED_BACKENDS:
-            raise ValueError(
-                f"不支持的后端: {self.backend}，可选 {sorted(SUPPORTED_BACKENDS)}"
-            )
         if self.transport not in SUPPORTED_TRANSPORTS:
             raise ValueError(
                 f"不支持的传输层: {self.transport}，可选 "
                 f"{sorted(SUPPORTED_TRANSPORTS)}"
+            )
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(
+                f"输出尺寸必须为正: width={self.width} height={self.height}；"
+                f"本模块不探测流分辨率（默认 720p 即 1280x720）"
             )
         if self.telemetry_lag < 0:
             raise ValueError(f"telemetry_lag 不能为负: {self.telemetry_lag}")
@@ -173,18 +149,6 @@ class VideoStats:
     last_error: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class StreamInfo:
-    """一次探测的结果。"""
-
-    url: str
-    width: int
-    height: int
-    fps: float
-    open_seconds: float
-    first_frame_seconds: float
-
-
 # ----------------------------------------------------------------------
 # 工具
 # ----------------------------------------------------------------------
@@ -200,113 +164,38 @@ def _find_ffmpeg(explicit: str | None = None) -> str | None:
         return shutil.which("ffmpeg")
 
 
-def _opencv_ffmpeg_options(config: VideoConfig) -> str:
-    'OpenCV 4.x 的 FFmpeg 捕获选项串（只负责低延迟 flag）。'
-    if config.opencv_ffmpeg_options is not None:
-        return config.opencv_ffmpeg_options
-    return (
-        f"rtsp_transport;{config.transport}"
-        "|fflags;nobuffer"
-        "|flags;low_delay"
-        "|probesize;500000"
-        "|analyzeduration;0"
-        "|max_delay;500000"
-        "|reorder_queue_size;0"
-    )
-
-
 def _is_rtsp(url: str) -> bool:
     return url.lower().startswith("rtsp")
-
-
-def probe_stream(
-    url: str = HM30_DEFAULT_RTSP,
-    *,
-    transport: str = "udp",
-    timeout: float = 5.0,
-) -> StreamInfo | None:
-    """探测一条流是否能打开，并返回分辨率等基本信息。
-
-    用 OpenCV 后端实现，因此只依赖 opencv-python，不需要额外进程。
-    注意：本函数会临时改写进程级的 ``OPENCV_FFMPEG_CAPTURE_OPTIONS``
-    （对 OpenCV 5.0 无效，见 :func:`_opencv_ffmpeg_options`），
-    因此不要在拉流线程运行期间调用。
-    """
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = _opencv_ffmpeg_options(
-        VideoConfig(transport=transport, read_timeout=timeout)
-    )
-    capture = cv2.VideoCapture()
-    started = time.monotonic()
-    try:
-        # 与 _stream_opencv 一致：超时只能走 open() 的 params
-        if not capture.open(
-            url,
-            cv2.CAP_FFMPEG,
-            [
-                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
-                int(timeout * 1000),
-                cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                int(timeout * 1000),
-            ],
-        ):
-            return None
-        opened = time.monotonic()
-        ok, image = capture.read()
-        if not ok or image is None:
-            return None
-        first = time.monotonic()
-        return StreamInfo(
-            url=url,
-            width=int(image.shape[1]),
-            height=int(image.shape[0]),
-            fps=float(capture.get(cv2.CAP_PROP_FPS) or 0.0),
-            open_seconds=opened - started,
-            first_frame_seconds=first - started,
-        )
-    finally:
-        capture.release()
-
-
-def probe_candidates(
-    urls: list[str] | tuple[str, ...] | None = None,
-    *,
-    transports: tuple[str, ...] = ("udp",),
-    timeout: float = 5.0,
-) -> list[StreamInfo]:
-    """按顺序探测候选地址，返回所有成功的流。
-
-    HM30 现场最常见的坑就是"地址记错了"——相机、HDMI 输入转换模块、地面端
-    自身的地址各不相同。先用它把正确的地址筛出来，再谈调优。
-    """
-    if urls is None:
-        urls = [HM30_DEFAULT_RTSP]
-    found: list[StreamInfo] = []
-    for url in urls:
-        for transport in transports:
-            if not _is_rtsp(url) and transport != transports[0]:
-                continue  # 非 RTSP 流没有传输层可选，只试一次
-            info = probe_stream(url, transport=transport, timeout=timeout)
-            if info is not None:
-                found.append(info)
-    return found
 
 
 # ----------------------------------------------------------------------
 # 拉流源
 # ----------------------------------------------------------------------
 class Hm30VideoSource:
-    """HM30 图传拉流源：后台线程收流，对外只暴露"最新一帧"。
+    """HM30 图传拉流源：后台线程收流，每帧交给 sink，实时读取看最新一帧。
 
-    典型用法::
+    典型用法（每帧都留存，供侦查与事后分析）::
 
-        with Hm30VideoSource(VideoConfig(url=HM30_DEFAULT_RTSP)) as source:
-            frame = source.read(timeout=5.0)   # 阻塞到第一帧
-            while frame is not None:
-                results = model(frame.image)   # YOLO / OCR
-                frame = source.read(timeout=1.0)
+        config = VideoConfig(width=1280, height=720)
+        buffer = AlignmentBuffer(capacity_for(30, 180))
+        with Hm30VideoSource(config) as source:
+            source.add_sink(AlignmentWriter(buffer, FrameTelemetryAligner(broker)))
+            ...
 
-    消费速度慢于帧率时，中间帧会被直接覆盖并计入
-    :attr:`VideoStats.dropped`——这是刻意的，不是 bug。
+    只想实时看画面时，用 :meth:`read` / :meth:`latest` 即可::
+
+        frame = source.read(timeout=5.0)     # 阻塞到第一帧
+        while frame is not None:
+            results = model(frame.image)     # YOLO / OCR
+            frame = source.read(timeout=1.0)
+
+    地址或链路有问题时不会静默重试到底：第一帧都还没收到就失败时，错误会以
+    错误日志 + ``stats.last_error`` 的形式明确抛出（含 ffmpeg 的输出），
+    方便直接核对地址与网段。
+
+    两条消费路径的取舍：``add_sink`` 注册的回调在采集线程里**逐帧**调用，
+    一帧不落（这是"目标可能只出现一瞬"的要求）；而 :meth:`read` / :meth:`latest`
+    是实时的，消费速度慢于帧率时中间帧会被覆盖并计入 :attr:`VideoStats.dropped`。
     """
 
     def __init__(self, config: VideoConfig | None = None) -> None:
@@ -314,6 +203,7 @@ class Hm30VideoSource:
         self._condition = threading.Condition(threading.RLock())
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._sinks: list[Callable[[VideoFrame], None]] = []
 
         self._frame: VideoFrame | None = None
         self._delivered = 0
@@ -322,11 +212,35 @@ class Hm30VideoSource:
         self._fps_window_start = 0.0
         self._fps_window_frames = 0
 
-        # 仅 ffmpeg 后端使用
-        self._native_size: tuple[int, int] | None = None
-        self._output_size: tuple[int, int] | None = None
         self._process: subprocess.Popen | None = None
         self._ffmpeg_executable: str | None = None
+
+    # ------------------------------------------------------------------
+    # 每帧回调（sink）
+    # ------------------------------------------------------------------
+    def add_sink(self, sink: Callable[[VideoFrame], None]) -> None:
+        """注册一个**每帧**回调，用于"一帧都不能丢"的消费者。
+
+        回调在采集线程里同步执行，所以必须快——它每慢一毫秒，就直接吃掉一毫秒的
+        拉流预算（缓冲写入只做一次 JPEG 编码，几毫秒，可以接受；写磁盘之类请自己
+        再开线程或队列）。回调抛异常只记日志，不会打断拉流。
+
+        典型用法是挂 :class:`airdrop.buffer.AlignmentWriter`，把每帧连同拍摄时刻的
+        遥测写进环形缓冲。
+        """
+        with self._condition:
+            if sink not in self._sinks:
+                self._sinks.append(sink)
+
+    def remove_sink(self, sink: Callable[[VideoFrame], None]) -> None:
+        with self._condition:
+            if sink in self._sinks:
+                self._sinks.remove(sink)
+
+    @property
+    def sinks(self) -> tuple[Callable[[VideoFrame], None], ...]:
+        with self._condition:
+            return tuple(self._sinks)
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -387,15 +301,19 @@ class Hm30VideoSource:
     # 读取接口
     # ------------------------------------------------------------------
     def latest(self) -> VideoFrame | None:
-        """立刻返回最新一帧，没有则不等待。"""
+        """立刻返回最新一帧，没有则不等待（实时路径，同样会跳过中间帧）。"""
         with self._condition:
             return self._frame
 
     def read(self, timeout: float | None = None) -> VideoFrame | None:
         """阻塞等待**下一帧新画面**；超时或已停止返回 None。
 
-        面向单消费者：内部记录投递进度。多消费者场景请用 :meth:`latest` 各自
-        取帧，或每个消费者各自持有读游标。
+        这是**实时**读取：只关心当前画面，跟进不上就会丢掉中间帧（计入
+        :attr:`VideoStats.dropped`）。要保证一帧不丢，就别在这条路径上做重活——
+        用 :meth:`add_sink` 挂一个 :class:`airdrop.buffer.AlignmentWriter`，
+        历史都在缓冲里。
+
+        面向单消费者：内部记录投递进度。
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
@@ -434,15 +352,21 @@ class Hm30VideoSource:
     # 后台线程
     # ------------------------------------------------------------------
     def _run(self) -> None:
+        if self._ffmpeg_executable is None:
+            self._ffmpeg_executable = _find_ffmpeg(self._config.ffmpeg_executable)
+        if self._ffmpeg_executable is None:
+            # 环境问题，重连多少次都没用：直接说明白并停下
+            self._fail(
+                "找不到 ffmpeg 可执行文件（imageio-ffmpeg 与 PATH 里都没有），"
+                "无法拉流"
+            )
+            self._set_state("stopped")
+            return
+
         delay = self._config.reconnect_delay
         while not self._stop_event.is_set():
             try:
-                if self._effective_backend() == "ffmpeg":
-                    self._ensure_output_size()
-                    if self._output_size is not None:
-                        self._stream_ffmpeg()
-                else:
-                    self._stream_opencv()
+                self._stream_ffmpeg()
                 delay = self._config.reconnect_delay
             except Exception as exc:  # noqa: BLE001 - 线程不能因单次失败而死
                 LOGGER.exception("图传拉流异常")
@@ -457,64 +381,12 @@ class Hm30VideoSource:
             delay = min(delay * 2, self._config.max_reconnect_delay)
         self._set_state("stopped")
 
-    def _effective_backend(self) -> str:
-        """把 ``auto`` 解析成实际后端：优先 ffmpeg（延迟可控），找不到才退回 OpenCV。"""
-        if self._config.backend != "auto":
-            return self._config.backend
-        if self._ffmpeg_executable is None:
-            self._ffmpeg_executable = _find_ffmpeg(self._config.ffmpeg_executable)
-            if self._ffmpeg_executable is None:
-                LOGGER.warning(
-                    "找不到 ffmpeg，auto 退回 OpenCV 后端（画面滞后约 0.5s）；"
-                    "此时应把 telemetry_lag 调到 ≈0.57s，否则帧-遥测时间对齐会偏"
-                )
-        return "opencv" if self._ffmpeg_executable is None else "ffmpeg"
-
-    def _stream_opencv(self) -> None:
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = _opencv_ffmpeg_options(
-            self._config
-        )
-        capture = cv2.VideoCapture()
-        self._set_state("connecting")
-        try:
-            # 超时必须通过 open() 的 params 传入。实测（OpenCV 5.0）
-            # cap.set(CAP_PROP_READ_TIMEOUT_MSEC) 在 open 之前调用无效，
-            # OPENCV_FFMPEG_CAPTURE_OPTIONS 里的 rw_timeout 也无效——两者都会
-            # 退回到 30 秒默认值，链路一断拉流线程就卡死半分钟。
-            if not capture.open(
-                self._config.url,
-                cv2.CAP_FFMPEG,
-                [
-                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
-                    int(self._config.open_timeout * 1000),
-                    cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                    int(self._config.read_timeout * 1000),
-                ],
-            ):
-                self._fail(f"OpenCV 打开失败: {self._config.url}")
-                return
-            self._set_state("streaming")
-            while not self._stop_event.is_set():
-                ok, image = capture.read()
-                if not ok or image is None:
-                    self._fail("图传读取中断")
-                    return
-                self._publish(image)
-        finally:
-            capture.release()
-
     def _stream_ffmpeg(self) -> None:
-        executable = self._ffmpeg_executable or _find_ffmpeg(
-            self._config.ffmpeg_executable
-        )
-        if executable is None:
+        executable = self._ffmpeg_executable
+        if executable is None:  # pragma: no cover - _run 已保证
             self._fail("找不到 ffmpeg 可执行文件")
             return
-        size = self._output_size
-        if size is None:
-            self._fail("ffmpeg 后端需要先确定输出尺寸（config.width/height）")
-            return
-        width, height = size
+        width, height = self._config.width, self._config.height
 
         command = self._build_ffmpeg_command(executable, width, height)
         LOGGER.debug("ffmpeg 命令: %s", " ".join(command))
@@ -540,7 +412,8 @@ class Hm30VideoSource:
             while not self._stop_event.is_set():
                 if not _read_exact(process.stdout, buffer):
                     self._fail(
-                        f"ffmpeg 管道结束: {_read_stderr(process, stderr_file)}"
+                        f"拉流失败或中断（{self._config.url}）："
+                        f"{_read_stderr(process, stderr_file)}"
                     )
                     return
                 image = np.frombuffer(buffer, dtype=np.uint8).reshape(
@@ -576,31 +449,10 @@ class Hm30VideoSource:
         command += ["-i", config.url]
         # 输出端：直接吐 bgr24 裸帧，numpy 零解析接管
         command += ["-an", "-sn", "-dn"]
-        if self._native_size != (width, height):
-            # 只在需要时插滤镜：等比缩放到目标尺寸后再切帧
-            command += ["-vf", f"scale={width}:{height}"]
+        command += ["-vf", f"scale={width}:{height}"]
         command += list(config.extra_output_args)
         command += ["-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
         return command
-
-    def _ensure_output_size(self) -> None:
-        """ffmpeg 后端必须提前知道输出尺寸：优先用配置，其次探测源。"""
-        if self._output_size is not None:
-            return
-        config = self._config
-        if config.width > 0 and config.height > 0:
-            self._output_size = (config.width, config.height)
-            return
-        info = probe_stream(
-            config.url,
-            transport=config.transport,
-            timeout=config.open_timeout,
-        )
-        if info is None:
-            self._fail(f"无法探测流分辨率，请显式指定 width/height: {config.url}")
-            return
-        self._native_size = (info.width, info.height)
-        self._output_size = (config.width or info.width, config.height or info.height)
 
     # ------------------------------------------------------------------
     # 状态与发布
@@ -609,12 +461,13 @@ class Hm30VideoSource:
         now = time.time()
         with self._condition:
             self._counter += 1
-            self._frame = VideoFrame(
+            frame = VideoFrame(
                 index=self._counter,
                 image=image,
                 timestamp=now,
                 lag=self._config.telemetry_lag,
             )
+            self._frame = frame
             # 帧率按 1 秒滑窗统计：链路刚接上时往往会先吐一批缓冲帧，
             # 用相邻帧间隔做 EMA 会被这波突发带飞到几百 fps，失去参考价值。
             if self._fps_window_start == 0.0:
@@ -627,7 +480,17 @@ class Hm30VideoSource:
                 self._fps_window_frames = 0
             self._stats.frames += 1
             self._stats.state = "streaming"
+            sinks = tuple(self._sinks)
             self._condition.notify_all()
+
+        # 逐帧投递给 sink，且放在锁外——别让编码/落盘拖住 read()/latest()。
+        # "每一帧都被留存"的保证就在这里：frame 是复用视图，sink 必须在这
+        # 一帧还有效时把它接管（缓冲写入会拷贝，见 AlignmentWriter）。
+        for sink in sinks:
+            try:
+                sink(frame)
+            except Exception:  # noqa: BLE001 - 单个 sink 失败不能打断拉流
+                LOGGER.exception("图传帧 sink 执行失败")
 
     def _set_state(self, state: str) -> None:
         with self._condition:
@@ -635,10 +498,20 @@ class Hm30VideoSource:
             self._condition.notify_all()
 
     def _fail(self, message: str) -> None:
-        LOGGER.warning("图传中断: %s", message)
+        """记录失败原因并提示。
+
+        一帧都没收到就失败（地址写错、链路不通、配置不对）属于"用不了"，
+        用错误级别并原样给出 ffmpeg 的输出；已经跑起来之后的断流则是
+        "暂时中断"，警告级别即可——重连逻辑会继续尝试。
+        """
         with self._condition:
+            never_streamed = self._stats.frames == 0
             self._stats.last_error = message
             self._condition.notify_all()
+        if never_streamed:
+            LOGGER.error("图传不可用：%s", message)
+        else:
+            LOGGER.warning("图传中断：%s", message)
 
 
 # ----------------------------------------------------------------------

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from .broker import SUPPORTED_QUERY_MODES, TelemetryBroker
 from .models import TelemetrySnapshot
-from .video import DEFAULT_TELEMETRY_LAG, Hm30VideoSource, VideoFrame
+from .video import DEFAULT_TELEMETRY_LAG, VideoFrame
 
 LOGGER = logging.getLogger(__name__)
 
@@ -95,10 +95,6 @@ class FrameTelemetryAligner:
     # 属性
     # ------------------------------------------------------------------
     @property
-    def broker(self) -> TelemetryBroker:
-        return self._broker
-
-    @property
     def lag(self) -> float | None:
         """覆盖用的固定延时；None 表示采用每一帧自带的值。"""
         return self._lag
@@ -153,14 +149,6 @@ class FrameTelemetryAligner:
             extrapolated=extrapolated,
             offset=offset,
         )
-
-    def align_latest(self, source: Hm30VideoSource) -> AlignedSample | None:
-        """取 :class:`~airdrop.video.Hm30VideoSource` 的当前画面并立即对齐。
-
-        等价于 ``aligner.align(source.latest())``，不阻塞等待新帧——视觉引导
-        要的永远是"现在这一帧"，不是队列里的下一帧。
-        """
-        return self.align(source.latest())
 
     # ------------------------------------------------------------------
     # 内部实现

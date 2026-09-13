@@ -52,9 +52,10 @@ ffmpeg 后端每帧的 ``image`` 是**复用管道缓冲区的视图**（零拷�
 缓冲区）；``raw`` 模式下是**内部数组的只读视图**（零拷贝，需要可写请自行
 ``.copy()``）。
 
-另外注意 :meth:`AlignmentBuffer.between` 一次会把命中的帧全部解码进内存——
-5400 帧的 720p 就是 13.9 GiB。批量消费请用 :meth:`AlignmentBuffer.iter_between`，
-它分批解码，内存占用与批量大小同阶而与总量无关。
+回看历史一律走 :meth:`AlignmentBuffer.iter_between`：它分批解码，内存占用与批量
+大小同阶而与总量无关（一次性把 5400 帧 720p 全解出来是 13.9 GiB，本模块因此
+**不提供**"一把返回列表"的接口——真要列表就 ``list(buffer.iter_between(...))``，
+那时的内存账由调用方自己认）。
 """
 
 from __future__ import annotations
@@ -71,8 +72,9 @@ from typing import Iterator
 import cv2
 import numpy as np
 
-from .alignment import AlignedSample
+from .alignment import AlignedSample, FrameTelemetryAligner
 from .models import TelemetrySnapshot
+from .video import VideoFrame
 
 LOGGER = logging.getLogger(__name__)
 
@@ -327,32 +329,6 @@ class AlignmentBuffer:
                 return None
             return self._records[0].index, self._records[-1].index
 
-    def time_span(self) -> tuple[float, float] | None:
-        """当前保留记录的拍摄时刻范围 ``(最早, 最新)``；空缓冲返回 None。"""
-        with self._lock:
-            if not self._records:
-                return None
-            return (
-                self._records[0].capture_timestamp,
-                self._records[-1].capture_timestamp,
-            )
-
-    def between(
-        self,
-        start: float | None = None,
-        end: float | None = None,
-        *,
-        limit: int | None = None,
-    ) -> list[BufferedFrame]:
-        """按拍摄时刻取一段时间区间（闭区间）。
-
-        **注意内存**：每个命中帧都会解出完整图像——5400 帧的 720p 就是 13.9 GiB。
-        只想要几帧时传 ``limit``，批量消费请用 :meth:`iter_between`。
-        """
-        records = self._records_between(start, end, limit)
-        frames = [self._materialize(stored) for stored in records]
-        return [frame for frame in frames if frame is not None]
-
     def iter_between(
         self,
         start: float | None = None,
@@ -362,8 +338,7 @@ class AlignmentBuffer:
     ) -> Iterator[BufferedFrame]:
         """按时间区间逐帧迭代，分批解码，内存占用与 ``batch`` 同阶。
 
-        与 :meth:`between` 不同，它在整个迭代过程中不会持有锁，因此采集线程
-        不会被读者的解码拖慢。
+        整个迭代过程不持有锁，因此采集线程不会被读者的解码拖慢。
 
         这是**快照式**迭代：只覆盖开始迭代那一刻已入库的记录，之后新写入的
         内容不在本次迭代范围内（要跟随最新数据请用 :meth:`wait_new`）。
@@ -495,15 +470,6 @@ class AlignmentBuffer:
                 return 0
             return records[pos - 1].index
 
-    def _records_between(
-        self, start: float | None, end: float | None, limit: int | None
-    ) -> list[_StoredFrame]:
-        with self._lock:
-            records = self._select_locked(start, end)
-            if limit is not None:
-                records = records[:limit]
-            return list(records)
-
     def _records_after(
         self, after_index: int, batch: int, max_index: int
     ) -> list[_StoredFrame]:
@@ -516,18 +482,6 @@ class AlignmentBuffer:
                 for stored in records[pos : pos + batch]
                 if stored.index <= max_index
             ]
-
-    def _select_locked(
-        self, start: float | None, end: float | None
-    ) -> list[_StoredFrame]:
-        records = self._records
-        if not records:
-            return []
-        lo = 0 if start is None else bisect.bisect_left(records, start, key=_capture_timestamp)
-        hi = len(records) if end is None else bisect.bisect_right(
-            records, end, key=_capture_timestamp
-        )
-        return records[lo:hi] if hi > lo else []
 
     def _evict_locked(self) -> None:
         """按帧数上限与字节上限从最旧一端驱逐。"""
@@ -558,3 +512,68 @@ class AlignmentBuffer:
             estimate / 1024 / 1024 / 1024,
             "（受 max_bytes 限制）" if self._max_bytes else "",
         )
+
+
+# ----------------------------------------------------------------------
+# 拉流源 → 缓冲的接线
+# ----------------------------------------------------------------------
+class AlignmentWriter:
+    """把**每一帧**对齐后写进缓冲；直接挂到拉流源上当 sink 用。
+
+    它只做一件事：``aligner.align(frame)`` → ``buffer.put(sample)``。挂上去以后，
+    拉流源采集线程读出的每一帧都会被接管（缓冲内部会拷贝图像，不受"下一帧覆盖
+    管道缓冲"的影响），因此不存在"消费者跟不上就丢帧"的问题::
+
+        buffer = AlignmentBuffer(capacity_for(30, 180))
+        writer = AlignmentWriter(buffer, FrameTelemetryAligner(broker, lag=0.15))
+
+        with Hm30VideoSource(VideoConfig()) as source:
+            source.add_sink(writer)        # 从这一帧起，一帧不落
+            ...
+
+    唯一会跳过画面的情况是对齐拿不到遥测（历史为空，或超出 ``max_extrapolation``
+    被拒），这类帧计入 :attr:`skipped`；正常写入计入 :attr:`written`。两个数字分开看，
+    就能区分"没写进去"与"跟不上"——后者在这个类里不会发生。
+
+    它跑在采集线程里，所以必须快：``put`` 只做一次 JPEG 编码（720p 几毫秒）。
+    """
+
+    def __init__(
+        self, buffer: AlignmentBuffer, aligner: FrameTelemetryAligner
+    ) -> None:
+        self._buffer = buffer
+        self._aligner = aligner
+        self._lock = threading.Lock()
+        self._written = 0
+        self._skipped = 0
+
+    def __call__(self, frame: VideoFrame) -> None:
+        sample = self._aligner.align(frame)
+        if sample is None:
+            with self._lock:
+                self._skipped += 1
+            return
+        self._buffer.put(sample)
+        with self._lock:
+            self._written += 1
+
+    @property
+    def buffer(self) -> AlignmentBuffer:
+        return self._buffer
+
+    @property
+    def written(self) -> int:
+        """已成功写进缓冲的帧数。"""
+        with self._lock:
+            return self._written
+
+    @property
+    def skipped(self) -> int:
+        """因取不到遥测而跳过的帧数（唯一会丢画面、且原因明确的场合）。"""
+        with self._lock:
+            return self._skipped
+
+    def stats(self) -> tuple[int, int]:
+        """返回 ``(written, skipped)`` 快照，方便日志里一起打印。"""
+        with self._lock:
+            return self._written, self._skipped

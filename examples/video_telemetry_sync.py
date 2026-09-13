@@ -1,46 +1,25 @@
-"""图传帧 ↔ 遥测的时间对齐示例：扣掉链路延时取遥测，结果入缓冲供其他模块读。
+"""图传帧 ↔ 遥测的对齐与留存示例：**每一帧都进缓冲**，随时回看。
 
-背景：从"相机曝光"到"本进程读出一帧"之间有约 150ms 的固定链路延时（编码 +
-传输 + 解码 + 管道缓冲）。直接用收到帧的时刻去查遥测，等于拿"现在的姿态"
-解释"150ms 前的画面"——飞机以 10 m/s 平飞时就是 1.5 米的系统性偏差。
-所以每拿到一帧，先把它的接收时间减掉这段延时，得到真正的拍摄时刻，再按
-那个时刻向 :class:`~airdrop.broker.TelemetryBroker` 查询遥测（默认线性内插）。
+为什么不是"读一帧 → 处理 → 再读一帧"：那样只要有一帧处理慢了，中间帧就被覆盖
+丢掉了。而目标出现的时间可能极短，漏一帧就可能漏掉目标。本项目走"先侦查后空投"，
+可以接受一定的处理延时，不能接受丢帧。所以这里的结构是：
 
-对齐结果同时放进 :class:`~airdrop.buffer.AlignmentBuffer`：本文件的主循环扮演
-"写者"，另起一个读者线程演示"其他模块"如何按自己的节奏回看这段数据。
+1. 建一个环形缓冲（默认 30 fps × 3 分钟 = 5400 帧）；
+2. 把 :class:`~airdrop.buffer.AlignmentWriter` 挂到拉流源上——它在采集线程里
+   **逐帧**被调用，对齐遥测后写进缓冲，一帧不落；
+3. 另起一个线程扮演"其他模块"，从缓冲里按自己的节奏取数据（推理 / 落盘 / 回放），
+   快慢都不影响第 2 步。
 
-缓冲容量默认按 30 fps × 3 分钟 = 5400 帧。注意未压缩 720p 单帧 2.64 MiB，
-5400 帧 ≈ 13.9 GiB，普通机器放不下，所以默认 ``storage="jpeg"``（约 0.6~1 GiB）；
-需要像素级无损时用 ``--buffer-storage raw``，并务必配 ``--buffer-max-mb`` 限制内存。
+链路延时（默认 150ms）在写入时就已扣掉：缓冲里的每一帧都带着它**拍摄时刻**的
+遥测，回看的人不用再自己换算。
 
-常用命令：
+    python -m examples.video_telemetry_sync
 
-    # 连飞控 + 拉默认 RTSP 地址，缓冲 3 分钟
-    python -m examples.video_telemetry_sync --address udpin://0.0.0.0:14540
-
-    # 标定出新延时后覆盖默认的 150ms
-    python -m examples.video_telemetry_sync --lag 0.32
-
-    # 只跑 10 秒，缩到 960x540，缓冲只留 30 秒
-    python -m examples.video_telemetry_sync --duration 10 --width 960 --height 540 \
-        --buffer-seconds 30
-
-    # 无损缓冲（raw），并把内存限制在 4 GiB
-    python -m examples.video_telemetry_sync --buffer-storage raw --buffer-max-mb 4096
-
-    # 换成 OpenCV 后端做对照：此时链路延时约 0.57s，必须同步调 --lag
-    python -m examples.video_telemetry_sync --backend opencv --lag 0.57
-
-    # 换个图传地址
-    python -m examples.video_telemetry_sync --url rtsp://192.168.144.25:8554/main.264
-
-输出里每行会打印：帧号、画面拍摄至今的时长（应略大于 lag）、对齐时刻是内插
-还是外推、以及那一刻的姿态与位置；读者线程另行打印缓冲的消费进度与占用。
+地址、分辨率、缓冲容量、延时都在下面的"配置"区。
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import threading
 import time
@@ -49,6 +28,7 @@ from airdrop import (
     DEFAULT_TELEMETRY_LAG,
     HM30_DEFAULT_RTSP,
     AlignmentBuffer,
+    AlignmentWriter,
     FrameTelemetryAligner,
     Hm30VideoSource,
     MavsdkThread,
@@ -57,111 +37,34 @@ from airdrop import (
     capacity_for,
 )
 
+# ----------------------------------------------------------------------
+# 配置（改这里，不用命令行参数）
+# ----------------------------------------------------------------------
+ADDRESS = "udpin://0.0.0.0:14540"  # MAVSDK 系统地址
+VIDEO_URL = HM30_DEFAULT_RTSP  # 图传 RTSP 地址
+WIDTH, HEIGHT = 1280, 720  # 图传输出尺寸（不探测，直接按这个尺寸切帧）
+LAG = DEFAULT_TELEMETRY_LAG  # 链路固定延时（秒）
+
+BUFFER_SECONDS = 180.0  # 缓冲保留时长（秒）：30 × 180 = 5400 帧
+BUFFER_FPS = 30.0  # 容量换算帧率
+BUFFER_STORAGE = "jpeg"  # jpeg 省内存（满载约 0.6~1 GiB）/ raw 无损但 ≈13.9 GiB
+BUFFER_MAX_MB = 0  # 缓冲占用上限（MB），0=不限
+
+RUN_SECONDS = 0.0  # 运行时长，0=一直跑
+REPORT_INTERVAL = 2.0  # 状态汇报间隔（秒）
+READ_INTERVAL = 0.05  # 读者线程两次取帧之间的间隔（秒），模拟"慢慢消费"
+
 LOGGER = logging.getLogger("video_telemetry_sync")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--address", default="udpin://0.0.0.0:14540", help="MAVSDK 系统地址"
-    )
-    parser.add_argument(
-        "--url", default=HM30_DEFAULT_RTSP, help="图传 RTSP 地址"
-    )
-    parser.add_argument(
-        "--lag",
-        type=float,
-        default=DEFAULT_TELEMETRY_LAG,
-        help=(
-            "链路固定延时（秒），默认 150ms。它是链路属性：ffmpeg 后端约 0.15，"
-            "OpenCV 后端约 0.57"
-        ),
-    )
-    parser.add_argument(
-        "--max-extrapolation",
-        type=float,
-        default=None,
-        help="允许的最大外推秒数，超过则跳过该帧（默认不限制，只做标记）",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=("auto", "opencv", "ffmpeg"),
-        default="auto",
-        help="拉流后端，auto=ffmpeg 优先",
-    )
-    parser.add_argument("--width", type=int, default=960, help="输出宽度，0=源分辨率")
-    parser.add_argument("--height", type=int, default=540, help="输出高度，0=源分辨率")
-    parser.add_argument("--timeout", type=float, default=8.0, help="探流/首帧超时")
-    parser.add_argument("--duration", type=float, default=0.0, help="运行秒数，0=不限")
-    parser.add_argument(
-        "--interval", type=float, default=1.0, help="主循环打印间隔（秒）"
-    )
-    parser.add_argument(
-        "--buffer-seconds",
-        type=float,
-        default=180.0,
-        help="对齐缓冲保留多少秒的画面，0=关闭缓冲（默认 180 秒）",
-    )
-    parser.add_argument(
-        "--buffer-fps",
-        type=float,
-        default=30.0,
-        help="按多少帧率换算缓冲容量（默认 30，即 30×180=5400 帧）",
-    )
-    parser.add_argument(
-        "--buffer-storage",
-        choices=("jpeg", "raw"),
-        default="jpeg",
-        help="缓冲存储方式：jpeg 省内存（默认），raw 无损但 720p 单帧 2.64 MiB",
-    )
-    parser.add_argument(
-        "--buffer-max-mb",
-        type=float,
-        default=0.0,
-        help="缓冲占用上限（MB），0=不限制；raw 模式强烈建议设置",
-    )
-    return parser.parse_args()
-
-
-def fmt(value, pattern: str) -> str:
-    return "n/a" if value is None else pattern % value
-
-
-def report(sample, frame, lag: float) -> None:
-    """打印一帧的对齐结果。"""
-    if sample is None:
-        LOGGER.info(
-            "帧#%-6d 拍摄于 %.3fs 前 | 对齐遥测不可用（历史为空或超出外推限制）",
-            frame.index,
-            frame.capture_age,
-        )
-        return
-
-    snapshot = sample.snapshot
-    mode = "外推 +%.2fs" % sample.offset if sample.extrapolated else "内插"
-    LOGGER.info(
-        "帧#%-6d 拍摄于 %.3fs 前（lag=%.0fms）| 遥测 %s @%.3fs 前 | "
-        "yaw=%s roll=%s 相对高度=%s 北=%s 东=%s",
-        frame.index,
-        frame.capture_age,
-        lag * 1000.0,
-        mode,
-        sample.age,
-        fmt(snapshot.yaw_deg, "%.1f°"),
-        fmt(snapshot.roll_deg, "%.1f°"),
-        fmt(snapshot.relative_altitude_m, "%.2fm"),
-        fmt(snapshot.north_m, "%.2fm"),
-        fmt(snapshot.east_m, "%.2fm"),
-    )
-
-
 def reader_loop(
-    buffer: AlignmentBuffer, stop_event: threading.Event, interval: float = 2.0
+    buffer: AlignmentBuffer, stop_event: threading.Event, pace: float
 ) -> None:
-    """模拟"其他模块"从缓冲区回看数据。
+    """扮演"其他模块"：从缓冲里按自己的节奏取帧。
 
-    读者自己记游标，用 ``wait_new`` 往前跟；拿到的 ``record`` 里同时有画面和
-    那一刻的遥测，可以直接喂给下游（推理、落盘、回放）。
+    这里刻意放慢节奏（每帧 sleep 一小会儿）——它证明消费端再慢也不会让采集端
+    丢帧：慢的只有它自己的游标，缓冲里的历史一帧都不会少。
+    真实场景里这一段就是推理、落盘或回放。
     """
     index = 0
     seen = 0
@@ -173,14 +76,15 @@ def reader_loop(
             continue
         index = record.index
         seen += 1
-        # 真正消费画面/遥测的位置：这里只做一次轻量访问
+        # 真正消费的位置：画面 + 那一刻的遥测都在 record 里
         assert record.image.ndim == 3
+        time.sleep(pace)
 
         now = time.monotonic()
-        if now - last_report >= interval:
+        if now - last_report >= REPORT_INTERVAL:
             stats = buffer.stats
             LOGGER.info(
-                "读者：已消费 %d 帧（%.1f fps）| 最新 #%d 拍摄于 %.2fs 前 | "
+                "读者：已消费 %d 帧（%.1f fps，慢速模拟）| 最新 #%d 拍摄于 %.2fs 前 | "
                 "缓冲 %d/%d 帧、%.1f MiB、已驱逐 %d",
                 seen,
                 seen / max(now - started, 1e-6),
@@ -195,40 +99,33 @@ def reader_loop(
     LOGGER.info("读者线程退出：共消费 %d 帧", seen)
 
 
-def run(
-    source: Hm30VideoSource,
-    aligner: FrameTelemetryAligner,
-    buffer: AlignmentBuffer | None,
-    args: argparse.Namespace,
-) -> None:
-    """主循环：读一帧 → 对齐遥测 → 入缓冲 → 按间隔打印。"""
-    started = time.monotonic()
-    last_report = 0.0
-    while True:
-        frame = source.read(timeout=1.0)
-        now = time.monotonic()
-        if frame is not None:
-            # 关键的一步：拿到帧之后立刻对齐，把该帧对应的遥测一并取出来
-            sample = aligner.align(frame)
-            if sample is not None and buffer is not None:
-                buffer.put(sample)  # 缓冲内部会拷贝，不存复用视图
-            if now - last_report >= args.interval:
-                report(sample, frame, aligner.lag or frame.lag)
-                last_report = now
-        elif now - last_report >= args.interval:
-            stats = source.stats
-            LOGGER.warning(
-                "等待画面：状态=%s 已收=%d 丢弃=%d 重连=%d 最后错误=%s",
-                stats.state,
-                stats.frames,
-                stats.dropped,
-                stats.reconnects,
-                stats.last_error,
-            )
-            last_report = now
-
-        if args.duration and now - started >= args.duration:
-            return
+def review(buffer: AlignmentBuffer) -> None:
+    """演示"先侦查、后回看"：把缓冲里留下的数据按时间顺序过一遍。"""
+    span = buffer.indices()
+    if span is None:
+        LOGGER.warning("缓冲里没有数据可回看")
+        return
+    first_index, last_index = span
+    first = next(iter(buffer.iter_between(batch=1)), None)
+    if first is None:
+        return
+    latest = buffer.latest()
+    LOGGER.info(
+        "回看：缓冲保留 #%d~#%d 共 %d 帧，跨度 %.1f 秒",
+        first_index,
+        last_index,
+        len(buffer),
+        (latest.capture_timestamp - first.capture_timestamp) if latest else 0.0,
+    )
+    LOGGER.info(
+        "回看：第 #%d 帧拍摄于 %.3f，yaw=%s；最新 #%d 拍摄于 %.3f，yaw=%s",
+        first.index,
+        first.capture_timestamp,
+        first.snapshot.yaw_deg,
+        latest.index if latest else -1,
+        latest.capture_timestamp if latest else float("nan"),
+        latest.snapshot.yaw_deg if latest else None,
+    )
 
 
 def main() -> int:
@@ -237,83 +134,97 @@ def main() -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    args = parse_args()
 
     broker = TelemetryBroker()
-    mavsdk = MavsdkThread(broker=broker, system_address=args.address)
+    mavsdk = MavsdkThread(broker=broker, system_address=ADDRESS)
     mavsdk.start()
-    mavsdk.connect(args.address)
+    mavsdk.connect(ADDRESS)
 
     LOGGER.info("等待遥测就绪...")
-    first = broker.wait_next_snapshot(timeout=15.0, predicate=lambda s: s.is_valid())
-    if first is None:
-        LOGGER.warning("15 秒内没收到遥测，仍会拉流，但对齐结果会不可用（全为 n/a）")
+    if broker.wait_next_snapshot(timeout=15.0, predicate=lambda s: s.is_valid()) is None:
+        LOGGER.warning(
+            "15 秒内没收到遥测：拉流不受影响，但对齐拿不到遥测的帧会被计为 skipped"
+        )
 
-    aligner = FrameTelemetryAligner(
-        broker,
-        lag=args.lag,
-        mode="interpolate",
-        max_extrapolation=args.max_extrapolation,
+    aligner = FrameTelemetryAligner(broker, lag=LAG)
+
+    buffer = AlignmentBuffer(
+        capacity_for(BUFFER_FPS, BUFFER_SECONDS),
+        storage=BUFFER_STORAGE,
+        max_bytes=int(BUFFER_MAX_MB * 1024 * 1024) or None,
+    )
+    # 挂在拉流源上的"每帧必写"通道
+    writer = AlignmentWriter(buffer, aligner)
+    LOGGER.info(
+        "对齐缓冲：容量 %d 帧（%.0f fps × %.0f s）、存储 %s",
+        buffer.capacity,
+        BUFFER_FPS,
+        BUFFER_SECONDS,
+        BUFFER_STORAGE,
     )
 
-    buffer: AlignmentBuffer | None = None
     stop_event = threading.Event()
-    reader: threading.Thread | None = None
-    if args.buffer_seconds > 0:
-        capacity = capacity_for(args.buffer_fps, args.buffer_seconds)
-        buffer = AlignmentBuffer(
-            capacity,
-            storage=args.buffer_storage,
-            max_bytes=int(args.buffer_max_mb * 1024 * 1024) or None,
-        )
-        LOGGER.info(
-            "对齐缓冲：容量 %d 帧（%.0f fps × %.0f s）、存储 %s",
-            capacity,
-            args.buffer_fps,
-            args.buffer_seconds,
-            args.buffer_storage,
-        )
-        reader = threading.Thread(
-            target=reader_loop, args=(buffer, stop_event), daemon=True
-        )
-        reader.start()
+    reader = threading.Thread(
+        target=reader_loop, args=(buffer, stop_event, READ_INTERVAL), daemon=True
+    )
+    reader.start()
 
     config = VideoConfig(
-        url=args.url,
-        backend=args.backend,
-        width=args.width,
-        height=args.height,
-        open_timeout=args.timeout,
-        telemetry_lag=args.lag,
+        url=VIDEO_URL, width=WIDTH, height=HEIGHT, telemetry_lag=LAG
     )
     LOGGER.info(
-        "拉流 %s（backend=%s），链路延时按 %.0fms 扣除",
+        "拉流 %s（%dx%d），链路延时按 %.0fms 扣除",
         config.url,
-        config.backend,
+        config.width,
+        config.height,
         config.telemetry_lag * 1000.0,
     )
 
+    started = time.monotonic()
     try:
         with Hm30VideoSource(config) as source:
-            if not source.wait_ready(timeout=args.timeout):
+            source.add_sink(writer)  # 从这一帧起，读到的每一帧都进缓冲
+            if not source.wait_ready(timeout=10.0):
                 LOGGER.error("首帧超时：%s", source.stats.last_error or "无错误信息")
                 return 1
-            run(source, aligner, buffer, args)
+            LOGGER.info("已开始留存：采集线程每读一帧就写一帧进缓冲")
+
+            # 主循环只做汇报，不在采集路径上做重活（重活在读者线程里）
+            while True:
+                time.sleep(REPORT_INTERVAL)
+                stats = source.stats
+                written, skipped = writer.stats()
+                LOGGER.info(
+                    "采集：状态=%s 帧率=%.1f 已收=%d | 缓冲：写入=%d 跳过=%d "
+                    "帧数=%d 驱逐=%d | 画面延迟=%.3fs",
+                    stats.state,
+                    stats.fps,
+                    stats.frames,
+                    written,
+                    skipped,
+                    len(buffer),
+                    buffer.stats.evicted,
+                    (source.latest().age if source.latest() else float("nan")),
+                )
+                if RUN_SECONDS and time.monotonic() - started >= RUN_SECONDS:
+                    break
+                if stats.frames == 0 and stats.state not in ("connecting", "streaming"):
+                    LOGGER.error("一帧都没收到，退出：%s", stats.last_error)
+                    return 1
     except KeyboardInterrupt:
         LOGGER.info("用户中断")
     finally:
         stop_event.set()
-        if reader is not None:
-            reader.join(timeout=2.0)
-        if buffer is not None:
-            stats = buffer.stats
-            LOGGER.info(
-                "缓冲收尾：入库 %d 帧、驱逐 %d 帧、当前 %d 帧（%.1f MiB）",
-                stats.put,
-                stats.evicted,
-                stats.frames,
-                stats.bytes / 1024 / 1024,
-            )
+        reader.join(timeout=2.0)
+        written, skipped = writer.stats()
+        LOGGER.info(
+            "收尾：入库 %d 帧、因取不到遥测跳过 %d 帧、缓冲现有 %d 帧（%.1f MiB）",
+            written,
+            skipped,
+            len(buffer),
+            buffer.stats.bytes / 1024 / 1024,
+        )
+        review(buffer)
         mavsdk.stop()
     return 0
 

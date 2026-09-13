@@ -1,14 +1,15 @@
 """最小示例：MAVSDK 专用线程 + 遥测代理 + 指令发送。
 
-连接 SITL 或真实飞控（UDP）：
+连接 SITL 或真实飞控（默认 UDP 入站 ``udpin://0.0.0.0:14540``）：
 
-    python -m examples.basic_usage --address udpin://0.0.0.0:14540
-    python -m examples.basic_usage --address udpin://0.0.0.0:14540 --demo-commands
+    python -m examples.basic_usage
+
+参数在下面的"配置"区。``DEMO_COMMANDS`` 打开后会依次发 arm -> takeoff ->
+land，**只在安全环境（桨已拆除 / SITL）里用**。
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import threading
 import time
@@ -20,6 +21,12 @@ from airdrop import (
     TelemetryBroker,
     TelemetrySnapshot,
 )
+
+# ----------------------------------------------------------------------
+# 配置（改这里，不用命令行参数）
+# ----------------------------------------------------------------------
+ADDRESS = "udpin://0.0.0.0:14540"  # MAVSDK 系统地址
+DEMO_COMMANDS = False  # 是否演示 arm -> takeoff -> land（安全环境才开）
 
 LOGGER = logging.getLogger("basic_usage")
 
@@ -54,17 +61,6 @@ def reader_loop(broker: TelemetryBroker, stop_event: threading.Event) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--address", default="udpin://0.0.0.0:14540", help="MAVSDK 系统地址"
-    )
-    parser.add_argument(
-        "--demo-commands",
-        action="store_true",
-        help="发送 arm + takeoff + land 指令（仅在安全环境中使用）",
-    )
-    args = parser.parse_args()
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -73,9 +69,9 @@ def main() -> None:
     broker = TelemetryBroker()
     broker.subscribe(on_snapshot)
 
-    mavsdk = MavsdkThread(broker=broker, system_address=args.address)
+    mavsdk = MavsdkThread(broker=broker, system_address=ADDRESS)
     mavsdk.start()
-    mavsdk.connect(args.address)
+    mavsdk.connect(ADDRESS)
 
     LOGGER.info("等待第一条遥测快照...")
     first = broker.wait_next_snapshot(timeout=15.0, predicate=lambda s: s.is_valid())
@@ -96,7 +92,7 @@ def main() -> None:
     )
     reader.start()
 
-    if args.demo_commands:
+    if DEMO_COMMANDS:
         for command in (Command("arm"), Command("takeoff"), Command("land")):
             result = mavsdk.send_command(command)
             LOGGER.info(

@@ -1,116 +1,51 @@
-"""思翼 HM30 图传拉流示例：先探流，再拉流，可预览/存盘。
+"""思翼 HM30 图传拉流示例：拉流并统计链路质量，可选预览 / 存盘。
 
-接线上位机（Windows）：
+接线（Windows 上位机）：
 1. 网线插 HM30 **地面端** LAN 口；
 2. 电脑网卡配静态地址 ``192.168.144.20`` / 掩码 ``255.255.255.0``（同网段任意空闲地址）；
-3. 确认能 ping 通机载相机 ``192.168.144.25``。
+3. 先确认能 ping 通机载相机 ``192.168.144.25``。
 
-常用命令：
+地址不确定时本示例不替你猜：用 ffmpeg 命令行确认一次即可::
 
-    # 只探流，确认地址对不对
-    python -m examples.hm30_video --probe
+    ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f null -
 
-    # 默认地址拉流，统计帧率与延迟
+运行（参数都在下面的"配置"区，直接跑）：
+
     python -m examples.hm30_video
 
-    # 开窗口预览（按 q 退出）
-    python -m examples.hm30_video --preview
+拉流失败会在日志里直接给出 ffmpeg 的输出，不做地址探测、不轮询猜测。
 
-    # 缩放到 960x540（管道带宽降到 1/4，YOLO 前处理也更快）
-    python -m examples.hm30_video --width 960 --height 540
-
-    # NVDEC 硬解
-    python -m examples.hm30_video --decoder h264_cuvid
-
-    # 换成 OpenCV 后端做对照（画面会滞后约 0.5s）
-    python -m examples.hm30_video --backend opencv
-
-    # RTSP over TCP（丢包环境更稳但延迟略高）
-    python -m examples.hm30_video --transport tcp
-
-    # 地址不确定时一次性试多个候选
-    python -m examples.hm30_video --probe --url rtsp://192.168.144.25:8554/main.264 ^
-        --url rtsp://192.168.144.25:8554/sub.264
+注意本示例消费的是**实时**画面（``read()``）：它保证你看到的是当前一帧，但不保证
+每一帧都被处理过。要"一帧都不能丢"（目标可能只出现一瞬），看
+``examples/video_telemetry_sync.py``——那里把 ``AlignmentWriter`` 挂在拉流源上，
+采集线程每读一帧就写一帧进缓冲。
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import time
 
-from airdrop import (
-    HM30_DEFAULT_RTSP,
-    Hm30VideoSource,
-    VideoConfig,
-    probe_candidates,
-)
+from airdrop import HM30_DEFAULT_RTSP, Hm30VideoSource, VideoConfig
+
+# ----------------------------------------------------------------------
+# 配置（改这里，不用命令行参数）
+# ----------------------------------------------------------------------
+URL = HM30_DEFAULT_RTSP  # 图传 RTSP 地址
+WIDTH, HEIGHT = 1280, 720  # 输出尺寸（不探测源分辨率，直接按这个切帧）
+TRANSPORT = "udp"  # RTSP 传输层：udp 延迟更低、tcp 更耐丢包
+DECODER = None  # 硬解可填 "h264_cuvid" / "hevc_cuvid"（NVDEC）
+
+PREVIEW = False  # 开窗口预览（按 q 退出）
+SAVE_PATH = None  # 存成 mp4 的路径，例如 "hm30.mp4"
+DURATION = 0.0  # 运行秒数，0=不限
 
 LOGGER = logging.getLogger("hm30_video")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HM30 图传拉流")
-    parser.add_argument(
-        "--url",
-        action="append",
-        default=None,
-        help=f"RTSP 地址，可重复传入以做候选探测（默认 {HM30_DEFAULT_RTSP}）",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=("auto", "opencv", "ffmpeg"),
-        default="auto",
-        help="拉流后端，auto=ffmpeg 优先（延迟可控）；opencv 更简单但画面滞后约 0.5s",
-    )
-    parser.add_argument(
-        "--transport",
-        choices=("udp", "tcp"),
-        default="udp",
-        help="RTSP 传输层，udp 延迟更低、tcp 更耐丢包",
-    )
-    parser.add_argument("--width", type=int, default=0, help="输出宽度，0=源分辨率")
-    parser.add_argument("--height", type=int, default=0, help="输出高度，0=源分辨率")
-    parser.add_argument(
-        "--decoder",
-        default=None,
-        help="ffmpeg 解码器，如 h264_cuvid / hevc_cuvid（NVDEC 硬解）",
-    )
-    parser.add_argument("--probe", action="store_true", help="只探测地址，不拉流")
-    parser.add_argument("--preview", action="store_true", help="开窗口预览")
-    parser.add_argument("--save", default=None, help="把画面存成 mp4（用于事后核对）")
-    parser.add_argument("--duration", type=float, default=0.0, help="运行秒数，0=不限")
-    parser.add_argument("--timeout", type=float, default=5.0, help="探流/首帧超时")
-    return parser.parse_args()
-
-
-def do_probe(urls: list[str], transport: str, timeout: float) -> list[str]:
-    """探测候选地址，打印可用项，返回拿到的地址列表。"""
-    LOGGER.info("开始探测 %d 个候选地址（transport=%s）...", len(urls), transport)
-    found = probe_candidates(
-        urls,
-        transports=(transport, "tcp" if transport == "udp" else "udp"),
-        timeout=timeout,
-    )
-    if not found:
-        LOGGER.error("没有探测到可用图传，检查网线/网段/地址")
-        return []
-    for info in found:
-        LOGGER.info(
-            "可用   %s  %dx%d @%.1ffps  打开 %.2fs  首帧 %.2fs",
-            info.url,
-            info.width,
-            info.height,
-            info.fps,
-            info.open_seconds,
-            info.first_frame_seconds,
-        )
-    return [info.url for info in found]
-
-
-def run(source: Hm30VideoSource, args: argparse.Namespace) -> None:
+def run(source: Hm30VideoSource) -> None:
     """主循环：按"最新帧"消费，并周期性打印链路统计。"""
-    if not source.wait_ready(timeout=args.timeout):
+    if not source.wait_ready(timeout=10.0):
         LOGGER.error("首帧超时：%s", source.stats.last_error or "无错误信息")
         return
 
@@ -126,20 +61,20 @@ def run(source: Hm30VideoSource, args: argparse.Namespace) -> None:
                 LOGGER.warning("读取超时，状态=%s", source.stats.state)
                 continue
 
-            if args.save and writer is None:
+            if SAVE_PATH and writer is None:
                 import cv2
 
                 writer = cv2.VideoWriter(
-                    args.save,
+                    SAVE_PATH,
                     cv2.VideoWriter_fourcc(*"mp4v"),
                     max(source.stats.fps, 10.0),
                     (frame.width, frame.height),
                 )
-                LOGGER.info("开始存盘: %s (%dx%d)", args.save, frame.width, frame.height)
+                LOGGER.info("开始存盘: %s (%dx%d)", SAVE_PATH, frame.width, frame.height)
             if writer is not None:
                 writer.write(frame.image)
 
-            if args.preview:
+            if PREVIEW:
                 import cv2
 
                 cv2.imshow("HM30", frame.image)
@@ -153,7 +88,7 @@ def run(source: Hm30VideoSource, args: argparse.Namespace) -> None:
                 consumed = stats.frames - last_index
                 LOGGER.info(
                     "状态=%-11s 帧率=%5.1f 已收=%d 丢弃=%d 重连=%d "
-                    "本次读到=%d 画面延迟=%.3fs",
+                    "本次读到=%d 画面延迟=%.3fs 拍摄延迟=%.3fs",
                     stats.state,
                     stats.fps,
                     stats.frames,
@@ -161,18 +96,19 @@ def run(source: Hm30VideoSource, args: argparse.Namespace) -> None:
                     stats.reconnects,
                     consumed,
                     frame.age,
+                    frame.capture_age,
                 )
                 last_index = stats.frames
                 last_report = now
 
-            if args.duration and now - started >= args.duration:
+            if DURATION and now - started >= DURATION:
                 break
     except KeyboardInterrupt:
         LOGGER.info("用户中断")
     finally:
         if writer is not None:
             writer.release()
-        if args.preview:
+        if PREVIEW:
             import cv2
 
             cv2.destroyAllWindows()
@@ -184,26 +120,22 @@ def main() -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    args = parse_args()
-    urls = args.url or [HM30_DEFAULT_RTSP]
-
-    if args.probe:
-        return 0 if do_probe(urls, args.transport, args.timeout) else 1
-
     config = VideoConfig(
-        url=urls[0],
-        backend=args.backend,
-        transport=args.transport,
-        width=args.width,
-        height=args.height,
-        open_timeout=args.timeout,
-        ffmpeg_decoder=args.decoder,
+        url=URL,
+        transport=TRANSPORT,
+        width=WIDTH,
+        height=HEIGHT,
+        ffmpeg_decoder=DECODER,
     )
     LOGGER.info(
-        "拉流 %s（backend=%s transport=%s）", config.url, config.backend, config.transport
+        "拉流 %s（%dx%d transport=%s）",
+        config.url,
+        config.width,
+        config.height,
+        config.transport,
     )
     with Hm30VideoSource(config) as source:
-        run(source, args)
+        run(source)
     return 0
 
 
