@@ -6,11 +6,13 @@
     收到帧的时间 - 链路固定延时（150ms） → 按该时刻取遥测快照
 
 覆盖内插、nearest、外推标记、``max_extrapolation`` 保护、延时优先级
-（帧自带 / 显式覆盖 / 0 不补偿）与参数校验。
+（帧自带 / 显式覆盖 / 0 不补偿）、参数校验，以及 P2 引入的**等待语义**：
+``max_wait`` 让遥测追上拍摄时刻再内插，超时则按 ``on_timeout="drop"`` 丢弃。
 """
 
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
@@ -267,3 +269,155 @@ def test_align_follows_live_updates() -> None:
     )
     assert lo - 1e-9 <= sample.snapshot.latitude_deg <= hi + 1e-9
     assert sample.age < 0.5
+
+
+# ----------------------------------------------------------------------
+# P2：等待语义（max_wait + on_timeout="drop"）
+# ----------------------------------------------------------------------
+def test_align_no_wait_when_history_covers_capture_ts(broker: TelemetryBroker) -> None:
+    """历史已覆盖拍摄时刻：不等待、纯内插，waits 计数 0。"""
+    now = time.time()
+    base = now - 5.0
+    fill_history(broker, base, count=11, step=0.1)  # 最新 = base+1
+    capture_ts = base + 0.5  # 在历史中段
+    frame = make_frame(capture_ts + DEFAULT_TELEMETRY_LAG)
+
+    aligner = FrameTelemetryAligner(broker, max_wait=1.0, on_timeout="drop")
+    t0 = time.perf_counter()
+    sample = aligner.align(frame)
+    elapsed = time.perf_counter() - t0
+
+    assert sample is not None
+    assert not sample.extrapolated
+    assert elapsed < 0.05, f"历史已覆盖却仍然等了 {elapsed*1000:.0f}ms"
+    s = aligner.stats
+    assert s.waits == 0
+    assert s.wait_timeouts == 0
+    assert s.aligned == 1
+
+
+def test_align_max_wait_zero_keeps_old_extrapolation(
+    broker: TelemetryBroker,
+) -> None:
+    """max_wait=0（默认）= 旧行为：未覆盖时直接外推，不等待。"""
+    now = time.time()
+    base = now - 5.0
+    fill_history(broker, base, count=11, step=0.1)
+    capture_ts = (base + 1) + 0.5  # 在历史之后
+    frame = make_frame(capture_ts + DEFAULT_TELEMETRY_LAG)
+
+    aligner = FrameTelemetryAligner(broker)  # 默认 max_wait=0
+    sample = aligner.align(frame)
+
+    assert sample is not None
+    assert sample.extrapolated is True
+    assert sample.offset == pytest.approx(0.5, abs=1e-6)
+    s = aligner.stats
+    assert s.waits == 0
+    assert s.aligned == 1
+
+
+def test_align_waits_then_interpolates_when_telemetry_catches_up(
+    broker: TelemetryBroker,
+) -> None:
+    """max_wait 内追上了：内插出样本、waits 计数 +1、wait_timeouts=0。"""
+    now = time.time()
+    base = now - 5.0
+    fill_history(broker, base, count=11, step=0.1)  # 最新 = base+1（5s 前）
+    capture_ts = (base + 1) + 0.05  # 仅 0.05s 超出历史最新
+    frame = make_frame(capture_ts + DEFAULT_TELEMETRY_LAG)
+
+    aligner = FrameTelemetryAligner(broker, max_wait=1.0, on_timeout="drop")
+
+    # 60ms 后注入新遥测（其时间戳自动为 time.time()，必 > capture_ts）
+    def push() -> None:
+        time.sleep(0.06)
+        broker.update_global_position(make_position(lat=99.0))
+
+    t = threading.Thread(target=push, daemon=True)
+    t0 = time.perf_counter()
+    t.start()
+    sample = aligner.align(frame)
+    elapsed = time.perf_counter() - t0
+    t.join(timeout=1.0)
+
+    assert sample is not None, "应当等到新遥测并产出样本"
+    assert not sample.extrapolated, f"应为内插（offset={sample.offset}）"
+    assert 0.04 < elapsed < 0.5, f"等待时长异常: {elapsed*1000:.0f}ms"
+    s = aligner.stats
+    assert s.waits == 1
+    assert s.wait_timeouts == 0
+    assert s.aligned == 1
+    assert s.max_wait_s >= 0.05
+
+
+def test_align_times_out_and_drops_when_telemetry_stalls(
+    broker: TelemetryBroker,
+) -> None:
+    """max_wait 内没追上：丢弃样本、wait_timeouts +1、返回 None。"""
+    now = time.time()
+    base = now - 5.0
+    fill_history(broker, base, count=11, step=0.1)
+    capture_ts = (base + 1) + 0.5
+    frame = make_frame(capture_ts + DEFAULT_TELEMETRY_LAG)
+
+    aligner = FrameTelemetryAligner(broker, max_wait=0.2, on_timeout="drop")
+    t0 = time.perf_counter()
+    sample = aligner.align(frame)
+    elapsed = time.perf_counter() - t0
+
+    assert sample is None
+    assert 0.15 < elapsed < 0.5, f"等待时长异常: {elapsed*1000:.0f}ms"
+    s = aligner.stats
+    assert s.waits == 1
+    assert s.wait_timeouts == 1
+    assert s.aligned == 0
+    assert s.max_wait_s >= 0.15
+
+
+def test_align_empty_history_skips_wait_and_reports_no_telemetry(
+    broker: TelemetryBroker,
+) -> None:
+    """历史为空（一条遥测都没收到）：不等、计入 no_telemetry。"""
+    frame = make_frame(time.time())
+    aligner = FrameTelemetryAligner(broker, max_wait=1.0, on_timeout="drop")
+    t0 = time.perf_counter()
+    sample = aligner.align(frame)
+    elapsed = time.perf_counter() - t0
+
+    assert sample is None
+    assert elapsed < 0.05
+    s = aligner.stats
+    assert s.no_telemetry == 1
+    assert s.waits == 0
+    assert s.wait_timeouts == 0
+
+
+def test_align_constructor_validates_max_wait_and_on_timeout(
+    broker: TelemetryBroker,
+) -> None:
+    with pytest.raises(ValueError, match="max_wait"):
+        FrameTelemetryAligner(broker, max_wait=-0.1)
+    with pytest.raises(ValueError, match="on_timeout"):
+        FrameTelemetryAligner(broker, max_wait=0.5, on_timeout="ignore")
+
+
+def test_writer_unsynced_via_aligner_stats(broker: TelemetryBroker) -> None:
+    """``AlignmentWriter.skipped`` 是"丢了几帧"，细看对齐器 ``stats.wait_timeouts``。"""
+    from airdrop import AlignmentBuffer, AlignmentWriter
+
+    now = time.time()
+    base = now - 5.0
+    fill_history(broker, base, count=11, step=0.1)
+
+    aligner = FrameTelemetryAligner(broker, max_wait=0.15, on_timeout="drop")
+    buf = AlignmentBuffer(capacity=8, storage="raw")
+    writer = AlignmentWriter(buf, aligner)
+
+    for _ in range(3):
+        capture_ts = (base + 1) + 1.0
+        writer(make_frame(capture_ts + DEFAULT_TELEMETRY_LAG))
+
+    assert writer.skipped == 3
+    assert writer.written == 0
+    assert aligner.stats.wait_timeouts == 3

@@ -7,13 +7,13 @@
 from __future__ import annotations
 
 import math
-import queue
 import threading
 import time
 
 import pytest
 
-from airdrop import Command, ExternalBridge, MavsdkThread, TelemetryBroker
+from airdrop import Command, MavsdkThread, TelemetryBroker
+from airdrop.config import TelemetryConfig
 
 
 class Fake:
@@ -221,7 +221,7 @@ def test_mavsdk_thread_lifecycle_and_errors() -> None:
 
 def test_drone_released_on_session_end(monkeypatch) -> None:
     """会话结束时必须显式终止 mavsdk_server，而不是等 GC 收 ``__del__``。"""
-    import airdrop.mavsdk_thread as mt
+    import airdrop.telemetry.mavsdk_thread as mt
 
     released: list[bool] = []
 
@@ -245,35 +245,88 @@ def test_drone_released_on_session_end(monkeypatch) -> None:
     assert released, "会话结束后未显式终止 mavsdk_server 子进程"
 
 
-def test_external_bridge_snapshot_and_commands() -> None:
-    """跨进程桥接：共享 dict 可读，指令经队列往返（未连接 → 干净失败）。"""
-    broker = TelemetryBroker()
-    mav = MavsdkThread(broker=broker, reconnect=False)
-    bridge = ExternalBridge(mav, broker=broker, publish_hz=20.0)
-    try:
-        bridge.start()
-    except PermissionError:
-        # 受限沙箱里创建不了 Manager 的命名管道，这不是代码问题
-        mav.stop()
-        pytest.skip("当前环境无法创建 multiprocessing.Manager（受限沙箱）")
 
-    try:
-        assert "latitude_deg" in dict(bridge.snapshot)
-        cmd = Command("arm")
-        bridge.command_queue.put(cmd.as_dict())
 
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            try:
-                raw = bridge.result_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if raw.get("id") == cmd.id:
-                assert raw.get("success") is False
-                assert "尚未连接" in (raw.get("error") or "")
-                break
-        else:
-            pytest.fail("10s 内未收到指令结果")
-    finally:
-        bridge.stop()
-        mav.stop()
+# ----------------------------------------------------------------------
+# P2：连接就绪后下发遥测速率（set_rate_*）
+# ----------------------------------------------------------------------
+def test_apply_telemetry_rates_calls_set_rate_with_configured_hz() -> None:
+    """用 MAVSDK 的 FakeSystem：_apply_telemetry_rates 应按配置下发各字段的速率。"""
+    import asyncio
+    import airdrop.telemetry.mavsdk_thread as mt
+
+    calls: dict[str, float] = {}
+
+    def make_fake_telemetry() -> "object":
+        class _T:
+            async def set_rate_position(self, rate): calls["position"] = rate
+            async def set_rate_position_velocity_ned(self, rate): calls["pvn"] = rate
+            async def set_rate_attitude_euler(self, rate): calls["euler"] = rate
+            async def set_rate_attitude_quaternion(self, rate): calls["quat"] = rate
+        return _T()
+
+    class FakeDrone:
+        telemetry = make_fake_telemetry()
+
+    config = TelemetryConfig(
+        position_rate_hz=10.0,
+        position_velocity_ned_rate_hz=12.0,
+        attitude_rate_hz=33.0,
+    )
+    mav = mt.MavsdkThread.from_config(config, broker=TelemetryBroker())
+    asyncio.run(mav._apply_telemetry_rates(FakeDrone()))
+
+    assert calls["position"] == 10.0
+    assert calls["pvn"] == 12.0
+    assert calls["euler"] == 33.0
+    assert calls["quat"] == 33.0  # 姿态用同一速率覆盖四元数与欧拉
+
+
+
+def test_apply_telemetry_rates_skips_when_rate_is_none() -> None:
+    """默认 None 时不下发（飞控沿用默认速率，不主动覆盖）。"""
+    import asyncio
+    import airdrop.telemetry.mavsdk_thread as mt
+
+    calls: list[str] = []
+
+    class _T:
+        async def set_rate_position(self, rate): calls.append("position")
+        async def set_rate_position_velocity_ned(self, rate): calls.append("pvn")
+        async def set_rate_attitude_euler(self, rate): calls.append("euler")
+        async def set_rate_attitude_quaternion(self, rate): calls.append("quat")
+
+    class FakeDrone:
+        telemetry = _T()
+
+    mav = mt.MavsdkThread()  # 全部 rate=None
+    asyncio.run(mav._apply_telemetry_rates(FakeDrone()))
+    assert calls == []
+
+
+
+def test_apply_telemetry_rates_swallows_individual_failures() -> None:
+    """单条 set_rate 失败不应影响其它流（飞控/固件可能不支持个别流）。"""
+    import asyncio
+    import airdrop.telemetry.mavsdk_thread as mt
+
+    calls: list[str] = []
+
+    class _T:
+        async def set_rate_position(self, rate): calls.append("position")
+        async def set_rate_position_velocity_ned(self, rate):
+            raise RuntimeError("firmware not supported")
+        async def set_rate_attitude_euler(self, rate): calls.append("euler")
+        async def set_rate_attitude_quaternion(self, rate): calls.append("quat")
+
+    class FakeDrone:
+        telemetry = _T()
+
+    config = TelemetryConfig(
+        position_rate_hz=10.0,
+        position_velocity_ned_rate_hz=10.0,
+        attitude_rate_hz=30.0,
+    )
+    mav = mt.MavsdkThread.from_config(config, broker=TelemetryBroker())
+    asyncio.run(mav._apply_telemetry_rates(FakeDrone()))  # 不应抛
+    assert "position" in calls and "euler" in calls

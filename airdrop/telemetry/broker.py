@@ -175,6 +175,34 @@ class TelemetryBroker:
                 return None
             return self._history[0].timestamp, self._history[-1].timestamp
 
+    def wait_history_until(
+        self,
+        timestamp: float,
+        timeout: float | None = None,
+    ) -> bool:
+        """阻塞直到**历史**覆盖到 ``timestamp``（最新一条的时间戳 ≥ 它）。
+
+        给帧-遥测对齐用：当画面的拍摄时刻比手上最新的遥测还新时，先等一小会儿
+        让遥测追上，这样就能**内插**而不是外推（见
+        :mod:`airdrop.video.align` 的 ``max_wait``）。
+
+        为什么以历史为准而不是最新快照：内插只吃历史。若只等最新快照，
+        节流写入的 0.1s 间隔仍会让查询落在外推区间里。
+
+        返回 ``True`` 表示历史已覆盖该时刻；超时返回 ``False``。
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while True:
+                if self._history and self._history[-1].timestamp >= timestamp:
+                    return True
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                self._condition.wait(remaining)
+
     def wait_next_snapshot(
         self,
         timeout: float | None = None,

@@ -1,63 +1,86 @@
-"""AirDrop 无人机控制脚手架。
+'AirDrop —— 基于 PX4 + MAVSDK 的固定翼无人机空投系统（先侦查后空投）。\n\n规划中（按计划阶段推进）：``perception``（视频处理：YOLO+OCR/分类）、``georef``（坐标处理）、\n``targeting``（目标统计）、``ballistics``（弹道）、``mission``（任务编排）、``record``（记录与回放）。\n\n核心约定（迁移自 2.x，继续有效）\n--------------------------------\n1. MAVSDK 跑在专用线程里、持有自己的 asyncio 循环；指令经其队列串行执行。\n2. 遥测是"最新可用值合并"的快照；按时间查询走定采样率历史 + 内插/外推。\n3. 图传每一帧都交给 sink（**一帧不丢**）；``read()``/``latest()`` 是允许丢帧的实时路径。\n4. 帧按"收到时间 − 链路延时"还原拍摄时刻，再按该时刻取遥测（见 ``video.align``）。\n5. 对齐结果（画面 + 拍摄时刻遥测）进 FIFO 环形缓冲，供感知/记录等读者异步消费。\n'
 
-当前重点：
-1. MAVSDK 运行在专用线程，并拥有自己的 asyncio 事件循环。
-2. 遥测通过线程安全的进程内代理和可选的跨进程桥接发布。
-3. 任意线程/进程都可以向 MAVSDK 工作线程发送指令。
-4. 思翼 HM30 图传：采集线程读出的每一帧都交给 sink（一帧不丢），
-   实时读取（read/latest）另外只看当前一帧。
-5. 图传帧按"收到时间 - 固定链路延时（默认 150ms）"对齐到拍摄时刻的遥测。
-6. 对齐结果（画面 + 遥测）可存入环形缓冲，供其他模块回看/异步消费。
-"""
-
-from .alignment import AlignedSample, FrameTelemetryAligner
-from .broker import TelemetryBroker
-from .buffer import (
-    DEFAULT_BUFFER_CAPACITY,
-    AlignmentBuffer,
-    AlignmentWriter,
-    BufferStats,
-    BufferedFrame,
-    capacity_for,
-    raw_frame_bytes,
+from .config import (
+    AlignConfig,
+    BallisticsConfig,
+    CameraConfig,
+    Config,
+    DropConfig,
+    GripperConfig,
+    GroundConfig,
+    OverflyConfig,
+    PerceptionConfig,
+    RecordConfig,
+    RoutesConfig,
+    TargetingConfig,
+    TelemetryConfig,
+    Waypoint,
 )
-from .external_bridge import ExternalBridge
-from .mavsdk_thread import MavsdkThread
-from .models import Command, CommandResult, TelemetrySnapshot
+from .telemetry import (
+    SUPPORTED_QUERY_MODES,
+    Command,
+    CommandResult,
+    MavsdkThread,
+    TelemetryBroker,
+    TelemetrySnapshot,
+)
 from .video import (
+    DEFAULT_BUFFER_CAPACITY,
     DEFAULT_TELEMETRY_LAG,
     HM30_CAMERA_IP,
     HM30_DEFAULT_RTSP,
     HM30_GROUND_IP,
+    AlignedSample,
+    AlignmentBuffer,
+    AlignmentWriter,
+    BufferStats,
+    BufferedFrame,
+    FrameTelemetryAligner,
     Hm30VideoSource,
     VideoConfig,
     VideoFrame,
     VideoStats,
+    capacity_for,
     open_hm30_video,
+    raw_frame_bytes,
 )
 
 __all__ = [
+    "SUPPORTED_QUERY_MODES",
     "AlignedSample",
     "AlignmentBuffer",
     "AlignmentWriter",
+    "AlignConfig",
+    "BallisticsConfig",
     "BufferStats",
     "BufferedFrame",
+    "CameraConfig",
     "Command",
     "CommandResult",
+    "Config",
     "DEFAULT_BUFFER_CAPACITY",
     "DEFAULT_TELEMETRY_LAG",
-    "ExternalBridge",
+    "DropConfig",
     "FrameTelemetryAligner",
+    "GripperConfig",
+    "GroundConfig",
     "HM30_CAMERA_IP",
     "HM30_DEFAULT_RTSP",
     "HM30_GROUND_IP",
     "Hm30VideoSource",
     "MavsdkThread",
+    "OverflyConfig",
+    "PerceptionConfig",
+    "RecordConfig",
+    "RoutesConfig",
+    "TargetingConfig",
     "TelemetryBroker",
+    "TelemetryConfig",
     "TelemetrySnapshot",
     "VideoConfig",
     "VideoFrame",
     "VideoStats",
+    "Waypoint",
     "capacity_for",
     "open_hm30_video",
     "raw_frame_bytes",

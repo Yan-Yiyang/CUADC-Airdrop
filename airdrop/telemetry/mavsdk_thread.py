@@ -16,7 +16,7 @@ import asyncio
 import concurrent.futures
 import logging
 import threading
-from typing import Any, AsyncIterable, Coroutine, cast
+from typing import TYPE_CHECKING, Any, AsyncIterable, Coroutine, cast
 
 from mavsdk import System
 from mavsdk.action import ActionError
@@ -24,6 +24,9 @@ from mavsdk.telemetry import GpsGlobalOrigin, TelemetryError
 
 from .broker import SUPPORTED_QUERY_MODES, TelemetryBroker
 from .models import Command, CommandResult, TelemetrySnapshot
+
+if TYPE_CHECKING:  # 仅类型标注用，避免 telemetry → config 的运行时依赖
+    from ..config import TelemetryConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -95,6 +98,9 @@ class MavsdkThread:
         origin_refresh_interval: float = 5.0,
         reconnect: bool = True,
         reconnect_delay: float = 5.0,
+        position_rate_hz: float | None = None,
+        position_velocity_ned_rate_hz: float | None = None,
+        attitude_rate_hz: float | None = None,
         thread_name: str = "mavsdk-thread",
     ) -> None:
         self.broker = broker or TelemetryBroker()
@@ -106,6 +112,11 @@ class MavsdkThread:
         self.origin_refresh_interval = origin_refresh_interval
         self.reconnect = reconnect
         self.reconnect_delay = reconnect_delay
+        # 遥测速率（None = 不下发，沿用飞控默认）。速率决定帧-遥测内插的精度上限：
+        # 位置 1Hz 时两个采样点相隔十几米，内插等于猜。
+        self.position_rate_hz = position_rate_hz
+        self.position_velocity_ned_rate_hz = position_velocity_ned_rate_hz
+        self.attitude_rate_hz = attitude_rate_hz
         self._thread_name = thread_name
 
         self._thread: threading.Thread | None = None
@@ -116,6 +127,37 @@ class MavsdkThread:
         self._started = threading.Event()
         self._ready = threading.Event()
         self._stop_requested = threading.Event()
+
+    # ------------------------------------------------------------------
+    # 配置入口
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_config(
+        cls,
+        config: "TelemetryConfig",
+        *,
+        broker: TelemetryBroker | None = None,
+        thread_name: str = "mavsdk-thread",
+    ) -> "MavsdkThread":
+        """按 :class:`airdrop.config.TelemetryConfig` 装配（含遥测速率下发）。
+
+        把"配置 + 构造"合成一步，调用方只需要拿到配置、塞进来即可。
+        """
+        return cls(
+            broker=broker,
+            system_address=config.system_address,
+            connect_timeout=config.connect_timeout,
+            wait_for_health=config.wait_for_health,
+            health_timeout=config.health_timeout,
+            require_health_for_actions=config.require_health_for_actions,
+            origin_refresh_interval=config.origin_refresh_interval,
+            reconnect=config.reconnect,
+            reconnect_delay=config.reconnect_delay,
+            position_rate_hz=config.position_rate_hz,
+            position_velocity_ned_rate_hz=config.position_velocity_ned_rate_hz,
+            attitude_rate_hz=config.attitude_rate_hz,
+            thread_name=thread_name,
+        )
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -327,6 +369,11 @@ class MavsdkThread:
                 await self._wait_healthy(drone)
                 LOGGER.info("飞控健康检查通过")
 
+            # 下发遥测速率。位置/姿态速率直接决定帧-遥测内插的精度上限：
+            # 固定翼 15~20 m/s 平飞时，位置 1Hz 的内插误差是米级，10Hz 才到
+            # 分米级；姿态 1° 误差在 20m 高度 ≈0.35m 地面误差，所以姿态 30Hz 起步。
+            await self._apply_telemetry_rates(drone)
+
             # 连接就绪后先取一次 NED 原点，之后由采集任务周期刷新。
             await self._publish_origin(drone)
 
@@ -356,6 +403,38 @@ class MavsdkThread:
                 stop_server()
             except Exception:  # noqa: BLE001 - 清理失败不能影响重连/停止流程
                 LOGGER.exception("终止 mavsdk_server 子进程失败")
+
+    async def _apply_telemetry_rates(self, drone: System) -> None:
+        """下发遥测速率（连接就绪后调用一次）。
+
+        速率决定 :mod:`airdrop.video.align` 内插的精度上限。
+        单个速率失败只记日志、不中断连接（飞控/固件可能不支持某些流）；
+        ``None``/非正数表示不下发，沿用飞控默认。
+        """
+        wanted = (
+            ("position", self.position_rate_hz, drone.telemetry.set_rate_position),
+            (
+                "position_velocity_ned",
+                self.position_velocity_ned_rate_hz,
+                drone.telemetry.set_rate_position_velocity_ned,
+            ),
+            ("attitude_euler", self.attitude_rate_hz, drone.telemetry.set_rate_attitude_euler),
+            (
+                "attitude_quaternion",
+                self.attitude_rate_hz,
+                drone.telemetry.set_rate_attitude_quaternion,
+            ),
+        )
+        for name, rate, setter in wanted:
+            if rate is None or rate <= 0:
+                continue
+            try:
+                await setter(rate)
+                LOGGER.info("遥测速率已设置：%s = %.1f Hz", name, rate)
+            except Exception as exc:  # noqa: BLE001 单条失败不应阻塞其它流
+                LOGGER.warning(
+                    "设置遥测速率失败（%s=%.1fHz）：%s", name, rate, exc
+                )
 
     async def _wait_connected(self, drone: System) -> None:
         async def wait() -> None:

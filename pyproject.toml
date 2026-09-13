@@ -10,6 +10,7 @@ dependencies = [
     "pyproj",
     "pyyaml",
     "rapidocr",
+    "scikit-learn>=1.9.1",
     "scipy",
     "torch",
     "torchvision>=0.28.0",

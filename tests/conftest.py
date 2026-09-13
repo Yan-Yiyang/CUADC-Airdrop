@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from airdrop import TelemetryBroker  # noqa: E402
-from airdrop.video import Hm30VideoSource, VideoConfig, _find_ffmpeg  # noqa: E402
+from airdrop.video.source import Hm30VideoSource, VideoConfig, _find_ffmpeg  # noqa: E402
 
 # 本地测试流的参数（多个模块共用）
 STREAM_PORT = 51234

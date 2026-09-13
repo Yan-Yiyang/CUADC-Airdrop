@@ -16,7 +16,6 @@ import time
 
 from airdrop import (
     Command,
-    ExternalBridge,
     MavsdkThread,
     TelemetryBroker,
     TelemetrySnapshot,
@@ -105,14 +104,8 @@ def main() -> None:
                 break
             time.sleep(2.0)
 
-    # 跨进程共享：连接成功后启动，共享 dict 立即可用。
-    bridge = ExternalBridge(mavsdk, broker=broker, publish_hz=20.0)
-    bridge.start()
-    LOGGER.info(
-        "外部快照可用：lat=%s lon=%s",
-        bridge.snapshot.get("latitude_deg"),
-        bridge.snapshot.get("longitude_deg"),
-    )
+    # 3.0 起不再有跨进程桥（external_bridge 已删除）：消费者直接读同一个 broker；
+    # 唯一需要的多进程组件是感知侧的 OCR 工作进程（见 REWRITE_PLAN.md 4.3）。
 
     try:
         LOGGER.info("运行中... 按 Ctrl+C 停止")
@@ -121,7 +114,6 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        bridge.stop()
         stop_event.set()
         reader.join(timeout=2.0)
         mavsdk.stop()

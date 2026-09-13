@@ -72,9 +72,9 @@ from typing import Iterator
 import cv2
 import numpy as np
 
-from .alignment import AlignedSample, FrameTelemetryAligner
-from .models import TelemetrySnapshot
-from .video import VideoFrame
+from ..telemetry.models import TelemetrySnapshot
+from .align import AlignedSample, FrameTelemetryAligner
+from .source import VideoFrame
 
 LOGGER = logging.getLogger(__name__)
 
@@ -531,11 +531,18 @@ class AlignmentWriter:
             source.add_sink(writer)        # 从这一帧起，一帧不落
             ...
 
-    唯一会跳过画面的情况是对齐拿不到遥测（历史为空，或超出 ``max_extrapolation``
-    被拒），这类帧计入 :attr:`skipped`；正常写入计入 :attr:`written`。两个数字分开看，
-    就能区分"没写进去"与"跟不上"——后者在这个类里不会发生。
+    唯一会跳过画面的情况是对齐拿不到遥测——历史为空、等满 ``max_wait`` 仍未追上
+    （``on_timeout="drop"``）、或超出 ``max_extrapolation`` 被拒——这类帧计入
+    :attr:`skipped`；正常写入计入 :attr:`written`。两个数字分开看，就能区分
+    "没写进去"与"跟不上"——后者在这个类里不会发生。
 
-    它跑在采集线程里，所以必须快：``put`` 只做一次 JPEG 编码（720p 几毫秒）。
+    ``skipped`` 只回答"丢了几帧"，丢的原因看对齐器自己的
+    :attr:`~airdrop.video.align.FrameTelemetryAligner.stats`
+    （``no_telemetry`` / ``wait_timeouts`` / ``extrapolation_drops``）。
+
+    它跑在采集线程里，所以必须快：``put`` 只做一次 JPEG 编码（720p 几毫秒）；
+    若给对齐器设了 ``max_wait``，等待也会发生在这个线程里（见
+    :mod:`airdrop.video.align` 的"关于等待"）。
     """
 
     def __init__(
@@ -560,6 +567,11 @@ class AlignmentWriter:
     @property
     def buffer(self) -> AlignmentBuffer:
         return self._buffer
+
+    @property
+    def aligner(self) -> FrameTelemetryAligner:
+        """本 writer 使用的对齐器（丢弃原因的细分统计在它身上）。"""
+        return self._aligner
 
     @property
     def written(self) -> int:
