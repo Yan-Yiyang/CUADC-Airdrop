@@ -16,10 +16,12 @@ import numpy as np
 import pytest
 
 from airdrop.perception import (
+    CropResult,
     Detection,
     DetectorConfig,
     OcrEngine,
     OcrEngineConfig,
+    OcrOrientation,
     OcrResult,
     OcrText,
     OpenCvPostProcess,
@@ -122,16 +124,20 @@ def test_pixel_box_expanded_never_inverts() -> None:
 # 几何：五边形顶点与转正
 # ----------------------------------------------------------------------
 def _pentagon_approx(angle_deg: float = 0.0) -> np.ndarray:
-    """造一个目标五边形 approx（正方形 + 等边三角形）。
+    """造一个目标五边形 approx（正方形 + 架在正方形上边的等边三角形）。
 
-    正方形 (70,90)-(130,150)，**三角形的底边就是正方形的上边**，顶角在
-    ``(100, 90 - 51.96)``——顶角高度是 ``边长×0.866`` 相对正方形上边而言，
-    若误把顶角放到 ``cy - half - tri/2`` 之类的位置，得到的是"风筝形"而不是
-    目标五边形（内角会变成 15°/75° 这种），几何判据全部失真。
+    正方形 (70,90)-(130,150)；三角形底边 = 正方形上边 (tl—tr，长 60)，
+    顶角在上边中点正上方 ``90 − 60·√3/2``。三条边都是 60，**顶角内角就是 60°**。
+
+    ⚠ **顶点顺序必须是简单的多边形绕行**：``apex, tl, bl, br, tr``。
+    曾经写成 ``apex, tl, tr, br, bl``——那是**自交**图形，顶角的两个"邻居"变成了
+    两个下角（bl/bl 与 tl），量出的顶角是 15° 而不是 60°，还害我误判成
+    "等边三角形顶角是 15°、门限失效"。正确顺序下的内角是
+    60（顶角）/120（tl）/90（bl）/90（br）/120（tr），合计 540 = (5−2)·180。
     """
     side = 60.0
     half = side / 2.0
-    tri = side * 0.866
+    tri = side * 0.8660254037844386          # 等边三角形的高 = 边长·√3/2
     x0, y0 = 70.0, 90.0
     cx = x0 + half
     apex = [cx, y0 - tri]
@@ -139,7 +145,8 @@ def _pentagon_approx(angle_deg: float = 0.0) -> np.ndarray:
     tr = [x0 + side, y0]
     br = [x0 + side, y0 + side]
     bl = [x0, y0 + side]
-    pts = np.array([apex, tl, tr, br, bl], dtype=np.float64)
+    # 绕行顺序：顶角 → 左上 → 左下 → 右下 → 右上（简单多边形）
+    pts = np.array([apex, tl, bl, br, tr], dtype=np.float64)
     if angle_deg:
         theta = np.radians(angle_deg)
         rot = np.array([[np.cos(theta), -np.sin(theta)],
@@ -166,6 +173,79 @@ def test_find_apex_by_parallel_rejects_non_pentagon() -> None:
     assert apex is None and pair is None
 
 
+def _square_with_noise_corner() -> np.ndarray:
+    """近方形五边形：正方形边上插一个顶点（饱和度过严时掩码只圈住编号底板）。
+
+    这就是实测帧 1840 在 ``s_min=100`` 上撞到的情形——``approxPolyDP`` 把一块
+    编号底板凑成 5 个顶点，`_find_apex_by_parallel` 照样能找出一对平行边。
+    """
+    return np.array(
+        [[0, 0], [30, 3], [60, 0], [60, 60], [0, 60]], dtype=np.float64
+    ).reshape(-1, 1, 2)
+
+
+def test_is_house_pentagon_accepts_the_target_shape() -> None:
+    """标准"房子"任意旋转都算数——顶角恒为 60°，与朝向无关。"""
+    for angle in (0.0, 12.0, -25.0, 40.0, 180.0):
+        approx = _pentagon_approx(angle_deg=angle)
+        apex, pair, _ = OpenCvPostProcess._find_apex_by_parallel(approx)
+        assert apex is not None
+        assert OpenCvPostProcess._is_house_pentagon(approx, apex), f"angle={angle}"
+
+
+def test_is_house_pentagon_rejects_square_like_pentagon() -> None:
+    """近方形必须判负：它有平行边、能凑出 5 个顶点，但顶角不是 60°。
+
+    这一条是**真实缺陷**的回归——缺了这道门限时，这种假房子会给出任意角度的
+    "转正"，而 OCR 还能读出一个自信的错编号（帧 1840 把 56 读成 95）。
+    """
+    approx = _square_with_noise_corner()
+    apex, pair, _ = OpenCvPostProcess._find_apex_by_parallel(approx)
+    assert apex is not None, "前提：这种形状确实能找出一对平行边"
+    assert not OpenCvPostProcess._is_house_pentagon(approx, apex)
+
+
+def test_best_candidate_prefers_house_shape_over_confidence() -> None:
+    """形态成立的候选优先于置信度更高的假房子——两种先后顺序都要成立。"""
+    post = OpenCvPostProcess(color="blue")
+    probe = np.zeros((10, 10, 3), np.uint8)
+    empty = CropResult(None, -1.0, None, "", 0.0, stage="none")
+    fake = [(5.0, 5.0, "95", 1.0)]          # 假房子读出来的（置信度更高）
+    real = [(5.0, 5.0, "56", 0.9)]
+
+    picked = post._best_candidate(
+        fake, 10.0, probe, empty, saturation_level=100, stage="parallel", house_ok=False
+    )
+    picked = post._best_candidate(
+        real, 10.0, probe, picked, saturation_level=60, stage="parallel", house_ok=True
+    )
+    assert picked.number == 56 and picked.house_ok
+
+    picked = post._best_candidate(
+        real, 10.0, probe, empty, saturation_level=60, stage="parallel", house_ok=True
+    )
+    picked = post._best_candidate(
+        fake, 10.0, probe, picked, saturation_level=100, stage="parallel", house_ok=False
+    )
+    assert picked.number == 56, "形态成立的结果不能被后来的假房子挤掉"
+
+
+def test_best_candidate_still_compares_confidence_without_house() -> None:
+    """都不成立时仍按置信度挑（老行为不能丢：真实素材里常常一个房子都找不到）。"""
+    post = OpenCvPostProcess(color="blue")
+    probe = np.zeros((10, 10, 3), np.uint8)
+    empty = CropResult(None, -1.0, None, "", 0.0, stage="none")
+    low = post._best_candidate(
+        [(5.0, 5.0, "12", 0.7)], 10.0, probe, empty,
+        saturation_level=100, stage="parallel", house_ok=False,
+    )
+    high = post._best_candidate(
+        [(5.0, 5.0, "56", 0.95)], 10.0, probe, low,
+        saturation_level=40, stage="min_angle", house_ok=False,
+    )
+    assert high.number == 56 and high.saturation_level == 40
+
+
 def test_parallel_rectify_angle_makes_parallel_edges_vertical() -> None:
     """转正角必须把平行边对（房子的上/下边）转到竖直。"""
     for angle in (0.0, 12.0, -25.0, 40.0):
@@ -185,13 +265,20 @@ def test_parallel_rectify_angle_makes_parallel_edges_vertical() -> None:
 
 
 def test_find_apex_by_parallel_reports_the_pair() -> None:
-    """平行边对必须是正方形的上/下边（索引 1-2 与 3-4 两条边）。"""
+    """平行边对必须是正方形的**两条对边**。
+
+    在 ``apex, tl, bl, br, tr`` 这个绕行顺序下，边 1（tl→bl）与边 3（br→tr）是
+    正方形的左右两边——它们互相平行、方向角都是 90°，是轮廓里唯一的平行边对。
+    """
     approx = _pentagon_approx()
     apex, pair, diff = OpenCvPostProcess._find_apex_by_parallel(approx)
     assert apex is not None
-    assert pair == (1, 3), f"平行边对应当是上边(1)与下边(3)，实际 {pair}"
+    assert pair == (1, 3), f"平行边对应当是正方形的两条对边(1 与 3)，实际 {pair}"
+    assert diff == pytest.approx(0.0, abs=1e-6)
     # 顶角就是 apex 顶点本身
-    assert np.allclose(apex, [100.0, 90.0 - 60.0 * 0.866], atol=1e-6)
+    assert np.allclose(
+        apex, [100.0, 90.0 - 60.0 * 0.8660254037844386], atol=1e-6
+    )
 
 
 # 关于"转正后顶点朝哪边"：不在合成数据上断言。目标形态（三角形朝向相对正方形
@@ -201,24 +288,63 @@ def test_find_apex_by_parallel_reports_the_pair() -> None:
 
 
 def test_find_min_angle_locates_triangle_tip() -> None:
-    """最小内角顶点 = 三角形顶角。
+    """最小内角顶点 = 三角形顶角，且那个角就是 60°。
 
-    注意几何事实：正方形边上架一个**等边**三角形时，顶角的内角是 **15°**
-    （不是 60°）——60° 出现在三角形底边的两个角上（腰与正方形上边的夹角）。
-    旧版 的注释把这里写反了，但它用"最小内角顶点"来定位顶角这件事本身是对的：
-    90°（正方形角）、75°/60°（腰与上边）都不是最小，仍然是顶角最小。
+    等边三角形的内角恒为 60°。正方形上边中点架等边三角形时，五边形内角是
+    60°（顶角）、120°（两个上角）、90°（两个下角）——最小仍是顶角，
+    所以"用最小内角定位顶角"这条判据是成立的。
     """
     approx = _pentagon_approx()
     point, min_deg = OpenCvPostProcess._find_min_angle(approx)
-    assert min_deg == pytest.approx(15.0, abs=0.5)
-    assert np.allclose(point, [100.0, 90.0 - 60.0 * 0.866], atol=1e-6)
+    assert min_deg == pytest.approx(60.0, abs=0.5)
+    assert np.allclose(point, [100.0, 90.0 - 60.0 * 0.8660254037844386], atol=1e-6)
 
 
-def test_find_min_angle_gate_rejects_very_sharp_apex() -> None:
-    '兜底路径的 40~130° 门限会拒掉"过于尖锐"的顶角。'
+def test_pentagon_interior_angles() -> None:
+    """把五边形内角钉死：60/120/120/90/90——顶点摆错时这里会立刻报出来。"""
+    pts = _pentagon_approx().reshape(-1, 2)
+    labels = ["apex", "tl", "bl", "br", "tr"]
+    got = {}
+    for index, name in enumerate(labels):
+        previous = pts[(index - 1) % 5]
+        following = pts[(index + 1) % 5]
+        got[name] = OpenCvPostProcess._angle(previous, pts[index], following)
+    assert got["apex"] == pytest.approx(60.0, abs=1e-6)
+    assert got["tl"] == pytest.approx(150.0, abs=1e-6)
+    assert got["tr"] == pytest.approx(150.0, abs=1e-6)
+    assert got["br"] == pytest.approx(90.0, abs=1e-6)
+    assert got["bl"] == pytest.approx(90.0, abs=1e-6)
+    assert sum(got.values()) == pytest.approx(540.0, abs=1e-6)   # (5-2)·180
+
+
+def test_find_min_angle_accepts_standard_pentagon() -> None:
+    """兜底路径的 40~130° 门限对标准形态是**通过**的（顶角 60° 落在区间内）。"""
     approx = _pentagon_approx()
     _, min_deg = OpenCvPostProcess._find_min_angle(approx)
-    assert not (40.0 < min_deg < 130.0), "等边形态的顶角本就在门限之外（已知约束）"
+    assert 40.0 < min_deg < 130.0
+
+
+def test_find_min_angle_gate_rejects_bent_pentagon() -> None:
+    """门限要能挡掉不合法（自交/折线）的轮廓形状。
+
+    这里直接构造一个自交顺序（``apex, tl, tr, br, bl``）——顶角的两个邻居被错认成
+    两个不同侧的角，量出 15°，落在 40~130° 之外。门限拦下它是**正确**行为。
+    """
+    side = 60.0
+    x0, y0 = 70.0, 90.0
+    tri = side * 0.8660254037844386
+    self_intersecting = np.array(
+        [
+            [x0 + side / 2, y0 - tri],
+            [x0, y0],
+            [x0 + side, y0],
+            [x0 + side, y0 + side],
+            [x0, y0 + side],
+        ],
+        dtype=np.float64,
+    ).reshape(-1, 1, 2)
+    _, min_deg = OpenCvPostProcess._find_min_angle(self_intersecting)
+    assert not (40.0 < min_deg < 130.0), f"自交轮廓不该通过门限，量得 {min_deg}"
 
 
 def test_angle_helpers() -> None:
@@ -309,6 +435,81 @@ def test_engine_config_paths() -> None:
     assert config.det_path() == Path("m/d.pth")
     assert config.rec_path() == Path("m/r.pth")
     assert config.keys_path() == Path("m/k.txt")
+
+
+# ----------------------------------------------------------------------
+# 方向分类（Cls）：接线与方向 API（不加载任何权重）
+# ----------------------------------------------------------------------
+class _FakeEngineType:
+    """假的 ``rapidocr.EngineType``——只为在不 import rapidocr 的前提下验参数。"""
+
+    TORCH = "engine:torch"
+    ONNXRUNTIME = "engine:onnxruntime"
+
+
+def _cls_params(config: OcrEngineConfig) -> dict:
+    return OcrEngine(config)._cls_params(_FakeEngineType)  # noqa: SLF001 - 就是要测它
+
+
+def test_cls_engine_selects_engine_and_model() -> None:
+    """``cls_engine`` 决定引擎与权重文件；``off`` 只关自动旋转。"""
+    onnx = _cls_params(OcrEngineConfig(cls_engine="onnx", cls_use_cuda=True))
+    assert onnx["Cls.engine_type"] == "engine:onnxruntime"
+    assert onnx["EngineConfig.onnxruntime.use_cuda"] is True
+    assert onnx["Global.use_cls"] is True
+    assert onnx["Cls.model_path"].endswith("ch_ppocr_mobile_v2.0_cls_mobile.onnx")
+
+    torch = _cls_params(OcrEngineConfig(cls_engine="torch", cls_use_cuda=False))
+    assert torch["Cls.engine_type"] == "engine:torch"
+    assert torch["EngineConfig.torch.use_cuda"] is False
+    # ⚠ 权重文件名里的 ptocr 是 RapidOCR 的拼写错误，与 arch_config.yaml 的键一致，
+    #   改名会直接加载失败（见 cropproc 模块 docstring）
+    assert torch["Cls.model_path"].endswith("ch_ptocr_mobile_v2.0_cls_mobile.pth")
+
+    off = _cls_params(OcrEngineConfig(cls_engine="off"))
+    assert off["Global.use_cls"] is False
+    assert "Cls.engine_type" not in off, "off 时不该选引擎（仍会给本地路径避免联网下载）"
+
+
+def test_cls_engine_rejects_unknown_name() -> None:
+    with pytest.raises(ValueError, match="cls_engine"):
+        _cls_params(OcrEngineConfig(cls_engine="openvino"))
+
+
+def test_cls_config_paths_follow_engine() -> None:
+    config = OcrEngineConfig(model_dir="m", cls_engine="torch")
+    assert config.cls_path() == config.cls_torch_path() == Path(
+        "m/ch_ptocr_mobile_v2.0_cls_mobile.pth"
+    )
+    config = OcrEngineConfig(model_dir="m", cls_engine="onnx")
+    assert config.cls_path() == config.cls_onnx_path() == Path(
+        "m/ch_ppocr_mobile_v2.0_cls_mobile.onnx"
+    )
+    assert config.cls_enabled() and not OcrEngineConfig(cls_engine="off").cls_enabled()
+
+
+def test_cls_weight_is_required_when_enabled() -> None:
+    """启用方向分类时缺权重必须显式报错，且错误里点出是哪个文件。"""
+    engine = OcrEngine(OcrEngineConfig(model_dir="models/does-not-exist"))
+    with pytest.raises(FileNotFoundError, match="cls_mobile"):
+        engine.ensure()
+
+
+def test_classify_orientation_refuses_when_disabled() -> None:
+    """``cls_engine="off"`` 时方向 API 要明确拒绝，而不是给个默认值。"""
+    engine = OcrEngine(OcrEngineConfig(cls_engine="off"))
+    with pytest.raises(RuntimeError, match="未启用方向分类"):
+        engine.classify_orientation(np.zeros((48, 192, 3), np.uint8))
+
+
+def test_cls_providers_is_empty_before_loading() -> None:
+    """``cls_providers()`` 只是读取：没加载时返回空，别把它当"未启用"。"""
+    assert OcrEngine(OcrEngineConfig()).cls_providers() == ()
+
+
+def test_ocr_orientation_flipped_flag() -> None:
+    assert OcrOrientation(label="0", score=0.98).flipped is False
+    assert OcrOrientation(label="180", score=0.98).flipped is True
 
 
 # ----------------------------------------------------------------------

@@ -5,6 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
     "imageio-ffmpeg",
     "mavsdk",
+    "onnxruntime-gpu>=1.30.0",
     "opencv-python",
     "pillow",
     "pyproj",

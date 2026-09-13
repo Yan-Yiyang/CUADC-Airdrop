@@ -15,6 +15,9 @@
 * YOLO：``SOURCE_DIR/best2.pt`` → ``models/best2.pt``
   （实测可用的是 best2.pt；best.pt / best1.pt 对现目标形态零检出）
 * PP-OCRv6：``SOURCE_DIR`` 里的 ``*.pth`` 与 ``*dict.txt`` → ``models/ppocr/``
+* 方向分类（Cls）：同一目录下的 ``ch_ptocr_mobile_v2.0_cls_mobile.pth``（TORCH 版）
+  与 ``ch_ppocr_mobile_v2.0_cls_mobile.onnx``（ONNX 版）→ ``models/ppocr/``；
+  **文件名不能规范化**，理由见下面 ``OCR_FILES`` 的注释。
 
  ``SOURCE_DIR`` 默认指向 旧版 的安装位置（那里已下载好 TORCH 权重）。
 换机器时改成你自己的素材路径即可。**本脚本只做复制，不联网**——要重新下载
@@ -49,6 +52,15 @@ OCR_FILES = (
     "PP-OCRv6_rec_tiny.pth",
     "ppocrv6_dict.txt",
     "ppocrv6_tiny_dict.txt",
+    # 方向分类（Cls）。两个名字**都不能改**：
+    # * ``.onnx`` 用 RapidOCR 的正规模型名；
+    # * ``.pth`` 必须叫 ``ch_ptocr_...``——RapidOCR 的 ``arch_config.yaml`` 里那条 cls
+    #   架构被拼错了（``ptocr`` 而非 ``ppocr``），而 TORCH 引擎是**按文件名 stem 查架构**
+    #   （``networks/main.py`` 的 ``_load_arch_config``），名字对不上直接
+    #   ``ValueError: architecture ... is not in arch_config.yaml``。
+    #   实测：同一个权重改名成 ``ch_ppocr_...pth`` 就加载不了，叫 ``ch_ptocr_...pth`` 才行。
+    "ch_ptocr_mobile_v2.0_cls_mobile.pth",
+    "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
 )
 
 

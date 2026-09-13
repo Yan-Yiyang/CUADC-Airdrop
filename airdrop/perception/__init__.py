@@ -14,7 +14,14 @@
 依赖这一点。
 """
 
-from .cropproc import CropResult, OcrEngine, OcrEngineConfig, OcrText, OpenCvPostProcess
+from .cropproc import (
+    CropResult,
+    OcrEngine,
+    OcrEngineConfig,
+    OcrOrientation,
+    OcrText,
+    OpenCvPostProcess,
+)
 from .detector import DetectionBatch, Detector, DetectorConfig
 from .models import Detection, PixelBox
 from .number import OCR_CHAR_MAP, correct_ocr_number
@@ -30,6 +37,7 @@ __all__ = [
     "OCR_CHAR_MAP",
     "OcrEngine",
     "OcrEngineConfig",
+    "OcrOrientation",
     "OcrRequest",
     "OcrResult",
     "OcrText",
