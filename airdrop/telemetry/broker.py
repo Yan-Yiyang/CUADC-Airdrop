@@ -283,9 +283,42 @@ class TelemetryBroker:
         """发布一个 MAVSDK 四元数姿态更新。"""
         return self._update(lambda s: s.update_attitude_quaternion(quaternion))
 
+    def publish(self, snapshot: TelemetrySnapshot) -> TelemetrySnapshot:
+        """直接发布一条**完整快照**（保留它自己的 ``timestamp``、不做节流）。
+
+        给"离线回填"用：:class:`~airdrop.record.replay.TelemetryPacer` 把飞行
+        目录里 ``telemetry.jsonl`` 的快照按**原始时间戳**按序灌回来，于是
+        ``get_snapshot_at`` 能在与当时完全一致的时间轴上查询——回放与实飞
+        走同一条对齐/解算代码，不需要为离线模式开分支。
+
+        与 ``update_*`` 的区别：那些方法从 MAVSDK 消息更新**单个字段**、时间戳
+        取当前墙钟；本方法要求调用方自己保证 ``timestamp`` 单调递增，且**每次
+        调用都进历史**（不看 ``history_interval``）——回填的时间轴不能像实时流
+        那样被采样节流修改。
+        """
+        return self._update_from_snapshot(snapshot)
+
     # ------------------------------------------------------------------
     # 内部实现
     # ------------------------------------------------------------------
+    def _update_from_snapshot(self, snapshot: TelemetrySnapshot) -> TelemetrySnapshot:
+        """把整条快照作为最新值 + 历史写入，时间戳原样保留。"""
+        with self._condition:
+            record = copy.copy(snapshot)
+            self._latest = record
+            self._history.append(record)
+            self._last_history_timestamp = record.timestamp
+            # 锁内复制订阅者列表，避免遍历时与 subscribe/unsubscribe 竞态
+            subscribers = tuple(self._subscribers)
+            self._condition.notify_all()
+
+        for callback in subscribers:
+            try:
+                callback(copy.copy(record))
+            except Exception:  # noqa: BLE001 - 订阅者异常不能影响代理继续工作
+                LOGGER.exception("遥测订阅回调执行失败")
+
+        return record
     def _update(
         self,
         mutator: Callable[[TelemetrySnapshot], None],
