@@ -15,6 +15,7 @@ import numpy as np  # noqa: E402
 from tests._harness import use_utf8_console  # noqa: E402
 
 from airdrop.video import (  # noqa: E402
+    DEFAULT_TELEMETRY_LAG,
     Hm30VideoSource,
     VideoConfig,
     _find_ffmpeg,
@@ -264,6 +265,49 @@ def test_ffmpeg_reconnect() -> None:
     print("[ok] ffmpeg 后端断流重连 + stop() 能从阻塞的管道读脱身")
 
 
+def test_frame_lag_on_live_stream() -> None:
+    """真实拉流路径下，帧必须携带链路延时——帧-遥测时间对齐的前提。
+
+    见 :mod:`airdrop.alignment`：拿到帧后要用
+    ``frame.capture_timestamp``（= 收到时间 - lag）去查遥测，而不是
+    ``frame.timestamp``。
+    """
+    source = Hm30VideoSource(
+        VideoConfig(
+            url=URL,
+            backend="ffmpeg",
+            width=SRC_W,
+            height=SRC_H,
+            open_timeout=8.0,
+            telemetry_lag=0.2,
+        )
+    )
+    sender = None
+    try:
+        source.start()
+        time.sleep(0.8)
+        sender = start_sender()
+        assert source.wait_ready(timeout=12.0), "首帧未在超时内到达"
+
+        frames = read_some(source, 3)
+        assert frames, "未读到帧"
+        for frame in frames:
+            assert abs(frame.lag - 0.2) < 1e-12, frame.lag
+            assert abs(
+                frame.capture_timestamp - (frame.timestamp - 0.2)
+            ) < 1e-9, frame.capture_timestamp
+            assert frame.capture_timestamp < frame.timestamp
+            assert frame.capture_age > frame.age
+    finally:
+        stop_sender(sender)
+        source.stop()
+
+    # 默认配置的链路延时就是 150ms
+    default = Hm30VideoSource(VideoConfig(url=URL))
+    assert abs(default.config.telemetry_lag - DEFAULT_TELEMETRY_LAG) < 1e-12
+    print("[ok] 真实流帧携带链路延时（拍摄时刻 = 收到时间 - lag，默认 150ms）")
+
+
 def test_stop_is_clean() -> None:
     source = Hm30VideoSource(VideoConfig(url=URL, backend="opencv", read_timeout=1.0))
     source.start()
@@ -288,6 +332,7 @@ def main() -> int:
         test_probe,
         test_opencv_reconnect,
         test_ffmpeg_reconnect,
+        test_frame_lag_on_live_stream,
         test_stop_is_clean,
     ]
     for test in tests:

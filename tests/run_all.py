@@ -16,8 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tests._harness import use_utf8_console  # noqa: E402
 
-# 顺序有意义：MAVSDK 基础设施先跑（快、依赖少），图传在后（要起 ffmpeg）
-MODULES = ("tests.test_telemetry", "tests.test_video")
+# 顺序有意义：MAVSDK 基础设施先跑（快、依赖少），帧-遥测对齐与缓冲次之（只要 broker），
+# 图传在后（要起 ffmpeg 子进程、占用本机 UDP 端口）
+MODULES = (
+    "tests.test_telemetry",
+    "tests.test_alignment",
+    "tests.test_buffer",
+    "tests.test_video",
+)
 
 
 def main() -> int:

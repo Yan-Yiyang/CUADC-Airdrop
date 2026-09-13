@@ -163,6 +163,18 @@ class TelemetryBroker:
 
             return copy.copy(self._evaluate_snapshot_locked(timestamp))
 
+    def history_span(self) -> tuple[float, float] | None:
+        """返回历史覆盖的时间范围 ``(最早, 最新)``；历史为空时返回 None。
+
+        调用方据此判断 :meth:`get_snapshot_at` 给出的结果是不是外推出来的
+        （查询时刻落在范围之外），例如 :mod:`airdrop.alignment` 用它在
+        帧-遥测对齐时标记"这一刻没有可信遥测"。
+        """
+        with self._lock:
+            if not self._history:
+                return None
+            return self._history[0].timestamp, self._history[-1].timestamp
+
     def wait_next_snapshot(
         self,
         timeout: float | None = None,

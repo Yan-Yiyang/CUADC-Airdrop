@@ -40,6 +40,15 @@ HM30_DEFAULT_RTSP = f"rtsp://{HM30_CAMERA_IP}:8554/main.264"
 SUPPORTED_BACKENDS = frozenset({"auto", "opencv", "ffmpeg"})
 SUPPORTED_TRANSPORTS = frozenset({"udp", "tcp"})
 
+# 图传链路固定延时的默认估计（秒）：从"机载相机曝光"到"本进程从管道里切出
+# 一帧"之间的处理时间，含 H.264 编码、无线传输、解码与管道缓冲。本机在
+# ffmpeg 后端实测 ≈0.15s（见模块开头的实测数据）。
+# 拿到一帧后用它反推该画面真正的拍摄时刻（VideoFrame.capture_timestamp），
+# 再按那一刻取遥测，见 :mod:`airdrop.alignment`。
+# 注意：改用 OpenCV 后端做对照时链路延时约 0.57s，这个值要同步调大，否则
+# 对齐结果会系统地偏向"未来"。
+DEFAULT_TELEMETRY_LAG = 0.15
+
 
 # ----------------------------------------------------------------------
 # 配置与数据结构
@@ -60,6 +69,10 @@ class VideoConfig:
     height: int = 0
     open_timeout: float = 5.0
     read_timeout: float = 3.0
+    # 图传链路的固定延时（秒），会被写进每一帧（VideoFrame.lag）。默认
+    # DEFAULT_TELEMETRY_LAG=0.15；用 OpenCV 后端做对照时链路延时约 0.57s，
+    # 需同步调大。0 表示不做延时补偿（帧的拍摄时刻 = 收到时刻）。
+    telemetry_lag: float = DEFAULT_TELEMETRY_LAG
     reconnect_delay: float = 1.0
     max_reconnect_delay: float = 10.0
     # 覆盖 OPENCV_FFMPEG_CAPTURE_OPTIONS。注意：OpenCV 5.0 已移除该环境变量，
@@ -84,6 +97,8 @@ class VideoConfig:
                 f"不支持的传输层: {self.transport}，可选 "
                 f"{sorted(SUPPORTED_TRANSPORTS)}"
             )
+        if self.telemetry_lag < 0:
+            raise ValueError(f"telemetry_lag 不能为负: {self.telemetry_lag}")
         return self
 
 
@@ -91,13 +106,23 @@ class VideoConfig:
 class VideoFrame:
     """一帧图传画面。
 
-    ``image`` 是 BGR 顺序的 ndarray，可写但**不应**被修改——它是当前被持有的
-    唯一一份数据，改了不会有人帮你恢复。
+    ``image`` 是 BGR 顺序的 ndarray。**它可能在下一帧到达时被覆盖**：ffmpeg
+    后端是从复用的管道缓冲区上切出视图（零拷贝换带宽），所以拿到的数组只在
+    "下一次读取之前"有效。要跨帧持有画面（入缓冲区、异步推理、落盘）必须先
+    :meth:`copy`——否则你保存下来的每一帧最后都会显示成同一张最新的画。同样，
+    不要就地修改 ``image``（对视图而言就是在改管道缓冲区）。
+
+    ``timestamp`` 是**收到**这一帧的本地墙钟时间；``lag`` 是链路固定延时
+    （取自 :attr:`VideoConfig.telemetry_lag`），二者之差
+    :attr:`capture_timestamp` 才是画面真正被拍下来的时刻。按时间取遥测时
+    必须用后者，否则会带上整段链路延时的系统性偏差——无人机以 10 m/s 平飞
+    时，150ms 就是 1.5 米的位置差。
     """
 
     index: int
     image: np.ndarray
     timestamp: float
+    lag: float = 0.0
 
     @property
     def width(self) -> int:
@@ -111,6 +136,29 @@ class VideoFrame:
     def age(self) -> float:
         """距收到该帧已经过去多少秒。"""
         return time.time() - self.timestamp
+
+    @property
+    def capture_timestamp(self) -> float:
+        """该画面真正的拍摄时刻（本地时钟）= ``timestamp - lag``。
+
+        把它交给 :meth:`airdrop.broker.TelemetryBroker.get_snapshot_at`
+        才能拿到与画面同一时刻的飞机状态。``lag`` 为 0 时与 ``timestamp``
+        相同，即不做延时补偿。
+        """
+        return self.timestamp - self.lag
+
+    @property
+    def capture_age(self) -> float:
+        """距该画面被拍下已经过去多少秒（= ``age + lag``）。"""
+        return self.age + self.lag
+
+    def copy(self) -> "VideoFrame":
+        """返回一份图像数据独立的副本。
+
+        跨帧持有画面时必须用它：ffmpeg 后端的 ``image`` 是复用管道缓冲区的
+        视图，下一帧读入时就会被覆盖（见类文档）。
+        """
+        return replace(self, image=self.image.copy())
 
 
 @dataclass(slots=True)
@@ -416,7 +464,10 @@ class Hm30VideoSource:
         if self._ffmpeg_executable is None:
             self._ffmpeg_executable = _find_ffmpeg(self._config.ffmpeg_executable)
             if self._ffmpeg_executable is None:
-                LOGGER.warning("找不到 ffmpeg，auto 退回 OpenCV 后端（画面滞后约 0.5s）")
+                LOGGER.warning(
+                    "找不到 ffmpeg，auto 退回 OpenCV 后端（画面滞后约 0.5s）；"
+                    "此时应把 telemetry_lag 调到 ≈0.57s，否则帧-遥测时间对齐会偏"
+                )
         return "opencv" if self._ffmpeg_executable is None else "ffmpeg"
 
     def _stream_opencv(self) -> None:
@@ -495,6 +546,8 @@ class Hm30VideoSource:
                 image = np.frombuffer(buffer, dtype=np.uint8).reshape(
                     height, width, 3
                 )
+                # 注意：image 是 buffer 的视图（零拷贝），下一轮 readinto 会覆盖
+                # 它。要保留画面必须 copy —— 见 VideoFrame.copy()。
                 self._publish(image)
         finally:
             _terminate(process, stderr_file)
@@ -557,7 +610,10 @@ class Hm30VideoSource:
         with self._condition:
             self._counter += 1
             self._frame = VideoFrame(
-                index=self._counter, image=image, timestamp=now
+                index=self._counter,
+                image=image,
+                timestamp=now,
+                lag=self._config.telemetry_lag,
             )
             # 帧率按 1 秒滑窗统计：链路刚接上时往往会先吐一批缓冲帧，
             # 用相邻帧间隔做 EMA 会被这波突发带飞到几百 fps，失去参考价值。
