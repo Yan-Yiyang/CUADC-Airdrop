@@ -82,10 +82,18 @@ class PerceptionConfig:
     '视频处理（YOLO + RapidOCR）。**起飞前按任务选模式**。\n\n    - ``mode="ocr"``：YOLO 检出目标框 → 裁剪 → RapidOCR 读印刷数字（编码 00–99）；\n    - ``mode="cls12"``：YOLO 12 类直出编号（1–12），无 OCR 环节。'
 
     mode: str = "ocr"
-    weights_ocr: str = "weights/ocr_best.pt"
-    weights_cls12: str = "weights/cls12_best.pt"
+    # YOLO 检测权重（单类 target）。实测可用的是 best2.pt，见上。
+    model_path: str = "models/best2.pt"
     device: str = "0"
     conf_threshold: float = 0.25
+    imgsz: int = 1280               # best2.pt 训练分辨率 640；实测 640/1280 检出数一致
+
+    # OCR 引擎（TORCH，本地权重；P5 复测：medium ~97ms/帧 @RTX3060Laptop）
+    models_dir: str = "models/ppocr"
+    det_model: str = "PP-OCRv6_det_medium.pth"
+    rec_model: str = "PP-OCRv6_rec_medium.pth"
+    rec_keys: str = "ppocrv6_dict.txt"
+    ocr_use_cuda: bool = True
 
     # OCR 目标形态（旧版 实战规格：五边形=正方形+等边三角形，边长 1m）
     target_color: str = "blue"          # blue / red
@@ -106,6 +114,39 @@ class PerceptionConfig:
     # 处理落后监控（全帧处理，不抽帧）
     lag_warn_frames: int = 900
 
+    def ocr_engine_config(self):
+        """装配 OCR 引擎参数（返回 :class:`~airdrop.perception.OcrEngineConfig`）。"""
+        from .perception import OcrEngineConfig
+
+        return OcrEngineConfig(
+            model_dir=self.models_dir,
+            det_model=self.det_model,
+            rec_model=self.rec_model,
+            rec_keys=self.rec_keys,
+            use_cuda=self.ocr_use_cuda,
+        )
+
+    def to_pipeline_config(self):
+        """装配 :class:`~airdrop.perception.PerceptionWorker` 需要的参数切片。"""
+        from .perception import PerceptionConfigLike
+
+        return PerceptionConfigLike(
+            mode=self.mode,
+            model_path=self.model_path,
+            device=self.device,
+            conf_threshold=self.conf_threshold,
+            imgsz=self.imgsz,
+            target_color=self.target_color,
+            ocr_conf_threshold=self.ocr_conf_threshold,
+            ocr_workers=self.ocr_workers,
+            ocr_queue_size=self.ocr_queue_size,
+            ocr_dedupe_s=self.ocr_dedupe_s,
+            ocr_dedupe_px=self.ocr_dedupe_px,
+            min_side_px=self.min_side_px,
+            max_side_px=self.max_side_px,
+            engine=self.ocr_engine_config(),
+        )
+
 
 # ---------------------------------------------------------------- 坐标处理
 @dataclass(frozen=True, slots=True)
@@ -114,6 +155,18 @@ class CameraConfig:
 
     calib_file: str = "camera_calib.json"
     undistort: bool = True
+    #: 标定文件缺失时的回退图像尺寸（用于粗估内参；正式任务必须先标定）
+    fallback_width: int = 1280
+    fallback_height: int = 720
+
+    def load_model(self):
+        """按 :attr:`calib_file` 装配 :class:`~airdrop.georef.CameraModel`。"""
+        from .georef import load_camera_model
+
+        return load_camera_model(
+            self.calib_file,
+            fallback_size=(self.fallback_width, self.fallback_height),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +181,17 @@ class GroundConfig:
     ground_point_lat: float | None = None
     ground_point_lon: float | None = None
     ground_point_alt: float | None = None
+
+    def ground_z(self, origin_alt_m: float | None) -> float | None:
+        """地面在 NED 下的 z（向下为正）；缺参数时返回 None。
+
+        ``ground_z = 原点海拔 − 地面点海拔``：三者同高时 ground_z=0，
+        地面比原点高时 ground_z 为负（NED 里向上是负）。参数不全**不猜**，
+        由调用方决定是否记事件日志。
+        """
+        if origin_alt_m is None or self.ground_point_alt is None:
+            return None
+        return float(origin_alt_m) - float(self.ground_point_alt)
 
 
 # ---------------------------------------------------------------- 目标统计
@@ -268,6 +332,19 @@ class Config:
             )
         if self.perception.ocr_workers < 1:
             raise ValueError(f"perception.ocr_workers 至少为 1: {self.perception.ocr_workers}")
+        if self.perception.ocr_queue_size < 1:
+            raise ValueError(
+                f"perception.ocr_queue_size 至少为 1: {self.perception.ocr_queue_size}"
+            )
+        if self.perception.imgsz < 32:
+            raise ValueError(f"perception.imgsz 太小: {self.perception.imgsz}")
+        if self.perception.min_side_px >= self.perception.max_side_px:
+            raise ValueError(
+                "perception 像素边长区间无效: "
+                f"{self.perception.min_side_px} >= {self.perception.max_side_px}"
+            )
+        if self.perception.ocr_dedupe_s < 0 or self.perception.ocr_dedupe_px < 0:
+            raise ValueError("perception 去重阈值不能为负")
         if self.targeting.eps_m <= 0:
             raise ValueError(f"targeting.eps_m 必须为正: {self.targeting.eps_m}")
         if self.drop.radius_m <= 0:

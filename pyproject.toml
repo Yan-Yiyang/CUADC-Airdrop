@@ -44,12 +44,17 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
+    # realdata 用例要 GPU + 旧版 实战素材（分钟级、依赖外部文件），
+    # 默认跳过；要跑就显式 `-m realdata`
+    "-m",
+    "not realdata",
     "--cov=airdrop",
     "--cov-report=term-missing:skip-covered",
 ]
 markers = [
     "stream: 需要 ffmpeg 与本机 UDP 端口（会起子进程，秒级）",
     "network: 走网络错误路径，需要等超时或连接被拒",
+    "realdata: 需要 GPU + 真实素材/权重（旧版 实战视频、PP-OCR 权重），分钟级",
 ]
 # 全局超时兜底：拉流用例一旦卡住（管道读不回、子进程不退）要能失败而不是挂死。
 # Windows 上没有 SIGALRM，必须用 thread 方式。
