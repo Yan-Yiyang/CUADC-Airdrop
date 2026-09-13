@@ -16,6 +16,7 @@ from .config import (
     TelemetryConfig,
     Waypoint,
 )
+from .record import DetectionWriter, EventLog, FlightRecorder, RecorderStats
 from .telemetry import (
     SUPPORTED_QUERY_MODES,
     Command,
@@ -60,7 +61,10 @@ __all__ = [
     "Config",
     "DEFAULT_BUFFER_CAPACITY",
     "DEFAULT_TELEMETRY_LAG",
+    "DetectionWriter",
     "DropConfig",
+    "EventLog",
+    "FlightRecorder",
     "FrameTelemetryAligner",
     "GripperConfig",
     "GroundConfig",
@@ -72,6 +76,7 @@ __all__ = [
     "OverflyConfig",
     "PerceptionConfig",
     "RecordConfig",
+    "RecorderStats",
     "RoutesConfig",
     "TargetingConfig",
     "TelemetryBroker",

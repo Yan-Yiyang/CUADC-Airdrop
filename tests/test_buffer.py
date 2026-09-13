@@ -236,9 +236,10 @@ def test_wait_new() -> None:
         buffer.put(make_sample(1000.0 + i))
     # 之前已有 1 号，共 6 条，容量 4 → 保留 3..6
     assert buffer.indices() == (3, 6)
-    # 游标落后到已被驱逐的记录：直接给最新一条，不会死等
+    # 游标落后到已被驱逐的记录：返回当前保留的**最早**一条（不会被死等，
+    # 但中间被驱逐的 1、2 在此路径上不可见——需要完整消费请用 iter_between）
     lagging = buffer.wait_new(1, timeout=0.2)
-    assert lagging is not None and lagging.index == 6
+    assert lagging is not None and lagging.index == 3
 
 
 # ----------------------------------------------------------------------

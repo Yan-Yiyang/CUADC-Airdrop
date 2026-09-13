@@ -12,6 +12,7 @@ from .buffer import (
     AlignmentWriter,
     BufferStats,
     BufferedFrame,
+    StoredFrame,
     capacity_for,
     raw_frame_bytes,
 )

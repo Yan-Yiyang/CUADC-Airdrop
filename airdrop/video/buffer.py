@@ -155,8 +155,13 @@ class BufferStats:
 
 
 @dataclass(frozen=True, slots=True)
-class _StoredFrame:
-    """内部存储记录：图像以 JPEG 字节串或独立的 ndarray 持有。"""
+class StoredFrame:
+    """缓冲内部的一条记录：图像以 JPEG 字节串或独立的 ndarray 持有。
+
+    原本是模块私有（下划线）；:class:`FlightRecorder` 需要按序号拿到 JPEG 字节
+    做"零重编码"落盘，所以把名字公开。这仍是缓冲内部数据——公共读者应该走
+    :class:`BufferedFrame`，需要原始字节请走 :meth:`AlignmentBuffer.read_jpeg_bytes`。
+    """
 
     index: int
     capture_timestamp: float
@@ -218,7 +223,7 @@ class AlignmentBuffer:
         self._condition = threading.Condition(self._lock)
         # 用 list 而不是 deque：容量 5400 时，驱逐的 O(n) 移动远小于
         # 索引访问的开销差异，而二分/切片在 list 上都是 O(log n)/O(k)。
-        self._records: list[_StoredFrame] = []
+        self._records: list[StoredFrame] = []
         self._bytes = 0
         self._next_index = 0
         self._put = 0
@@ -249,7 +254,7 @@ class AlignmentBuffer:
 
         with self._condition:
             self._next_index += 1
-            stored = _StoredFrame(
+            stored = StoredFrame(
                 index=self._next_index,
                 capture_timestamp=sample.timestamp,
                 received_timestamp=sample.frame.timestamp,
@@ -316,6 +321,23 @@ class AlignmentBuffer:
         with self._lock:
             return self._next_index
 
+    def read_jpeg_bytes(self, index: int) -> bytes | None:
+        """按写入序号取出**原始 JPEG 字节串**（**内部 API，专供 FlightRecorder 用**）。
+
+        默认 jpeg 模式下返回的是缓冲在写入时编码的那份字节——**直接落盘
+        即可，零重编码**，画质与编码耗时都和缓冲保持一致。raw 存储模式下
+        返回 None（因为保存的是未压缩 ndarray，没有"原始 JPEG"可言），
+        调用方需要自行把 :attr:`BufferedFrame.image` 重新编码。
+
+        该序号已被驱逐或尚未产生时同样返回 None。
+        """
+        with self._lock:
+            stored = self._find_by_index_locked(index)
+        if stored is None:
+            return None
+        payload = stored.payload
+        return payload if isinstance(payload, bytes) else None
+
     def at(self, index: int) -> BufferedFrame | None:
         """按写入序号取记录；该序号已被驱逐或尚未产生时返回 None。"""
         with self._lock:
@@ -366,35 +388,44 @@ class AlignmentBuffer:
     def wait_new(
         self, after_index: int = 0, timeout: float | None = None
     ) -> BufferedFrame | None:
-        """阻塞等待比 ``after_index`` 更新的记录，返回它。
+        """阻塞等待比 ``after_index`` 更新的记录，返回**最早**满足条件的那条。
 
-        这是给"跟随式"读者用的：先记住上次读到的 ``index``，再等下一个::
+        这是给"按序号完整消费"的读者用的——保证不漏中间记录::
 
             index = 0
             while True:
                 record = buffer.wait_new(index, timeout=1.0)
                 if record is None:
                     continue
+                # record.index == index + 1（除非中间记录被驱逐——见下）
                 index = record.index
 
-        超时返回 None（不是出错）；``timeout=None`` 表示一直等。若读者的游标
-        落后太多、中间记录已被驱逐，则直接返回当前最新的一条（会跳帧，
-        但不会永远卡住）。
+        超时返回 None（不是出错）；``timeout=None`` 表示一直等。
+
+        **游标落后太多**：若 ``after_index`` 已经早于缓冲里保留的**最早一条**
+        （记录被驱逐过），本方法返回**当前保留的最早一条**——不会永远卡在
+        已被驱逐的位置，但中间已丢的记录无法在此路径上补回。需要"一帧不漏"
+        的消费者（典型如 :class:`~airdrop.record.FlightRecorder`）应当
+        用 :meth:`AlignmentBuffer.iter_between` 配合自己的序号游标，而不是
+        仅靠 ``wait_new``。
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
             while True:
                 records = self._records
-                if records and records[-1].index > after_index:
-                    stored = records[-1]
-                    break
+                if records:
+                    first_index = records[0].index
+                    target = max(after_index + 1, first_index)
+                    idx = bisect.bisect_left(records, target, key=_index)
+                    if idx < len(records):
+                        stored = records[idx]
+                        return self._materialize(stored)
                 remaining = None
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return None
                 self._condition.wait(remaining)
-        return self._materialize(stored)
 
     # ------------------------------------------------------------------
     # 内部实现
@@ -415,7 +446,7 @@ class AlignmentBuffer:
         return data, len(data)
 
     @staticmethod
-    def _materialize(stored: _StoredFrame) -> BufferedFrame | None:
+    def _materialize(stored: StoredFrame) -> BufferedFrame | None:
         """把内部记录还原成对外记录（JPEG 在此解码）。"""
         payload = stored.payload
         if isinstance(payload, np.ndarray):
@@ -440,7 +471,7 @@ class AlignmentBuffer:
             offset=stored.offset,
         )
 
-    def _find_by_index_locked(self, index: int) -> _StoredFrame | None:
+    def _find_by_index_locked(self, index: int) -> StoredFrame | None:
         records = self._records
         if not records:
             return None
@@ -472,7 +503,7 @@ class AlignmentBuffer:
 
     def _records_after(
         self, after_index: int, batch: int, max_index: int
-    ) -> list[_StoredFrame]:
+    ) -> list[StoredFrame]:
         """取序号在 ``(after_index, max_index]`` 内、最靠前的至多 ``batch`` 条。"""
         with self._lock:
             records = self._records
