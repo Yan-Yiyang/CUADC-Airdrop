@@ -231,7 +231,7 @@ class MavsdkThread:
         )
         if not self._ready.wait(wait):
             raise TimeoutError(f"在 {wait:.0f}s 内未能连接飞机")
-        return self._require_drone()
+        return self.require_drone()
 
     # ------------------------------------------------------------------
     # 遥测 / 指令接口
@@ -470,6 +470,10 @@ class MavsdkThread:
 
         任一数据流结束（关闭或异常）都会让 ``TaskGroup`` 取消其余任务并抛出
         ExceptionGroup，这里记录后正常返回，由监督循环决定重连。
+
+        ⚠ **例外：风估计是"可选流"**（:meth:`_optional_stream`）——它结束或报错只记日志，
+        不影响会话。理由：风只影响弹道精度（没有它按零风降级），而飞控未必支持/未必
+        开启风估计；让一条增强流把整条遥测链路拖进重连循环是不划算的。
         """
         try:
             async with asyncio.TaskGroup() as tg:
@@ -499,6 +503,9 @@ class MavsdkThread:
                         "gps_global_origin", self._refresh_origin_loop(drone)
                     )
                 )
+                tg.create_task(
+                    self._optional_stream("wind", self._stream_wind(drone))
+                )
         except* Exception as group:
             LOGGER.warning("遥测采集中断：%s", group.exceptions[0])
 
@@ -512,6 +519,22 @@ class MavsdkThread:
         except Exception as exc:
             raise RuntimeError(f"遥测流 {name} 异常结束: {exc}") from exc
         raise RuntimeError(f"遥测流 {name} 已关闭")
+
+    @staticmethod
+    async def _optional_stream(name: str, stream: Coroutine[Any, Any, None]) -> None:
+        """**可选**遥测流：结束或异常只记日志，不影响会话（见 :meth:`_run_session`）。"""
+        try:
+            await stream
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 可选流失败不是会话失败
+            LOGGER.info("可选遥测流 %s 不可用（%s），相关功能降级", name, exc)
+            return
+        LOGGER.info("可选遥测流 %s 已结束，相关功能降级", name)
+
+    async def _stream_wind(self, drone: System) -> None:
+        async for wind in cast(AsyncIterable[Any], drone.telemetry.wind()):
+            self.broker.update_wind(wind)
 
     async def _stream_position(self, drone: System) -> None:
         async for position in cast(AsyncIterable[Any], drone.telemetry.position()):
@@ -559,7 +582,7 @@ class MavsdkThread:
             await self._publish_origin(drone)
 
     async def _query_origin(self) -> GpsGlobalOrigin:
-        drone = self._require_drone()
+        drone = self.require_drone()
         try:
             origin = await drone.telemetry.get_gps_global_origin()
         except Exception as exc:  # noqa: BLE001 - 统一包装为运行时错误
@@ -570,7 +593,13 @@ class MavsdkThread:
     # ------------------------------------------------------------------
     # 内部：指令执行
     # ------------------------------------------------------------------
-    def _require_drone(self) -> System:
+    def require_drone(self) -> System:
+        """返回已连接的 :class:`System`；未连接时抛出。
+
+        公开给任务级模块用（:class:`~airdrop.telemetry.controller.DroneController`
+        要拿它去调 mission/gripper 插件）。**只能在 MAVSDK 线程的事件循环上调用**
+        ——跨线程拿到的 System 引用在会话结束后就失效了。
+        """
         drone = self._drone
         if drone is None:
             raise RuntimeError("MAVSDK 尚未连接")
@@ -606,7 +635,7 @@ class MavsdkThread:
     async def _dispatch(
         self, name: str, params: dict[str, Any]
     ) -> dict[str, Any]:
-        drone = self._require_drone()
+        drone = self.require_drone()
 
         if name == "get_snapshot_at":
             return self._query_snapshot_at(params)

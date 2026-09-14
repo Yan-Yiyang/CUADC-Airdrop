@@ -14,6 +14,7 @@ __all__ = [
     "DropConfig",
     "GripperConfig",
     "GroundConfig",
+    "MissionConfig",
     "OverflyConfig",
     "PerceptionConfig",
     "RecordConfig",
@@ -29,6 +30,7 @@ TARGET_COLORS = frozenset({"blue", "red"})
 SELECTION_RULES = frozenset({"median", "max"})
 ALIGN_TIMEOUT_ACTIONS = frozenset({"drop"})
 WIND_SOURCES = frozenset({"telemetry", "zero"})
+ABORT_ACTIONS = frozenset({"hold", "rtl", "none"})
 
 
 # ---------------------------------------------------------------- 遥测与控制
@@ -213,11 +215,16 @@ class TargetingConfig:
 # ---------------------------------------------------------------- 弹道与投放
 @dataclass(frozen=True, slots=True)
 class BallisticsConfig:
-    """二次阻力弹道（RK 数值积分）。参数为 350ml 水瓶占位值，**需投放试验微调**。"""
+    """二次阻力弹道（RK 数值积分）。
 
-    mass_kg: float = 0.365
-    drag_coefficient: float = 0.6
-    cross_area_m2: float = 0.004
+    ⚠ **质量是称出来的**（台秤/天平实测，别当待估参数）；``drag_coefficient`` 与
+    ``cross_area_m2`` 只以 ``Cd·A`` 的乘积影响弹道，单靠落点数据分不开——固定面积、
+    **靠投放试验反演 Cd**（`tools/fit_ballistics.py`，见 :mod:`airdrop.ballistics.fit`）。
+    """
+
+    mass_kg: float = 0.365              # **实测称重**（占位值仅用于跑通链路）
+    drag_coefficient: float = 0.6       # 投放试验反演（占位值）
+    cross_area_m2: float = 0.004        # 几何量（卡尺/投影面积）
     gravity: float = 9.80665
     rk_dt: float = 0.005
     air_density_isa: bool = True        # 空气密度按 ISA 标准大气随高度变化
@@ -245,9 +252,15 @@ class OverflyConfig:
 
 @dataclass(frozen=True, slots=True)
 class GripperConfig:
-    """MAVSDK gripper 投放（PX4 侧需预先配置 gripper 输出）。"""
+    """MAVSDK gripper 投放（PX4 侧需预先配置 gripper 输出）。
+
+    ``instance`` 是 gripper 实例号（MAVSDK ``gripper.release(instance)``）；
+    ``release_settle_s`` 是投放指令之后给伺服/挂架留的动作时间——这段时间里
+    紧接着的下一条指令容易被飞控以 BUSY 拒绝，等一等更稳。
+    """
 
     enabled: bool = True
+    instance: int = 0
     release_settle_s: float = 0.5
 
 
@@ -271,10 +284,42 @@ class RoutesConfig:
     landing_route: tuple[Waypoint, ...] = ()
 
 
+# ---------------------------------------------------------------- 任务编排
+@dataclass(frozen=True, slots=True)
+class MissionConfig:
+    """任务状态机（计划 4.7）。
+
+    时长类参数都是**上限兜底**：正常流程靠事件推进（mission 完成、出结果），
+    只有卡住时才由这些上限把状态机推进到 `ABORT`——所以宁可给宽一点，
+    也不要让它去替飞控做决定。
+
+    ``abort_action``：进入 `ABORT` 时下的安全动作——``"hold"``（盘旋，默认，
+    把飞机留在空中交给操作手）、``"rtl"``（返航）、``"none"``（什么都不下，
+    用于演练/仿真）。链路本身断了时这条指令也发不出去，那种情况交给飞控自己的
+    failsafe。
+
+    ``takeoff_first`` / ``land_last``：侦查航线首个航点带**起飞项**（固定翼起飞
+    由它承担，计划 4.1）、降落航线末航点带**降落项**。
+    """
+
+    tick_hz: float = 20.0
+    init_max_s: float = 30.0            # 等遥测 + NED 原点
+    recon_max_s: float = 600.0          # 侦查航线（约 1 分钟）的兜底上限
+    hold_process_max_s: float = 10.0    # HOLD_PROCESS 等结果的上限（计划 4.7）
+    #: 至少等这么久再接受"没有结果"的判断——否则缓冲里还没被消费的帧会被当成"没看到目标"
+    hold_process_min_s: float = 2.0
+    land_max_s: float = 900.0           # 飞掠段 + 降落航线的兜底上限
+    #: 遥测超过这么久没更新就按链路故障处理（对齐侧 1s 就丢帧了，这里留两次余量）
+    telemetry_stale_s: float = 5.0
+    abort_action: str = "hold"
+    takeoff_first: bool = True
+    land_last: bool = True
+
+
 # ---------------------------------------------------------------- 记录与回放
 @dataclass(frozen=True, slots=True)
 class RecordConfig:
-    """飞行记录五件套（文本日志/遥测/检测/事件/视频帧）与回放。"""
+    """飞行记录（文本日志/遥测/检测/事件/投放/视频帧）与回放。"""
 
     dir: str = "flights"
     video: bool = True                  # 落盘缓冲内的 jpeg（零重编码）
@@ -301,6 +346,7 @@ class Config:
     overfly: OverflyConfig = field(default_factory=OverflyConfig)
     gripper: GripperConfig = field(default_factory=GripperConfig)
     routes: RoutesConfig = field(default_factory=RoutesConfig)
+    mission: MissionConfig = field(default_factory=MissionConfig)
     record: RecordConfig = field(default_factory=RecordConfig)
 
     def validated(self) -> "Config":
@@ -349,6 +395,35 @@ class Config:
             raise ValueError(f"targeting.eps_m 必须为正: {self.targeting.eps_m}")
         if self.drop.radius_m <= 0:
             raise ValueError(f"drop.radius_m 必须为正: {self.drop.radius_m}")
+        if self.mission.abort_action not in ABORT_ACTIONS:
+            raise ValueError(
+                f"mission.abort_action 只支持 {sorted(ABORT_ACTIONS)}: "
+                f"{self.mission.abort_action!r}"
+            )
+        if self.mission.tick_hz <= 0:
+            raise ValueError(f"mission.tick_hz 必须为正: {self.mission.tick_hz}")
+        for name in (
+            "init_max_s",
+            "recon_max_s",
+            "land_max_s",
+            "telemetry_stale_s",
+        ):
+            value = getattr(self.mission, name)
+            if value <= 0:
+                raise ValueError(f"mission.{name} 必须为正: {value}")
+        if self.mission.hold_process_max_s < 0 or self.mission.hold_process_min_s < 0:
+            raise ValueError("mission 的 HOLD_PROCESS 时长不能为负")
+        if self.mission.hold_process_min_s > self.mission.hold_process_max_s:
+            raise ValueError(
+                "mission.hold_process_min_s 不能大于 hold_process_max_s: "
+                f"{self.mission.hold_process_min_s} > {self.mission.hold_process_max_s}"
+            )
+        if self.gripper.instance < 0:
+            raise ValueError(f"gripper.instance 不能为负: {self.gripper.instance}")
+        if self.gripper.release_settle_s < 0:
+            raise ValueError(
+                f"gripper.release_settle_s 不能为负: {self.gripper.release_settle_s}"
+            )
         self.video.validated()
         return self
 

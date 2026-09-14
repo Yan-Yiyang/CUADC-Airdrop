@@ -283,6 +283,10 @@ class TelemetryBroker:
         """发布一个 MAVSDK 四元数姿态更新。"""
         return self._update(lambda s: s.update_attitude_quaternion(quaternion))
 
+    def update_wind(self, wind: Any) -> TelemetrySnapshot:
+        """发布一个 MAVSDK 风估计更新（可选流；没有它时投放判据按零风降级）。"""
+        return self._update(lambda s: s.update_wind(wind))
+
     def publish(self, snapshot: TelemetrySnapshot) -> TelemetrySnapshot:
         """直接发布一条**完整快照**（保留它自己的 ``timestamp``、不做节流）。
 

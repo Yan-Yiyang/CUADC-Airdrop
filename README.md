@@ -1,406 +1,227 @@
-# AirDrop Python 控制程序
+# AirDrop —— 固定翼无人机"先侦查后空投"控制系统
 
-当前阶段实现 MAVSDK 的三个基础能力：
+**版本 3.0.0**。一条完整链路已经跑通并有离线测试覆盖：
 
-1. **独立线程运行 MAVSDK**：MAVSDK 的 asyncio/gRPC 协程全部运行在专用后台线程的独立事件循环中，避免污染主线程或其他协程。
-2. **实时遥测 + 跨进程桥接**：
-    - *进程内访问*：同一进程内通过线程安全的 `TelemetryBroker` 读取最新快照或订阅推送。
-    - *跨进程访问*：通过 `ExternalBridge` 把快照共享给其他进程（`multiprocessing.Manager` dict），并让其他进程通过队列向 MAVSDK 线程发指令。
-    - *时间估计*：根据已有离散遥测快照计算任意时间戳的估计值；历史范围内使用**内插**，超出历史范围使用**外推**。
-3. **跨线程/跨进程指令**：任何线程/进程都可以发送 `Command`，由 MAVSDK 线程串行执行。
-4. **思翼 HM30 图传拉流**：采集线程读到的**每一帧都交给 sink**（一帧不丢，供侦查与事后分析），实时读取（`read()` / `latest()`）另外只看当前一帧；自带断流重连，不需要额外依赖。
-5. **画面与遥测的时间对齐**：拿到一帧后扣掉链路固定延时（默认 150ms）得到真实拍摄时刻，再按那一刻取遥测快照，消除"用当前姿态解释 150ms 前画面"的系统性偏差。
-6. **对齐结果缓冲**：拉流源读到的**每一帧**都经 sink 对齐后写进线程安全环形缓冲（默认 30 fps × 3 分钟 = 5400 帧），供其他模块按自己的节奏回看/异步消费——消费端再慢也不会丢帧。
+```
+起飞 → 预设侦查航线（约 1 分钟）→ 盘旋 hold
+     → 感知（YOLO 检测 + OCR 读编号）→ 像素→NED 坐标解算 → 目标统计（聚类 + 选唯一）
+     ├─ 有结果 → 生成飞掠航点（航向/高度/段长按配置）+ 降落航线，合并上传
+     └─ 无结果 → 以备用点为目标生成同样航点
+     → 飞掠段：弹道实时预测落点，距目标 ≤R 触发 gripper 投放；飞过目标未投则保底投放
+     → 沿降落航线返航降落
+全程：飞行目录（文本/遥测/检测/事件/投放/视频帧）落盘，飞后可回放迭代
+投放后：量出实际落点 → 反演弹道参数（质量/阻力/延迟），下一架次用标定过的模型
+```
+
+| 模块 | 干什么 | 离线用例 |
+| --- | --- | --- |
+| `airdrop.telemetry` | MAVSDK 线程 + 遥测代理（快照/历史/内插）+ 任务级控制器 | `test_telemetry.py` |
+| `airdrop.video` | HM30 ffmpeg 拉流（一帧不丢）、帧-遥测对齐、环形缓冲 | `test_video/alignment/buffer.py` |
+| `airdrop.perception` | YOLO 检测 + 五边形转正 + RapidOCR 读编号（或 12 类直出） | `test_perception.py` |
+| `airdrop.georef` | 像素 → NED（视线与地面求交）→ WGS84（pyproj） | `test_georef.py` |
+| `airdrop.targeting` | DBSCAN 聚类 + 类内编号众数 + 跨类 median/max 选唯一 | `test_targeting.py` |
+| `airdrop.ballistics` | 二次阻力 RK4 落点预测 + 投放判据（保底 + 锁存）+ **投放记录与参数反演** | `test_ballistics.py`、`test_fit.py` |
+| `airdrop.mission` | 状态机 + 飞掠/降落航线拼接 + 候选类→坐标 + 主循环 | `test_mission.py`、`test_e2e.py` |
+| `airdrop.record` | 飞行记录（五件套 + 投放记录）+ 按原时间轴回放 | `test_recorder/replay.py` |
+| `tools.calibrate` | 三步标定：内参 → 画面/遥测时间差 → 手眼外参 | `test_calibrate.py` |
+| `tools.fit_ballistics` | 投放试验反演弹道参数（最小二乘 + 可辨识性诊断） | `test_fit.py` |
 
 ## 目录结构
 
 ```text
 airdrop/
-    __init__.py
-    models.py           # TelemetrySnapshot / Command / CommandResult
-    broker.py           # 进程内：线程安全遥测仓库与订阅
-    mavsdk_thread.py    # MAVSDK 专用线程 + 遥测采集 + 指令分发
-    external_bridge.py  # 跨进程：快照共享 + 指令队列
-    video.py            # 思翼 HM30 图传拉流（ffmpeg 子进程）
-    alignment.py        # 帧 ↔ 遥测时间对齐（收到时间 - 链路延时 → 取遥测）
-    buffer.py           # 对齐结果环形缓冲（画面 + 遥测，供其他模块回看）
-examples/
-    basic_usage.py      # 线程内读取/订阅 + 指令示例
-    external_process.py # 子进程读取共享快照 + 发指令示例
-    hm30_video.py       # HM30 图传：拉流 / 统计 / 预览 / 存盘
-    video_telemetry_sync.py  # 帧-遥测对齐 + 入缓冲 + 读者线程示例
-tests/
-    conftest.py         # 公共 fixture：本地 H.264 测试流、broker、拉流源工厂
-    test_telemetry.py   # MAVSDK 基础设施（快照/插值/线程/跨进程桥接）
-    test_alignment.py   # 帧-遥测时间对齐（注入确定性历史时间戳）
-    test_buffer.py      # 对齐结果缓冲 + AlignmentWriter 接线
-    test_video.py       # 图传拉流（本地 UDP H.264，无需硬件；标记 stream）
+  config.py            # 全部参数的唯一集中处（frozen dataclass + 取值域校验，无命令行参数）
+  telemetry/           # models / broker / mavsdk_thread / controller（mission+gripper+原点）
+  video/               # source（ffmpeg 拉流）/ align（扣链路延时）/ buffer（环形缓冲）
+  perception/          # detector（YOLO）/ cropproc（五边形→转正→OCR）/ number / ocr_worker / pipeline
+  georef/              # camera（K/dist/R_bc/t_bc）/ project（视线交地平面）/ geo（NED↔WGS84）
+  targeting/           # models / cluster（DBSCAN + 众数 + median/max）
+  ballistics/          # model（RK4 二次阻力）/ release（判据）/ drops（投放记录）/ fit（参数反演）
+  mission/             # states（状态机）/ planner（航线）/ targets（坐标解算）/ runner（主循环）
+  record/              # recorder（五件套 + drops.jsonl）/ replay（回放源 + 遥测回填）
+tools/                 # fetch_models（取权重）/ calibrate（三步标定）/ fit_ballistics（投放试验反演）
+examples/              # full_mission / replay_flight / calibration_capture / sitl_mission / 其余演示
+tests/                 # 全部离线（GPU 与真实素材的用例标 realdata，默认跳过）
 ```
 
 ## 安装
 
-项目使用 `uv` 管理依赖：
+```bash
+uv sync                 # 依赖见 pyproject.toml（索引走清华镜像）
+python -m tools.fetch_models    # 把 YOLO / PP-OCR 权重取进 models/（不进 git）
+```
+
+## 几个入口
+
+示例都**不带命令行参数**：地址、航线、开关都在各自文件顶部的"配置"区。
 
 ```bash
-uv sync
+# 1) 离线迭代识别与坐标：一份回放素材反复跑，不碰硬件
+python -m examples.replay_flight         # 回放 → 感知 → 坐标 → 统计 → 航线（只生成不上传）
+
+# 2) 完整任务（需要飞控 + 图传 + 标定文件）
+python -m examples.full_mission          # 记录默认开；DRY_RUN=True 时不装弹演练
+
+# 3) SITL 演练：只走控制链路（合成目标 + 投放只记日志）
+python -m examples.sitl_mission          # 先起 PX4 SITL，见文件顶部说明
+
+# 4) 标定采集：录一个标准飞行目录给 tools/calibrate.py
+python -m examples.calibration_capture
+
+# 5) 投放试验反演：量完实际落点后估计弹道参数（只读数据，不接硬件）
+python -m tools.fit_ballistics
 ```
 
-## 快速开始
+其余演示：`basic_usage.py`（遥测/指令）、`hm30_video.py`（拉流与统计）、
+`video_telemetry_sync.py`（对齐 + 入缓冲 + 读者线程）。
 
-示例不带命令行参数：地址、分辨率、开关等都在各自文件顶部的"配置"区，改完直接运行。
-默认连接 SITL 或真机（UDP 入站 `udpin://0.0.0.0:14540`，兼容旧写法 `udp://:14540`）：
+## 配置
+
+**所有参数都在 `airdrop/config.py`**，装配成一个 `Config` 传下去；非法取值在
+`Config().validated()` 就报错（而不是飞到一半才发现）。关键几组：
+
+| 配置 | 关键字段 | 说明 |
+| --- | --- | --- |
+| `telemetry` | `system_address`、各流速率 | 位置/姿态速率决定帧-遥测内插精度上限 |
+| `video` | `url`、`telemetry_lag` | lag 是**链路属性**，标定后回填 |
+| `perception` | `mode`（`ocr`/`cls12`）、`model_path`、`device` | 权重必须用 `best2.pt`（另两个是废弃权重） |
+| `camera` | `calib_file` | `tools/calibrate.py` 产出的 `camera_calib.json` |
+| `ground` | 地面点 GPS | `ground_z` = 原点海拔 − 地面点海拔（平地假设） |
+| `targeting` | `eps_m`、`min_samples`、`selection_rule` | `median`/`max` **起飞前二选一** |
+| `ballistics`/`drop` | 质量/Cd/面积、`radius_m`、`force_after_pass`、`delay_s` | **质量按实测称重填入**；Cd 用投放试验反演（`tools/fit_ballistics.py`）；`delay_s` 也可反演后回填 |
+| `overfly`/`gripper`/`routes` | 航向/高度/段长、gripper 实例、三条航线 | 高度是**相对起飞点**的高度 |
+| `mission` | 各状态超时、`abort_action`、起飞/降落项开关 | 见下"状态机" |
+
+## 关键约定（写代码前先看这几条）
+
+1. **"留存"与"实时看"是两条路**：`add_sink()` 注册的回调在采集线程里**逐帧**调用
+   （一帧不落），`read()`/`latest()` 是允许丢帧的实时路径。**推理与落盘的输入要来自
+   `AlignmentBuffer`**，不要用 `read()` 循环去喂。
+2. **帧-遥测对齐要扣链路延时**：用 `frame.capture_timestamp`（= 收到时间 − `telemetry_lag`）
+   取遥测；直接用 `frame.timestamp` 会晚一整个链路延时（10m/s 平飞 ≈1.5m 偏差）。
+3. **别持有帧的 ndarray**：ffmpeg 后端的 `frame.image` 是复用缓冲区的视图，跨帧保留
+   必须 `copy()`；回看历史走 `buffer.iter_between()`/`wait_new()`。
+4. **像素与内参必须同一张图**：检测器已经去畸变时（`DetectorConfig.camera_matrix` 非空），
+   georef **不能**再纠正一次——`TargetTracker` 默认按检测结果里的 `undistorted` 标记自动判断。
+5. **失败要显式**：解算不出来不编坐标、投放判据给不出落点不投、任务异常进 `ABORT`
+   而不是"假装成功继续跑"。日志/事件里都有原因。
+
+## 状态机
+
+`INIT → RECON → HOLD_PROCESS → OVERFLY → LAND → DONE`，任意环节异常 → `ABORT`。
+
+- `RECON`：上传侦查航线（首航点带**起飞项**）并启动，按 `is_mission_finished()` 判定完成；
+  新任务刚上传时的**陈旧 True** 会被 `MissionMonitor` 挡掉（要求先见到一次 `False`）。
+- `HOLD_PROCESS`：`hold()` 盘旋，等 targeting 出结果；处理完且无结果就提前收工，
+  上限 `hold_process_max_s`（默认 10s），超时取当前已有结果。
+- `OVERFLY`：结果坐标（无则备用点）→ `[entry, exit]` 飞掠航点 + 降落航线**拼成一条任务**上传，
+  激活投放判据（每拍预测落点，≤`radius_m` 即投；越过目标保底投；**一次投放即锁存**）。
+- `LAND`：沿降落航线返航，任务飞完 → `DONE`。
+- `ABORT`：只下**一条**安全动作（`abort_action`：`hold` 默认 / `rtl` / `none`）——
+  链路断了这条指令也发不出去，那种情况交给飞控自己的 failsafe。
+
+想看整条链路怎么接：`examples/full_mission.py`；不装弹演练：`examples/sitl_mission.py`
+（`DryRunController` 拦下投放指令，其余全真）。
+
+## 标定（三步，离线）
+
+棋盘格**固定**、手持飞机在其上方**平移 + 旋转**，录一个标准飞行目录
+（`examples/calibration_capture.py`），然后：
 
 ```bash
-python -m examples.basic_usage        # 遥测订阅/轮询 +（可选）arm/takeoff/land 演示
-python -m examples.external_process   # 子进程读取共享快照并下发指令
-python -m examples.hm30_video         # HM30 图传拉流与链路统计
-python -m examples.video_telemetry_sync  # 帧-遥测对齐 + 环形缓冲
+python -m tools.calibrate     # 改文件顶部的 FLIGHT_DIR / 方格边长等常量
 ```
 
-`examples/basic_usage.py` 里的 `DEMO_COMMANDS` 打开后会依次发 arm → takeoff → land，
-**只在安全环境（桨已拆除 / SITL）里用**。
+1. **内参**：多视图棋盘格 → `calibrateCamera`（`K`、畸变 + 重投影 RMS）；
+2. **画面-遥测时间差**：棋盘格 PnP 角速度 × 飞控角速度互相关 → `telemetry_lag`（回填配置）；
+3. **手眼外参**：`AX=XB` 求 `R_bc`；**`t_bc` 以尺量为准**，标定估计值写进报告供对比校验
+   （室内手持没有 GPS，平移不可信）。
 
-## 核心用法
+## 记录与回放
 
-```python
-from airdrop import Command, MavsdkThread, TelemetryBroker
+一次飞行 = 一个 `flights/<时间戳>/` 目录：`flight.log`、`telemetry.jsonl`、
+`detections.jsonl`、`drops.jsonl`、`events.jsonl`、`frames/*.jpg` + `frames_index.jsonl`、
+`config_snapshot.json`。帧**零重编码**（直接写缓冲里的 jpeg），磁盘 ≈4.5MB/s @720p30。
 
-broker = TelemetryBroker()
-mavsdk = MavsdkThread(broker=broker, system_address="udpin://0.0.0.0:14540")
-mavsdk.connect()
+回放按**原时间轴**重放帧与遥测，于是对齐/解算/统计**一行都不用改**：
+`ReplayVideoSource` 与 `Hm30VideoSource` 是同一套接口，遥测由 `TelemetryPacer`
+按帧时刻推进（`load_broker_from_log`）。想迭代算法就用 `examples/replay_flight.py`。
 
-# 同进程其他线程读取
-snapshot = broker.get_snapshot()
-print(snapshot.as_dict())
+## 投放记录与弹道参数反演
 
-# 同进程订阅推送
-def on_snapshot(snap):
-    print(snap.yaw_deg)
+**质量用台秤/天平实测**（填 `MEASURED_MASS_KG`）——它不参与反演：反演对质量的分辨力远不如
+秤，而且弹道方程里 `Cd`/`m`/`A` 只以 **κ = Cd·A/m** 的形式出现，单靠落点数据分不开这三者。
+**数据真正识别到的就是 κ 一个数**（工具会打印它，以及按实测质量换算出的 `Cd·A`）。
 
-broker.subscribe(on_snapshot)
+每次投放的**瞬间状态**都当场落盘——位置、速度、**姿态**（欧拉角与四元数各一份）、风、
+离地高度、NED 原点、目标点，外加判据当时的前推位置与预测落点：
 
-# 任何线程向 MAVSDK 线程发送指令
-result = mavsdk.send_command(Command("arm"))
-print(result.success, result.error)
+```jsonc
+// flights/<时间戳>/drops.jsonl（一行一次投放；数字不四舍五入）
+{"index": 1, "timestamp": 1756... , "position_ned": [120.0, -35.0, -20.0],
+ "velocity_ned": [0.0, 18.0, 0.0], "attitude_deg": {"roll": 4.0, "pitch": -3.0, "yaw": 90.0},
+ "wind_ned": [2.0, -1.0, 0.0], "ground_z": 0.0, "delay_s": 0.08,
+ "origin": {"lon_deg": 8.0, "lat_deg": 47.0, "alt_m": 500.0},
+ "predicted_impact_ned": [...], "predicted_error_m": 0.45, "ballistics": {...}}
 ```
 
-## 连接流程与选项
+落地后量出实际落点，写进**同一个目录**的 `impacts.jsonl`（经纬度或 NED 都行；
+第一次跑工具会生成待填模板），然后：
 
-`MavsdkThread.connect()` 遵循 MAVSDK 官方 Python 用法，按顺序执行：
-
-1. `System.connect(system_address=...)` 建立 gRPC 连接；
-2. 等待 `core.connection_state().is_connected` 确认飞控上线；
-3. 可选等待 `telemetry.health()`（`is_global_position_ok` / `is_home_position_ok`）就绪；
-4. 查询 NED 原点（`GPS_GLOBAL_ORIGIN`）并写入快照；
-5. 启动各遥测流与 NED 原点后台刷新任务。
-
-任一遥测流异常/结束时，会按配置自动重连。常用参数：
-
-```python
-mavsdk = MavsdkThread(
-    broker=broker,
-    system_address="udpin://0.0.0.0:14540",
-    connect_timeout=30.0,        # System.connect 与等待连接状态的超时
-    wait_for_health=False,       # 连接后是否等待 health 就绪（默认关）
-    health_timeout=30.0,
-    require_health_for_actions=False,  # arm/takeoff 前是否强制等 health
-    origin_refresh_interval=5.0, # NED 原点刷新周期（秒）
-    reconnect=True,              # 遥测流断开后自动重连
-    reconnect_delay=5.0,
-)
-mavsdk.connect()
-print(mavsdk.connected)          # 是否已连接并就绪
+```bash
+python -m tools.fit_ballistics    # 改文件顶部的 FLIGHTS / FIT_* 常量
 ```
 
-## 按时间戳查询
+工具会打印逐次投放的"判据预测 / 反演后预测 / 实测"对照表（含沿航迹、垂直航迹分解），
+做最小二乘反演，并给出**识别量 κ = Cd·A/m、不确定度 σ、参数相关性、条件数、留一交叉验证**，
+最后输出可直接粘回配置的 `BallisticsConfig(...)` 与 `ballistics_fit.json` 报告。
 
-代理会保存最近一段历史快照（默认 `TelemetryBroker(history_maxlen=1200, history_interval=0.1)`，即按 10 Hz 采样、约覆盖 2 分钟；`history_interval=0` 表示每次遥测更新都写入历史）。历史写入是节流的，但最新快照与订阅推送始终实时。其他模块给出一个时间戳时，可以获取“那一刻”的状态：
+> ⚠ **先看结论行再抄数字**：Cd 与迎风面积只以 `Cd·A` 的乘积出现（同时拟合必然退化）、
+> 释放延迟与阻力沿航迹方向高度相关（同高同速投放分不开）；常数偏移（测量点/目标点坐标错）
+> 任何参数都吸收不了。这三种情况工具会**拒绝给结论**并说明原因——详见
+> [`AGENTS.md`](AGENTS.md) 的 P12 一节。
+> 另外：**质量填错多少，Cd 就跟着错多少**（κ 不变）——换配重（形状不变 ⇒ `Cd·A` 不变）时按
+> `κ' = Cd·A/m'` 重算即可，不必重做试验。
 
-```python
-# 默认：历史范围内线性内插，超出范围线性外推
-snap = broker.get_snapshot_at(1710000000.123)
-print(snap.as_dict())
+## HM30 图传
 
-# 也可以只取时间上最近的一条历史快照
-snap = broker.get_snapshot_at(1710000000.123, mode="nearest")
-```
-
-跨进程也可以通过指令队列查询：
-
-```python
-from airdrop import Command
-
-result = mavsdk.send_command(Command(
-    "get_snapshot_at",
-    {"timestamp": 1710000000.123, "mode": "interpolate"},
-))
-print(result.success, result.data["snapshot"])
-```
-
-注意：时间戳单位是秒，并与 `TelemetrySnapshot.timestamp` 使用同一时间轴（默认是 `time.time()` 本地墙钟时间）。
-
-`mode` 只接受 `"interpolate"`（默认）或 `"nearest"`，其余取值会抛出 `ValueError`，
-错误信息会列出可选值。该校验在 `broker` 层与 `get_snapshot_at` 指令入口两处生效，
-因此跨进程发指令时非法 `mode` 也会得到明确提示。
-
-跨进程：
-
-```python
-from airdrop import ExternalBridge
-
-bridge = ExternalBridge(mavsdk, broker=broker, publish_hz=20.0)
-bridge.start()
-
-# 把 bridge.snapshot / bridge.command_queue / bridge.result_queue
-# 作为参数传给 multiprocessing.Process 即可。
-```
-
-## 遥测快照字段
-
-`TelemetrySnapshot` 包含：
-
-- **世界坐标**：`latitude_deg` / `longitude_deg` / `absolute_altitude_m` / `relative_altitude_m`
-- **HOME 点 GPS 坐标**：`home_latitude_deg` / `home_longitude_deg` / `home_absolute_altitude_m` / `home_relative_altitude_m`
-- **本地 NED 原点 GPS 坐标（GPS_GLOBAL_ORIGIN）**：`origin_latitude_deg` / `origin_longitude_deg` / `origin_altitude_m`
-- **本地坐标（NED）**：`north_m` / `east_m` / `down_m`
-- **速度（NED）**：`vx_m_s` / `vy_m_s` / `vz_m_s`
-- **姿态（欧拉角）**：`roll_deg` / `pitch_deg` / `yaw_deg`
-- **姿态（四元数）**：`quaternion_w` / `quaternion_x` / `quaternion_y` / `quaternion_z`
-
-## PX4 NED 原点
-
-注意：**HOME 点不一定等于本地 NED 坐标系原点**。
-
-- PX4 的本地 NED 原点由 `vehicle_local_position.ref_lat / ref_lon / ref_alt` 表示。
-- MAVSDK 中对应的是 `telemetry.get_gps_global_origin()`，返回 `GpsGlobalOrigin`。
-- `telemetry.home()` 返回的是 HOME 点，二者通常接近，但可能在飞控初始化后、飞机移动或用户手动改 HOME 后不一致。
-
-本项目已自动获取 NED 原点并写入 `origin_*` 字段，同时保留 `home_*` 字段：
-
-```python
-snap = broker.get_snapshot()
-print("HOME:", snap.home_latitude_deg, snap.home_longitude_deg)
-print("NED 原点:", snap.origin_latitude_deg, snap.origin_longitude_deg, snap.origin_altitude_m)
-```
-
-## 支持指令
-
-| 指令名 | 参数 |
-| --- | --- |
-| `arm` | - |
-| `arm_force` | - |
-| `disarm` | - |
-| `takeoff` | - |
-| `land` | - |
-| `hold` | - |
-| `kill` | - |
-| `rtl` / `return_to_launch` | - |
-| `set_takeoff_altitude` | `altitude_m` |
-| `set_return_to_launch_altitude` | `relative_altitude_m` |
-| `set_current_speed` | `speed_m_s` |
-| `get_snapshot_at` | `timestamp`（秒）、`mode`（`interpolate`/`nearest`） |
-| `get_gps_global_origin` | - |
-
-## 思翼 HM30 图传
-
-HM30 地面端不"推"视频给上位机，而是把机载以太网 `192.168.144.0/24` **透明桥接**到
-LAN 口 / 内置 WiFi / USB WiFi 上（这三者同时承载 UDP 遥测）。官方 FAQ 的说法是：
-任何输出 RTSP、能接以太网的 IP 相机都可以配 HM30。所以"拉流"就是打开一条 RTSP。
-
-**接线**
-
-1. 网线插 HM30 **地面端** LAN 口；
-2. 电脑网卡配静态地址 `192.168.144.20` / 掩码 `255.255.255.0`；
-3. 确认能 ping 通机载相机 `192.168.144.25`。默认 RTSP
-   `rtsp://192.168.144.25:8554/main.264` 是 SIYI 云台/相机系列的约定地址；若用
-   HDMI-Ethernet 输入转换模块或第三方 IP 相机则不同。
-
-**地址不猜、不探测**：地址写错时不会静默重试，而是把 ffmpeg 的输出原样作为错误抛出来
-（错误日志 + `stats.last_error`）。想手动确认地址，直接用 ffmpeg 命令行试一次最清楚：
+HM30 地面端把机载以太网 `192.168.144.0/24` **透明桥接**到 LAN/内置 WiFi：网线插地面端
+LAN 口、电脑网卡配 `192.168.144.20/24`、能 ping 通 `192.168.144.25` 即可；
+SIYI 相机默认 `rtsp://192.168.144.25:8554/main.264`。地址**不猜也不探测**，写错就把
+ffmpeg 的错误原样抛出来（`stats.last_error`）；手动核对一条命令即可：
 
 ```bash
 ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f null -
-
-python -m examples.hm30_video     # 拉流并打印帧率 / 丢帧 / 重连 / 延迟
 ```
 
-**代码用法**
-
-```python
-from airdrop import Hm30VideoSource, VideoConfig
-
-# 尺寸在配置里给（默认 720p）；本模块不探测源分辨率
-with Hm30VideoSource(VideoConfig(width=1280, height=720)) as source:
-    while (frame := source.read(timeout=1.0)) is not None:
-        results = model(frame.image)   # YOLO / OCR 直接吃 BGR ndarray
-```
-
-**每帧都不丢：sink**
-
-`read()` / `latest()` 是**实时**路径——只保证你看到的是当前一帧，慢消费者会丢掉中间帧
-（计入 `stats.dropped`）。但本项目的要求是"**读到的每一帧都要留下来**"：目标出现的
-时间可能极短，漏一帧就可能漏掉目标；而"先侦查后空投"允许一定的处理延时，不允许丢帧。
-
-所以"留存"走另一条路：采集线程读出的**每一帧都会交给注册的 sink**，一帧不落。
-
-```python
-from airdrop import AlignmentBuffer, AlignmentWriter, FrameTelemetryAligner, capacity_for
-
-buffer = AlignmentBuffer(capacity_for(30, 180))          # 30 fps × 3 分钟 = 5400 帧
-writer = AlignmentWriter(buffer, FrameTelemetryAligner(broker, lag=0.15))
-
-with Hm30VideoSource(VideoConfig(width=1280, height=720)) as source:
-    source.add_sink(writer)          # 从这一帧起，读到的每一帧都进缓冲
-    ...
-```
-
-sink 在采集线程里同步执行，所以必须快（缓冲写入只做一次 JPEG 编码，几毫秒）；
-它抛异常只记日志，不会打断拉流。`AlignmentWriter.written` / `skipped` 分开计数：
-只有"对齐取不到遥测"才会跳过画面，**不会因为消费端慢而丢帧**。
-
-`source.stats` 可读到 `fps` / `dropped` / `reconnects` / `last_error`，断流后自动按
-指数退避重连（`dropped` 只统计实时路径没跟上的帧，与缓冲无关）。
-
-**为什么只有 ffmpeg 一个后端**
-
-ffmpeg 后端还完全掌握低延迟 flag，且子进程能被父进程直接杀掉——断流判定与 `stop()`
-都不会被卡住。细节见 `AGENTS.md` 的"关键约定与坑"。
-
-## 画面与遥测的时间对齐
-
-图传链路从"相机曝光"到"本进程读出一帧"之间有约 **150ms** 的固定延时（H.264 编码 +
-无线传输 + 解码 + 管道缓冲）。直接用收到帧的时刻去查遥测，等于拿"现在的姿态"解释
-"150ms 前的画面"——飞机以 10 m/s 平飞时，这就是 1.5 米的位置偏差，而且它会随速度
-变化伪装成"算法不准"。
-
-所以每拿到一帧，先把它**收到的时间减掉这段延时**，得到画面真正的拍摄时刻，再按
-那一刻向 `TelemetryBroker` 查询遥测（默认在历史之间线性内插）：
-
-```python
-from airdrop import FrameTelemetryAligner, Hm30VideoSource, TelemetryBroker, VideoConfig
-
-broker = TelemetryBroker()
-aligner = FrameTelemetryAligner(broker)          # 默认扣 150ms
-
-with Hm30VideoSource(VideoConfig()) as source:
-    while (frame := source.read(timeout=1.0)) is not None:
-        sample = aligner.align(frame)            # 帧 + 它拍摄时刻的遥测
-        if sample is None:                       # 遥测历史为空，或超出外推保护
-            continue
-        if sample.extrapolated:                  # 那一刻的遥测是外推来的，慎用
-            continue
-        aim_at(sample.image, sample.snapshot.latitude_deg, sample.snapshot.yaw_deg)
-```
-
-延时是**链路属性**而不是消费者的选择，所以它定义在 `VideoConfig.telemetry_lag` 上、
-由拉流源写进每一帧（`frame.capture_timestamp`）；对齐器默认直接采用帧上的值，也可以
-用 `FrameTelemetryAligner(broker, lag=...)` 覆盖。等价的手写形式：
-
-```python
-snapshot = broker.get_snapshot_at(frame.capture_timestamp)   # = frame.timestamp - 0.15
-```
-
-几点注意：
-
-- **延时是链路属性**：默认值 `DEFAULT_TELEMETRY_LAG = 0.15` 是 ffmpeg 后端的实测值。
-  换相机、换传输方式、或标定出新值之后，只改 `VideoConfig.telemetry_lag` 一处，之后
-  每一帧都会带上新值。
-- **外推有风险**：查询时刻落在历史范围之外时，代理仍会线性外推并返回结果。
-  `AlignedSample.extrapolated` / `offset` 如实标记了这一点；需要硬保证时给对齐器设
-  `max_extrapolation`，超限的帧直接返回 `None`。
-- **150ms 是经验值，不是精确测量**：标定方式是对着秒表拍摄，比较画面读数与本地时钟。
-  链路抖动（毫秒级）要靠相机自己的 RTCP 时间戳解决，不在本模块范围内。
-- **延时补偿 ≠ 实时性**：前者修的是"这帧是什么时候拍的"，后者说的是"你手里的画面
-  有多新"。两者都要：延时补偿保证回看时遥测对得上画面，实时路径保证当前画面不积压。
-
-运行示例（地址、延时、缓冲容量都在文件顶部配置区）：
-
-```bash
-python -m examples.video_telemetry_sync
-```
-
-## 对齐结果的缓冲
-
-`AlignmentBuffer` 是本项目的**留存层**。为什么必须留存：目标出现的时间可能极短，
-漏一帧就可能漏掉目标，而"先侦查后空投"的模式可以接受处理延时、不能接受丢帧。
-
-写者是采集线程里的 `AlignmentWriter`（挂成拉流源的 sink），它把每一帧连同**拍摄
-时刻**的遥测写进缓冲；读者（推理、落盘、回放、复盘）任意多个，各自按自己的节奏
-取走。消费端再慢也不会让缓冲少一帧，最多是它自己的游标落后——这一点和实时路径
-（`read()` / `latest()`，只看当前帧）互不影响。
-
-```python
-from airdrop import (
-    AlignmentBuffer, AlignmentWriter, FrameTelemetryAligner, capacity_for,
-)
-
-buffer = AlignmentBuffer(capacity_for(30, 180))   # 30 fps × 3 分钟 = 5400 帧
-writer = AlignmentWriter(buffer, FrameTelemetryAligner(broker, lag=0.15))
-
-# 写者：挂在采集线程上，逐帧对齐并入缓冲（缓冲内部会拷贝，不存复用视图）
-source.add_sink(writer)
-
-# 读者（其他模块）：自己记游标，往前跟
-index = 0
-while running:
-    record = buffer.wait_new(after_index=index, timeout=1.0)
-    if record is None:
-        continue
-    index = record.index
-    inference(record.image)               # 画面（BGR ndarray）
-    print(record.snapshot.yaw_deg)        # 那一刻的遥测
-    print(record.capture_timestamp, record.age)
-```
-
-`writer.written` / `writer.skipped` 用来核对"有没有丢"：`skipped` 只会因为"该时刻取不到
-遥测"（历史为空或超过 `max_extrapolation`）而增加，**不会因为消费慢而增加**。
-
-**容量与内存（先算账再选参数）**
-
-默认容量 5400 帧（30 fps × 3 分钟）。未压缩 720p 单帧是 2.64 MiB，5400 帧 ≈
-**13.9 GiB**——普通机器放不下内存，所以默认 `storage="jpeg"`（质量 80，约
-0.1~0.2 MB/帧，满载 0.6~1 GiB）。要像素级无损就用 `storage="raw"`，但请同时设
-`max_bytes` 兜底。入库第一帧时会打印一次按实测帧大小算出的满载估算。
-
-| 存储 | 单帧（720p） | 5400 帧 | 精度 |
-| --- | --- | --- | --- |
-| `jpeg`（默认，q=80） | 约 0.1~0.2 MB | 约 0.6~1 GiB | 有损（看画面/找目标足够） |
-| `raw` | 2.64 MiB | ≈13.9 GiB | 无损 |
-
-**几条必须知道的语义**
-
-- **入缓冲会拷贝**：ffmpeg 后端的帧是复用管道缓冲区的视图，下一帧到达时同一块内存
-  会被覆盖。缓冲在 `jpeg` 模式下编码成独立字节串、`raw` 模式下显式 `copy()`；你自己
-  保存 `frame.image` 时同样要 `.copy()`（或 `frame.copy()`）。
-- **满时从最旧一端驱逐**，不是丢最新——丢最新等于让所有读者一起挨饿。`stats.evicted`
-  记录累计驱逐数，`indices()` 给出当前保留的序号范围。
-- **序号单调递增且不回退**，可以安全地当读者游标；若游标落后到记录已被驱逐，会直接
-  返回最新一条（跳帧，但不会卡死）。
-- **回看历史一律用 `iter_between()`**：它分批解码，内存占用与 `batch` 同阶、迭代期间
-  不持锁，并且是快照式迭代（只覆盖开始那一刻已入库的记录）。要想一次拿全（5400 帧
-  720p 就是 13.9 GiB）就自己 `list(...)`，那份内存账由调用方认。
-- `raw` 模式读到的 `image` 是**只读视图**（零拷贝）；`jpeg` 模式是新解码的数组。
-  需要就地画框请先 `record.copy()`。
+图传**只有 ffmpeg 一个后端**，不要再引入 `cv2.VideoCapture`。真实理由是：(1) 管道反压让
+接收侧保持浅流水（实测 0 帧积压，而 cv2 后端有 17 帧 ≈0.57s 的内部排队）；(2) `read()`
+是 C 层不可中断调用，卡住只能杀进程；(3) 断流超时靠 ffmpeg 的 `-timeout`（微秒）。
+⚠ 早期文档里"OpenCV 5.0 移除了 `OPENCV_FFMPEG_CAPTURE_OPTIONS`"的说法**是错的**
+（那个字符串在插件 DLL 里，grep 错了文件）——完整复盘见 `AGENTS.md`。
 
 ## 测试
 
-基于 **pytest**，全部离线（不需要真实飞控或图传硬件）：
-
 ```bash
-./.venv/Scripts/python.exe -m pytest                    # 全部，附覆盖率报告
-./.venv/Scripts/python.exe -m pytest -m "not stream"    # 跳过要起 ffmpeg 的用例
-./.venv/Scripts/python.exe -m pytest -k alignment -v    # 只跑对齐相关
-./.venv/Scripts/python.exe -m pytest --no-cov           # 不统计覆盖率
+./.venv/Scripts/python.exe -m pytest                 # 全部（附覆盖率，当前 ≈81%）
+./.venv/Scripts/python.exe -m pytest -m "not stream" # 跳过要起 ffmpeg 的用例
+./.venv/Scripts/python.exe -m pytest -m realdata     # GPU + 旧版 实战素材（分钟级）
+./.venv/Scripts/python.exe -m pytest -k mission -v   # 只跑某个主题
 ```
 
-`tests/conftest.py` 提供公共 fixture：本地 H.264 测试流发送端（`sender`，可反复启停）、
-"起流并等到首帧"的拉流源工厂（`live_source`，可在 `start()` 之前挂 sink）、
-已就绪的 broker（`broker`）与订阅记录（`received`）。
+- 套件**全部离线**：不需要飞控/图传；`stream` 标记的用例会起本地 ffmpeg 并占 UDP 51234。
+- 端到端在 `tests/test_e2e.py`：回放素材 → 感知 → 坐标 → 统计 → 航线，其中
+  `-m realdata` 那条用**真视频 + 真 YOLO + 真 OCR**（位姿是合成的，见用例 docstring）。
+- 投放反演在 `tests/test_fit.py`：用**已知真值**的弹道模型造出"实测落点"再反演，
+  并钉住三种必须拒绝的退化情形、测量文件的各种写法、以及工具的现场流程。
+- ⚠ 受限沙箱里 pytest 的 `tmp_path` 不可用（`PermissionError`），12 个 `test_recorder.py`
+  + 8 个 `test_georef.py` 会挂在 fixture 上——那是沙箱限制、不是代码问题
+  （`tests/test_fit.py` 因此自带工作区内的 `workdir` fixture）。
 
-覆盖内容：
+## 已知边界与风险（别当成已完成）
 
 ## 安全提示
 
-- 真机测试前务必在仿真环境验证。
-- `arm` / `takeoff` / `kill` 等指令有安全风险，请自行增加确认/急停逻辑。
-- 当前遥测快照是“最新可用值合并”，各 MAVSDK 数据流本身没有全局时间戳，因此不保证多个字段来自同一时刻；如需严格时间同步请扩展为按 `timestamp_us` 对齐。
+- 任何会动的东西（arm / takeoff / mission upload / 投放）**只在拆桨或 SITL 环境里试**；
+  真机演练请用 `DRY_RUN = True`（投放指令只记日志）并确认 `abort_action` 符合你的空域要求。
+- 投放判据是**建议**而不是保证：它按弹道与风预测落点，参数没标定过就只是"按配置在飞"。

@@ -1,0 +1,154 @@
+"""任务状态机：状态、合法转移与转移历史（计划 4.7）。
+
+```
+INIT ──▶ RECON ──▶ HOLD_PROCESS ──▶ OVERFLY ──▶ LAND ──▶ DONE
+  │        │             │              │          │
+  └────────┴─────────────┴──────────────┴──────────┴──▶ ABORT
+```
+
+各状态的含义与**进入条件**（判定逻辑在 :mod:`airdrop.mission.runner`）：
+
+| 状态 | 进入时做了什么 | 离开条件 |
+| --- | --- | --- |
+| `INIT` | 等遥测与 NED 原点 | 遥测有效 + 原点就绪 → 上传并启动**侦查航线** → `RECON` |
+| `RECON` | （任务在飞） | mission 报告飞完 → `HOLD_PROCESS` |
+| `HOLD_PROCESS` | `hold()`（固定翼盘旋） | 出结果 **或** 处理完且无结果 **或** 10s 超时 → 上传**飞掠+降落**任务并启动 → `OVERFLY` |
+| `OVERFLY` | 激活投放判据 | 投放成功 → `LAND`；飞完仍未投放 → `ABORT` |
+| `LAND` | （沿降落航线返航） | mission 飞完 → `DONE` |
+| `ABORT` | 下安全动作（`MissionConfig.abort_action`） | 终止 |
+
+`DONE` / `ABORT` 是终态，不再离开——"任务完成后又重新开始"这种事由调用方
+新建一个 runner 表达，不在状态机里留后门。
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any, Callable
+
+LOGGER = logging.getLogger(__name__)
+
+__all__ = [
+    "TERMINAL_STATES",
+    "TRANSITIONS",
+    "InvalidTransition",
+    "MissionState",
+    "MissionStateMachine",
+    "MissionTransition",
+    "emit_event",
+]
+
+
+class MissionState(StrEnum):
+    """任务状态。继承 ``str`` 是为了直接进 JSONL 事件日志。"""
+
+    INIT = "INIT"
+    RECON = "RECON"
+    HOLD_PROCESS = "HOLD_PROCESS"
+    OVERFLY = "OVERFLY"
+    LAND = "LAND"
+    DONE = "DONE"
+    ABORT = "ABORT"
+
+
+#: 合法转移表（**唯一出处**；runner 只能走这里列出的边）
+TRANSITIONS: dict[MissionState, frozenset[MissionState]] = {
+    MissionState.INIT: frozenset({MissionState.RECON, MissionState.ABORT}),
+    MissionState.RECON: frozenset({MissionState.HOLD_PROCESS, MissionState.ABORT}),
+    MissionState.HOLD_PROCESS: frozenset({MissionState.OVERFLY, MissionState.ABORT}),
+    MissionState.OVERFLY: frozenset({MissionState.LAND, MissionState.ABORT}),
+    MissionState.LAND: frozenset({MissionState.DONE, MissionState.ABORT}),
+    MissionState.DONE: frozenset(),
+    MissionState.ABORT: frozenset(),
+}
+
+#: 终态：到这儿就停，不再转移
+TERMINAL_STATES = frozenset({MissionState.DONE, MissionState.ABORT})
+
+
+class InvalidTransition(RuntimeError):
+    """非法的状态转移（表里没有这条边）。"""
+
+
+@dataclass(frozen=True, slots=True)
+class MissionTransition:
+    """一次状态转移（进事件日志与历史）。"""
+
+    from_state: MissionState
+    to_state: MissionState
+    timestamp: float
+    reason: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "from_state": str(self.from_state),
+            "to_state": str(self.to_state),
+            "reason": self.reason,
+            "timestamp": self.timestamp,
+        }
+
+
+def emit_event(
+    on_event: Callable[[str, dict[str, Any]], None] | None,
+    kind: str,
+    data: dict[str, Any],
+) -> None:
+    """事件回调的统一入口：写盘失败只记日志，**绝不影响控制流**。
+
+    （recorder 的 ``EventLog.emit`` 在关闭后抛 ``RuntimeError``；任务收尾阶段
+    仍可能有事件要落，这种异常不能把状态机带崩。）
+    """
+    if on_event is None:
+        return
+    try:
+        on_event(kind, data)
+    except Exception:  # noqa: BLE001 - 事件写盘失败不影响控制
+        LOGGER.exception("写入任务事件失败（控制继续）")
+
+
+@dataclass
+class MissionStateMachine:
+    """带合法转移校验与历史的状态机（runner 持有一个）。
+
+    ``on_event`` 收到 ``("state", {...})``——即每次**成功**的转移都记一条，
+    非法转移直接抛 :class:`InvalidTransition` 且**状态不变**。
+    """
+
+    state: MissionState = MissionState.INIT
+    on_event: Callable[[str, dict[str, Any]], None] | None = None
+    history: list[MissionTransition] = field(default_factory=list)
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state in TERMINAL_STATES
+
+    def can_transition(self, to_state: MissionState) -> bool:
+        return to_state in TRANSITIONS[self.state]
+
+    def transition(
+        self,
+        to_state: MissionState,
+        *,
+        reason: str = "",
+        now: float | None = None,
+    ) -> MissionTransition:
+        """执行一次转移；非法边抛 :class:`InvalidTransition`（状态保持原样）。"""
+        if not self.can_transition(to_state):
+            raise InvalidTransition(
+                f"非法状态转移：{self.state} → {to_state}"
+                f"（允许 {sorted(str(s) for s in TRANSITIONS[self.state])}）"
+            )
+        record = MissionTransition(
+            from_state=self.state,
+            to_state=to_state,
+            timestamp=time.time() if now is None else float(now),
+            reason=reason,
+        )
+        self.state = to_state
+        self.history.append(record)
+        LOGGER.info("任务状态：%s → %s（%s）", record.from_state, record.to_state, reason)
+        emit_event(self.on_event, "state", record.as_dict())
+        return record

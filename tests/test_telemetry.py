@@ -47,6 +47,52 @@ def make_quat(w, x, y, z):
     return q
 
 
+def make_wind(x, y, z, alt_msl=100.0):
+    """MAVSDK ``Wind`` 的字段名是 ``wind_x/y/z_ned_m_s``（x=北、y=东、z=地）。"""
+    w = Fake()
+    w.wind_x_ned_m_s = x
+    w.wind_y_ned_m_s = y
+    w.wind_z_ned_m_s = z
+    w.wind_altitude_msl_m = alt_msl
+    return w
+
+
+def test_wind_fields_are_published_and_interpolated(broker: TelemetryBroker) -> None:
+    """风估计是可选流，但既然进了快照，就该和其它数值字段一样能查能内插。"""
+    assert broker.get_snapshot().wind_north_m_s is None, "没有风估计时应当是 None"
+
+    s1 = broker.update_wind(make_wind(2.0, -1.0, 0.5))
+    assert broker.get_snapshot().wind_north_m_s == pytest.approx(2.0)
+    assert broker.get_snapshot().wind_east_m_s == pytest.approx(-1.0)
+    assert broker.get_snapshot().wind_down_m_s == pytest.approx(0.5)
+
+    time.sleep(0.01)
+    s2 = broker.update_wind(make_wind(6.0, -3.0, 1.5))
+    mid = (s1.timestamp + s2.timestamp) / 2
+    interp = broker.get_snapshot_at(mid, mode="interpolate")
+    assert interp is not None
+    assert interp.wind_north_m_s == pytest.approx(4.0, abs=0.5), "风也该线性内插"
+    assert interp.wind_east_m_s == pytest.approx(-2.0, abs=0.5)
+
+
+def test_wind_fields_survive_json_round_trip() -> None:
+    """回放要靠 as_dict/字典重建；风字段必须跟着走，否则回放里的弹道会静默变零风。"""
+    import json
+
+    from airdrop.telemetry.models import TelemetrySnapshot
+
+    snapshot = TelemetrySnapshot(timestamp=1.0)
+    snapshot.update_wind(make_wind(3.0, 4.0, 0.0))
+    payload = json.loads(json.dumps(snapshot.as_dict()))
+    assert payload["wind_north_m_s"] == pytest.approx(3.0)
+    assert payload["wind_east_m_s"] == pytest.approx(4.0)
+    restored = TelemetrySnapshot(
+        **{k: v for k, v in payload.items()
+           if k in TelemetrySnapshot.__dataclass_fields__}
+    )
+    assert restored.wind_north_m_s == pytest.approx(3.0)
+
+
 def test_broker_snapshot_interpolation_subscribe(
     broker: TelemetryBroker, received: list
 ) -> None:

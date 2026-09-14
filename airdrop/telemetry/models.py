@@ -57,6 +57,12 @@ class TelemetrySnapshot:
     origin_longitude_deg: float | None = None
     origin_altitude_m: float | None = None
 
+    # 风估计（NED，单位：米/秒）——来自 MAVSDK ``telemetry.wind()`` 的**可选**流，
+    # 飞控没有风估计时一直是 None（投放判据会降级成零风并记日志，见 ballistics）。
+    wind_north_m_s: float | None = None
+    wind_east_m_s: float | None = None
+    wind_down_m_s: float | None = None
+
     # MAVSDK 时间戳（系统启动后的微秒数），仅在可用时填充
     attitude_timestamp_us: int | None = None
 
@@ -97,6 +103,16 @@ class TelemetrySnapshot:
         self.pitch_deg = float(euler.pitch_deg)
         self.yaw_deg = float(euler.yaw_deg)
         self.attitude_timestamp_us = int(euler.timestamp_us)
+
+    def update_wind(self, wind: Any) -> None:
+        """从 MAVSDK ``Wind`` 对象复制风估计字段。
+
+        ⚠ MAVSDK 的字段名是 ``wind_x/y/z_ned_m_s``（x=北、y=东、z=地），
+        与快照里的 ``vx/vy/vz_m_s`` 命名习惯不同——这里显式对齐到 north/east/down。
+        """
+        self.wind_north_m_s = float(wind.wind_x_ned_m_s)
+        self.wind_east_m_s = float(wind.wind_y_ned_m_s)
+        self.wind_down_m_s = float(wind.wind_z_ned_m_s)
 
     def update_attitude_quaternion(self, quaternion: Any) -> None:
         """从 MAVSDK ``Quaternion`` 对象复制字段。"""

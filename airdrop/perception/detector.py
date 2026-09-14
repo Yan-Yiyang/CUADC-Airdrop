@@ -264,7 +264,12 @@ class Detector:
                             # cls12：类别直出编号（1 起）。ocr 模式留空待补。
                             code=int(cls) + 1 if mode == "cls12" else None,
                             mode=mode,
-                            extra={"class_name": self._names.get(int(cls), "")},
+                            # ``undistorted`` 是给下游坐标解算看的：像素在**去过畸变**的
+                            # 图上时，georef 不能再纠正一遍（否则纠正两次）。
+                            extra={
+                                "class_name": self._names.get(int(cls), ""),
+                                "undistorted": bool(rectified),
+                            },
                         )
                     )
         detections.sort(key=lambda d: d.confidence, reverse=True)

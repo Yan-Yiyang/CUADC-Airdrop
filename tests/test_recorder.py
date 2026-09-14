@@ -2,7 +2,7 @@
 
 所有用例都跑在 ``pytest`` 的 ``tmp_path`` 下，**离线**——不需要飞控、不需要
 ffmpeg、不需要硬件。手动往 ``AlignmentBuffer`` 喂帧、往 ``TelemetryBroker``
-灌数据，验证五件套落盘 + 帧零重编码 + 线程安全 + 幂等行为。
+灌数据，验证五件套 + 投放记录落盘 + 帧零重编码 + 线程安全 + 幂等行为。
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from airdrop import (
     AlignmentBuffer,
     Config,
     DetectionWriter,
+    DropRecord,
     EventLog,
     FlightRecorder,
     TelemetryBroker,
@@ -129,10 +130,28 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
             _bump_broker(broker, time.time())
             time.sleep(0.005)
 
-        # 事件 + 检测（中间夹杂）
+        # 事件 + 检测 + 投放（中间夹杂）
         recorder.events.emit("state", from_state="RECON", to_state="HOLD")
         recorder.detections.append({"frame_index": 1, "code": 42, "confidence": 0.9})
         recorder.detections.append(_FakeDetection(code=7, confidence=0.85, frame_index=2))
+        recorder.drops.append(
+            DropRecord(
+                index=1,
+                timestamp=time.time(),
+                position_ned=(120.0, -35.0, -20.0),
+                velocity_ned=(0.0, 18.0, 0.0),
+                ground_z=0.0,
+                roll_deg=4.0,
+                pitch_deg=-3.0,
+                yaw_deg=90.0,
+                wind_ned=(2.0, -1.0, 0.0),
+                reason="predict",
+                delay_s=0.08,
+                predicted_impact_ned=(0.4, 0.2, 0.0),
+                predicted_flight_time_s=2.1,
+                predicted_error_m=0.45,
+            )
+        )
 
         # 等 recorder 把帧全部落盘
         assert _wait_until(
@@ -152,12 +171,13 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
         flight_dir / "flight.log",
         flight_dir / "telemetry.jsonl",
         flight_dir / "detections.jsonl",
+        flight_dir / "drops.jsonl",
         flight_dir / "events.jsonl",
         flight_dir / "frames_index.jsonl",
         flight_dir / "config_snapshot.json",
     }
     missing = {p for p in expected_files if not p.exists()}
-    assert not missing, f"五件套缺失: {missing}"
+    assert not missing, f"五件套 + 投放记录缺失: {missing}"
 
     # 帧文件齐
     frame_files = sorted((flight_dir / "frames").glob("*.jpg"))
@@ -200,6 +220,20 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
     assert second["code"] == 7 and second["confidence"] == pytest.approx(0.85)
     assert "as_dict" not in second  # dataclass 已展开为字段
 
+    # drops.jsonl：投放瞬间的状态（位置/速度/姿态/风）与判据的预测都要在
+    drop_lines = (flight_dir / "drops.jsonl").read_text("utf-8").strip().split("\n")
+    assert len(drop_lines) == 1
+    drop = json.loads(drop_lines[0])
+    assert drop["index"] == 1
+    assert drop["position_ned"] == pytest.approx([120.0, -35.0, -20.0])
+    assert drop["velocity_ned"] == pytest.approx([0.0, 18.0, 0.0])
+    assert drop["attitude_deg"] == pytest.approx(
+        {"roll": 4.0, "pitch": -3.0, "yaw": 90.0}
+    )
+    assert drop["wind_ned"] == pytest.approx([2.0, -1.0, 0.0])
+    assert drop["delay_s"] == pytest.approx(0.08)
+    assert drop["predicted_error_m"] == pytest.approx(0.45)
+
     # flight.log 含 recorder 启动信息（root logger 被挂上 FileHandler）
     log_text = (flight_dir / "flight.log").read_text("utf-8")
     assert "FlightRecorder 已启动" in log_text
@@ -219,6 +253,8 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
     assert stats.frames_written == 5
     assert stats.raw_reencoded == 0
     assert stats.events >= 3  # started + state + stopped
+    assert stats.drops == 1
+    assert stats.detections == 2
 
 
 # ----------------------------------------------------------------------

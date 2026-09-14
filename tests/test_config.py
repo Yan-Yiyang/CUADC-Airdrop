@@ -9,7 +9,11 @@ from __future__ import annotations
 import pytest
 
 from airdrop import (
+    AlignConfig,
+    BallisticsConfig,
     Config,
+    GripperConfig,
+    MissionConfig,
     PerceptionConfig,
     TargetingConfig,
     TelemetryConfig,
@@ -29,6 +33,19 @@ def test_default_config_is_valid() -> None:
     assert cfg.video.telemetry_lag > 0
 
 
+def test_mission_config_defaults_match_plan() -> None:
+    """计划 4.7 写死的几个数：HOLD_PROCESS 上限 10s、判据 20Hz、超时兜底。"""
+    mission = MissionConfig()
+    assert mission.hold_process_max_s == 10.0
+    assert mission.tick_hz == 20.0 == Config().drop.evaluation_hz
+    assert mission.abort_action == "hold"
+    assert mission.takeoff_first and mission.land_last
+    assert mission.telemetry_stale_s > Config().align.max_wait, (
+        "状态机的链路看门狗要比对齐的超时宽——单帧同步不上不该把整个任务判失败"
+    )
+    assert Config().gripper.instance == 0
+
+
 def test_replace_derives_new_config() -> None:
     """replace 派生不修改原配置（frozen dataclass 语义）。"""
     base = Config()
@@ -45,6 +62,15 @@ def test_replace_derives_new_config() -> None:
         ({"targeting": TargetingConfig(selection_rule="mode")}, "selection_rule"),
         ({"targeting": TargetingConfig(eps_m=0.0)}, "eps_m"),
         ({"perception": PerceptionConfig(ocr_workers=0)}, "ocr_workers"),
+        ({"perception": PerceptionConfig(imgsz=16)}, "imgsz"),
+        ({"align": AlignConfig(on_timeout="skip")}, "on_timeout"),
+        ({"ballistics": BallisticsConfig(wind_source="manual")}, "wind_source"),
+        ({"mission": MissionConfig(abort_action="land")}, "abort_action"),
+        ({"mission": MissionConfig(tick_hz=0.0)}, "tick_hz"),
+        ({"mission": MissionConfig(recon_max_s=-1.0)}, "recon_max_s"),
+        ({"mission": MissionConfig(hold_process_min_s=20.0)}, "hold_process_min_s"),
+        ({"gripper": GripperConfig(instance=-1)}, "gripper.instance"),
+        ({"gripper": GripperConfig(release_settle_s=-0.5)}, "release_settle_s"),
     ],
 )
 def test_invalid_values_rejected(changes: dict, message: str) -> None:

@@ -11,6 +11,11 @@
   注入 broker，与视频帧在同一条时间线上对得上。
 * 检测（``detections.jsonl``）：每条 Detection 与当时的 TargetPoint；P3
   只留接口，P5 PerceptionWorker 接入。
+* 投放（``drops.jsonl``）：**每一次实际投放**记一条
+  :class:`~airdrop.ballistics.drops.DropRecord`——投放瞬间的位置/速度/姿态/风、
+  目标点、判据的前推位置与预测落点。这份数据事后**无法重建**（飞机当时怎么飞的、
+  弹落在哪，都不在别的文件里），而反演弹道参数只能靠它，所以默认就写
+  （:attr:`FlightRecorder.drops`，现场再手填 ``impacts.jsonl`` 提供实测落点）。
 * 事件（``events.jsonl``）：状态机转移、任务上传、对齐统计、释放评估、
   投放动作、错误——结构化 JSON，方便事后脚本过滤。
 * 文本日志（``flight.log``）：所有模块的 ``logging`` 输出汇总，**通过
@@ -52,6 +57,7 @@ from typing import Any, Mapping
 import cv2
 import numpy as np
 
+from ..ballistics.drops import DROPS_NAME, DropRecord
 from ..config import Config, RecordConfig
 from ..telemetry.broker import TelemetryBroker
 from ..video.buffer import AlignmentBuffer, BufferedFrame
@@ -59,7 +65,9 @@ from ..video.buffer import AlignmentBuffer, BufferedFrame
 LOGGER = logging.getLogger(__name__)
 
 __all__ = [
+    "DROPS_NAME",
     "DetectionWriter",
+    "DropWriter",
     "EventLog",
     "FlightRecorder",
     "RecorderStats",
@@ -184,22 +192,9 @@ class DetectionWriter(_JsonlWriter):
     """
 
     def append(self, record: Mapping[str, Any] | Any) -> bool:
-        """记录一条 Detection；dataclass / SimpleNamespace / Mapping 都接受。
-
-        解析顺序：
-
-        1. 有 ``as_dict`` 可调用方法：调用它（dataclass 习惯）；
-        2. 是 ``Mapping``（dict 等）：直接 ``dict()``；
-        3. 有 ``__dict__``（普通对象、SimpleNamespace）：用 ``vars()`` 当字段源；
-        4. 都没有：记 ERROR 丢弃。
-        """
-        if hasattr(record, "as_dict") and callable(record.as_dict):
-            payload = record.as_dict()
-        elif isinstance(record, Mapping):
-            payload = dict(record)
-        elif hasattr(record, "__dict__"):
-            payload = dict(vars(record))
-        else:
+        """记录一条 Detection；dataclass / SimpleNamespace / Mapping 都接受。"""
+        payload = _payload_of(record)
+        if payload is None:
             LOGGER.error("DetectionWriter.append 收到不支持的类型: %r", type(record))
             return False
         with self._lock:
@@ -207,6 +202,40 @@ class DetectionWriter(_JsonlWriter):
                 LOGGER.warning("DetectionWriter 已关闭，丢弃检测")
                 return False
             return self._write_locked(payload)
+
+
+class DropWriter(_JsonlWriter):
+    """投放记录写入器（``drops.jsonl``）——接 ``MissionRunner`` 的 ``on_drop``。
+
+    一行一次投放，写的是 :meth:`~airdrop.ballistics.drops.DropRecord.as_dict` 的
+    全部字段（**不四舍五入**：反演要用原始数值）。现场量到落点后，在同一个飞行目录里
+    另写 ``impacts.jsonl`` 即可，不必改动这个文件。
+    """
+
+    def append(self, record: DropRecord | Mapping[str, Any] | Any) -> bool:
+        """记录一次投放（``DropRecord`` / Mapping / 有 ``as_dict()`` 的对象）。"""
+        payload = _payload_of(record)
+        if payload is None:
+            LOGGER.error("DropWriter.append 收到不支持的类型: %r", type(record))
+            return False
+        with self._lock:
+            if self._closed:
+                # 收尾阶段才投出去的那一次：记日志、返回 False，但不抛——调用方
+                # （MissionRunner）已经投完了，异常改变不了任何事。
+                LOGGER.error("DropWriter 已关闭，这次投放记录没有落盘")
+                return False
+            return self._write_locked(payload)
+
+
+def _payload_of(record: Any) -> dict[str, Any] | None:
+    """把任意"记录对象"摊成字典：``as_dict()`` > Mapping > ``__dict__`` > None。"""
+    if hasattr(record, "as_dict") and callable(record.as_dict):
+        return dict(record.as_dict())
+    if isinstance(record, Mapping):
+        return dict(record)
+    if hasattr(record, "__dict__"):
+        return dict(vars(record))
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -232,6 +261,7 @@ class RecorderStats:
         "telemetry_written",
         "events",
         "detections",
+        "drops",
         "raw_reencoded",
     )
 
@@ -242,6 +272,7 @@ class RecorderStats:
         telemetry_written: int,
         events: int,
         detections: int,
+        drops: int,
         raw_reencoded: int,
     ) -> None:
         self.flight_dir = flight_dir
@@ -249,6 +280,7 @@ class RecorderStats:
         self.telemetry_written = telemetry_written
         self.events = events
         self.detections = detections
+        self.drops = drops
         self.raw_reencoded = raw_reencoded
 
 
@@ -303,6 +335,7 @@ class FlightRecorder:
         self._frames_index_file = None
         self._events: EventLog | None = None
         self._detections: DetectionWriter | None = None
+        self._drops: DropWriter | None = None
 
         # 线程
         self._frame_thread: threading.Thread | None = None
@@ -316,6 +349,7 @@ class FlightRecorder:
         self._raw_reencoded = 0
         self._events_written = 0
         self._detections_written = 0
+        self._drops_written = 0
 
         # 依赖（start 时绑定）
         self._broker: TelemetryBroker | None = None
@@ -348,6 +382,16 @@ class FlightRecorder:
         return self._detections
 
     @property
+    def drops(self) -> DropWriter:
+        """投放记录写入器（``drops.jsonl``）；启动后才有。
+
+        接法是 ``MissionRunner(..., on_drop=recorder.drops.append)``。
+        """
+        if self._drops is None:
+            raise RuntimeError("FlightRecorder 尚未启动")
+        return self._drops
+
+    @property
     def record_config(self) -> RecordConfig:
         return self._config.record
 
@@ -360,7 +404,7 @@ class FlightRecorder:
         broker: TelemetryBroker,
         buffer: AlignmentBuffer,
     ) -> "FlightRecorder":
-        """创建飞行目录、打开五件套、启动后台线程。
+        """创建飞行目录、打开五件套 + 投放记录、启动后台线程。
 
         幂等：重复调用直接返回 self。``broker`` / ``buffer`` 在第一次启动时
         必须给出，后续启动会用相同的依赖（重新 start 会复用已有目录，但
@@ -441,6 +485,7 @@ class FlightRecorder:
                     telemetry_written=self._telemetry_written,
                     events=self._events.count,
                     detections=self._detections.count if self._detections else 0,
+                    drops=self._drops.count if self._drops else 0,
                 )
             except Exception:  # noqa: BLE001
                 LOGGER.exception("recorder_stopped 事件写入失败")
@@ -458,12 +503,14 @@ class FlightRecorder:
         detections = (
             self._detections.count if self._detections else self._detections_written
         )
+        drops = self._drops.count if self._drops else self._drops_written
         return RecorderStats(
             flight_dir=self._flight_dir,
             frames_written=self._frames_written,
             telemetry_written=self._telemetry_written,
             events=events,
             detections=detections,
+            drops=drops,
             raw_reencoded=self._raw_reencoded,
         )
 
@@ -590,6 +637,7 @@ class FlightRecorder:
         assert self._flight_dir is not None
         self._events = EventLog(self._flight_dir / EVENTS_NAME)
         self._detections = DetectionWriter(self._flight_dir / DETECTIONS_NAME)
+        self._drops = DropWriter(self._flight_dir / DROPS_NAME)
         self._telemetry_file = open(
             self._flight_dir / TELEMETRY_NAME, "a", encoding="utf-8"
         )
@@ -606,6 +654,10 @@ class FlightRecorder:
             self._detections_written = self._detections.count
             self._detections.close()
             self._detections = None
+        if self._drops is not None:
+            self._drops_written = self._drops.count
+            self._drops.close()
+            self._drops = None
         for attr in ("_telemetry_file", "_frames_index_file"):
             handle = getattr(self, attr)
             if handle is not None and not handle.closed:
