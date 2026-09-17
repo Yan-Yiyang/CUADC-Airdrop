@@ -45,6 +45,7 @@ from airdrop import (
     DetectionBatch,
     FrameTelemetryAligner,
     GroundConfig,
+    MAV_CMD_NAV_LAND,
     MissionConfig,
     MissionRunner,
     MissionState,
@@ -54,6 +55,7 @@ from airdrop import (
     PerceptionTargetSource,
     PerceptionWorker,
     PixelBox,
+    PreflightConfig,
     ReplayVideoSource,
     RoutesConfig,
     TargetTracker,
@@ -91,9 +93,14 @@ def _blank_image(width: int = 320, height: int = 180) -> np.ndarray:
 
 
 def _pose_snapshot(timestamp: float) -> TelemetrySnapshot:
-    """水平、朝下、位置固定在 (100, 200) 的合成遥测（四元数为单位四元数）。"""
+    """水平、朝下、位置固定在 (100, 200) 的合成遥测（四元数为单位四元数）。
+
+    ``in_air=True``：状态机的 ``WAIT_AIRBORNE`` 那道门靠它放行（回放素材里没有
+    相对高度，兜底的 ``relative_altitude_m`` 判据在这条素材上永远不满足）。
+    """
     return TelemetrySnapshot(
         timestamp=timestamp,
+        in_air=True,
         north_m=POSE_NORTH,
         east_m=POSE_EAST,
         down_m=POSE_DOWN,
@@ -298,9 +305,17 @@ def _config(**overrides: Any) -> Config:
     params: dict[str, Any] = {
         "routes": routes,
         "overfly": OverflyConfig(heading_deg=90.0, altitude_m=20.0, leg_length_m=200.0),
-        "mission": MissionConfig(tick_hz=20.0),
+        # 侦查航线由测试上传（auto）；正式任务默认 operator，由操作手在 QGC 上传并启动
+        "mission": MissionConfig(tick_hz=20.0, recon_upload="auto"),
         "ground": GroundConfig(ground_point_alt=GROUND_ALT),
         "targeting": TargetingConfig(eps_m=0.75, min_samples=2),
+        # 回放链路里没有相机/模型：起飞前自检的**四项检查全关**（关掉≠通过，只是离线跑通）
+        "preflight": PreflightConfig(
+            load_detector=False,
+            load_ocr=False,
+            load_camera=False,
+            check_video=False,
+        ),
     }
     params.update(overrides)
     return Config(**params).validated()
@@ -322,6 +337,10 @@ class StubController:
     def start_mission(self) -> None:
         self.calls.append("start_mission")
         self.finished = False
+
+    def in_mission_mode(self) -> bool:
+        self.calls.append("in_mission_mode")
+        return True
 
     def hold(self) -> None:
         self.calls.append("hold")
@@ -411,13 +430,22 @@ def test_replay_drives_full_chain_to_target_coordinates(workdir: Path) -> None:
     )
     _advance(runner, controller, clock)
     assert runner.state is MissionState.LAND, runner.history[-1].reason
+    # 正式流程的前两跳（自检 → 等在空中）也要走：INIT 不再直接跳到侦查
+    assert [str(record.to_state) for record in runner.history] == [
+        "PREFLIGHT",
+        "WAIT_AIRBORNE",
+        "RECON",
+        "HOLD_PROCESS",
+        "OVERFLY",
+        "LAND",
+    ]
 
     plan = runner.plan
     assert plan is not None and plan.source == "target"
     assert plan.target_ned[0] == pytest.approx(POSE_NORTH, abs=0.05)
     assert plan.target_ned[1] == pytest.approx(POSE_EAST, abs=0.05)
     assert len(controller.uploads) == 2, "先侦查航线、再飞掠+降落"
-    assert [item.action for item in controller.uploads[1]][-1] == "land"
+    assert [item.command for item in controller.uploads[1]][-1] == MAV_CMD_NAV_LAND
 
     targeting_event = [data for kind, data in events if kind == "targeting"]
     assert targeting_event and targeting_event[0]["targeting"]["selected"]["code"] == 56

@@ -287,6 +287,18 @@ class TelemetryBroker:
         """发布一个 MAVSDK 风估计更新（可选流；没有它时投放判据按零风降级）。"""
         return self._update(lambda s: s.update_wind(wind))
 
+    def update_mission_progress(self, current: int, total: int) -> TelemetrySnapshot:
+        """发布一次任务进度更新（可选流；状态机靠它判断"任务是否飞完"）。"""
+        return self._update(lambda s: s.update_mission_progress(current, total))
+
+    def update_flight_mode(self, mode: Any) -> TelemetrySnapshot:
+        """发布一次飞行模式更新（可选流；状态机靠它确认"真的进了任务模式"）。"""
+        return self._update(lambda s: s.update_flight_mode(mode))
+
+    def update_in_air(self, in_air: Any) -> TelemetrySnapshot:
+        """发布一次"是否在空中"更新（可选流；状态机的等起飞门用它）。"""
+        return self._update(lambda s: s.update_in_air(in_air))
+
     def publish(self, snapshot: TelemetrySnapshot) -> TelemetrySnapshot:
         """直接发布一条**完整快照**（保留它自己的 ``timestamp``、不做节流）。
 

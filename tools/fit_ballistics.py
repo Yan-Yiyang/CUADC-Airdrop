@@ -29,21 +29,13 @@ import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from airdrop.ballistics import (
-    IMPACTS_CSV_NAME,
-    IMPACTS_JSONL_NAME,
-    DropSample,
-    FitConfig,
-    FitResult,
-    fit_ballistics,
-    load_drops,
-    load_impacts,
-    match_impacts,
-    write_impact_template,
-)
 from airdrop.config import BallisticsConfig, Config, DropConfig
 
 LOGGER = logging.getLogger("fit_ballistics")
+
+#: 惰性导入标记（见模块 docstring）：`airdrop.ballistics` 的 drops 会间接拉 georef（cv2），
+#: 所以只在真正反演的函数体内导入——`python -m airdrop.run fit-ballistics --help` 不加载它。
+_LAZY = "from airdrop.ballistics import ...  # 惰性：重依赖，见模块 docstring"
 
 # ----------------------------------------------------------------------
 # 配置（改这里）
@@ -61,6 +53,10 @@ class FlightInput:
 FLIGHTS: tuple[FlightInput, ...] = ()
 #: 记录根目录（``Config().record.dir``）；FLIGHTS 为空时在里面找最新架次
 FLIGHTS_ROOT = Path(Config().record.dir)
+#: 只跑一个架次时的输入（命令行 ``--drops``）：飞行目录或 ``drops.jsonl``；None = 取最新架次
+DROPS: Path | None = None
+#: 实测落点文件（命令行 ``--impacts``）；None = 在飞行目录里自动找
+IMPACTS: Path | None = None
 
 #: 拟合哪些参数。⚠ 两条硬约束（都不是"随便调调"）：
 #: 1. **质量不在其中**——用台秤/天平实测后填 :data:`MEASURED_MASS_KG`，不靠反演：
@@ -101,6 +97,8 @@ def _drops_path(path: Path) -> Path:
 
 def _auto_impacts(drops_path: Path) -> Path | None:
     """在投放记录旁边找测量文件（jsonl 优先）。"""
+    from airdrop.ballistics import IMPACTS_CSV_NAME, IMPACTS_JSONL_NAME  # 惰性：见模块 docstring
+
     for name in (IMPACTS_JSONL_NAME, IMPACTS_CSV_NAME):
         candidate = drops_path.parent / name
         if candidate.exists():
@@ -129,6 +127,13 @@ def load_samples(
     返回 ``(样本, 每架次的账目, 缺测量文件的架次路径)``；样本的 ``label`` 是
     ``"<架次目录名>#<序号>"``，跨架次也不会混。
     """
+    from airdrop.ballistics import (  # 惰性：见模块 docstring
+        DropSample,
+        load_drops,
+        load_impacts,
+        match_impacts,
+    )
+
     chosen = tuple(flights if flights is not None else FLIGHTS)
     if not chosen:
         chosen = (FlightInput(path=_latest_flight_dir(FLIGHTS_ROOT)),)
@@ -336,26 +341,19 @@ def build_report(
 
 
 # ----------------------------------------------------------------------
-def main(
-    flights: tuple[FlightInput, ...] | None = None,
-    *,
-    output_path: Path | None = None,
-    fit_config: FitConfig | None = None,
-) -> int:
-    """跑一次反演；返回进程退出码（0 可信 / 2 不可信 / 3 缺测量 / 1 出错）。"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    target = Path(OUTPUT_PATH if output_path is None else output_path)
-    settings = fit_config or FitConfig(
+def build_config(**overrides) -> "FitConfig":
+    """按关键字覆盖派生一份反演配置（``dataclasses.replace``；未知字段直接报错）。
+
+    ``overrides`` 里除了 ``FitConfig`` 自己的字段，还可以给 ``mass_kg`` /
+    ``cross_area_m2``（这两个是**实测输入**，写进配置里的 ``base``，不参与反演）。
+    """
+    from airdrop.ballistics import FitConfig  # 惰性：见模块 docstring
+
+    mass_kg = overrides.pop("mass_kg", MEASURED_MASS_KG)
+    cross_area_m2 = overrides.pop("cross_area_m2", MEASURED_CROSS_AREA_M2)
+    settings = FitConfig(
         # 质量与（固定时的）迎风面积是**已知输入**：质量按实测填，不参与反演
-        base=replace(
-            BallisticsConfig(),
-            mass_kg=MEASURED_MASS_KG,
-            cross_area_m2=MEASURED_CROSS_AREA_M2,
-        ),
+        base=replace(BallisticsConfig(), mass_kg=mass_kg, cross_area_m2=cross_area_m2),
         fit_drag_coefficient=FIT_DRAG_COEFFICIENT,
         fit_cross_area_m2=FIT_CROSS_AREA_M2,
         fit_release_delay_s=FIT_RELEASE_DELAY_S,
@@ -363,6 +361,57 @@ def main(
         release_offset_body_m=RELEASE_OFFSET_BODY_M,
         max_condition_number=MAX_CONDITION_NUMBER,
     )
+    return replace(settings, **overrides) if overrides else settings
+
+
+def flight_inputs(
+    *,
+    drops: Path | None = None,
+    impacts: Path | None = None,
+    root: Path | None = None,
+) -> tuple[FlightInput, ...]:
+    """把"只跑一个架次"的覆盖（``--drops`` / ``--impacts``）变成 :class:`FlightInput` 序列。
+
+    两个都不给就返回模块常量 :data:`FLIGHTS`（空 = 自动取最新架次）。
+    """
+    if drops is None and impacts is None:
+        return FLIGHTS
+    base = Path(FLIGHTS_ROOT if root is None else root) if drops is None else Path(drops)
+    if drops is None:
+        base = _latest_flight_dir(base)
+    return (FlightInput(path=base, impacts=None if impacts is None else Path(impacts)),)
+
+
+def main(
+    flights: tuple[FlightInput, ...] | None = None,
+    *,
+    drops: Path | None = None,
+    impacts: Path | None = None,
+    output_path: Path | None = None,
+    fit_config: "FitConfig | None" = None,
+    **fit_overrides,
+) -> int:
+    """跑一次反演；返回进程退出码（0 可信 / 2 不可信 / 3 缺测量 / 1 出错）。
+
+    ``fit_overrides`` 原样交给 :func:`build_config`（命令行 ``--mass-kg`` 之类）。
+    """
+    from airdrop.ballistics import (  # 惰性：见模块 docstring
+        IMPACTS_JSONL_NAME,
+        FitConfig,
+        fit_ballistics,
+        load_drops,
+        write_impact_template,
+    )
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    target = Path(OUTPUT_PATH if output_path is None else output_path)
+    settings = fit_config or build_config(**fit_overrides)
+    if flights is None:
+        flights = flight_inputs(drops=drops, impacts=impacts)
     if len([name for name in settings.fitted_names]) == 0:
         print("配置里没有选中任何要拟合的参数（FIT_* 全为 False）", file=sys.stderr)
         return 1

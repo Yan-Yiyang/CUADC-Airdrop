@@ -93,6 +93,44 @@ def test_wind_fields_survive_json_round_trip() -> None:
     assert restored.wind_north_m_s == pytest.approx(3.0)
 
 
+def test_in_air_stream_is_published_to_the_snapshot(broker: TelemetryBroker) -> None:
+    """``in_air`` 是可选流，但既然进了快照，就要能查、能推、能按时刻取。
+
+    状态机的 ``WAIT_AIRBORNE`` 那道门读的就是它：``None`` 表示"这条流还没数据"
+    （退化到 ``relative_altitude_m`` 兜底），**不是**"在地面上"——两者不能混。
+    """
+    assert broker.get_snapshot().in_air is None, "没有这条流时必须是 None，别默认 False"
+
+    pushed: list[bool | None] = []
+    broker.subscribe(lambda snapshot: pushed.append(snapshot.in_air))
+
+    broker.update_in_air(True)
+    assert broker.get_snapshot().in_air is True
+    assert broker._history[-1].in_air is True, "也要进历史，回放/按时刻查询才看得到"
+
+    broker.update_in_air(0)      # 飞控侧偶尔给 0/1，统一按 bool 归一
+    assert broker.get_snapshot().in_air is False
+    nearest = broker.get_snapshot_at(time.time(), mode="nearest")
+    assert nearest is not None and nearest.in_air is False
+    assert pushed[-2:] == [True, False], "订阅推送也要带上这个字段"
+
+
+def test_in_air_survives_json_round_trip() -> None:
+    """回放靠 ``as_dict`` / 字典重建快照：``in_air`` 丢了，回放就会卡在 WAIT_AIRBORNE。"""
+    import json
+
+    from airdrop.telemetry.models import TelemetrySnapshot
+
+    snapshot = TelemetrySnapshot(timestamp=1.0, in_air=True)
+    payload = json.loads(json.dumps(snapshot.as_dict()))
+    assert payload["in_air"] is True
+    restored = TelemetrySnapshot(
+        **{k: v for k, v in payload.items()
+           if k in TelemetrySnapshot.__dataclass_fields__}
+    )
+    assert restored.in_air is True
+
+
 def test_broker_snapshot_interpolation_subscribe(
     broker: TelemetryBroker, received: list
 ) -> None:

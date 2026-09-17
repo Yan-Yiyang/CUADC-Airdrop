@@ -1,17 +1,19 @@
 """任务状态机：状态、合法转移与转移历史（计划 4.7）。
 
 ```
-INIT ──▶ RECON ──▶ HOLD_PROCESS ──▶ OVERFLY ──▶ LAND ──▶ DONE
-  │        │             │              │          │
-  └────────┴─────────────┴──────────────┴──────────┴──▶ ABORT
+INIT ──▶ PREFLIGHT ──▶ WAIT_AIRBORNE ──▶ RECON ──▶ HOLD_PROCESS ──▶ OVERFLY ──▶ LAND ──▶ DONE
+  │          │               │             │             │              │          │
+  └──────────┴───────────────┴─────────────┴─────────────┴──────────────┴──────────┴──▶ ABORT
 ```
 
 各状态的含义与**进入条件**（判定逻辑在 :mod:`airdrop.mission.runner`）：
 
 | 状态 | 进入时做了什么 | 离开条件 |
 | --- | --- | --- |
-| `INIT` | 等遥测与 NED 原点 | 遥测有效 + 原点就绪 → 上传并启动**侦查航线** → `RECON` |
-| `RECON` | （任务在飞） | mission 报告飞完 → `HOLD_PROCESS` |
+| `INIT` | 等遥测与 NED 原点（**不上传任何任务**） | 遥测有效 + 原点就绪 → `PREFLIGHT` |
+| `PREFLIGHT` | 起飞前自检：载入模型（detector/ocr/camera）→ 视频自检（见 :mod:`airdrop.preflight`） | 全部通过 → `WAIT_AIRBORNE`；任一项失败 → `ABORT("preflight_failed:<check>")`；超 `preflight.max_s` → `ABORT` |
+| `WAIT_AIRBORNE` | （什么都不下发）等"飞机真的在空中"（``in_air``，取不到时用 `relative_altitude_m >= airborne_alt_m` 兜底）；``MissionConfig.require_airborne=False``（地面演练/测试）时立即放行并记 ``airborne_skipped`` | 在空中 → `RECON`；超 `airborne_timeout_s` → `ABORT("airborne_timeout")` |
+| `RECON` | `recon_upload="operator"`（默认，正式任务）：**不上传**，等操作手在 QGC 启动；`"auto"`（自动测试）：本包上传并启动 | mission 报告飞完 → `HOLD_PROCESS` |
 | `HOLD_PROCESS` | `hold()`（固定翼盘旋） | 出结果 **或** 处理完且无结果 **或** 10s 超时 → 上传**飞掠+降落**任务并启动 → `OVERFLY` |
 | `OVERFLY` | 激活投放判据 | 投放成功 → `LAND`；飞完仍未投放 → `ABORT` |
 | `LAND` | （沿降落航线返航） | mission 飞完 → `DONE` |
@@ -46,6 +48,8 @@ class MissionState(StrEnum):
     """任务状态。继承 ``str`` 是为了直接进 JSONL 事件日志。"""
 
     INIT = "INIT"
+    PREFLIGHT = "PREFLIGHT"
+    WAIT_AIRBORNE = "WAIT_AIRBORNE"
     RECON = "RECON"
     HOLD_PROCESS = "HOLD_PROCESS"
     OVERFLY = "OVERFLY"
@@ -56,7 +60,9 @@ class MissionState(StrEnum):
 
 #: 合法转移表（**唯一出处**；runner 只能走这里列出的边）
 TRANSITIONS: dict[MissionState, frozenset[MissionState]] = {
-    MissionState.INIT: frozenset({MissionState.RECON, MissionState.ABORT}),
+    MissionState.INIT: frozenset({MissionState.PREFLIGHT, MissionState.ABORT}),
+    MissionState.PREFLIGHT: frozenset({MissionState.WAIT_AIRBORNE, MissionState.ABORT}),
+    MissionState.WAIT_AIRBORNE: frozenset({MissionState.RECON, MissionState.ABORT}),
     MissionState.RECON: frozenset({MissionState.HOLD_PROCESS, MissionState.ABORT}),
     MissionState.HOLD_PROCESS: frozenset({MissionState.OVERFLY, MissionState.ABORT}),
     MissionState.OVERFLY: frozenset({MissionState.LAND, MissionState.ABORT}),

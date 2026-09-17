@@ -9,30 +9,16 @@
 
 坐标约定见 :mod:`~airdrop.georef.camera` 的模块 docstring——相机系与机体系的轴
 定义、``R_bc`` 的方向（相机→机体）都在那里写死了，改之前先读它。
+
+⚠ **惰性导出**（见 :mod:`airdrop._lazy`）：`import airdrop.georef` 只执行本文件。
+``project`` 会拉 cv2，所以它排在最后——标定脚本只要 ``rotation_z`` 这类几何工具，
+不该顺带加载 OpenCV。
 """
 
-from .camera import (
-    DEFAULT_R_BC,
-    CameraModel,
-    default_camera_model,
-    euler_to_matrix,
-    load_camera_model,
-    rotation_x,
-    rotation_y,
-    rotation_z,
-)
-from .geo import LLARef, ned_distance, ned_to_wgs84, wgs84_to_ned
-from .project import (
-    GroundIntersection,
-    SideLengthCheck,
-    MIN_DOWN_COS,
-    cross_check_by_side,
-    estimate_depth_by_side,
-    pixel_to_ned,
-    pixel_to_ray_ned,
-    quaternion_to_matrix,
-    undistort_pixel,
-)
+from .._lazy import lazy_dir, lazy_exports
+
+__getattr__ = lazy_exports(__name__, ("camera", "geo", "project"))
+__dir__ = lazy_dir(__name__)
 
 __all__ = [
     "CameraModel",

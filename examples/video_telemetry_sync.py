@@ -13,9 +13,13 @@
 链路延时（默认 150ms）在写入时就已扣掉：缓冲里的每一帧都带着它**拍摄时刻**的
 遥测，回看的人不用再自己换算。
 
-    python -m examples.video_telemetry_sync
+用法（**集中式入口在 `airdrop/run.py`**）::
 
-地址、分辨率、缓冲容量、延时都在下面的"配置"区。
+    ./.venv/Scripts/python.exe -m airdrop.run video-sync
+    ./.venv/Scripts/python.exe -m airdrop.run video-sync --rtsp-url rtsp://... --telemetry-lag 0.18
+
+本文件是**纯库模块**：顶部常量是默认值，`build_config(**覆盖)` / `main(**kwargs)` 按需传值；
+命令行由 `airdrop/run.py` 解析，重依赖都在函数体内导入（`--help` 不加载它们）。
 """
 
 from __future__ import annotations
@@ -23,24 +27,23 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import replace
 
 from airdrop import (
     DEFAULT_TELEMETRY_LAG,
     HM30_DEFAULT_RTSP,
-    AlignmentBuffer,
-    AlignmentWriter,
+    Config,
     FrameTelemetryAligner,
     Hm30VideoSource,
-    MavsdkThread,
     TelemetryBroker,
     VideoConfig,
-    capacity_for,
 )
 
 # ----------------------------------------------------------------------
-# 配置（改这里，不用命令行参数）
+# 配置（改这里）
 # ----------------------------------------------------------------------
-ADDRESS = "udpin://0.0.0.0:14540"  # MAVSDK 系统地址
+SYSTEM_ADDRESS: str | None = None  # 保留位：None = 不改 TelemetryConfig 的地址
+ADDRESS = "udpin://0.0.0.0:14540"  # MAVSDK 系统地址（与 TelemetryConfig 默认值一致）
 VIDEO_URL = HM30_DEFAULT_RTSP  # 图传 RTSP 地址
 WIDTH, HEIGHT = 1280, 720  # 图传输出尺寸（不探测，直接按这个尺寸切帧）
 LAG = DEFAULT_TELEMETRY_LAG  # 链路固定延时（秒）
@@ -55,6 +58,24 @@ REPORT_INTERVAL = 2.0  # 状态汇报间隔（秒）
 READ_INTERVAL = 0.05  # 读者线程两次取帧之间的间隔（秒），模拟"慢慢消费"
 
 LOGGER = logging.getLogger("video_telemetry_sync")
+
+
+def build_config(
+    *,
+    system_address: str = ADDRESS,
+    video_url: str = VIDEO_URL,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    lag: float = LAG,
+) -> Config:
+    """图传 + 遥测那两片配置（本示例不用感知/任务）。"""
+    base = Config()
+    return Config(
+        telemetry=replace(base.telemetry, system_address=system_address),
+        video=VideoConfig(
+            url=video_url, width=width, height=height, telemetry_lag=lag
+        ).validated(),
+    ).validated()
 
 
 def reader_loop(
@@ -128,17 +149,47 @@ def review(buffer: AlignmentBuffer) -> None:
     )
 
 
-def main() -> int:
+def main(
+    *,
+    system_address: str = ADDRESS,
+    video_url: str = VIDEO_URL,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    lag: float = LAG,
+    buffer_seconds: float = BUFFER_SECONDS,
+    buffer_fps: float = BUFFER_FPS,
+    buffer_storage: str = BUFFER_STORAGE,
+    buffer_max_mb: float = BUFFER_MAX_MB,
+    run_seconds: float = RUN_SECONDS,
+    report_interval: float = REPORT_INTERVAL,
+    read_interval: float = READ_INTERVAL,
+) -> int:
+    """拉流 + 逐帧留存演示；返回进程退出码。"""
+    # 重依赖在使用时才导入：`python -m airdrop.run video-sync --help` 不加载它们
+    from airdrop import (
+        AlignmentBuffer,
+        AlignmentWriter,
+        MavsdkThread,
+        capacity_for,
+    )
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    config = build_config(
+        system_address=system_address,
+        video_url=video_url,
+        width=width,
+        height=height,
+        lag=lag,
+    )
 
     broker = TelemetryBroker()
-    mavsdk = MavsdkThread(broker=broker, system_address=ADDRESS)
+    mavsdk = MavsdkThread(broker=broker, system_address=config.telemetry.system_address)
     mavsdk.start()
-    mavsdk.connect(ADDRESS)
+    mavsdk.connect(config.telemetry.system_address)
 
     LOGGER.info("等待遥测就绪...")
     if broker.wait_next_snapshot(timeout=15.0, predicate=lambda s: s.is_valid()) is None:
@@ -146,43 +197,40 @@ def main() -> int:
             "15 秒内没收到遥测：拉流不受影响，但对齐拿不到遥测的帧会被计为 skipped"
         )
 
-    aligner = FrameTelemetryAligner(broker, lag=LAG)
+    aligner = FrameTelemetryAligner(broker, lag=config.video.telemetry_lag)
 
     buffer = AlignmentBuffer(
-        capacity_for(BUFFER_FPS, BUFFER_SECONDS),
-        storage=BUFFER_STORAGE,
-        max_bytes=int(BUFFER_MAX_MB * 1024 * 1024) or None,
+        capacity_for(buffer_fps, buffer_seconds),
+        storage=buffer_storage,
+        max_bytes=int(buffer_max_mb * 1024 * 1024) or None,
     )
     # 挂在拉流源上的"每帧必写"通道
     writer = AlignmentWriter(buffer, aligner)
     LOGGER.info(
         "对齐缓冲：容量 %d 帧（%.0f fps × %.0f s）、存储 %s",
         buffer.capacity,
-        BUFFER_FPS,
-        BUFFER_SECONDS,
-        BUFFER_STORAGE,
+        buffer_fps,
+        buffer_seconds,
+        buffer_storage,
     )
 
     stop_event = threading.Event()
     reader = threading.Thread(
-        target=reader_loop, args=(buffer, stop_event, READ_INTERVAL), daemon=True
+        target=reader_loop, args=(buffer, stop_event, read_interval), daemon=True
     )
     reader.start()
 
-    config = VideoConfig(
-        url=VIDEO_URL, width=WIDTH, height=HEIGHT, telemetry_lag=LAG
-    )
     LOGGER.info(
         "拉流 %s（%dx%d），链路延时按 %.0fms 扣除",
-        config.url,
-        config.width,
-        config.height,
-        config.telemetry_lag * 1000.0,
+        config.video.url,
+        config.video.width,
+        config.video.height,
+        config.video.telemetry_lag * 1000.0,
     )
 
     started = time.monotonic()
     try:
-        with Hm30VideoSource(config) as source:
+        with Hm30VideoSource(config.video) as source:
             source.add_sink(writer)  # 从这一帧起，读到的每一帧都进缓冲
             if not source.wait_ready(timeout=10.0):
                 LOGGER.error("首帧超时：%s", source.stats.last_error or "无错误信息")
@@ -191,7 +239,7 @@ def main() -> int:
 
             # 主循环只做汇报，不在采集路径上做重活（重活在读者线程里）
             while True:
-                time.sleep(REPORT_INTERVAL)
+                time.sleep(report_interval)
                 stats = source.stats
                 written, skipped = writer.stats()
                 LOGGER.info(
@@ -206,7 +254,7 @@ def main() -> int:
                     buffer.stats.evicted,
                     (source.latest().age if source.latest() else float("nan")),
                 )
-                if RUN_SECONDS and time.monotonic() - started >= RUN_SECONDS:
+                if run_seconds and time.monotonic() - started >= run_seconds:
                     break
                 if stats.frames == 0 and stats.state not in ("connecting", "streaming"):
                     LOGGER.error("一帧都没收到，退出：%s", stats.last_error)

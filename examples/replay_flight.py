@@ -1,8 +1,12 @@
 """回放全链路示例：一份素材反复迭代"识别 → 坐标 → 统计 → 航线"，全程不碰硬件。
 
-用法::
+用法（**集中式入口在 `airdrop/run.py`**）::
 
-    python -m examples.replay_flight
+    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/20260913-185512
+    ./.venv/Scripts/python.exe -m airdrop.run replay --speed 2.0
+
+本文件是**纯库模块**：顶部常量是默认值，`build_config(**覆盖)` / `main(**kwargs)` 可按需传值；
+命令行由 `airdrop/run.py` 解析，重依赖都在函数体内导入（`--help` 不加载它们）。
 
 把 ``FLIGHT_DIR`` 指向 ``FlightRecorder`` 录出来的飞行目录（或指向 ``flights/``
 自动取最新一次）。脚本按原时间轴重放帧与遥测，然后走**与实飞完全相同**的那条链路::
@@ -26,78 +30,111 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 
-from airdrop import (
-    AlignmentBuffer,
-    AlignmentWriter,
-    Config,
-    FrameTelemetryAligner,
-    LLARef,
-    PerceptionTargetSource,
-    PerceptionWorker,
-    ReplayVideoSource,
-    TargetTracker,
-    build_drop_mission,
-    capacity_for,
-    load_broker_from_log,
-    ned_to_wgs84,
-)
+from airdrop import Config
 
 # ----------------------------------------------------------------------
-# 配置（改这里，不用命令行参数）
+# 配置（改这里）
 # ----------------------------------------------------------------------
 FLIGHT_DIR = Path("flights")  # 指向具体某次 flights/20260913-185512，或 flights/ 取最新
 SPEED = 0.0                   # 0=全速 / 1.0=原速 / 2.0=两倍速
 BUFFER_SECONDS = 180.0
 BUFFER_FPS = 30.0
 PLAN_DROP_MISSION = True      # 出了结果就生成飞掠+降落航线（不上传，只打印）
+STRICT = True                 # 回放异常（缺帧/sink 抛异常）就让本次以 error 结束
+PERCEPTION_MODE: str | None = None   # None = 用 Config 默认（ocr）
+SELECTION_RULE: str | None = None    # None = 用 Config 默认（median）
 
 LOGGER = logging.getLogger("replay_flight")
 
 
-def resolve_flight_dir() -> Path:
-    """``FLIGHT_DIR`` 指向具体目录时直接用；指向 ``flights/`` 时取最新一次。"""
-    if (FLIGHT_DIR / "frames_index.jsonl").is_file():
-        return FLIGHT_DIR
+def build_config(
+    *,
+    perception_mode: str | None = PERCEPTION_MODE,
+    selection_rule: str | None = SELECTION_RULE,
+) -> Config:
+    """回放用的配置（感知模式/选唯一规则可覆盖；其余用 :class:`Config` 默认值）。
+
+    ``None`` = **不覆盖**（沿用 `airdrop/config.py` 里的默认值），而不是"设成 None"。
+    """
+    base = Config()
+    if perception_mode is not None:
+        base = base.replace(perception=replace(base.perception, mode=perception_mode))
+    if selection_rule is not None:
+        base = base.replace(targeting=replace(base.targeting, selection_rule=selection_rule))
+    return base.validated()
+
+
+def resolve_flight_dir(flight_dir: Path = FLIGHT_DIR) -> Path:
+    """``flight_dir`` 指向具体目录时直接用；指向 ``flights/`` 时取最新一次。"""
+    if (flight_dir / "frames_index.jsonl").is_file():
+        return flight_dir
     candidates = sorted(
-        (p for p in FLIGHT_DIR.glob("*") if (p / "frames_index.jsonl").is_file()),
+        (p for p in flight_dir.glob("*") if (p / "frames_index.jsonl").is_file()),
         key=lambda p: p.name,
     )
     if not candidates:
         raise SystemExit(
-            f"{FLIGHT_DIR} 下没有找到飞行目录（需要 frames_index.jsonl + telemetry.jsonl）。\n"
+            f"{flight_dir} 下没有找到飞行目录（需要 frames_index.jsonl + telemetry.jsonl）。\n"
             "先跑一次带录制的飞行，或把 FLIGHT_DIR 指到已有的素材上。"
         )
     LOGGER.info("FLIGHT_DIR 指向 flights/ 根目录，自动选用最新一次：%s", candidates[-1].name)
     return candidates[-1]
 
 
-def main() -> int:
+def main(
+    *,
+    flight_dir: Path = FLIGHT_DIR,
+    speed: float = SPEED,
+    buffer_seconds: float = BUFFER_SECONDS,
+    buffer_fps: float = BUFFER_FPS,
+    plan_drop_mission: bool = PLAN_DROP_MISSION,
+    strict: bool = STRICT,
+    **config_overrides,
+) -> int:
+    """回放一次；``config_overrides`` 原样交给 :func:`build_config`。"""
+    # 重依赖在使用时才导入：`python -m airdrop.run replay --help` 不加载它们
+    from airdrop import (
+        AlignmentBuffer,
+        AlignmentWriter,
+        FrameTelemetryAligner,
+        LLARef,
+        PerceptionTargetSource,
+        PerceptionWorker,
+        ReplayVideoSource,
+        TargetTracker,
+        build_drop_mission,
+        capacity_for,
+        load_broker_from_log,
+        ned_to_wgs84,
+    )
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    config = Config().validated()
-    flight_dir = resolve_flight_dir()
+    config = build_config(**config_overrides)
+    resolved = resolve_flight_dir(Path(flight_dir))
 
     # 1) 遥测回填：专用 broker + 按帧推进的 pacer（帧拍摄时刻必然落在历史区间内）
-    broker, pacer = load_broker_from_log(flight_dir)
-    LOGGER.info("素材：%s（%d 条遥测）", flight_dir, pacer.total)
+    broker, pacer = load_broker_from_log(resolved)
+    LOGGER.info("素材：%s（%d 条遥测）", resolved, pacer.total)
 
     # 2) 回放源：与 Hm30VideoSource 同一套接口，直接换掉即可
-    source = ReplayVideoSource(flight_dir, speed=SPEED, telemetry=pacer)
+    source = ReplayVideoSource(resolved, speed=speed, telemetry=pacer, strict=strict)
     LOGGER.info(
         "回放：%d 帧、素材跨度 %.1fs、%s",
         source.stats.total,
         source.stats.duration_s,
-        "全速" if SPEED == 0 else f"{SPEED}× 速度",
+        "全速" if speed == 0 else f"{speed}× 速度",
     )
 
     # 3) 与实飞一致：对齐 → 环形缓冲 → 感知 → 坐标解算 → 目标统计
     aligner = FrameTelemetryAligner(broker, max_wait=config.align.max_wait, mode=config.align.mode)
-    buffer = AlignmentBuffer(capacity_for(BUFFER_FPS, BUFFER_SECONDS), storage="jpeg")
+    buffer = AlignmentBuffer(capacity_for(buffer_fps, buffer_seconds), storage="jpeg")
     writer = AlignmentWriter(buffer, aligner)
     worker = PerceptionWorker(config.perception.to_pipeline_config(), buffer=buffer)
     camera = config.camera.load_model()
@@ -142,7 +179,7 @@ def main() -> int:
     LOGGER.info("结果：编号 %s @ NED (%.2f, %.2f)", result.code, result.north_m, result.east_m)
     LOGGER.info("候选类：%s", [cluster.as_dict() for cluster in result.clusters])
 
-    if PLAN_DROP_MISSION:
+    if plan_drop_mission:
         # NED → WGS84 需要 NED 原点；回放素材里原点在遥测快照里（origin_*）
         snapshot = broker.get_snapshot()
         if None in (

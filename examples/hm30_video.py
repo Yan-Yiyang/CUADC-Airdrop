@@ -9,9 +9,13 @@
 
     ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f null -
 
-运行（参数都在下面的"配置"区，直接跑）：
+运行（**集中式入口在 `airdrop/run.py`**）::
 
-    python -m examples.hm30_video
+    ./.venv/Scripts/python.exe -m airdrop.run hm30-video
+    ./.venv/Scripts/python.exe -m airdrop.run hm30-video --rtsp-url rtsp://192.168.144.25:8554/main.264
+
+本文件是**纯库模块**：顶部常量是默认值，`build_config(**覆盖)` / `main(**kwargs)` 按需传值；
+命令行由 `airdrop/run.py` 解析。cv2 只在"预览/存盘"那两条分支里导入，`--help` 不加载它。
 
 拉流失败会在日志里直接给出 ffmpeg 的输出，不做地址探测、不轮询猜测。
 
@@ -29,7 +33,7 @@ import time
 from airdrop import HM30_DEFAULT_RTSP, Hm30VideoSource, VideoConfig
 
 # ----------------------------------------------------------------------
-# 配置（改这里，不用命令行参数）
+# 配置（改这里）
 # ----------------------------------------------------------------------
 URL = HM30_DEFAULT_RTSP  # 图传 RTSP 地址
 WIDTH, HEIGHT = 1280, 720  # 输出尺寸（不探测源分辨率，直接按这个切帧）
@@ -43,7 +47,31 @@ DURATION = 0.0  # 运行秒数，0=不限
 LOGGER = logging.getLogger("hm30_video")
 
 
-def run(source: Hm30VideoSource) -> None:
+def build_config(
+    *,
+    url: str = URL,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    transport: str = TRANSPORT,
+    decoder: str | None = DECODER,
+) -> VideoConfig:
+    """图传那一片配置（本示例只用得到它）。"""
+    return VideoConfig(
+        url=url,
+        transport=transport,
+        width=width,
+        height=height,
+        ffmpeg_decoder=decoder,
+    ).validated()
+
+
+def run(
+    source: Hm30VideoSource,
+    *,
+    preview: bool = PREVIEW,
+    save_path: str | None = SAVE_PATH,
+    duration: float = DURATION,
+) -> None:
     """主循环：按"最新帧"消费，并周期性打印链路统计。"""
     if not source.wait_ready(timeout=10.0):
         LOGGER.error("首帧超时：%s", source.stats.last_error or "无错误信息")
@@ -61,20 +89,20 @@ def run(source: Hm30VideoSource) -> None:
                 LOGGER.warning("读取超时，状态=%s", source.stats.state)
                 continue
 
-            if SAVE_PATH and writer is None:
+            if save_path and writer is None:
                 import cv2
 
                 writer = cv2.VideoWriter(
-                    SAVE_PATH,
+                    save_path,
                     cv2.VideoWriter_fourcc(*"mp4v"),
                     max(source.stats.fps, 10.0),
                     (frame.width, frame.height),
                 )
-                LOGGER.info("开始存盘: %s (%dx%d)", SAVE_PATH, frame.width, frame.height)
+                LOGGER.info("开始存盘: %s (%dx%d)", save_path, frame.width, frame.height)
             if writer is not None:
                 writer.write(frame.image)
 
-            if PREVIEW:
+            if preview:
                 import cv2
 
                 cv2.imshow("HM30", frame.image)
@@ -101,31 +129,38 @@ def run(source: Hm30VideoSource) -> None:
                 last_index = stats.frames
                 last_report = now
 
-            if DURATION and now - started >= DURATION:
+            if duration and now - started >= duration:
                 break
     except KeyboardInterrupt:
         LOGGER.info("用户中断")
     finally:
         if writer is not None:
             writer.release()
-        if PREVIEW:
+        if preview:
             import cv2
 
             cv2.destroyAllWindows()
 
 
-def main() -> int:
+def main(
+    *,
+    url: str = URL,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+    transport: str = TRANSPORT,
+    decoder: str | None = DECODER,
+    preview: bool = PREVIEW,
+    save_path: str | None = SAVE_PATH,
+    duration: float = DURATION,
+) -> int:
+    """拉流并统计链路质量（可选预览/存盘）；返回进程退出码。"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    config = VideoConfig(
-        url=URL,
-        transport=TRANSPORT,
-        width=WIDTH,
-        height=HEIGHT,
-        ffmpeg_decoder=DECODER,
+    config = build_config(
+        url=url, width=width, height=height, transport=transport, decoder=decoder
     )
     LOGGER.info(
         "拉流 %s（%dx%d transport=%s）",
@@ -135,7 +170,7 @@ def main() -> int:
         config.transport,
     )
     with Hm30VideoSource(config) as source:
-        run(source)
+        run(source, preview=preview, save_path=save_path, duration=duration)
     return 0
 
 

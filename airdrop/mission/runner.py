@@ -43,15 +43,16 @@ from ..ballistics.model import wind_from_snapshot
 from ..ballistics.release import ReleaseDecision
 from ..config import Config
 from ..georef import LLARef
+from ..preflight import PreflightError, PreflightLike
 from ..targeting.models import TargetingResult
 from ..telemetry.broker import TelemetryBroker
 from ..telemetry.controller import (
     ControllerError,
     MissionController,
-    MissionItemSpec,
     NedOrigin,
 )
 from ..telemetry.models import TelemetrySnapshot
+from .items import MissionItem
 from .planner import (
     DropMissionPlan,
     PlanningError,
@@ -67,6 +68,7 @@ __all__ = [
     "MissionMonitor",
     "MissionRunner",
     "MissionStats",
+    "PreflightLike",
     "ReleaseJudgeLike",
     "TargetResultReader",
 ]
@@ -91,6 +93,10 @@ class ReleaseJudgeLike(Protocol):
 
 #: HOLD_PROCESS 里读"当前统计结果"的回调（`analyze(points, config.targeting)` 之类）
 TargetResultReader = Callable[[], TargetingResult]
+
+
+#: 一拍内允许连跳的"瞬时"状态：条件当场满足就没有必要占满一拍
+_INSTANT_STATES = frozenset({MissionState.PREFLIGHT, MissionState.WAIT_AIRBORNE})
 
 
 @dataclass
@@ -188,6 +194,7 @@ class MissionRunner:
         release_judge: ReleaseJudgeLike | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         on_drop: Callable[[DropRecord], None] | None = None,
+        preflight: PreflightLike | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -199,6 +206,7 @@ class MissionRunner:
         self._judge = release_judge
         self._on_event = on_event
         self._on_drop = on_drop
+        self._preflight = preflight
         self._clock = clock
         self._sleep = sleep
 
@@ -218,6 +226,11 @@ class MissionRunner:
         self._ground_warned = False
         self._target_error_logged = False
         self._query_reported: set[str] = set()
+        #: 启动确认：``True`` = 已经确认"任务真的在跑"（或模式流不可用、退化为不确认）
+        self._start_confirmed = True
+        self._start_deadline: float | None = None
+        #: 起飞前自检（载入模型 + 视频自检，见 airdrop.preflight）
+        self._preflight = preflight
 
     # ------------------------------------------------------------------
     # 只读视图
@@ -290,20 +303,34 @@ class MissionRunner:
         self.abort(reason)
 
     def update(self, now: float | None = None) -> MissionState:
-        """推进一步（主循环里每拍调一次；测试里手动调）。"""
+        """推进一步（主循环里每拍调一次；测试里手动调）。
+
+        ``PREFLIGHT`` / ``WAIT_AIRBORNE`` 是**瞬时**状态：条件当场就满足时（预检跳过、
+        飞机已经在空中）允许在同一拍里连续转移，于是"已经起飞"的离线用例仍是一拍进
+        ``RECON``；但每一次转移都照常记进历史与事件（不会把两跳藏起来）。
+        """
         stamp = float(self._clock()) if now is None else float(now)
         self._stats.ticks += 1
-        state = self._machine.state
-        if state is MissionState.INIT:
-            self._tick_init(stamp)
-        elif state is MissionState.RECON:
-            self._tick_recon(stamp)
-        elif state is MissionState.HOLD_PROCESS:
-            self._tick_hold(stamp)
-        elif state is MissionState.OVERFLY:
-            self._tick_overfly(stamp)
-        elif state is MissionState.LAND:
-            self._tick_land(stamp)
+        for _ in range(3):
+            state = self._machine.state
+            if state is MissionState.INIT:
+                self._tick_init(stamp)
+            elif state is MissionState.PREFLIGHT:
+                self._tick_preflight(stamp)
+            elif state is MissionState.WAIT_AIRBORNE:
+                self._tick_airborne(stamp)
+            elif state is MissionState.RECON:
+                self._tick_recon(stamp)
+            elif state is MissionState.HOLD_PROCESS:
+                self._tick_hold(stamp)
+            elif state is MissionState.OVERFLY:
+                self._tick_overfly(stamp)
+            elif state is MissionState.LAND:
+                self._tick_land(stamp)
+            if self._machine.is_terminal or self._machine.state is state:
+                break
+            if self._machine.state not in _INSTANT_STATES:
+                break
         return self._machine.state
 
     def abort(self, reason: str) -> None:
@@ -317,6 +344,7 @@ class MissionRunner:
     # 各状态的一拍
     # ------------------------------------------------------------------
     def _tick_init(self, now: float) -> None:
+        """``INIT``：等遥测与 NED 原点（**不上传任何任务**）→ ``PREFLIGHT``。"""
         snapshot = self._broker.get_snapshot()
         if not self._has_position(snapshot):
             if self._timed_out(now, self._config.mission.init_max_s):
@@ -340,18 +368,142 @@ class MissionRunner:
                     "alt_m": origin.alt_m,
                 },
             )
+        self._transition(MissionState.PREFLIGHT, "telemetry_ready", now)
+
+    def _tick_preflight(self, now: float) -> None:
+        """``PREFLIGHT``：载入模型 + 视频自检（**一次性**，见 :mod:`airdrop.preflight`）。
+
+        * 没有注入预检（离线测试）→ 记一条 ``preflight_skipped`` 事件后放过；
+        * 任一项失败（异常或 ``ok=False``）→ ``ABORT("preflight_failed:<check>")``；
+        * 整体超过 ``PreflightConfig.max_s`` → ``ABORT("preflight_timeout")``。
+        """
+        if self._preflight is None:
+            self._emit(
+                "preflight_skipped",
+                {"reason": "没有注入预检（离线测试/演练）"},
+            )
+            LOGGER.warning("没有注入起飞前自检：跳过（正式入口必须传 preflight）")
+            self._transition(MissionState.WAIT_AIRBORNE, "preflight_skipped", now)
+            return
+        started = float(self._clock())
         try:
-            items = build_recon_mission(self._config)
-        except PlanningError as exc:
-            self._fail("plan_recon", exc)
+            checks = self._preflight.run()
+        except PreflightError as exc:
+            self._preflight_failed(str(exc).split(":")[0].strip() or "unknown", exc)
             return
-        if not self._upload_and_start(items, "recon"):
+        except Exception as exc:  # noqa: BLE001 - 预检自己不抛别的，防御性兜底
+            self._preflight_failed("unknown", exc)
             return
+        failed = [check for check in checks if check.ok is False]
+        if failed:
+            self._preflight_failed(
+                failed[0].name,
+                PreflightError(f"{failed[0].name}: {failed[0].detail}"),
+            )
+            return
+        elapsed = float(self._clock()) - started
+        if elapsed > float(self._config.preflight.max_s):
+            self._stats.errors += 1
+            LOGGER.error("起飞前自检超时：%.1fs", elapsed)
+            self._emit(
+                "error",
+                {
+                    "module": "mission",
+                    "where": "preflight:timeout",
+                    "message": f"预检用了 {elapsed:.1f}s，超过上限 {self._config.preflight.max_s:.1f}s",
+                },
+            )
+            self.abort("preflight_timeout")
+            return
+        self._transition(MissionState.WAIT_AIRBORNE, "preflight_ok", now)
+
+    def _preflight_failed(self, check: str, exc: BaseException) -> None:
+        """预检失败：记错误事件与计数，然后 ``ABORT("preflight_failed:<check>")``。"""
+        self._stats.errors += 1
+        LOGGER.error("起飞前自检失败（%s）：%s", check, exc)
+        self._emit(
+            "error",
+            {"module": "mission", "where": f"preflight:{check}", "message": str(exc)},
+        )
+        self.abort(f"preflight_failed:{check}")
+
+    def _tick_airborne(self, now: float) -> None:
+        """``WAIT_AIRBORNE``：什么都不下发，等飞机**真的在空中**再进侦查。
+
+        在停机坪上就进侦查（旧行为）等于让飞机在地面执行任务：PX4 会在起飞前就
+        开始"追"第一个航点，或者干脆因为任务不可行而盘旋。
+
+        ``MissionConfig.require_airborne=False`` 是**地面演练/测试的逃生开关**：
+        这道门立即放行，但**绝不静默**——记一条 ``airborne_skipped`` 事件加一条
+        WARNING 日志（正式任务必须保持 ``True``，否则飞机在停机坪上就会开始侦查）。
+        """
+        if not self._config.mission.require_airborne:
+            reason = "require_airborne=False（地面演练/测试开关，正式任务不要关）"
+            self._emit("airborne_skipped", {"reason": reason})
+            LOGGER.warning(
+                "跳过「等飞机在空中」这道门：%s；本架次在停机坪上也会进侦查", reason
+            )
+            self._begin_recon(now, "airborne_skipped")
+            return
+        if not self._link_ok(now):
+            return
+        snapshot = self._broker.get_snapshot()
+        source = self._airborne(snapshot)
+        if source is not None:
+            self._emit("airborne", {"source": source})
+            LOGGER.info("已检测到飞机在空中（判据：%s），进入侦查", source)
+            self._begin_recon(now, "airborne")
+            return
+        if self._timed_out(now, self._config.mission.airborne_timeout_s):
+            self.abort("airborne_timeout")
+
+    def _airborne(self, snapshot: TelemetrySnapshot) -> str | None:
+        """在空中吗？返回判据名（``in_air`` / ``altitude``）或 ``None``（还没起飞）。
+
+        以遥测 ``in_air`` 为主；它取不到（可选流未就绪）时用
+        ``relative_altitude_m >= MissionConfig.airborne_alt_m`` 兜底。
+        """
+        if snapshot.in_air is not None:
+            return "in_air" if snapshot.in_air else None
+        altitude = snapshot.relative_altitude_m
+        if altitude is not None and float(altitude) >= float(
+            self._config.mission.airborne_alt_m
+        ):
+            return "altitude"
+        return None
+
+    def _begin_recon(self, now: float, reason: str) -> None:
+        """进入侦查：``recon_upload="auto"`` 自己上传并启动，``"operator"`` 等操作手启动。
+
+        正式任务走 ``operator``：**侦查航线由操作手在 QGC 里上传并启动**，本包只等它开始、
+        然后监视进度（进度是飞控侧状态，谁上传的都一样能读到）。``auto`` 只用于自动测试。
+        """
+        flags = self._config.mission
+        if flags.recon_upload == "auto":
+            try:
+                items = build_recon_mission(self._config)
+            except PlanningError as exc:
+                self._fail("plan_recon", exc)
+                return
+            if not self._upload_and_start(items, "recon"):
+                return
+        else:
+            self._emit(
+                "recon_waiting_operator",
+                {"note": "等操作手在 QGC 上传并启动侦查航线"},
+            )
+            LOGGER.info(
+                "侦查航线由操作手上传（mission.recon_upload=operator）：等任务启动后再监视"
+            )
+            self._start_confirmed = False
+            self._start_deadline = now + float(self._config.mission.recon_max_s)
         self._monitor = MissionMonitor()
-        self._transition(MissionState.RECON, "recon_started", now)
+        self._transition(MissionState.RECON, reason, now)
 
     def _tick_recon(self, now: float) -> None:
         if not self._link_ok(now):
+            return
+        if not self._confirm_started(now):
             return
         finished = self._query(
             self._controller.mission_finished, "mission_finished", default=False
@@ -381,6 +533,8 @@ class MissionRunner:
 
     def _tick_overfly(self, now: float) -> None:
         if not self._link_ok(now):
+            return
+        if not self._confirm_started(now):
             return
         if self._judge is not None and self._plan is not None:
             snapshot = self._broker.get_snapshot()
@@ -588,7 +742,7 @@ class MissionRunner:
         self._on_enter(to_state, now)
 
     def _upload_and_start(
-        self, items: Sequence[MissionItemSpec], leg: str
+        self, items: Sequence[MissionItem], leg: str
     ) -> bool:
         """上传并启动一条任务；失败返回 False（已进 ABORT）。"""
         try:
@@ -598,8 +752,47 @@ class MissionRunner:
             self._fail(f"{leg}_upload", exc)
             return False
         self._stats.uploads += 1
+        # 启动回成功 ≠ 飞控真的进了任务模式 —— 交给 _confirm_started 在有限时间内确认
+        self._start_confirmed = False
+        self._start_deadline = float(self._clock()) + float(
+            self._config.mission.mission_start_timeout_s
+        )
         LOGGER.info("%s 任务已上传并启动：%d 个任务项", leg, count)
         return True
+
+    def _confirm_started(self, now: float) -> bool:
+        """确认"任务真的在跑"：飞控进了任务模式。
+
+        为什么必须有这一步：``mission.start_mission()`` 回成功**不等于**进了任务模式
+        ——飞控可能拒绝模式切换却仍然回 ACK，飞机继续盘旋。2026-09 SITL 演练里因此
+        白等了 15 分钟才被状态超时抓出来。这里给它一个短的确认窗口
+        （``MissionConfig.mission_start_timeout_s``），超时按显式失败处理。
+
+        模式流不可用时（``flight_mode`` 为 ``None``）**退化为不做确认**并只记一次日志：
+        宁可退回旧行为，也不要因为拿不到模式就把任务判失败。
+        """
+        if self._start_confirmed:
+            return True
+        try:
+            in_mission = bool(self._controller.in_mission_mode())
+        except ControllerError as exc:
+            if "flight_mode" not in self._query_reported:
+                self._query_reported.add("flight_mode")
+                LOGGER.warning(
+                    "拿不到飞行模式（%s），本次不做「任务真的启动了」的确认", exc
+                )
+            self._start_confirmed = True
+            self._start_deadline = None
+            return True
+        if in_mission:
+            self._start_confirmed = True
+            self._start_deadline = None
+            self._emit("mission_confirmed", {"mode": "MISSION"})
+            return True
+        if self._start_deadline is not None and now >= self._start_deadline:
+            self.abort("mission_not_started")
+            return False
+        return False
 
     def _command(self, call: Callable[[], Any], where: str) -> Any | None:
         """执行一条控制命令；失败进 ABORT 并返回 None。"""

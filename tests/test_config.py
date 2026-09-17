@@ -15,10 +15,12 @@ from airdrop import (
     GripperConfig,
     MissionConfig,
     PerceptionConfig,
+    PreflightConfig,
     TargetingConfig,
     TelemetryConfig,
     VideoConfig,
 )
+from airdrop.config import RECON_UPLOAD_MODES
 
 
 def test_default_config_is_valid() -> None:
@@ -69,6 +71,12 @@ def test_replace_derives_new_config() -> None:
         ({"mission": MissionConfig(tick_hz=0.0)}, "tick_hz"),
         ({"mission": MissionConfig(recon_max_s=-1.0)}, "recon_max_s"),
         ({"mission": MissionConfig(hold_process_min_s=20.0)}, "hold_process_min_s"),
+        ({"mission": MissionConfig(recon_upload="manual")}, "recon_upload"),
+        ({"mission": MissionConfig(airborne_alt_m=-1.0)}, "airborne_alt_m"),
+        ({"mission": MissionConfig(airborne_timeout_s=0.0)}, "airborne_timeout_s"),
+        ({"preflight": PreflightConfig(video_min_frames=0)}, "video_min_frames"),
+        ({"preflight": PreflightConfig(video_probe_s=0.0)}, "video_probe_s"),
+        ({"preflight": PreflightConfig(max_s=-1.0)}, "max_s"),
         ({"gripper": GripperConfig(instance=-1)}, "gripper.instance"),
         ({"gripper": GripperConfig(release_settle_s=-0.5)}, "release_settle_s"),
     ],
@@ -91,3 +99,32 @@ def test_telemetry_config_defaults_match_requirement() -> None:
     assert tel.position_velocity_ned_rate_hz >= 10.0
     assert tel.attitude_rate_hz >= 30.0
     assert tel.history_interval > 0.0
+
+
+def test_preflight_and_airborne_defaults_match_the_new_flow() -> None:
+    """正式流程的三个默认值："检查全开"、"等起飞"、"侦查航线人工上传"。
+
+    它们都是**安全侧的默认**：默认不放过任何一项检查、默认不在停机坪上进侦查、
+    默认不覆盖操作手画好的侦查航线（``auto`` 只给自动测试用）。
+    """
+    preflight = PreflightConfig()
+    assert preflight.load_detector and preflight.load_ocr and preflight.load_camera
+    assert preflight.check_video
+    assert preflight.video_probe_s > 0 and preflight.video_min_frames >= 1
+    assert preflight.max_s >= preflight.video_probe_s
+
+    mission = MissionConfig()
+    assert mission.recon_upload == "operator", "默认必须等操作手在 QGC 上传并启动"
+    assert mission.airborne_alt_m > 0.0, "收不到 in_air 时的兜底判据要有非零门限"
+    assert mission.airborne_timeout_s > 0.0
+    assert RECON_UPLOAD_MODES == frozenset({"operator", "auto"})
+
+
+def test_require_airborne_defaults_to_true() -> None:
+    """``require_airborne`` 默认 **True**：正式任务必须等飞机真的在空中。
+
+    ``False`` 是地面演练/离线测试的逃生开关（``WAIT_AIRBORNE`` 立即放行 + 记
+    ``airborne_skipped``），默认值绝不能反过来——那等于让飞机在停机坪上开始侦查。
+    """
+    assert MissionConfig().require_airborne is True
+    assert Config().mission.require_airborne is True

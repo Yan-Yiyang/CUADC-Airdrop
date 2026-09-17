@@ -30,7 +30,9 @@
 
 ```text
 airdrop/
-  config.py            # 全部参数的唯一集中处（frozen dataclass + 取值域校验，无命令行参数）
+  run.py               # **唯一的命令行入口**（argparse 子命令 → 关键字覆盖到各入口的 build_config）
+  _lazy.py             # PEP 562 惰性导出：import airdrop / --help 不加载 cv2、mavsdk、torch
+  config.py            # 全部参数的唯一集中处（frozen dataclass + 取值域校验，参数本身不带命令行）
   telemetry/           # models / broker / mavsdk_thread / controller（mission+gripper+原点）
   video/               # source（ffmpeg 拉流）/ align（扣链路延时）/ buffer（环形缓冲）
   perception/          # detector（YOLO）/ cropproc（五边形→转正→OCR）/ number / ocr_worker / pipeline
@@ -39,8 +41,8 @@ airdrop/
   ballistics/          # model（RK4 二次阻力）/ release（判据）/ drops（投放记录）/ fit（参数反演）
   mission/             # states（状态机）/ planner（航线）/ targets（坐标解算）/ runner（主循环）
   record/              # recorder（五件套 + drops.jsonl）/ replay（回放源 + 遥测回填）
-tools/                 # fetch_models（取权重）/ calibrate（三步标定）/ fit_ballistics（投放试验反演）
-examples/              # full_mission / replay_flight / calibration_capture / sitl_mission / 其余演示
+tools/                 # 纯库模块：fetch_models / calibrate / fit_ballistics / dump_api / check_docs
+examples/              # 纯库模块：full_mission / replay_flight / calibration_capture / sitl_mission / 其余演示
 tests/                 # 全部离线（GPU 与真实素材的用例标 realdata，默认跳过）
 ```
 
@@ -48,32 +50,39 @@ tests/                 # 全部离线（GPU 与真实素材的用例标 realdata
 
 ```bash
 uv sync                 # 依赖见 pyproject.toml（索引走清华镜像）
-python -m tools.fetch_models    # 把 YOLO / PP-OCR 权重取进 models/（不进 git）
+python -m airdrop.run fetch-models    # 把 YOLO / PP-OCR 权重取进 models/（不进 git）
 ```
 
 ## 几个入口
 
-示例都**不带命令行参数**：地址、航线、开关都在各自文件顶部的"配置"区。
+**只有 `airdrop/run.py` 一个命令行入口**（argparse 子命令）：`examples/*.py` 与 `tools/*.py`
+都是纯库模块——文件顶部的常量就是默认值，`build_config(**覆盖)` / `main(**kwargs)`
+按需传值；选项到配置走关键字覆盖，默认值直接取自模块常量。
+`--help` 与 `check-docs` **不加载** torch / cv2 / mavsdk 这些重依赖（惰性导出 + 函数体内导入）。
 
 ```bash
+python -m airdrop.run --help                 # 列出全部子命令
+python -m airdrop.run <子命令> --help         # 该子命令的选项与默认值来源
+
 # 1) 离线迭代识别与坐标：一份回放素材反复跑，不碰硬件
-python -m examples.replay_flight         # 回放 → 感知 → 坐标 → 统计 → 航线（只生成不上传）
+python -m airdrop.run replay --flight flights/<架次> --speed 2
 
 # 2) 完整任务（需要飞控 + 图传 + 标定文件）
-python -m examples.full_mission          # 记录默认开；DRY_RUN=True 时不装弹演练
+python -m airdrop.run full-mission --land-plan routes/land.plan       # --dry-run 不装弹演练
+python -m airdrop.run full-mission --no-video --no-preflight          # 无图传/免自检的演练档
 
-# 3) SITL 演练：只走控制链路（合成目标 + 投放只记日志）
-python -m examples.sitl_mission          # 先起 PX4 SITL，见文件顶部说明
+# 3) SITL 演练：只走控制链路（合成目标 + 投放只记日志，默认不等起飞）
+python -m airdrop.run sitl --target-offset 300,0,0
 
-# 4) 标定采集：录一个标准飞行目录给 tools/calibrate.py
-python -m examples.calibration_capture
+# 4) 标定采集：录一个标准飞行目录给 calibrate 用
+python -m airdrop.run calibration-capture
+python -m airdrop.run calibrate --flight flights/<那份目录> --strict
 
 # 5) 投放试验反演：量完实际落点后估计弹道参数（只读数据，不接硬件）
-python -m tools.fit_ballistics
+python -m airdrop.run fit-ballistics --impacts flights/<那份目录>/impacts.jsonl --mass-kg 0.365
 ```
 
-其余演示：`basic_usage.py`（遥测/指令）、`hm30_video.py`（拉流与统计）、
-`video_telemetry_sync.py`（对齐 + 入缓冲 + 读者线程）。
+其余演示：`basic`（遥测/指令）、`hm30-video`（拉流与统计）、`video-sync`（对齐 + 入缓冲 + 读者线程）。
 
 ## 配置
 
@@ -129,7 +138,7 @@ python -m tools.fit_ballistics
 （`examples/calibration_capture.py`），然后：
 
 ```bash
-python -m tools.calibrate     # 改文件顶部的 FLIGHT_DIR / 方格边长等常量
+python -m airdrop.run calibrate --flight flights/<那份目录>   # 常量仍是默认值（--help 里能看到出处）
 ```
 
 1. **内参**：多视图棋盘格 → `calibrateCamera`（`K`、畸变 + 重投影 RMS）；
@@ -169,7 +178,7 @@ python -m tools.calibrate     # 改文件顶部的 FLIGHT_DIR / 方格边长等�
 第一次跑工具会生成待填模板），然后：
 
 ```bash
-python -m tools.fit_ballistics    # 改文件顶部的 FLIGHTS / FIT_* 常量
+python -m airdrop.run fit-ballistics --impacts <落点文件> --mass-kg <称重值>
 ```
 
 工具会打印逐次投放的"判据预测 / 反演后预测 / 实测"对照表（含沿航迹、垂直航迹分解），
@@ -179,7 +188,7 @@ python -m tools.fit_ballistics    # 改文件顶部的 FLIGHTS / FIT_* 常量
 > ⚠ **先看结论行再抄数字**：Cd 与迎风面积只以 `Cd·A` 的乘积出现（同时拟合必然退化）、
 > 释放延迟与阻力沿航迹方向高度相关（同高同速投放分不开）；常数偏移（测量点/目标点坐标错）
 > 任何参数都吸收不了。这三种情况工具会**拒绝给结论**并说明原因——详见
-> [`AGENTS.md`](AGENTS.md) 的 P12 一节。
+> [`docs/ballistics_fit.md`](docs/ballistics_fit.md)（P12 专题笔记）。
 > 另外：**质量填错多少，Cd 就跟着错多少**（κ 不变）——换配重（形状不变 ⇒ `Cd·A` 不变）时按
 > `κ' = Cd·A/m'` 重算即可，不必重做试验。
 
@@ -198,7 +207,8 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
 接收侧保持浅流水（实测 0 帧积压，而 cv2 后端有 17 帧 ≈0.57s 的内部排队）；(2) `read()`
 是 C 层不可中断调用，卡住只能杀进程；(3) 断流超时靠 ffmpeg 的 `-timeout`（微秒）。
 ⚠ 早期文档里"OpenCV 5.0 移除了 `OPENCV_FFMPEG_CAPTURE_OPTIONS`"的说法**是错的**
-（那个字符串在插件 DLL 里，grep 错了文件）——完整复盘见 `AGENTS.md`。
+（那个字符串在插件 DLL 里，grep 错了文件）——完整复盘与逐项实测表见
+[`docs/video_hm30_ffmpeg.md`](docs/video_hm30_ffmpeg.md)。
 
 ## 测试
 

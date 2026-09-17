@@ -65,6 +65,13 @@ class TelemetrySnapshot:
 
     # MAVSDK 时间戳（系统启动后的微秒数），仅在可用时填充
     attitude_timestamp_us: int | None = None
+    #: 任务进度（PX4 ``MISSION_CURRENT``）：``mission_current == mission_total`` 即飞完
+    mission_current: int | None = None
+    mission_total: int | None = None
+    #: 飞行模式（MAVSDK ``FlightMode`` 的名字，如 ``"MISSION"`` / ``"HOLD"``）
+    flight_mode: str | None = None
+    #: 是否在空中（MAVSDK ``in_air``）：状态机的"等起飞"门用它
+    in_air: bool | None = None
 
     def update_global_position(self, position: Any) -> None:
         """从 MAVSDK ``Telemetry.Position`` 对象复制字段。"""
@@ -113,6 +120,36 @@ class TelemetrySnapshot:
         self.wind_north_m_s = float(wind.wind_x_ned_m_s)
         self.wind_east_m_s = float(wind.wind_y_ned_m_s)
         self.wind_down_m_s = float(wind.wind_z_ned_m_s)
+
+    def update_mission_progress(self, current: int, total: int) -> None:
+        """任务进度（PX4 ``MISSION_CURRENT``）。
+
+        ⚠ 语义来自 MAVSDK：``current`` 是**0 基**的任务项下标，``current == total``
+        表示任务飞完。任务项一律走 ``mission_raw`` 上传，所以进度也只能从这里来——
+        MAVSDK ``mission`` 插件的 ``is_mission_finished()`` 依赖它自己上传过的任务，
+        走 raw 之后它对任务一无所知（实测：飞控已 "Mission finished, loitering"，
+        它仍然回 ``False``）。
+        """
+        self.mission_current = int(current)
+        self.mission_total = int(total)
+
+    def update_flight_mode(self, mode: Any) -> None:
+        """飞行模式（MAVSDK ``FlightMode`` 枚举）→ 字符串名字。
+
+        ⚠ **``start_mission()`` 回成功不等于进了任务模式**：飞控可能拒绝模式切换而
+        只发 ACK（实测：``mission.start_mission()`` 不抛异常，模式却停在 ``HOLD``，
+        导航器随后打印 ``No valid mission available, loitering``）。状态机靠这个字段
+        做"真的进了 MISSION"的正向确认（见 :meth:`MissionRunner._tick_recon`）。
+        """
+        self.flight_mode = str(mode).split(".")[-1]
+
+    def update_in_air(self, in_air: Any) -> None:
+        """是否在空中（可选流）。
+
+        正式任务的"等起飞"就靠它：只有**真的离地**才进侦查（在停机坪上就上传并启动
+        侦查航线，等于让飞机在地面就想执行任务）。
+        """
+        self.in_air = bool(in_air)
 
     def update_attitude_quaternion(self, quaternion: Any) -> None:
         """从 MAVSDK ``Quaternion`` 对象复制字段。"""

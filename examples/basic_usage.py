@@ -1,11 +1,14 @@
 """最小示例：MAVSDK 专用线程 + 遥测代理 + 指令发送。
 
-连接 SITL 或真实飞控（默认 UDP 入站 ``udpin://0.0.0.0:14540``）：
+连接 SITL 或真实飞控（默认 UDP 入站 ``udpin://0.0.0.0:14540``）::
 
-    python -m examples.basic_usage
+    ./.venv/Scripts/python.exe -m airdrop.run basic --system-address udpin://0.0.0.0:14540
 
-参数在下面的"配置"区。``DEMO_COMMANDS`` 打开后会依次发 arm -> takeoff ->
-land，**只在安全环境（桨已拆除 / SITL）里用**。
+本文件是**纯库模块**：顶部常量是默认值，`build_config(**覆盖)` / `main(**kwargs)` 按需传值；
+命令行由 `airdrop/run.py` 解析，重依赖（mavsdk）在函数体内导入（`--help` 不加载它）。
+
+``DEMO_COMMANDS`` 打开后会依次发 arm -> takeoff -> land，
+**只在安全环境（桨已拆除 / SITL）里用**。
 """
 
 from __future__ import annotations
@@ -13,21 +16,25 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import replace
 
-from airdrop import (
-    Command,
-    MavsdkThread,
-    TelemetryBroker,
-    TelemetrySnapshot,
-)
+from airdrop import Command, Config, TelemetryBroker, TelemetrySnapshot
 
 # ----------------------------------------------------------------------
-# 配置（改这里，不用命令行参数）
+# 配置（改这里）
 # ----------------------------------------------------------------------
 ADDRESS = "udpin://0.0.0.0:14540"  # MAVSDK 系统地址
 DEMO_COMMANDS = False  # 是否演示 arm -> takeoff -> land（安全环境才开）
 
 LOGGER = logging.getLogger("basic_usage")
+
+
+def build_config(*, system_address: str = ADDRESS) -> Config:
+    """只装遥测那一片（本示例不用图传/感知/任务）。"""
+    base = Config()
+    return base.replace(
+        telemetry=replace(base.telemetry, system_address=system_address)
+    ).validated()
 
 
 def on_snapshot(snapshot: TelemetrySnapshot) -> None:
@@ -59,25 +66,30 @@ def reader_loop(broker: TelemetryBroker, stop_event: threading.Event) -> None:
         stop_event.wait(0.5)
 
 
-def main() -> None:
+def main(*, system_address: str = ADDRESS, demo_commands: bool = DEMO_COMMANDS) -> int:
+    """连上飞控看遥测（可选演示 arm/takeoff/land）；返回进程退出码。"""
+    # 重依赖在使用时才导入：`python -m airdrop.run basic --help` 不加载 mavsdk
+    from airdrop import MavsdkThread
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    build_config(system_address=system_address)   # 先过一遍取值域校验（地址等）
 
     broker = TelemetryBroker()
     broker.subscribe(on_snapshot)
 
-    mavsdk = MavsdkThread(broker=broker, system_address=ADDRESS)
+    mavsdk = MavsdkThread(broker=broker, system_address=system_address)
     mavsdk.start()
-    mavsdk.connect(ADDRESS)
+    mavsdk.connect(system_address)
 
     LOGGER.info("等待第一条遥测快照...")
     first = broker.wait_next_snapshot(timeout=15.0, predicate=lambda s: s.is_valid())
     if first is None:
         LOGGER.error("15 秒内未收到任何遥测数据")
         mavsdk.stop()
-        return
+        return 1
 
     LOGGER.info("第一条快照：%s", first.as_dict())
 
@@ -91,7 +103,7 @@ def main() -> None:
     )
     reader.start()
 
-    if DEMO_COMMANDS:
+    if demo_commands:
         for command in (Command("arm"), Command("takeoff"), Command("land")):
             result = mavsdk.send_command(command)
             LOGGER.info(
@@ -117,7 +129,8 @@ def main() -> None:
         stop_event.set()
         reader.join(timeout=2.0)
         mavsdk.stop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

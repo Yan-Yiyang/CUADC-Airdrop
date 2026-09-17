@@ -31,6 +31,8 @@ SELECTION_RULES = frozenset({"median", "max"})
 ALIGN_TIMEOUT_ACTIONS = frozenset({"drop"})
 WIND_SOURCES = frozenset({"telemetry", "zero"})
 ABORT_ACTIONS = frozenset({"hold", "rtl", "none"})
+#: 侦查航线由谁上传：operator = 操作手在 QGC 上传并启动（正式任务）；auto = 本包上传（自动测试）
+RECON_UPLOAD_MODES = frozenset({"operator", "auto"})
 
 
 # ---------------------------------------------------------------- 遥测与控制
@@ -277,11 +279,29 @@ class Waypoint:
 
 @dataclass(frozen=True, slots=True)
 class RoutesConfig:
-    """预设航线：侦查航线（含起飞项）、备用投放点、降落航线。"""
+    """预设航线：侦查段与降落段，**每条腿二选一**（配置航点 或 QGC ``.plan``）。
+
+    * ``recon_route`` / ``recon_plan``：侦查段。plan 模式下是操作手在 QGroundControl
+      里画好、另存为 ``.plan`` 的完整航线，本包**原样使用**（不自动补起飞项）；
+    * ``landing_route`` / ``land_plan``：飞掠段**之后**要飞的那一段（返航 + 降落）。
+      plan 模式下飞掠段插在它前面，合成一条任务上传——"必须让飞控认可的降落剖面"
+      因此由画航线的人（QGC）负责；
+    * ``backup_point``：没有目标时的备用投放点（Q11）；
+    * ``fw_land_angle_deg``：飞控参数 ``FW_LND_ANG``（默认 8.0）。降落预检用它算
+      允许的最大下滑角（:func:`airdrop.mission.plan_file.check_fixed_wing_landing`），
+      飞机改过这个参数就要同步，否则预检会与飞控的判断不一致。
+
+    一条腿同时给两个来源会在 :meth:`Config.validated` 里报错：让其中一个**静默**优先
+    比报错危险得多（飞的可能不是你以为的那条航线）。
+    """
 
     recon_route: tuple[Waypoint, ...] = ()
     backup_point: Waypoint | None = None
     landing_route: tuple[Waypoint, ...] = ()
+    #: QGC ``.plan`` 路径（相对仓库根或绝对路径）；空串 = 不用 plan
+    recon_plan: str = ""
+    land_plan: str = ""
+    fw_land_angle_deg: float = 8.0
 
 
 # ---------------------------------------------------------------- 任务编排
@@ -300,6 +320,10 @@ class MissionConfig:
 
     ``takeoff_first`` / ``land_last``：侦查航线首个航点带**起飞项**（固定翼起飞
     由它承担，计划 4.1）、降落航线末航点带**降落项**。
+
+    ``require_airborne``：``WAIT_AIRBORNE`` 那道门的逃生开关。默认为 ``True``
+    （正式任务：必须等飞机真的在空中）；``False`` 时该状态**立即放行**，并记一条
+    ``airborne_skipped`` 事件 + WARNING 日志——**只给地面演练/离线测试用**。
     """
 
     tick_hz: float = 20.0
@@ -309,11 +333,50 @@ class MissionConfig:
     #: 至少等这么久再接受"没有结果"的判断——否则缓冲里还没被消费的帧会被当成"没看到目标"
     hold_process_min_s: float = 2.0
     land_max_s: float = 900.0           # 飞掠段 + 降落航线的兜底上限
+    #: 上传并启动后，等多久确认"飞控真的进了任务模式"（见 MissionRunner 的启动确认）。
+    #: 飞控可能拒绝模式切换却仍然回 ACK：不确认的话飞机一直盘旋，要等到状态超时才失败。
+    mission_start_timeout_s: float = 20.0
+    #: ``WAIT_AIRBORNE`` 等"飞机在空中"的上限与判据：
+    #: 以遥测 ``in_air`` 为主，取不到时用 ``relative_altitude_m >= airborne_alt_m`` 兜底
+    airborne_timeout_s: float = 1800.0
+    airborne_alt_m: float = 5.0
+    #: ``False`` = 不等飞机起飞就放行 ``WAIT_AIRBORNE``（**地面演练/测试开关**，正式任务必须为 True）
+    require_airborne: bool = True
+    #: 侦查航线谁上传：``"operator"``（默认，正式任务：操作手在 QGC 上传并启动）/ ``"auto"``
+    recon_upload: str = "operator"
     #: 遥测超过这么久没更新就按链路故障处理（对齐侧 1s 就丢帧了，这里留两次余量）
     telemetry_stale_s: float = 5.0
     abort_action: str = "hold"
     takeoff_first: bool = True
     land_last: bool = True
+
+
+# ---------------------------------------------------------------- 起飞前自检
+@dataclass(frozen=True, slots=True)
+class PreflightConfig:
+    """起飞前自检（正式任务流程的第一步：**载入模型 → 视频自检**）。
+
+    每一项都能单独关掉——测试/SITL 里常常没有相机、没有模型：
+
+    * ``load_detector`` / ``load_ocr`` / ``load_camera``：分别载入 YOLO 权重、
+      OCR 权重与字典、相机标定；
+    * ``check_video``：视频自检（``video_probe_s`` 窗口内至少 ``video_min_frames`` 帧；
+      已载入标定时还要核对画面分辨率与标定一致）；
+    * ``max_s``：整个预检的总上限。
+
+    ⚠ **关掉 ≠ 通过**：被关掉的检查会记一条 ``preflight`` 事件（``ok=None``），
+    正式任务起飞前核一眼就知道哪几项没有把关。
+    """
+
+    load_detector: bool = True
+    load_ocr: bool = True
+    load_camera: bool = True
+    check_video: bool = True
+    #: 视频探测窗口（秒）与窗口内要求的最少帧数
+    video_probe_s: float = 5.0
+    video_min_frames: int = 10
+    #: 预检总上限（超过就算失败，避免卡在载入上不动）
+    max_s: float = 120.0
 
 
 # ---------------------------------------------------------------- 记录与回放
@@ -347,6 +410,7 @@ class Config:
     gripper: GripperConfig = field(default_factory=GripperConfig)
     routes: RoutesConfig = field(default_factory=RoutesConfig)
     mission: MissionConfig = field(default_factory=MissionConfig)
+    preflight: PreflightConfig = field(default_factory=PreflightConfig)
     record: RecordConfig = field(default_factory=RecordConfig)
 
     def validated(self) -> "Config":
@@ -406,6 +470,8 @@ class Config:
             "init_max_s",
             "recon_max_s",
             "land_max_s",
+            "mission_start_timeout_s",
+            "airborne_timeout_s",
             "telemetry_stale_s",
         ):
             value = getattr(self.mission, name)
@@ -423,6 +489,38 @@ class Config:
         if self.gripper.release_settle_s < 0:
             raise ValueError(
                 f"gripper.release_settle_s 不能为负: {self.gripper.release_settle_s}"
+            )
+        if self.routes.recon_route and self.routes.recon_plan:
+            raise ValueError(
+                "侦查段只能二选一：routes.recon_route（配置航点）与 "
+                f"routes.recon_plan（{self.routes.recon_plan}）同时给了"
+            )
+        if self.routes.landing_route and self.routes.land_plan:
+            raise ValueError(
+                "降落段只能二选一：routes.landing_route（配置航点）与 "
+                f"routes.land_plan（{self.routes.land_plan}）同时给了"
+            )
+        if not 0.0 < self.routes.fw_land_angle_deg <= 45.0:
+            raise ValueError(
+                f"routes.fw_land_angle_deg 应在 (0, 45] 度：{self.routes.fw_land_angle_deg}"
+            )
+        if self.mission.recon_upload not in RECON_UPLOAD_MODES:
+            raise ValueError(
+                f"mission.recon_upload 只支持 {sorted(RECON_UPLOAD_MODES)}: "
+                f"{self.mission.recon_upload!r}"
+            )
+        if self.mission.airborne_alt_m < 0:
+            raise ValueError(
+                f"mission.airborne_alt_m 不能为负：{self.mission.airborne_alt_m}"
+            )
+        if self.preflight.video_probe_s <= 0 or self.preflight.max_s <= 0:
+            raise ValueError(
+                "preflight.video_probe_s / max_s 必须为正："
+                f"{self.preflight.video_probe_s} / {self.preflight.max_s}"
+            )
+        if self.preflight.video_min_frames < 1:
+            raise ValueError(
+                f"preflight.video_min_frames 至少为 1：{self.preflight.video_min_frames}"
             )
         self.video.validated()
         return self

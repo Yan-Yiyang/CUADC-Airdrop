@@ -3,10 +3,13 @@
 为什么单独一层
 --------------
 :class:`~airdrop.telemetry.mavsdk_thread.MavsdkThread` 管的是"连接 + 遥测流 +
-指令串行"，它不知道什么叫"任务"。本模块把 MAVSDK 的 ``mission`` / ``gripper`` /
-``action`` 插件包成**任务级动作**，供 :class:`airdrop.mission.MissionRunner` 调用；
-同时定义 :class:`MissionItemSpec`——它比 :class:`~airdrop.config.Waypoint` 多一个
-动作字段（起飞/降落），因为固定翼起飞由侦查航线首航点的**起飞项**承担（计划 4.1）。
+指令串行"，它不知道什么叫"任务"。本模块把 MAVSDK 的 ``mission_raw`` / ``gripper`` /
+``action`` 插件包成**任务级动作**，供 :class:`airdrop.mission.MissionRunner` 调用。
+
+任务项用 :class:`airdrop.mission.items.MissionItem`（MAVLink 级：command/frame/
+params/位置），**上传一律走 ``mission_raw``**——``mission`` 插件那层翻译会把
+``vehicle_action=LAND`` 拆成两项、让 PX4 固定翼把整条任务判为不可行（详见
+:mod:`airdrop.mission.items` 的说明）。
 
 失败语义（刻意统一，状态机只需要处理一种异常）
 --------------------------------------------
@@ -23,46 +26,31 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import math
 import threading
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Protocol, Sequence, runtime_checkable
 
-from mavsdk.mission import MissionItem, MissionPlan
+from mavsdk.mission_raw import MissionItem as RawMissionItem
 
 if TYPE_CHECKING:  # 仅类型标注：见模块 docstring 的导入顺序说明
     from ..config import Config, GripperConfig
+    from ..mission.items import MissionItem
     from .mavsdk_thread import MavsdkThread
 
 LOGGER = logging.getLogger(__name__)
 
 __all__ = [
-    "ACTION_LAND",
-    "ACTION_NONE",
-    "ACTION_TAKEOFF",
-    "MISSION_ACTIONS",
-    "UNSET",
+    "MISSION_TYPE_MISSION",
     "ControllerError",
     "DroneController",
     "DryRunController",
     "MissionController",
-    "MissionItemSpec",
     "NedOrigin",
-    "to_mission_item",
+    "to_raw_item",
 ]
 
-#: 任务项动作（映射到 MAVSDK ``MissionItem.VehicleAction``）
-ACTION_NONE = "none"
-ACTION_TAKEOFF = "takeoff"
-ACTION_LAND = "land"
-MISSION_ACTIONS = frozenset({ACTION_NONE, ACTION_TAKEOFF, ACTION_LAND})
-
-#: MAVSDK 约定：**数值字段用 NaN 表示"不指定"**（C++ 结构体默认值即 NAN，
-#: 官方 Python 示例也传 ``float('nan')``）。0 是有意义的值（速度 0、盘旋 0 秒），
-#: 所以"没用到的字段"必须填 NaN——mavsdk_server 正是按 ``isnan`` 决定要不要生成
-#: ``DO_CHANGE_SPEED`` / ``LOITER_TIME`` 这类附加任务项。
-UNSET = float("nan")
+#: MAVLink ``mission_type``：0 = 普通任务（fence / rally 本包不用）。
+MISSION_TYPE_MISSION = 0
 
 
 class ControllerError(RuntimeError):
@@ -81,107 +69,34 @@ class NedOrigin(NamedTuple):
     alt_m: float
 
 
-@dataclass(frozen=True, slots=True)
-class MissionItemSpec:
-    """要上传的一个任务项。
+def to_raw_item(item: MissionItem, index: int) -> RawMissionItem:
+    """任务项 → MAVSDK **raw** 项（``mission_raw`` 通道用；纯函数，离线可测）。
 
-    ``alt_m`` 是**相对起飞点的高度**（MAVSDK ``relative_altitude_m``），与
-    :attr:`airdrop.config.OverflyConfig.altitude_m` 同一口径——不是海拔。
+    为什么走 raw
+    ------------
+    ``mission`` 插件会做一层不透明翻译：``vehicle_action=LAND`` 的一项被拆成
+    "同坐标航点 + ``NAV_LAND``"，PX4 固定翼的降落判据随即把**整条任务**判为不可行，
+    飞机原地盘旋而 ``start_mission()`` 仍回成功。raw 通道是原样投递，命令与参数
+    怎么写就怎么到飞控（详见 :mod:`airdrop.mission.items`）。
 
-    ``None`` 表示"不指定、用飞控默认"（落到 MAVSDK 上是 NaN）：速度、盘旋时间、
-    接受半径、偏航角都如此，别用 0 代替（0 是合法值，含义完全不同）。
+    ⚠ ``current`` 只能给第 0 项置 1：MAVSDK 会校验，全 0 直接报 ``CURRENT_INVALID``
+    （实测），全 1 则含义错乱。⚠ ``autocontinue`` 在 protobuf 里是 **int**，
+    传 bool 会被 MAVSDK 直接拒（``Expected an int, got a boolean``，实测）。
     """
-
-    lat: float
-    lon: float
-    alt_m: float
-    action: str = ACTION_NONE
-    acceptance_radius_m: float | None = None
-    speed_m_s: float | None = None
-    loiter_time_s: float | None = None
-    yaw_deg: float | None = None
-
-    def __post_init__(self) -> None:
-        if self.action not in MISSION_ACTIONS:
-            raise ValueError(
-                f"任务项动作只支持 {sorted(MISSION_ACTIONS)}: {self.action!r}"
-            )
-        if not -90.0 <= float(self.lat) <= 90.0:
-            raise ValueError(f"纬度超出 ±90°: {self.lat}")
-        if not -180.0 <= float(self.lon) <= 180.0:
-            raise ValueError(f"经度超出 ±180°: {self.lon}")
-        if not math.isfinite(float(self.alt_m)):
-            raise ValueError(f"相对高度必须是有限值: {self.alt_m}")
-        if self.acceptance_radius_m is not None and self.acceptance_radius_m < 0:
-            raise ValueError(f"接受半径不能为负: {self.acceptance_radius_m}")
-        if self.speed_m_s is not None and self.speed_m_s <= 0:
-            raise ValueError(f"速度必须为正: {self.speed_m_s}")
-        if self.loiter_time_s is not None and self.loiter_time_s < 0:
-            raise ValueError(f"盘旋时间不能为负: {self.loiter_time_s}")
-
-    @classmethod
-    def from_waypoint(
-        cls,
-        waypoint: Any,
-        *,
-        action: str = ACTION_NONE,
-        **overrides: Any,
-    ) -> "MissionItemSpec":
-        """由 :class:`~airdrop.config.Waypoint` 构造（``acceptance_radius_m=0`` → 不指定）。
-
-        ``waypoint`` 只要带 ``lat``/``lon``/``alt_m``/``acceptance_radius_m`` 即可
-        （结构化类型，测试里用假航点也行）。
-        """
-        radius = float(getattr(waypoint, "acceptance_radius_m", 0.0) or 0.0)
-        params: dict[str, Any] = {
-            "lat": float(waypoint.lat),
-            "lon": float(waypoint.lon),
-            "alt_m": float(waypoint.alt_m),
-            "action": action,
-            "acceptance_radius_m": radius if radius > 0 else None,
-        }
-        params.update(overrides)
-        return cls(**params)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "lat": round(float(self.lat), 8),
-            "lon": round(float(self.lon), 8),
-            "alt_m": round(float(self.alt_m), 3),
-            "action": self.action,
-            "acceptance_radius_m": self.acceptance_radius_m,
-            "speed_m_s": self.speed_m_s,
-            "loiter_time_s": self.loiter_time_s,
-            "yaw_deg": self.yaw_deg,
-        }
-
-
-def to_mission_item(spec: MissionItemSpec) -> MissionItem:
-    """任务项 → MAVSDK ``MissionItem``（纯函数，离线可测）。"""
-    action = {
-        ACTION_NONE: MissionItem.VehicleAction.NONE,
-        ACTION_TAKEOFF: MissionItem.VehicleAction.TAKEOFF,
-        ACTION_LAND: MissionItem.VehicleAction.LAND,
-    }[spec.action]
-    return MissionItem(
-        latitude_deg=float(spec.lat),
-        longitude_deg=float(spec.lon),
-        relative_altitude_m=float(spec.alt_m),
-        speed_m_s=UNSET if spec.speed_m_s is None else float(spec.speed_m_s),
-        # 固定翼到点即过、不停；**降落项例外**——那一点是要落下去的，
-        # 让它"飞掠"就等于让飞机想着过点而不是落地。
-        is_fly_through=spec.action != ACTION_LAND,
-        gimbal_pitch_deg=UNSET,
-        gimbal_yaw_deg=UNSET,
-        camera_action=MissionItem.CameraAction.NONE,
-        loiter_time_s=UNSET if spec.loiter_time_s is None else float(spec.loiter_time_s),
-        camera_photo_interval_s=UNSET,
-        acceptance_radius_m=UNSET
-        if spec.acceptance_radius_m is None
-        else float(spec.acceptance_radius_m),
-        yaw_deg=UNSET if spec.yaw_deg is None else float(spec.yaw_deg),
-        camera_photo_distance_m=UNSET,
-        vehicle_action=action,
+    return RawMissionItem(
+        seq=int(index),
+        frame=int(item.frame),
+        command=int(item.command),
+        current=1 if index == 0 else 0,
+        autocontinue=1 if item.autocontinue else 0,
+        param1=float(item.param1),
+        param2=float(item.param2),
+        param3=float(item.param3),
+        param4=float(item.param4),
+        x=int(round(float(item.lat) * 1e7)),
+        y=int(round(float(item.lon) * 1e7)),
+        z=float(item.alt_m),
+        mission_type=MISSION_TYPE_MISSION,
     )
 
 
@@ -193,9 +108,11 @@ class MissionController(Protocol):
     查询类只回"读到的事实"。
     """
 
-    def upload_mission(self, items: Sequence[MissionItemSpec], /) -> int: ...
+    def upload_mission(self, items: Sequence[MissionItem], /) -> int: ...
 
     def start_mission(self) -> None: ...
+
+    def in_mission_mode(self) -> bool: ...
 
     def hold(self) -> None: ...
 
@@ -273,56 +190,142 @@ class DroneController:
     # ------------------------------------------------------------------
     # mission
     # ------------------------------------------------------------------
-    def upload_mission(self, items: Sequence[MissionItemSpec], /) -> int:
+    def upload_mission(self, items: Sequence[MissionItem], /) -> int:
         """上传任务（覆盖飞控上的旧任务），返回任务项数量。
 
-        空任务**显式报错**：MAVSDK 上传空计划等于清空任务，那多半是调用方的 bug，
-        不该静默发生。
+        两处刻意的显式失败：
+
+        * 空任务**直接报错**——上传空计划等于清空飞控上的任务，那多半是调用方的 bug；
+        * 上传后**回读校验**（命令与位置逐项比对）——飞控存下来的不是我们发的那条，
+          必须在"以为任务已经在飞"之前暴露出来。
         """
         specs = tuple(items)
         if not specs:
             raise ControllerError("任务项为空，拒绝上传")
         with self._lock:
             self._run(lambda: self._upload(specs), "上传任务")
+            self._verify_upload(specs)
         self._emit(
             "mission_upload",
             {
                 "count": len(specs),
-                "items": [spec.as_dict() for spec in specs],
+                "items": [item.as_dict() for item in specs],
             },
         )
-        LOGGER.info("任务已上传：%d 个任务项", len(specs))
+        LOGGER.info("任务已上传并回读校验通过：%d 个任务项", len(specs))
         return len(specs)
 
-    async def _upload(self, specs: tuple[MissionItemSpec, ...]) -> None:
+    async def _upload(self, specs: tuple[MissionItem, ...]) -> None:
         drone = self._thread.require_drone()
-        await drone.mission.upload_mission(
-            MissionPlan([to_mission_item(spec) for spec in specs])
+        # mission_raw：原样投递。走 mission 插件会被它把 vehicle_action=LAND
+        # 拆成两项，PX4 固定翼随即拒掉整条任务（见 to_raw_item 的说明）。
+        await drone.mission_raw.upload_mission(
+            [to_raw_item(item, index) for index, item in enumerate(specs)]
         )
 
+    async def _download(self) -> list[RawMissionItem]:
+        drone = self._thread.require_drone()
+        return list(await drone.mission_raw.download_mission())
+
+    def _verify_upload(self, specs: tuple[MissionItem, ...]) -> None:
+        """回读飞控上的任务，逐项比对命令与位置；不一致抛 :class:`ControllerError`。"""
+        from ..mission.items import command_name  # 惰性导入：避免 telemetry ↔ mission 成环
+
+        stored = self._run(self._download, "回读任务")
+        if len(stored) != len(specs):
+            raise ControllerError(
+                f"上传后回读：飞控上有 {len(stored)} 项，我们发了 {len(specs)} 项"
+            )
+        problems: list[str] = []
+        for index, (sent, got) in enumerate(zip(specs, stored)):
+            if int(got.command) != int(sent.command):
+                problems.append(
+                    f"第 {index} 项命令 {sent.command}({command_name(sent.command)}) "
+                    f"→ 飞控 {got.command}({command_name(got.command)})"
+                )
+                continue
+            if not sent.is_positional:
+                continue
+            lat, lon, alt = got.x / 1e7, got.y / 1e7, float(got.z)
+            if (
+                abs(lat - float(sent.lat)) > 2e-7
+                or abs(lon - float(sent.lon)) > 2e-7
+                or abs(alt - float(sent.alt_m)) > 0.01
+            ):
+                problems.append(
+                    f"第 {index} 项位置不符：发 ({sent.lat:.7f}, {sent.lon:.7f}, {sent.alt_m:.2f})、"
+                    f"回读 ({lat:.7f}, {lon:.7f}, {alt:.2f})"
+                )
+        if problems:
+            raise ControllerError("上传后回读不一致：" + "；".join(problems))
+
     def start_mission(self) -> None:
-        """启动任务。"""
+        """启动任务：**先把当前任务项复位到 0**，再下发启动。
+
+        为什么要复位
+        ------------
+        PX4 会把"任务已飞完"的状态锁存；当新上传的任务与上一条**内容相同**
+        （``mission_id`` 是同一个 CRC）时飞控不会自动复位它，于是
+        ``mission.start_mission()`` 回成功、模式却停在 ``HOLD``，导航器随后打印
+        ``No valid mission available, loitering``。2026-09 SITL 对照实验（同一飞控、
+        同一会话）：
+
+        ============ ========== ===================================
+        上传后模式    直接启动    先 ``set_current_mission_item(0)`` 再启动
+        ============ ========== ===================================
+        ``HOLD``     ✗ 停在 HOLD ✓ 进入 ``MISSION``
+        ``MISSION``  ✓          ✓
+        ============ ========== ===================================
+
+        ``MAV_CMD_DO_SET_MISSION_CURRENT``（"把当前项设成第 0 项"）正好清掉那个锁存，
+        所以每次都先复位再启动——实测复位那一路 100% 进 ``MISSION``。
+        启动后是否**真的**进了任务模式由状态机用 :meth:`in_mission_mode` 确认。
+        """
         with self._lock:
+            self._run(self._rewind, "复位任务项")
             self._run(self._start, "启动任务")
         self._emit("mission_start", {})
-        LOGGER.info("任务已启动")
+        LOGGER.info("任务已启动（已复位到第 0 项）")
+
+    async def _rewind(self) -> None:
+        drone = self._thread.require_drone()
+        await drone.mission_raw.set_current_mission_item(0)
 
     async def _start(self) -> None:
         drone = self._thread.require_drone()
         await drone.mission.start_mission()
 
-    def mission_finished(self) -> bool:
-        """任务是否已飞完（最后一个任务项已到达）。
+    def in_mission_mode(self) -> bool:
+        """飞控是否**真的**在任务模式（``FlightMode.MISSION``）。
 
-        用 MAVSDK 的 ``mission.is_mission_finished()`` 而不是自己解析进度流：
-        它是**请求/响应**，没有"等下一帧进度"的滞后；判据侧的防陈旧见
-        :class:`airdrop.mission.MissionMonitor`。
+        与 :meth:`mission_finished` 一样读快照（``flight_mode`` 可选流）。
+        ⚠ 不能拿"``start_mission()`` 没抛异常"当证据：飞控可能拒绝模式切换却仍然回
+        ACK，飞机继续盘旋（实测症状：状态机等到状态超时才失败）。
         """
-        return bool(self._run(self._finished, "查询任务完成状态"))
+        snapshot = self._thread.get_snapshot()
+        if snapshot.flight_mode is None:
+            raise ControllerError("还没有飞行模式（flight_mode 流未就绪）")
+        return snapshot.flight_mode == "MISSION"
 
-    async def _finished(self) -> bool:
-        drone = self._thread.require_drone()
-        return bool(await drone.mission.is_mission_finished())
+    def mission_finished(self) -> bool:
+        """任务是否已飞完（最后一项已到达：``mission_current == mission_total``）。
+
+        为什么**不用** MAVSDK 的 ``mission.is_mission_finished()``：它依赖 ``mission``
+        插件自己上传过的任务（``last_upload``），而我们的任务项一律走 ``mission_raw``
+        ——走 raw 之后插件对任务一无所知：飞控已经 ``Mission finished, loitering`` 了，
+        它仍然回 ``False``（2026-09 SITL 实测，状态机因此卡在 RECON 直到超时）。
+
+        进度来自 :class:`~airdrop.telemetry.mavsdk_thread.MavsdkThread` 的
+        ``mission_raw.mission_progress()`` 可选流（写进快照的
+        ``mission_current/mission_total``），所以这里是**读快照**，不是每拍一次 RPC。
+        进度流不可用时抛 :class:`ControllerError`——调用方按"查询失败"处理
+        （:meth:`~airdrop.mission.MissionRunner._query` 只记一次日志），最终由状态超时兜底。
+        """
+        snapshot = self._thread.get_snapshot()
+        current, total = snapshot.mission_current, snapshot.mission_total
+        if current is None or total is None or int(total) <= 0:
+            raise ControllerError("还没有任务进度（mission_raw 进度流未就绪）")
+        return int(current) >= int(total)
 
     # ------------------------------------------------------------------
     # 动作
@@ -442,11 +445,14 @@ class DryRunController:
         self.releases = 0
 
     # ---- 全部委托给真控制器 ------------------------------------------
-    def upload_mission(self, items: Sequence[MissionItemSpec], /) -> int:
+    def upload_mission(self, items: Sequence[MissionItem], /) -> int:
         return self._inner.upload_mission(items)
 
     def start_mission(self) -> None:
         self._inner.start_mission()
+
+    def in_mission_mode(self) -> bool:
+        return self._inner.in_mission_mode()
 
     def hold(self) -> None:
         self._inner.hold()

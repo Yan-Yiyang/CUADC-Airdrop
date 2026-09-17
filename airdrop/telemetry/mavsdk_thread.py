@@ -506,6 +506,17 @@ class MavsdkThread:
                 tg.create_task(
                     self._optional_stream("wind", self._stream_wind(drone))
                 )
+                tg.create_task(
+                    self._optional_stream(
+                        "mission_progress", self._stream_mission_progress(drone)
+                    )
+                )
+                tg.create_task(
+                    self._optional_stream("flight_mode", self._stream_flight_mode(drone))
+                )
+                tg.create_task(
+                    self._optional_stream("in_air", self._stream_in_air(drone))
+                )
         except* Exception as group:
             LOGGER.warning("遥测采集中断：%s", group.exceptions[0])
 
@@ -535,6 +546,30 @@ class MavsdkThread:
     async def _stream_wind(self, drone: System) -> None:
         async for wind in cast(AsyncIterable[Any], drone.telemetry.wind()):
             self.broker.update_wind(wind)
+
+    async def _stream_mission_progress(self, drone: System) -> None:
+        """任务进度（PX4 ``MISSION_CURRENT``）→ 快照。
+
+        用 ``mission_raw`` 的进度流：任务项走 raw 上传，``mission`` 插件的
+        ``is_mission_finished()`` 只知道它自己上传过的任务，走 raw 之后永远回 False
+        （实测）。状态机读快照里的 ``mission_current/mission_total`` 判断飞完。
+        """
+        async for progress in cast(
+            AsyncIterable[Any], drone.mission_raw.mission_progress()
+        ):
+            self.broker.update_mission_progress(
+                int(progress.current), int(progress.total)
+            )
+
+    async def _stream_flight_mode(self, drone: System) -> None:
+        """飞行模式 → 快照（状态机用它确认"任务真的启动了"，见 models.py）。"""
+        async for mode in cast(AsyncIterable[Any], drone.telemetry.flight_mode()):
+            self.broker.update_flight_mode(mode)
+
+    async def _stream_in_air(self, drone: System) -> None:
+        """是否在空中 → 快照（状态机的"等起飞"门用它）。"""
+        async for in_air in cast(AsyncIterable[Any], drone.telemetry.in_air()):
+            self.broker.update_in_air(in_air)
 
     async def _stream_position(self, drone: System) -> None:
         async for position in cast(AsyncIterable[Any], drone.telemetry.position()):

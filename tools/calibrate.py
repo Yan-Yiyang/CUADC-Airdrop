@@ -2,8 +2,12 @@
 
 用法（输入 = ``FlightRecorder`` 录出的飞行目录，见计划第 6 章）::
 
-    python -m tools.calibrate                 # 用下面 FLIGHT_DIR 常量
-    python -m tools.calibrate --flight <目录>  # 指定目录
+    ./.venv/Scripts/python.exe -m airdrop.run calibrate --flight flights/20260913-185512
+    ./.venv/Scripts/python.exe -m airdrop.run calibrate --help
+
+本文件是**纯库模块**：顶部常量是默认值，:class:`CalibrateConfig` / :func:`build_config`
+/ :func:`main` 都能按关键字覆盖；**命令行解析集中在 `airdrop/run.py`**（本文件不 import
+argparse）。重依赖 ``cv2`` 只在各个真正做标定的函数体内导入，所以 `--help` 不加载 OpenCV。
 
 采集方式（计划第 6 章）
 ----------------------
@@ -49,16 +53,14 @@ FlightRecorder 的标准飞行目录）。
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import math
 from bisect import bisect_left
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-import cv2
 import numpy as np
 
 from airdrop.georef import euler_to_matrix, rotation_x, rotation_y, rotation_z
@@ -78,6 +80,10 @@ SQUARE_SIZE_M = 0.025
 #: 参与内参标定的最少/最多视图数
 MIN_VIEWS = 8
 MAX_VIEWS = 60
+#: 一次标定最多读取多少帧
+MAX_FRAMES = 200
+#: 严格模式：外参/时间差没标出来时返回非 0（默认只警告，照样写文件）
+STRICT = False
 #: 时间差搜索范围（秒）与步长
 LAG_SEARCH_S = 0.5
 LAG_STEP_S = 0.005
@@ -178,6 +184,7 @@ def detect_corners(
     先用 ``findChessboardCornersSB``（更稳、自带亚像素），失败再退回经典
     ``findChessboardCorners`` + ``cornerSubPix``。
     """
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
     gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     found = None
     if hasattr(cv2, "findChessboardCornersSB"):
@@ -226,6 +233,7 @@ def pattern_phase_ok(
 
     阈值取"所有采样点的中值"，所以不依赖绝对灰度（真实照片的曝光差异不影响）。
     """
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
     cols, rows = pattern_size
     centres: list[tuple[float, float, float]] = []
     want_light: list[bool] = []
@@ -278,6 +286,7 @@ def solve_board_poses(
 
     返回与 ``images`` 等长的列表，检不出角点的位置为 ``None``。
     """
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
     poses: list[tuple[np.ndarray, np.ndarray] | None] = []
     previous: np.ndarray | None = None
     for image in images:
@@ -328,6 +337,7 @@ def render_board(
     tile_value: int = 235,
 ) -> np.ndarray:
     '把棋盘格按给定位姿渲染成一张图（用于标定流水线的合成自洽验证）。\n\n    实现方式：在棋盘坐标系里先做一次正投影得到"正视模板"，再用\n    ``cv2.getPerspectiveTransform`` 把模板的四角映射到真实位姿下的四角——\n    对 z=0 平面来说这就是精确的透视变换（不是近似）。'
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
     cols, rows = pattern_size
     tile = int(pixels_per_square)
     # 模板**不带外框边距**：模板边界就是棋盘的物理边界（(cols+1)×(rows+1) 个格子）。
@@ -434,6 +444,7 @@ def look_at_board(
     返回的 ``(rvec, tvec)`` 由 ``cv2.solvePnP`` 在"棋盘格角点 + 这些相机参数"
     上解出，因此**保证与 OpenCV 的投影约定一致**。
     """
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
     cols, rows = pattern_size
     center = np.array(
         [(cols - 1) * square_size / 2.0, (rows - 1) * square_size / 2.0, 0.0]
@@ -472,6 +483,7 @@ def _base_look_down_pose(
     合成图上的棋盘格成为**镜像**，检测出的角点标签整体反序，PnP 于是稳定地落到
     另一个分支上（实测 4 个视图全部差 180°）。别"顺手改成更直观的"写法。
     """
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
     cols, rows = pattern_size
     # 临时相机：主点设在希望板子中心落在的位置，光轴竖直向下（俯视）
     temp = camera_matrix.copy()
@@ -515,6 +527,7 @@ def run_intrinsics(
     points of type Point3f``）。而 :func:`detect_corners` 的 SB 路径给的是 float64，
     所以这里必须显式转 float32——不转的话内参这步会直接失败。
     """
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
     object_points: list[np.ndarray] = []
     image_points: list[np.ndarray] = []
     size: tuple[int, int] | None = None
@@ -1137,6 +1150,7 @@ def lever_arm_report(
 
 
 def _pose_matrix(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
     rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
     matrix = np.eye(4)
     matrix[:3, :3] = rotation
@@ -1156,6 +1170,7 @@ def _pose_matrix_from_rotation(rotation: np.ndarray, translation: Sequence[float
 # ----------------------------------------------------------------------
 def load_flight_frames(flight_dir: Path, limit: int = 200) -> list[np.ndarray]:
     """读飞行目录里的帧（``frames_index.jsonl`` + ``frames/``）。"""
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
     index_path = flight_dir / "frames_index.jsonl"
     if not index_path.is_file():
         raise FileNotFoundError(f"缺少帧索引: {index_path}")
@@ -1210,6 +1225,7 @@ def calibrate(
     max_frames: int = 200,
 ) -> dict[str, Any]:
     """跑完三步，返回可写入 ``camera_calib.json`` 的字典。"""
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
     LOGGER.info("读取标定素材: %s", flight_dir)
     frames = load_flight_frames(flight_dir, max_frames)
     if not frames:
@@ -1382,41 +1398,75 @@ def calibrate(
 _DEFAULT_R_BC_LIST = rotation_z(90.0).tolist()
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+# ----------------------------------------------------------------------
+# 配置与入口（命令行解析在 airdrop/run.py，本文件只暴露库接口）
+# ----------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class CalibrateConfig:
+    """一次标定用到的全部参数（默认值 = 本文件顶部的常量）。"""
+
+    #: 标定采集目录（FlightRecorder 产出）
+    flight_dir: Path = FLIGHT_DIR
+    output_path: Path = OUTPUT_PATH
+    #: 棋盘格内角点数（列, 行）与方格边长（米）
+    pattern_size: tuple[int, int] = PATTERN_SIZE
+    square_size: float = SQUARE_SIZE_M
+    #: 时间差搜索范围与步长（秒）
+    lag_search_s: float = LAG_SEARCH_S
+    lag_step_s: float = LAG_STEP_S
+    #: 最多读取多少帧
+    max_frames: int = MAX_FRAMES
+    #: 严格模式：外参/时间差没标出来时返回非 0（默认只警告，照样写文件）
+    strict: bool = STRICT
+
+
+def build_config(**overrides) -> CalibrateConfig:
+    """按关键字覆盖派生一份标定配置（``dataclasses.replace``；未知字段直接报错）。"""
+    return replace(CalibrateConfig(), **overrides)
+
+
+def main(**overrides) -> int:
+    """跑一次三步标定并写出 JSON；关键字与 :func:`build_config` 一致。
+
+    退出码：0 = 正常写出；2 = ``strict=True`` 且外参或时间差没标出来；1 = 出错（异常抛出）。
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    parser = argparse.ArgumentParser(description="三步相机标定（内参 → 时间差 → 手眼外参）")
-    parser.add_argument("--flight", type=Path, default=FLIGHT_DIR,
-                        help="标定采集的飞行目录（默认取模块常量 FLIGHT_DIR）")
-    parser.add_argument("--out", type=Path, default=OUTPUT_PATH, help="输出 JSON 路径")
-    parser.add_argument("--cols", type=int, default=PATTERN_SIZE[0], help="棋盘格内角点列数")
-    parser.add_argument("--rows", type=int, default=PATTERN_SIZE[1], help="棋盘格内角点行数")
-    parser.add_argument("--square", type=float, default=SQUARE_SIZE_M, help="方格边长（米）")
-    parser.add_argument("--lag-search", type=float, default=LAG_SEARCH_S, help="时间差搜索半径（秒）")
-    parser.add_argument("--lag-step", type=float, default=LAG_STEP_S, help="时间差搜索步长（秒）")
-    parser.add_argument("--max-frames", type=int, default=200, help="最多读取多少帧")
-    args = parser.parse_args(argv)
-
-    flight_dir = Path(args.flight)
+    settings = build_config(**overrides)
+    flight_dir = Path(settings.flight_dir)
     if not flight_dir.is_dir():
-        parser.error(f"飞行目录不存在: {flight_dir}")
+        # 失败要显式：目录不存在直接抛，不静默换个目录
+        raise FileNotFoundError(f"飞行目录不存在: {flight_dir}")
 
     payload = calibrate(
         flight_dir,
-        pattern_size=(args.cols, args.rows),
-        square_size=args.square,
-        lag_search_s=args.lag_search,
-        lag_step_s=args.lag_step,
-        max_frames=args.max_frames,
+        pattern_size=tuple(settings.pattern_size),
+        square_size=settings.square_size,
+        lag_search_s=settings.lag_search_s,
+        lag_step_s=settings.lag_step_s,
+        max_frames=settings.max_frames,
     )
-    out_path = Path(args.out)
+    out_path = Path(settings.output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     LOGGER.info("标定结果已写入 %s", out_path.resolve())
+    if not settings.strict:
+        return 0
+    # 严格模式：把"写进文件的那两处降级"当失败报出来（默认只警告）
+    problems: list[str] = []
+    if payload.get("telemetry_lag") is None:
+        problems.append("画面-遥测时间差没有标出来（telemetry_lag=null）")
+    if payload["meta"].get("extrinsics") is None:
+        problems.append("手眼外参没有标出来（R_bc 用的是默认值）")
+    if problems:
+        for item in problems:
+            LOGGER.error("严格模式判定标定不合格：%s", item)
+        return 2
     return 0
 
 

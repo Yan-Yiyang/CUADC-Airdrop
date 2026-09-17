@@ -11,22 +11,17 @@
 
 重依赖（``ultralytics`` / ``rapidocr`` / ``torch``）都在**使用时**才导入，
 所以 ``import airdrop.perception`` 在没有 GPU 栈的机器上也能成功——离线单测
-依赖这一点。
+依赖这一点。**导出同样是惰性的**（见 :mod:`airdrop._lazy`）：``cropproc`` / ``detector``
+会拉 cv2，第一次取名字时才加载。
 """
 
-from .cropproc import (
-    CropResult,
-    OcrEngine,
-    OcrEngineConfig,
-    OcrOrientation,
-    OcrText,
-    OpenCvPostProcess,
+from .._lazy import lazy_dir, lazy_exports
+
+__getattr__ = lazy_exports(
+    __name__,
+    ("models", "number", "cropproc", "detector", "ocr_worker", "pipeline"),
 )
-from .detector import DetectionBatch, Detector, DetectorConfig
-from .models import Detection, PixelBox
-from .number import OCR_CHAR_MAP, correct_ocr_number
-from .ocr_worker import OcrRequest, OcrResult, OcrWorkerPool, ocr_worker_main, put_drop_oldest
-from .pipeline import PerceptionConfigLike, PerceptionStats, PerceptionWorker
+__dir__ = lazy_dir(__name__)
 
 __all__ = [
     "CropResult",

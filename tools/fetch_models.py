@@ -6,9 +6,12 @@
 版本固定下来（否则某次飞行前模型悄悄换了，识别率变化无法归因），所以约定：
 权重放在 ``models/`` 下，由本脚本从指定来源复制过来，路径写进 ``Config``。
 
-用法（无命令行参数，改下面常量）::
+用法（**命令行解析在 `airdrop/run.py`**）::
 
-    python -m tools.fetch_models
+    ./.venv/Scripts/python.exe -m airdrop.run fetch-models
+    ./.venv/Scripts/python.exe -m airdrop.run fetch-models --source-dir D:\\weights
+
+本文件是**纯库模块**：顶部常量是默认值，:func:`build_config` / :func:`main` 按需覆盖。
 
 来源
 ----
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 # ----------------------------------------------------------------------
@@ -82,13 +86,37 @@ def copy_missing(source: Path, target: Path, names: tuple[str, ...]) -> int:
     return copied
 
 
-def main() -> int:
-    print(f"YOLO 权重源: {SOURCE_DIR}")
-    print(f"OCR  权重源: {SOURCE_OCR_DIR}")
-    print(f"目标目录   : {TARGET_DIR.resolve()}")
+@dataclass(frozen=True, slots=True)
+class FetchConfig:
+    """复制权重用到的路径（默认值 = 本文件顶部的常量）。"""
+
+    source_dir: Path = SOURCE_DIR
+    source_ocr_dir: Path = SOURCE_OCR_DIR
+    target_dir: Path = TARGET_DIR
+    yolo_files: tuple[str, ...] = YOLO_FILES
+    ocr_files: tuple[str, ...] = OCR_FILES
+
+
+def build_config(**overrides) -> FetchConfig:
+    """按关键字覆盖派生一份取权重配置（``dataclasses.replace``）。"""
+    return replace(FetchConfig(), **overrides)
+
+
+def main(**overrides) -> int:
+    """复制缺失的权重；关键字与 :func:`build_config` 一致。返回进程退出码。"""
+    settings = build_config(**overrides)
+    print(f"YOLO 权重源: {settings.source_dir}")
+    print(f"OCR  权重源: {settings.source_ocr_dir}")
+    print(f"目标目录   : {settings.target_dir.resolve()}")
     print()
-    total = copy_missing(SOURCE_DIR, TARGET_DIR, YOLO_FILES)
-    total += copy_missing(SOURCE_OCR_DIR, TARGET_OCR_DIR, OCR_FILES)
+    total = copy_missing(
+        Path(settings.source_dir), Path(settings.target_dir), tuple(settings.yolo_files)
+    )
+    total += copy_missing(
+        Path(settings.source_ocr_dir),
+        Path(settings.target_dir) / "ppocr",
+        tuple(settings.ocr_files),
+    )
     print(f"\n共复制 {total} 个文件")
     if total == 0:
         print("（都已在位，无需复制）")

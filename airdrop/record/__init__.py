@@ -6,26 +6,15 @@
   **原时间轴**重放为可与原架构完全对接的"假实时"视频流与遥测代理
   （详见 :mod:`airdrop.record.replay`）——离线迭代 perception / georef /
   targeting 时，实飞与回放走同一条代码路径。
+
+⚠ **惰性导出**（见 :mod:`airdrop._lazy`）：`import airdrop.record` 只执行本文件。
+``recorder``（帧落盘用 cv2）与 ``replay``（解码用 cv2）都在第一次取名字时才加载。
 """
 
-from .recorder import (
-    DROPS_NAME,
-    DetectionWriter,
-    DropWriter,
-    EventLog,
-    FlightRecorder,
-    RecorderStats,
-)
-from .replay import (
-    FlightLog,
-    FlightLogError,
-    FrameIndexError,
-    FrameRecord,
-    ReplayStats,
-    ReplayVideoSource,
-    TelemetryPacer,
-    load_broker_from_log,
-)
+from .._lazy import lazy_dir, lazy_exports
+
+__getattr__ = lazy_exports(__name__, ("recorder", "replay"))
+__dir__ = lazy_dir(__name__)
 
 __all__ = [
     "DROPS_NAME",

@@ -12,36 +12,16 @@
 ⚠ :class:`~airdrop.config.BallisticsConfig` 里的**质量是称出来的**（台秤实测，不参与反演），
 阻力系数与迎风面积只以 ``Cd·A`` 的乘积影响弹道（单靠落点数据分不开）——固定面积、
 用投放试验反演 Cd，流程见 :mod:`airdrop.ballistics.fit` 与 ``tools/fit_ballistics.py``。
+
+⚠ **惰性导出**（见 :mod:`airdrop._lazy`）：`import airdrop.ballistics` 只执行本文件。
+``drops`` 会间接拉 georef 的 cv2 依赖，所以排在后面——取个 ``BallisticsModel``
+不该顺带加载 OpenCV。
 """
 
-from .drops import (
-    DROPS_NAME,
-    IMPACTS_CSV_NAME,
-    IMPACTS_JSONL_NAME,
-    DropRecord,
-    DropSample,
-    ImpactMeasurement,
-    append_drop,
-    attitude_matrix,
-    load_drops,
-    load_impacts,
-    match_impacts,
-    predict_record_impact,
-    release_conditions,
-    resolve_wind,
-    write_impact_template,
-)
-from .fit import FIT_PARAMETERS, DropResidual, FitConfig, FitResult, fit_ballistics
-from .model import (
-    MAX_FLIGHT_TIME_S,
-    SEA_LEVEL_DENSITY,
-    ZERO_WIND,
-    BallisticsModel,
-    Impact,
-    isa_air_density,
-    wind_from_snapshot,
-)
-from .release import SUMMARY_HZ, ReleaseDecision, ReleaseJudge, heading_unit_vector
+from .._lazy import lazy_dir, lazy_exports
+
+__getattr__ = lazy_exports(__name__, ("model", "release", "drops", "fit"))
+__dir__ = lazy_dir(__name__)
 
 __all__ = [
     "DROPS_NAME",

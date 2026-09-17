@@ -1,0 +1,38 @@
+# routes/ — 操作手的 QGroundControl 航线（`.plan`）
+
+放**在 QGC 里画好、另存为 `.plan`** 的固定翼航线。项目按 `RoutesConfig` 的路径读取它们：
+
+| 文件 | 配置项 | 用途 |
+| --- | --- | --- |
+| `recon.plan` | `RoutesConfig.recon_plan` | 侦查段：整条航线**原样使用**（缺起飞项时只告警，不自动补） |
+| `land.plan` | `RoutesConfig.land_plan` | 飞掠段**之后**的部分（返航 + 降落）：项目把飞掠段插在它**前面**，合成一条任务上传 |
+
+⚠ **一条腿只能二选一**：给了 `.plan` 就不能再配 `recon_route` / `landing_route`（`Config.validated()` 会报错）——让两个来源静默竞争比报错危险得多。
+
+## 怎么存
+
+QGC 里画好航线 → **Save / 另存为** → 选本目录：
+
+## 对文件内容的要求
+
+飞控（PX4 固定翼）会对上传的任务做**可行性检查**，不合规就**整条任务被拒**，而且飞控只会"没有可用任务，盘旋"。本包在规划阶段会照同一套判据**先预检一遍**（`check_fixed_wing_landing`），不合格直接带着原因失败。
+
+1. `vehicleType=1`（固定翼）、`firmwareType=12`（PX4）；
+2. 降落段最后一项是 `NAV_LAND`（`command=21`）；
+3. **`NAV_LAND` 的紧前一项必须严格高于落点**，且
+   `(前项高 − 落点高) / 水平距离 ≤ tan(FW_LND_ANG + 0.1°)`
+   （`FW_LND_ANG` 默认 8° ⇒ 约 0.142；改过飞控参数就把 `RoutesConfig.fw_land_angle_deg` 同步）。
+   例：**20 m 高 / 距落点 300 m** ⇒ 0.067 ✓；**40 m 高 / 距落点 183 m** ⇒ 0.219 ✗ 被判"下滑角过陡"；
+4. 进场点只能是普通航点或 QGC"固定翼降落航线"复杂项里的绕圈下降到高度
+   （`fwLandingPattern`：`DO_LAND_START + NAV_LOITER_TO_ALT + NAV_LAND`，本包会照 QGC 的逻辑展开）；
+5. 其它 QGC 复杂项（VTOL 降落、测绘/结构航线）**不支持**，请改存成普通航点。
+
+## 已验证
+
+2026-09 SITL（PX4 1.17 + `gz_rc_cessna`，`routes/land.plan` 就是本目录里那份）：
+
+```
+状态轨迹: RECON → HOLD_PROCESS → OVERFLY → LAND → DONE
+上传/投放: 2 / 1   判据评估 408 次    ABORT/错误: 0 / 0
+投放触发时预测落点误差 1.35 m（高度 20 m、飞行时间 2.15 s）
+```
