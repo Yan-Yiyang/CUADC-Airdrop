@@ -1,32 +1,30 @@
 """任务主循环：驱动控制器、监视遥测、推进状态机（计划 4.7）。
 
-一条完整任务（Q/计划 1 章）：
+一条完整任务（Q/计划 1 章）::
 
-```
-INIT      等遥测 + NED 原点 → 上传并启动侦查航线
-RECON     侦查航线在飞（约 1 分钟），mission 报飞完为止
-HOLD_PROCESS  hold()（固定翼盘旋）→ 等 targeting 出结果，上限 10s
-              ├─ 有结果 → 目标 NED
-              └─ 无结果 → 备用点（Q11：走同一套弹道判据）
-OVERFLY   上传"飞掠段 + 降落航线"（一条任务，Q13）并启动 → 激活投放判据
-              ├─ 判据触发 → gripper 投放 → LAND
-              └─ 任务飞完仍未投放 → ABORT（显式失败，不静默收工）
-LAND      沿降落航线返航；mission 报飞完 → DONE
-ABORT     下 MissionConfig.abort_action（默认 hold）
-```
+    INIT      等遥测 + NED 原点 → 上传并启动侦查航线
+    RECON     侦查航线在飞（约 1 分钟），mission 报飞完为止
+    HOLD_PROCESS  hold()（固定翼盘旋）→ 等 targeting 出结果，上限 10s
+                  ├─ 有结果 → 目标 NED
+                  └─ 无结果 → 备用点（Q11：走同一套弹道判据）
+    OVERFLY   上传"飞掠段 + 降落航线"（一条任务，Q13）并启动 → 激活投放判据
+                  ├─ 判据触发 → gripper 投放 → LAND
+                  └─ 任务飞完仍未投放 → ABORT（显式失败，不静默收工）
+    LAND      沿降落航线返航；mission 报飞完 → DONE
+    ABORT     下 MissionConfig.abort_action（默认 hold）
 
 设计取舍
 --------
-* **不自己起线程**：:meth:`MissionRunner.run` 是普通循环，调用方决定跑在哪个线程
+* 不自己起线程：:meth:`MissionRunner.run` 是普通循环，调用方决定跑在哪个线程
   （示例里是主线程 + Ctrl-C）；:meth:`update` 可以单拍驱动，测试才可能确定性地跑。
-* **面向协议编程**：控制器只要求满足 :class:`~airdrop.telemetry.MissionController`
+* 面向协议编程：控制器只要求满足 :class:`~airdrop.telemetry.MissionController`
   （离线测试用假控制器），投放判据只要求 :class:`ReleaseJudgeLike`。
-* **完成判定用 MAVSDK 的 ``is_mission_finished()``** 而不是自己解析进度流，但它是
+* 完成判定用 MAVSDK 的 ``is_mission_finished()`` 而不是自己解析进度流，但它是
   请求/响应，新任务刚上传时可能仍回上一次的 ``True`` → 由 :class:`MissionMonitor`
   要求"先见到 False 再见到 True"，避免刚起飞就以为任务飞完了。
-* **失败必须显式**：命令失败、规划失败、链路陈旧、超时 —— 一律进 ``ABORT`` 并写
+* 失败必须显式：命令失败、规划失败、链路陈旧、超时 —— 一律进 ``ABORT`` 并写
   事件日志；不会"假装成功继续跑"。
-* **只有两个时钟来源**：注入的 ``clock``（时间）与 ``sleep``（节拍），测试里换成
+* 只有两个时钟来源：注入的 ``clock``（时间）与 ``sleep``（节拍），测试里换成
   假时钟即可把分钟级的任务压成毫秒级跑完。
 """
 
@@ -35,8 +33,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from ..ballistics.drops import DropRecord
 from ..ballistics.model import wind_from_snapshot
@@ -91,7 +90,7 @@ class ReleaseJudgeLike(Protocol):
     def reset(self) -> None: ...
 
 
-#: HOLD_PROCESS 里读"当前统计结果"的回调（`analyze(points, config.targeting)` 之类）
+#: HOLD_PROCESS 里读"当前统计结果"的回调（analyze(points, config.targeting) 之类）
 TargetResultReader = Callable[[], TargetingResult]
 
 
@@ -101,11 +100,11 @@ _INSTANT_STATES = frozenset({MissionState.PREFLIGHT, MissionState.WAIT_AIRBORNE}
 
 @dataclass
 class MissionMonitor:
-    """跟踪**一次上传任务**的完成情况，对 ``is_mission_finished()`` 的陈旧值免疫。
+    """跟踪一次上传任务的完成情况，对 ``is_mission_finished()`` 的陈旧值免疫。
 
     背景：``is_mission_finished()`` 是请求/响应，飞控（或 mavsdk_server）在新任务刚
-    上传、还没跑起来的那一拍，可能仍回上一次任务留下的 ``True``。判据：**先看到
-    ``False``（任务确实在跑），之后的 ``True`` 才算数**。每上传一次任务换一个新实例
+    上传、还没跑起来的那一拍，可能仍回上一次任务留下的 ``True``。判据：先看到
+    ``False``（任务确实在跑），之后的 ``True`` 才算数。每上传一次任务换一个新实例
     （正常任务都是分钟级，绝不会整段时间都观测不到 ``False``）。
     """
 
@@ -114,7 +113,7 @@ class MissionMonitor:
     true_seen: int = 0
 
     def update(self, finished: bool) -> bool:
-        """喂一拍 ``is_mission_finished()`` 的读数，返回"这次任务是否已完成"。"""
+        """传入一拍 ``is_mission_finished()`` 的读数，返回"这次任务是否已完成"。"""
         if not finished:
             self.armed = True
             self.false_seen += 1
@@ -167,23 +166,23 @@ class MissionRunner:
         :class:`~airdrop.targeting.TargetingResult`；``None`` 表示这架次没有统计来源
         （到点直接走备用点）。
     target_busy:
-        "感知/坐标解算还有没处理的帧"的回调；给了它，处理完且无结果时可以**提前**
+        "感知/坐标解算还有没处理的帧"的回调；给了它，处理完且无结果时可以提前
         结束等待，而不是硬等满 10s。
     release_judge:
         投放判据；``None`` 表示不自动投放（演练/手动投），OVERFLY 会直接进 LAND。
     on_drop:
-        投放记录回调——**指令被飞控接受之后**调一次，拿到的是
+        投放记录回调——指令被飞控接受之后调一次，拿到的是
         :class:`~airdrop.ballistics.drops.DropRecord`（投放瞬间的位置/速度/姿态/风、
-        目标点、判据的前推位置与预测落点）。这条数据事后无法重建，所以要落盘
+        目标点、判据的前推位置与预测落点）。这条数据事后无法重建，所以要写入磁盘
         （实飞接 ``recorder.drops.append``），也是投放试验反演弹道参数的唯一输入。
-        回调抛异常只记日志——**投放已经发生了**，不能因为写不进记录就改变任务状态。
+        回调抛异常只记日志——投放已经发生了，不能因为写不进记录就改变任务状态。
     on_event:
         ``(kind, data)`` 事件回调（状态转移、投放、规划、错误……）。
     clock / sleep:
         注入的时间源与节拍（测试用假时钟）。
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - 依赖全部按协议注入，关键字参数是刻意的可读性
         self,
         config: Config,
         controller: MissionController,
@@ -305,7 +304,7 @@ class MissionRunner:
     def update(self, now: float | None = None) -> MissionState:
         """推进一步（主循环里每拍调一次；测试里手动调）。
 
-        ``PREFLIGHT`` / ``WAIT_AIRBORNE`` 是**瞬时**状态：条件当场就满足时（预检跳过、
+        ``PREFLIGHT`` / ``WAIT_AIRBORNE`` 是瞬时状态：条件当场就满足时（预检跳过、
         飞机已经在空中）允许在同一拍里连续转移，于是"已经起飞"的离线用例仍是一拍进
         ``RECON``；但每一次转移都照常记进历史与事件（不会把两跳藏起来）。
         """
@@ -344,16 +343,14 @@ class MissionRunner:
     # 各状态的一拍
     # ------------------------------------------------------------------
     def _tick_init(self, now: float) -> None:
-        """``INIT``：等遥测与 NED 原点（**不上传任何任务**）→ ``PREFLIGHT``。"""
+        """``INIT``：等遥测与 NED 原点（不上传任何任务）→ ``PREFLIGHT``。"""
         snapshot = self._broker.get_snapshot()
         if not self._has_position(snapshot):
             if self._timed_out(now, self._config.mission.init_max_s):
                 self.abort("init_no_telemetry")
             return
         if self._origin is None:
-            origin = self._query(
-                self._controller.request_origin, "request_origin", default=None
-            )
+            origin = self._query(self._controller.request_origin, "request_origin", default=None)
             if origin is None:
                 if self._timed_out(now, self._config.mission.init_max_s):
                     self.abort("init_no_origin")
@@ -371,7 +368,7 @@ class MissionRunner:
         self._transition(MissionState.PREFLIGHT, "telemetry_ready", now)
 
     def _tick_preflight(self, now: float) -> None:
-        """``PREFLIGHT``：载入模型 + 视频自检（**一次性**，见 :mod:`airdrop.preflight`）。
+        """``PREFLIGHT``：载入模型 + 视频自检（一次性，见 :mod:`airdrop.preflight`）。
 
         * 没有注入预检（离线测试）→ 记一条 ``preflight_skipped`` 事件后放过；
         * 任一项失败（异常或 ``ok=False``）→ ``ABORT("preflight_failed:<check>")``；
@@ -428,20 +425,21 @@ class MissionRunner:
         self.abort(f"preflight_failed:{check}")
 
     def _tick_airborne(self, now: float) -> None:
-        """``WAIT_AIRBORNE``：什么都不下发，等飞机**真的在空中**再进侦查。
+        """``WAIT_AIRBORNE``：什么都不下发，等飞机真的在空中再进侦查。
 
         在停机坪上就进侦查（旧行为）等于让飞机在地面执行任务：PX4 会在起飞前就
         开始"追"第一个航点，或者干脆因为任务不可行而盘旋。
 
-        ``MissionConfig.require_airborne=False`` 是**地面演练/测试的逃生开关**：
-        这道门立即放行，但**绝不静默**——记一条 ``airborne_skipped`` 事件加一条
+        ``MissionConfig.require_airborne=False`` 是地面演练/测试的临时放行开关：
+        该检查立即放行，但绝不静默——记一条 ``airborne_skipped`` 事件加一条
         WARNING 日志（正式任务必须保持 ``True``，否则飞机在停机坪上就会开始侦查）。
         """
         if not self._config.mission.require_airborne:
-            reason = "require_airborne=False（地面演练/测试开关，正式任务不要关）"
+            reason = "require_airborne=False（仅地面演练与离线测试使用，正式任务必须为 True）"
             self._emit("airborne_skipped", {"reason": reason})
             LOGGER.warning(
-                "跳过「等飞机在空中」这道门：%s；本架次在停机坪上也会进侦查", reason
+                "跳过等待起飞（require_airborne=False）：%s；本架次飞机未起飞也会进入侦查",
+                reason,
             )
             self._begin_recon(now, "airborne_skipped")
             return
@@ -466,16 +464,14 @@ class MissionRunner:
         if snapshot.in_air is not None:
             return "in_air" if snapshot.in_air else None
         altitude = snapshot.relative_altitude_m
-        if altitude is not None and float(altitude) >= float(
-            self._config.mission.airborne_alt_m
-        ):
+        if altitude is not None and float(altitude) >= float(self._config.mission.airborne_alt_m):
             return "altitude"
         return None
 
     def _begin_recon(self, now: float, reason: str) -> None:
         """进入侦查：``recon_upload="auto"`` 自己上传并启动，``"operator"`` 等操作手启动。
 
-        正式任务走 ``operator``：**侦查航线由操作手在 QGC 里上传并启动**，本包只等它开始、
+        正式任务走 ``operator``：侦查航线由操作手在 QGC 里上传并启动，本包只等它开始、
         然后监视进度（进度是飞控侧状态，谁上传的都一样能读到）。``auto`` 只用于自动测试。
         """
         flags = self._config.mission
@@ -492,9 +488,7 @@ class MissionRunner:
                 "recon_waiting_operator",
                 {"note": "等操作手在 QGC 上传并启动侦查航线"},
             )
-            LOGGER.info(
-                "侦查航线由操作手上传（mission.recon_upload=operator）：等任务启动后再监视"
-            )
+            LOGGER.info("侦查航线由操作手上传（mission.recon_upload=operator）：等任务启动后再监视")
             self._start_confirmed = False
             self._start_deadline = now + float(self._config.mission.recon_max_s)
         self._monitor = MissionMonitor()
@@ -505,9 +499,7 @@ class MissionRunner:
             return
         if not self._confirm_started(now):
             return
-        finished = self._query(
-            self._controller.mission_finished, "mission_finished", default=False
-        )
+        finished = self._query(self._controller.mission_finished, "mission_finished", default=False)
         if self._monitor.update(bool(finished)):
             self._transition(MissionState.HOLD_PROCESS, "recon_finished", now)
             return
@@ -525,10 +517,7 @@ class MissionRunner:
         if elapsed >= self._config.mission.hold_process_max_s:
             self._finish_hold(now, result, "timeout")
             return
-        if (
-            elapsed >= self._config.mission.hold_process_min_s
-            and not self._busy()
-        ):
+        if elapsed >= self._config.mission.hold_process_min_s and not self._busy():
             self._finish_hold(now, result, "no_target")
 
     def _tick_overfly(self, now: float) -> None:
@@ -545,19 +534,17 @@ class MissionRunner:
                     ground_z=self._ground_z(),
                     now=now,
                 )
-            except Exception as exc:  # noqa: BLE001 - 判据异常按任务失败处理
+            except Exception as exc:  # noqa: BLE001 - 判据异常按任务失败处理，不让主循环带崩
                 self._fail("release_judge", exc)
                 return
             if decision.should_release:
-                # 把判据看到的那份快照一起带过去：投放记录记的是**判据用的同一份状态**，
+                # 把判据看到的那份快照一起带过去：投放记录记的是判据用的同一份状态，
                 # 免得记录与决策之间又插进一拍遥测（那会让残差归因错位）。
                 self._release(now, decision, snapshot)
                 return
-        finished = self._query(
-            self._controller.mission_finished, "mission_finished", default=False
-        )
+        finished = self._query(self._controller.mission_finished, "mission_finished", default=False)
         if self._monitor.update(bool(finished)):
-            # 飞掠+降落整条任务都飞完了却没投出去 —— 这是**失败**，不是"顺利完成"
+            # 飞掠+降落整条任务都飞完了却没投出去 —— 这是失败，不是"顺利完成"
             self.abort("overfly_finished_without_release")
             return
         if self._deadline is not None and now >= self._deadline:
@@ -566,9 +553,7 @@ class MissionRunner:
     def _tick_land(self, now: float) -> None:
         if not self._link_ok(now):
             return
-        finished = self._query(
-            self._controller.mission_finished, "mission_finished", default=False
-        )
+        finished = self._query(self._controller.mission_finished, "mission_finished", default=False)
         if self._monitor.update(bool(finished)):
             self._transition(MissionState.DONE, "mission_finished", now)
             return
@@ -578,9 +563,7 @@ class MissionRunner:
     # ------------------------------------------------------------------
     # HOLD_PROCESS → OVERFLY
     # ------------------------------------------------------------------
-    def _finish_hold(
-        self, now: float, result: TargetingResult | None, reason: str
-    ) -> None:
+    def _finish_hold(self, now: float, result: TargetingResult | None, reason: str) -> None:
         """结束等待：有结果用结果，没有就用备用点（Q11）。"""
         self._target = result
         payload: dict[str, Any] = {
@@ -591,9 +574,7 @@ class MissionRunner:
         self._emit("targeting", payload)
         target_ned = result.ned if (result is not None and result.ok) else None
         try:
-            plan = build_drop_mission(
-                self._config, origin=self._origin, target_ned=target_ned
-            )
+            plan = build_drop_mission(self._config, origin=self._origin, target_ned=target_ned)
         except PlanningError as exc:
             self._fail("plan_drop", exc)
             return
@@ -629,7 +610,7 @@ class MissionRunner:
             )
             return
         self._stats.releases += 1
-        # 投放**已经发生**了，从这里往后任何失败都只记日志：记录写不进去不能改变
+        # 投放已经发生了，从这里往后任何失败都只记日志：记录写不进去不能改变
         # 任务状态（真实世界里的弹已经出去了）。
         self._record_drop(
             decision,
@@ -661,13 +642,12 @@ class MissionRunner:
                     None if decision.predicted is None else decision.predicted.ned
                 ),
                 predicted_flight_time_s=(
-                    None if decision.predicted is None
-                    else decision.predicted.flight_time_s
+                    None if decision.predicted is None else decision.predicted.flight_time_s
                 ),
                 predicted_error_m=decision.horizontal_error_m,
                 ballistics=self._config.ballistics,
             )
-        except Exception as exc:  # noqa: BLE001 - 记录失败不能改变任务状态
+        except Exception as exc:
             LOGGER.exception("投放记录失败（任务继续，投放已发生）")
             self._emit(
                 "error",
@@ -683,13 +663,11 @@ class MissionRunner:
         if self._on_drop is not None:
             try:
                 self._on_drop(record)
-            except Exception:  # noqa: BLE001 - 同上
+            except Exception:
                 LOGGER.exception("投放记录回调失败（任务继续）")
 
-    def _resolve_wind(
-        self, snapshot: TelemetrySnapshot
-    ) -> tuple[float, float, float] | None:
-        """记录里存的风：取不到就存 None（**不写 0**，见 ballistics.model 的说明）。"""
+    def _resolve_wind(self, snapshot: TelemetrySnapshot) -> tuple[float, float, float] | None:
+        """记录里存的风：取不到就存 None（不写 0，见 ballistics.model 的说明）。"""
         return wind_from_snapshot(snapshot, self._config.ballistics)
 
     # ------------------------------------------------------------------
@@ -705,9 +683,7 @@ class MissionRunner:
             if self._judge is not None:
                 self._judge.reset()
             else:
-                LOGGER.warning(
-                    "没有投放判据（release_judge=None）：本架次只飞航线、不自动投放"
-                )
+                LOGGER.warning("没有投放判据（release_judge=None）：本架次只飞航线、不自动投放")
                 self._emit("drop_skipped", {"reason": "no_judge"})
                 self._transition(MissionState.LAND, "no_release_judge", now)
         elif state is MissionState.ABORT:
@@ -741,9 +717,7 @@ class MissionRunner:
         self._entered_at = now
         self._on_enter(to_state, now)
 
-    def _upload_and_start(
-        self, items: Sequence[MissionItem], leg: str
-    ) -> bool:
+    def _upload_and_start(self, items: Sequence[MissionItem], leg: str) -> bool:
         """上传并启动一条任务；失败返回 False（已进 ABORT）。"""
         try:
             count = self._controller.upload_mission(items)
@@ -763,13 +737,13 @@ class MissionRunner:
     def _confirm_started(self, now: float) -> bool:
         """确认"任务真的在跑"：飞控进了任务模式。
 
-        为什么必须有这一步：``mission.start_mission()`` 回成功**不等于**进了任务模式
+        为什么必须有这一步：``mission.start_mission()`` 回成功不等于进了任务模式
         ——飞控可能拒绝模式切换却仍然回 ACK，飞机继续盘旋。2026-09 SITL 演练里因此
-        白等了 15 分钟才被状态超时抓出来。这里给它一个短的确认窗口
+        空等了 15 分钟才被状态超时抓出来。这里给它一个短的确认窗口
         （``MissionConfig.mission_start_timeout_s``），超时按显式失败处理。
 
-        模式流不可用时（``flight_mode`` 为 ``None``）**退化为不做确认**并只记一次日志：
-        宁可退回旧行为，也不要因为拿不到模式就把任务判失败。
+        模式流不可用时（``flight_mode`` 为 ``None``）退化为不做确认并只记一次日志：
+        宁可退回旧行为，也不要因为取不到模式就把任务判失败。
         """
         if self._start_confirmed:
             return True
@@ -778,9 +752,7 @@ class MissionRunner:
         except ControllerError as exc:
             if "flight_mode" not in self._query_reported:
                 self._query_reported.add("flight_mode")
-                LOGGER.warning(
-                    "拿不到飞行模式（%s），本次不做「任务真的启动了」的确认", exc
-                )
+                LOGGER.warning("读不到飞行模式（%s），本次不确认任务是否真的启动", exc)
             self._start_confirmed = True
             self._start_deadline = None
             return True
@@ -802,15 +774,13 @@ class MissionRunner:
             self._fail(where, exc)
             return None
 
-    def _query(
-        self, call: Callable[[], Any], where: str, *, default: Any
-    ) -> Any:
+    def _query(self, call: Callable[[], Any], where: str, *, default: Any) -> Any:
         """查询类调用：失败只记日志并返回 ``default``。
 
         链路真断了会被 :meth:`_link_ok` 的看门狗抓出来（遥测陈旧 → ABORT），
         所以这里不必再叠一层计数——状态自身的超时上限是最后的兜底。
 
-        ⚠ 失败按 ``where`` **只报一次**：查询是每拍都调的（20Hz），
+        ⚠ 失败按 ``where`` 只报一次：查询是每拍都调的（20Hz），
         一个持续失败（比如飞控一直拒绝回 ``is_mission_finished``）会把日志和
         事件刷爆，反而盖住真正的原因。
         """
@@ -820,15 +790,13 @@ class MissionRunner:
             if where not in self._query_reported:
                 self._query_reported.add(where)
                 LOGGER.warning("%s 查询失败：%s", where, exc)
-                self._emit(
-                    "error", {"module": "mission", "where": where, "message": str(exc)}
-                )
+                self._emit("error", {"module": "mission", "where": where, "message": str(exc)})
             else:
                 LOGGER.debug("%s 查询仍然失败：%s", where, exc)
             return default
 
     def _fail(self, where: str, exc: BaseException) -> None:
-        """命令/规划失败：记事件 + 计数 + 进 ABORT（**不吞**）。"""
+        """命令/规划失败：记事件 + 计数 + 进 ABORT（不吞）。"""
         self._stats.errors += 1
         LOGGER.error("任务失败（%s）：%s", where, exc)
         self._emit("error", {"module": "mission", "where": where, "message": str(exc)})
@@ -855,7 +823,7 @@ class MissionRunner:
             return None
         try:
             return self._target_result()
-        except Exception as exc:  # noqa: BLE001 - 统计失败不该把状态机带崩
+        except Exception as exc:
             if not self._target_error_logged:
                 self._target_error_logged = True
                 self._stats.errors += 1
@@ -876,7 +844,7 @@ class MissionRunner:
             return False
         try:
             return bool(self._target_busy())
-        except Exception:  # noqa: BLE001 - 同 _read_result
+        except Exception:  # noqa: BLE001 - 目标回调异常一律视为「还没好」
             return False
 
     def _ground_z(self) -> float:
@@ -894,8 +862,7 @@ class MissionRunner:
     @staticmethod
     def _has_position(snapshot: TelemetrySnapshot) -> bool:
         return all(
-            value is not None
-            for value in (snapshot.north_m, snapshot.east_m, snapshot.down_m)
+            value is not None for value in (snapshot.north_m, snapshot.east_m, snapshot.down_m)
         )
 
     def _timed_out(self, now: float, limit: float) -> bool:

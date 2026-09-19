@@ -28,14 +28,22 @@ import logging
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from airdrop.config import BallisticsConfig, Config, DropConfig
+
+if TYPE_CHECKING:
+    # 标注用的类型（`from __future__ import annotations` 下运行时不求值）。
+    # 真正的运行期导入仍在函数体内——`airdrop.ballistics` 会间接拉 georef（cv2），
+    # 见上面 _LAZY 那条约定。
+    from airdrop.ballistics import DropSample, FitConfig, FitResult
 
 LOGGER = logging.getLogger("fit_ballistics")
 
 #: 惰性导入标记（见模块 docstring）：`airdrop.ballistics` 的 drops 会间接拉 georef（cv2），
 #: 所以只在真正反演的函数体内导入——`python -m airdrop.run fit-ballistics --help` 不加载它。
 _LAZY = "from airdrop.ballistics import ...  # 惰性：重依赖，见模块 docstring"
+
 
 # ----------------------------------------------------------------------
 # 配置（改这里）
@@ -128,7 +136,6 @@ def load_samples(
     ``"<架次目录名>#<序号>"``，跨架次也不会混。
     """
     from airdrop.ballistics import (  # 惰性：见模块 docstring
-        DropSample,
         load_drops,
         load_impacts,
         match_impacts,
@@ -145,9 +152,9 @@ def load_samples(
     for item in chosen:
         drops_path = _drops_path(Path(item.path))
         records = load_drops(drops_path)
-        impacts_path = (
-            None if item.impacts is None else Path(item.impacts)
-        ) or _auto_impacts(drops_path)
+        impacts_path = (None if item.impacts is None else Path(item.impacts)) or _auto_impacts(
+            drops_path
+        )
         measurements = () if impacts_path is None else load_impacts(impacts_path)
         if impacts_path is None:
             missing_files.append(drops_path)
@@ -161,9 +168,7 @@ def load_samples(
             "impacts": None if impacts_path is None else str(impacts_path),
         }
         ledger.append(entry)
-        samples.extend(
-            replace(sample, label=f"{label}#{sample.index}") for sample in matched
-        )
+        samples.extend(replace(sample, label=f"{label}#{sample.index}") for sample in matched)
     return tuple(samples), ledger, missing_files
 
 
@@ -177,14 +182,18 @@ def describe(
     by_name = {sample.name: sample for sample in samples}
     lines: list[str] = []
     lines.append("")
-    lines.append("投放 / 序号            高度m   速度m/s  航向°  风(m/s)      判据误差m  反演后误差m  沿/横(m)")
+    lines.append(
+        "投放 / 序号            高度m   速度m/s  航向°  风(m/s)      判据误差m  反演后误差m  沿/横(m)"
+    )
     lines.append("-" * 104)
     for item in result.per_drop:
         sample = by_name.get(item.label)
         record = None if sample is None else sample.record
         judged = None if record is None else record.predicted_error_m
-        wind = "" if record is None or record.wind_ned is None else (
-            f"{record.wind_ned[0]:+.1f}/{record.wind_ned[1]:+.1f}"
+        wind = (
+            ""
+            if record is None or record.wind_ned is None
+            else (f"{record.wind_ned[0]:+.1f}/{record.wind_ned[1]:+.1f}")
         )
         lines.append(
             "{label:<22} {alt:6.1f} {speed:8.1f} {heading:6.1f}  {wind:<11} "
@@ -192,7 +201,8 @@ def describe(
                 label=item.label[:22],
                 alt=0.0 if record is None else record.height_agl_m,
                 speed=0.0 if record is None else record.horizontal_speed_m_s,
-                heading=float("nan") if record is None or record.heading_deg is None
+                heading=float("nan")
+                if record is None or record.heading_deg is None
                 else record.heading_deg,
                 wind=wind,
                 judged="—" if judged is None else f"{judged:.3f}",
@@ -210,16 +220,14 @@ def describe(
         value = result.parameters.get(name, float("nan"))
         sigma = result.sigma.get(name)
         lines.append(
-            f"  {name:<20} = {value:.6g}"
-            + ("" if sigma is None else f"  ± {sigma:.3g} (1σ)")
+            f"  {name:<20} = {value:.6g}" + ("" if sigma is None else f"  ± {sigma:.3g} (1σ)")
         )
     if result.drag_k_per_m is not None:
         # 数据识别到的**只有一个数**：κ = Cd·A/m。Cd·A 是"给定实测质量"后的换算量。
         area = result.ballistics.cross_area_m2
         mass = result.ballistics.mass_kg
         lines.append(
-            f"  识别量 κ = Cd·A/m     = {result.drag_k_per_m:.6g} 1/m"
-            "（数据只识别这一个数）"
+            f"  识别量 κ = Cd·A/m     = {result.drag_k_per_m:.6g} 1/m（数据只识别这一个数）"
         )
         lines.append(
             f"    ⇒ 按**实测**质量 {mass:g} kg 换算：Cd·A = {result.drag_area_m2:.6g} m²"
@@ -232,7 +240,7 @@ def describe(
         )
         lines.append(
             "    ⚠ 质量填错多少，Cd 与 Cd·A 就跟着错多少（κ 不变）；"
-            f"换配重 m' 时按 κ' = Cd·A/m' 重算，不必重做试验"
+            "换配重 m' 时按 κ' = Cd·A/m' 重算，不必重做试验"
         )
     if result.correlation:
         names = list(result.fitted)
@@ -261,9 +269,7 @@ def describe(
             f"最大 {result.leave_one_out_max_m:.3f} m"
         )
     verdict = (
-        "可信 → 可以按下面的参数回填配置"
-        if result.reliable
-        else "不可信 → 别回填，先看 warnings"
+        "可信 → 可以按下面的参数回填配置" if result.reliable else "不可信 → 别回填，先看 warnings"
     )
     lines.append(f"  结论：ok={result.ok} reliable={result.reliable}：{verdict}")
     if result.reason:
@@ -397,7 +403,6 @@ def main(
     """
     from airdrop.ballistics import (  # 惰性：见模块 docstring
         IMPACTS_JSONL_NAME,
-        FitConfig,
         fit_ballistics,
         load_drops,
         write_impact_template,
@@ -412,7 +417,7 @@ def main(
     settings = fit_config or build_config(**fit_overrides)
     if flights is None:
         flights = flight_inputs(drops=drops, impacts=impacts)
-    if len([name for name in settings.fitted_names]) == 0:
+    if len(settings.fitted_names) == 0:
         print("配置里没有选中任何要拟合的参数（FIT_* 全为 False）", file=sys.stderr)
         return 1
 
@@ -444,17 +449,11 @@ def main(
         return 3
 
     result = fit_ballistics(samples, settings)
-    print(
-        describe(
-            result, samples, max_condition_number=settings.max_condition_number
-        )
-    )
+    print(describe(result, samples, max_condition_number=settings.max_condition_number))
 
     report = build_report(result, samples, ledger)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    target.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[报告] {target}")
     print("[回填] 把下面这段抄进配置（airdrop/config.py 的默认值或 examples 里的装配处）：")
     print(config_snippet(result))

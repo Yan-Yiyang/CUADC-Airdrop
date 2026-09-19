@@ -8,8 +8,8 @@ pipeline 的 detector / pool 都是构造注入的，这里正是为了可测性
 
 from __future__ import annotations
 
-import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -83,9 +83,9 @@ def test_correct_ocr_number_maps_confusable_letters_in_words() -> None:
     保留**：那张映射表是实测调出来的，改它就得重新验证所有历史识别结果。
     真正的把关在别处——OCR 置信度阈值 + 像素边长区间 + 后续的跨帧投票。
     """
-    assert correct_ocr_number("abc") == 6      # b→6
-    assert correct_ocr_number("oo") == 0       # o→0
-    assert correct_ocr_number("sl") == 51      # s→5, l→1
+    assert correct_ocr_number("abc") == 6  # b→6
+    assert correct_ocr_number("oo") == 0  # o→0
+    assert correct_ocr_number("sl") == 51  # s→5, l→1
 
 
 def test_two_digit_results_are_not_truncated() -> None:
@@ -108,7 +108,7 @@ def test_pixel_box_basics() -> None:
 
 def test_pixel_box_expand_and_clip() -> None:
     box = PixelBox(10, 20, 40, 60)
-    expanded = box.expanded(0.2)     # 外扩 20%
+    expanded = box.expanded(0.2)  # 外扩 20%
     assert expanded.x1 == pytest.approx(7.0)
     assert expanded.x2 == pytest.approx(43.0)
     clipped = PixelBox(-5, -5, 200, 300).clipped(100, 100)
@@ -137,7 +137,7 @@ def _pentagon_approx(angle_deg: float = 0.0) -> np.ndarray:
     """
     side = 60.0
     half = side / 2.0
-    tri = side * 0.8660254037844386          # 等边三角形的高 = 边长·√3/2
+    tri = side * 0.8660254037844386  # 等边三角形的高 = 边长·√3/2
     x0, y0 = 70.0, 90.0
     cx = x0 + half
     apex = [cx, y0 - tri]
@@ -149,8 +149,7 @@ def _pentagon_approx(angle_deg: float = 0.0) -> np.ndarray:
     pts = np.array([apex, tl, bl, br, tr], dtype=np.float64)
     if angle_deg:
         theta = np.radians(angle_deg)
-        rot = np.array([[np.cos(theta), -np.sin(theta)],
-                        [np.sin(theta), np.cos(theta)]])
+        rot = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
         center = np.array([cx, y0 + half])
         pts = (pts - center) @ rot.T + center
     return pts.reshape(-1, 1, 2)
@@ -166,9 +165,7 @@ def test_find_apex_by_parallel_finds_triangle_tip() -> None:
 
 
 def test_find_apex_by_parallel_rejects_non_pentagon() -> None:
-    square = np.array(
-        [[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float64
-    ).reshape(-1, 1, 2)
+    square = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float64).reshape(-1, 1, 2)
     apex, pair, diff = OpenCvPostProcess._find_apex_by_parallel(square)
     assert apex is None and pair is None
 
@@ -179,9 +176,9 @@ def _square_with_noise_corner() -> np.ndarray:
     这就是实测帧 1840 在 ``s_min=100`` 上撞到的情形——``approxPolyDP`` 把一块
     编号底板凑成 5 个顶点，`_find_apex_by_parallel` 照样能找出一对平行边。
     """
-    return np.array(
-        [[0, 0], [30, 3], [60, 0], [60, 60], [0, 60]], dtype=np.float64
-    ).reshape(-1, 1, 2)
+    return np.array([[0, 0], [30, 3], [60, 0], [60, 60], [0, 60]], dtype=np.float64).reshape(
+        -1, 1, 2
+    )
 
 
 def test_is_house_pentagon_accepts_the_target_shape() -> None:
@@ -210,7 +207,7 @@ def test_best_candidate_prefers_house_shape_over_confidence() -> None:
     post = OpenCvPostProcess(color="blue")
     probe = np.zeros((10, 10, 3), np.uint8)
     empty = CropResult(None, -1.0, None, "", 0.0, stage="none")
-    fake = [(5.0, 5.0, "95", 1.0)]          # 假房子读出来的（置信度更高）
+    fake = [(5.0, 5.0, "95", 1.0)]  # 假房子读出来的（置信度更高）
     real = [(5.0, 5.0, "56", 0.9)]
 
     picked = post._best_candidate(
@@ -236,12 +233,22 @@ def test_best_candidate_still_compares_confidence_without_house() -> None:
     probe = np.zeros((10, 10, 3), np.uint8)
     empty = CropResult(None, -1.0, None, "", 0.0, stage="none")
     low = post._best_candidate(
-        [(5.0, 5.0, "12", 0.7)], 10.0, probe, empty,
-        saturation_level=100, stage="parallel", house_ok=False,
+        [(5.0, 5.0, "12", 0.7)],
+        10.0,
+        probe,
+        empty,
+        saturation_level=100,
+        stage="parallel",
+        house_ok=False,
     )
     high = post._best_candidate(
-        [(5.0, 5.0, "56", 0.95)], 10.0, probe, low,
-        saturation_level=40, stage="min_angle", house_ok=False,
+        [(5.0, 5.0, "56", 0.95)],
+        10.0,
+        probe,
+        low,
+        saturation_level=40,
+        stage="min_angle",
+        house_ok=False,
     )
     assert high.number == 56 and high.saturation_level == 40
 
@@ -259,9 +266,7 @@ def test_parallel_rectify_angle_makes_parallel_edges_vertical() -> None:
         e1 = OpenCvPostProcess._edge_angle_deg(pts[pair[0]], pts[(pair[0] + 1) % n])
         # 旋转后（α_after = α - row）边方向应当竖直
         after = (e1 - row) % 180.0
-        assert abs(after - 90.0) < 1e-6, (
-            f"angle={angle}: 转正后平行边方向 {after} 不是竖直"
-        )
+        assert abs(after - 90.0) < 1e-6, f"angle={angle}: 转正后平行边方向 {after} 不是竖直"
 
 
 def test_find_apex_by_parallel_reports_the_pair() -> None:
@@ -276,9 +281,7 @@ def test_find_apex_by_parallel_reports_the_pair() -> None:
     assert pair == (1, 3), f"平行边对应当是正方形的两条对边(1 与 3)，实际 {pair}"
     assert diff == pytest.approx(0.0, abs=1e-6)
     # 顶角就是 apex 顶点本身
-    assert np.allclose(
-        apex, [100.0, 90.0 - 60.0 * 0.8660254037844386], atol=1e-6
-    )
+    assert np.allclose(apex, [100.0, 90.0 - 60.0 * 0.8660254037844386], atol=1e-6)
 
 
 # 关于"转正后顶点朝哪边"：不在合成数据上断言。目标形态（三角形朝向相对正方形
@@ -314,7 +317,7 @@ def test_pentagon_interior_angles() -> None:
     assert got["tr"] == pytest.approx(150.0, abs=1e-6)
     assert got["br"] == pytest.approx(90.0, abs=1e-6)
     assert got["bl"] == pytest.approx(90.0, abs=1e-6)
-    assert sum(got.values()) == pytest.approx(540.0, abs=1e-6)   # (5-2)·180
+    assert sum(got.values()) == pytest.approx(540.0, abs=1e-6)  # (5-2)·180
 
 
 def test_find_min_angle_accepts_standard_pentagon() -> None:
@@ -365,11 +368,16 @@ def test_rotate_img_keeps_target_visible() -> None:
 # ----------------------------------------------------------------------
 # 候选合并
 # ----------------------------------------------------------------------
-def _text(text: str, cx: float, cy: float, w: float = 20.0, h: float = 30.0,
-          score: float = 0.9) -> OcrText:
+def _text(
+    text: str, cx: float, cy: float, w: float = 20.0, h: float = 30.0, score: float = 0.9
+) -> OcrText:
     box = np.array(
-        [[cx - w / 2, cy - h / 2], [cx + w / 2, cy - h / 2],
-         [cx + w / 2, cy + h / 2], [cx - w / 2, cy + h / 2]],
+        [
+            [cx - w / 2, cy - h / 2],
+            [cx + w / 2, cy - h / 2],
+            [cx + w / 2, cy + h / 2],
+            [cx - w / 2, cy + h / 2],
+        ],
         dtype=np.float64,
     )
     return OcrText(box=box, text=text, score=score)
@@ -409,9 +417,7 @@ def test_ocr_engine_reports_missing_models() -> None:
 
 def test_postprocess_unavailable_engine_returns_empty_result() -> None:
     """引擎不可用时 recognize 必须返回"没读出"，而不是抛异常。"""
-    post = OpenCvPostProcess(
-        color="blue", engine_config=OcrEngineConfig(model_dir="models/nope")
-    )
+    post = OpenCvPostProcess(color="blue", engine_config=OcrEngineConfig(model_dir="models/nope"))
     result = post.recognize(np.full((64, 64, 3), 100, np.uint8))
     assert result.number is None
     assert result.raw_text == ""
@@ -430,8 +436,7 @@ def test_postprocess_empty_image_is_safe() -> None:
 
 
 def test_engine_config_paths() -> None:
-    config = OcrEngineConfig(model_dir="m", det_model="d.pth", rec_model="r.pth",
-                             rec_keys="k.txt")
+    config = OcrEngineConfig(model_dir="m", det_model="d.pth", rec_model="r.pth", rec_keys="k.txt")
     assert config.det_path() == Path("m/d.pth")
     assert config.rec_path() == Path("m/r.pth")
     assert config.keys_path() == Path("m/k.txt")
@@ -448,7 +453,7 @@ class _FakeEngineType:
 
 
 def _cls_params(config: OcrEngineConfig) -> dict:
-    return OcrEngine(config)._cls_params(_FakeEngineType)  # noqa: SLF001 - 就是要测它
+    return OcrEngine(config)._cls_params(_FakeEngineType)
 
 
 def test_cls_engine_selects_engine_and_model() -> None:
@@ -478,12 +483,16 @@ def test_cls_engine_rejects_unknown_name() -> None:
 
 def test_cls_config_paths_follow_engine() -> None:
     config = OcrEngineConfig(model_dir="m", cls_engine="torch")
-    assert config.cls_path() == config.cls_torch_path() == Path(
-        "m/ch_ptocr_mobile_v2.0_cls_mobile.pth"
+    assert (
+        config.cls_path()
+        == config.cls_torch_path()
+        == Path("m/ch_ptocr_mobile_v2.0_cls_mobile.pth")
     )
     config = OcrEngineConfig(model_dir="m", cls_engine="onnx")
-    assert config.cls_path() == config.cls_onnx_path() == Path(
-        "m/ch_ppocr_mobile_v2.0_cls_mobile.onnx"
+    assert (
+        config.cls_path()
+        == config.cls_onnx_path()
+        == Path("m/ch_ppocr_mobile_v2.0_cls_mobile.onnx")
     )
     assert config.cls_enabled() and not OcrEngineConfig(cls_engine="off").cls_enabled()
 
@@ -529,7 +538,6 @@ def test_detector_undistort_is_skipped_without_camera_matrix() -> None:
 
 
 def test_detector_prepares_remap_for_matrix() -> None:
-    import cv2
 
     detector = Detector(
         DetectorConfig(
@@ -603,8 +611,12 @@ def test_detector_crop_clips_at_border() -> None:
     detector = Detector(DetectorConfig())
     image = np.zeros((50, 50, 3), np.uint8)
     detection = Detection(
-        frame_index=1, capture_timestamp=1.0, pixel=(0.0, 0.0),
-        box=PixelBox(0, 0, 4, 4), confidence=0.9, telemetry=TelemetrySnapshot(),
+        frame_index=1,
+        capture_timestamp=1.0,
+        pixel=(0.0, 0.0),
+        box=PixelBox(0, 0, 4, 4),
+        confidence=0.9,
+        telemetry=TelemetrySnapshot(),
     )
     batch = DetectionBatch(image=image, detections=(detection,))
     crop = detector.crop(batch, detection)
@@ -655,8 +667,16 @@ class _FakeDetector:
     def load(self) -> "_FakeDetector":
         return self
 
-    def detect(self, image, *, frame_index=0, capture_timestamp=0.0,
-               telemetry=None, mode="", undistort=None):
+    def detect(
+        self,
+        image,
+        *,
+        frame_index=0,
+        capture_timestamp=0.0,
+        telemetry=None,
+        mode="",
+        undistort=None,
+    ):
         from airdrop.perception.detector import DetectionBatch
 
         self.calls.append(frame_index)
@@ -670,7 +690,7 @@ class _FakeDetector:
                 confidence=0.9 - 0.1 * i,
                 telemetry=snapshot,
                 # cls12：类别直出编号（类别 0 → 1 起编号）
-                code=(int(0) + 1) if mode == "cls12" else None,
+                code=(0 + 1) if mode == "cls12" else None,
                 mode=mode,
             )
             for i in range(self.detections_per_frame)
@@ -684,8 +704,7 @@ class _FakeDetector:
 class _FakePool:
     """同步返回结果的假 OCR 池（在 submit 时就生成结果，便于确定性断言）。"""
 
-    def __init__(self, numbers: list[int | None] | None = None,
-                 side_px: float = 120.0) -> None:
+    def __init__(self, numbers: Sequence[int | None] | None = None, side_px: float = 120.0) -> None:
         self.numbers = list(numbers or [])
         self.side_px = side_px
         self.submitted: list[tuple[int, float, float]] = []
@@ -703,11 +722,15 @@ class _FakePool:
 
     @property
     def stats(self) -> dict[str, int]:
-        return {"submitted": len(self.submitted), "dropped": self._dropped,
-                "results": self._next, "workers": 1, "pending": 0}
+        return {
+            "submitted": len(self.submitted),
+            "dropped": self._dropped,
+            "results": self._next,
+            "workers": 1,
+            "pending": 0,
+        }
 
-    def submit(self, crop, *, frame_index: int, capture_timestamp: float,
-               payload=None) -> int:
+    def submit(self, crop, *, frame_index: int, capture_timestamp: float, payload=None) -> int:
         self._next += 1
         number = self.numbers.pop(0) if self.numbers else None
         self.submitted.append((frame_index, capture_timestamp, self._next))
@@ -857,7 +880,7 @@ def test_pipeline_dedupe_allows_distinct_targets() -> None:
 def test_pipeline_drops_invalid_side_length() -> None:
     """像素边长超出有效区间 → 编号作废（但仍产出该检测，供解算参考）。"""
     buffer = _buffer_with(1)
-    pool = _FakePool(numbers=[42], side_px=5.0)   # 5px < min_side_px=10
+    pool = _FakePool(numbers=[42], side_px=5.0)  # 5px < min_side_px=10
     worker = PerceptionWorker(
         PerceptionConfigLike(mode="ocr", min_side_px=10.0, max_side_px=400.0),
         buffer=buffer,

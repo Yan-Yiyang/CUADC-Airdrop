@@ -3,17 +3,17 @@
 * :mod:`~airdrop.ballistics.model`：RK4 定步长积分 → 落点与飞行时间（含 ISA 空气密度、
   风平移）；
 * :mod:`~airdrop.ballistics.release`：:class:`ReleaseJudge`——每拍预测落点，距离 ≤ 半径
-  即投；越过目标保底投放；一次投放即锁存。
-* :mod:`~airdrop.ballistics.drops`：:class:`DropRecord`——**投放瞬间**的位置/速度/姿态/
-  风/预测落点（事后无法重建，所以实飞必须落盘），以及实测落点的读取与配对；
+  即投；越过目标后强制投放；一次投放即锁存。
+* :mod:`~airdrop.ballistics.drops`：:class:`DropRecord`——投放瞬间的位置/速度/姿态/
+  风/预测落点（事后无法重建，所以实飞必须写入磁盘），以及实测落点的读取与配对；
 * :mod:`~airdrop.ballistics.fit`：:func:`fit_ballistics`——用投放试验的"投放状态 +
   实测落点"反演弹道参数，并给出可辨识性诊断（退化/相关/留一验证）。
 
-⚠ :class:`~airdrop.config.BallisticsConfig` 里的**质量是称出来的**（台秤实测，不参与反演），
+⚠ :class:`~airdrop.config.BallisticsConfig` 里的质量是称出来的（台秤实测，不参与反演），
 阻力系数与迎风面积只以 ``Cd·A`` 的乘积影响弹道（单靠落点数据分不开）——固定面积、
 用投放试验反演 Cd，流程见 :mod:`airdrop.ballistics.fit` 与 ``tools/fit_ballistics.py``。
 
-⚠ **惰性导出**（见 :mod:`airdrop._lazy`）：`import airdrop.ballistics` 只执行本文件。
+⚠ 惰性导出（见 :mod:`airdrop._lazy`）：import airdrop.ballistics 只执行本文件。
 ``drops`` 会间接拉 georef 的 cv2 依赖，所以排在后面——取个 ``BallisticsModel``
 不该顺带加载 OpenCV。
 """

@@ -57,7 +57,7 @@ class TelemetrySnapshot:
     origin_longitude_deg: float | None = None
     origin_altitude_m: float | None = None
 
-    # 风估计（NED，单位：米/秒）——来自 MAVSDK ``telemetry.wind()`` 的**可选**流，
+    # 风估计（NED，单位：米/秒）——来自 MAVSDK ``telemetry.wind()`` 的可选流，
     # 飞控没有风估计时一直是 None（投放判据会降级成零风并记日志，见 ballistics）。
     wind_north_m_s: float | None = None
     wind_east_m_s: float | None = None
@@ -93,9 +93,7 @@ class TelemetrySnapshot:
         self.origin_longitude_deg = float(origin.longitude_deg)
         self.origin_altitude_m = float(origin.altitude_m)
 
-    def update_local_position_velocity(
-        self, position_ned: Any, velocity_ned: Any
-    ) -> None:
+    def update_local_position_velocity(self, position_ned: Any, velocity_ned: Any) -> None:
         """从 MAVSDK ``PositionNed`` 和 ``VelocityNed`` 对象复制字段。"""
         self.north_m = float(position_ned.north_m)
         self.east_m = float(position_ned.east_m)
@@ -124,7 +122,7 @@ class TelemetrySnapshot:
     def update_mission_progress(self, current: int, total: int) -> None:
         """任务进度（PX4 ``MISSION_CURRENT``）。
 
-        ⚠ 语义来自 MAVSDK：``current`` 是**0 基**的任务项下标，``current == total``
+        ⚠ 语义来自 MAVSDK：``current`` 是0 基的任务项下标，``current == total``
         表示任务飞完。任务项一律走 ``mission_raw`` 上传，所以进度也只能从这里来——
         MAVSDK ``mission`` 插件的 ``is_mission_finished()`` 依赖它自己上传过的任务，
         走 raw 之后它对任务一无所知（实测：飞控已 "Mission finished, loitering"，
@@ -136,7 +134,7 @@ class TelemetrySnapshot:
     def update_flight_mode(self, mode: Any) -> None:
         """飞行模式（MAVSDK ``FlightMode`` 枚举）→ 字符串名字。
 
-        ⚠ **``start_mission()`` 回成功不等于进了任务模式**：飞控可能拒绝模式切换而
+        ⚠ ``start_mission()`` 回成功不等于进了任务模式：飞控可能拒绝模式切换而
         只发 ACK（实测：``mission.start_mission()`` 不抛异常，模式却停在 ``HOLD``，
         导航器随后打印 ``No valid mission available, loitering``）。状态机靠这个字段
         做"真的进了 MISSION"的正向确认（见 :meth:`MissionRunner._tick_recon`）。
@@ -146,7 +144,7 @@ class TelemetrySnapshot:
     def update_in_air(self, in_air: Any) -> None:
         """是否在空中（可选流）。
 
-        正式任务的"等起飞"就靠它：只有**真的离地**才进侦查（在停机坪上就上传并启动
+        正式任务的"等起飞"就靠它：只有真的离地才进侦查（在停机坪上就上传并启动
         侦查航线，等于让飞机在地面就想执行任务）。
         """
         self.in_air = bool(in_air)

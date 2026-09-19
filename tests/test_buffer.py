@@ -1,9 +1,9 @@
 """对齐结果缓冲的单元测试。
 
 不依赖飞控与图传硬件：手工构造 ``AlignedSample`` / ``VideoFrame`` 后验证写入、驱逐、
-时间区间迭代、多读者跟随、字节上限与参数校验，并盯住两条最容易踩的坑——
+时间区间迭代、多读者跟随、字节上限与参数校验，并盯住两条最容易踩的易错点——
 
-* **ffmpeg 后端的帧是复用缓冲区的视图**，入缓冲必须拷贝，否则历史帧会被后续帧改写；
+* ffmpeg 后端的帧是复用缓冲区的视图，入缓冲必须拷贝，否则历史帧会被后续帧改写；
 * 回看历史一律走 ``iter_between()``：分批解码，不会一次把 5400 帧解进内存。
 """
 
@@ -30,15 +30,11 @@ from airdrop import (
 )
 
 
-def make_frame(
-    timestamp: float, image: np.ndarray | None = None
-) -> VideoFrame:
+def make_frame(timestamp: float, image: np.ndarray | None = None) -> VideoFrame:
     """构造一帧（``timestamp`` 是收到时间，拍摄时刻 = timestamp - lag）。"""
     if image is None:
         image = np.full((8, 8, 3), 128, dtype=np.uint8)
-    return VideoFrame(
-        index=1, image=image, timestamp=timestamp, lag=DEFAULT_TELEMETRY_LAG
-    )
+    return VideoFrame(index=1, image=image, timestamp=timestamp, lag=DEFAULT_TELEMETRY_LAG)
 
 
 def make_sample(
@@ -67,9 +63,7 @@ def test_put_and_read() -> None:
         assert record.index == i + 1
         assert record.image.shape == (8, 8, 3)
         assert record.capture_timestamp == 1000.0 + i
-        assert record.received_timestamp == pytest.approx(
-            1000.0 + i + DEFAULT_TELEMETRY_LAG
-        )
+        assert record.received_timestamp == pytest.approx(1000.0 + i + DEFAULT_TELEMETRY_LAG)
         assert record.lag == pytest.approx(DEFAULT_TELEMETRY_LAG)
         assert record.snapshot.latitude_deg == pytest.approx(47.0 + i * 0.1)
 
@@ -99,9 +93,7 @@ def test_capacity_evicts_oldest() -> None:
 
 def test_max_bytes_eviction() -> None:
     frame_bytes = 32 * 32 * 3
-    buffer = AlignmentBuffer(
-        capacity=100, storage="raw", max_bytes=frame_bytes * 3
-    )
+    buffer = AlignmentBuffer(capacity=100, storage="raw", max_bytes=frame_bytes * 3)
     for i in range(10):
         buffer.put(
             make_sample(
@@ -196,9 +188,7 @@ def test_iter_between() -> None:
         buffer.put(make_sample(1000.0 + i))
 
     # 闭区间；分批（batch=2/3）与一次取完结果一致
-    assert [
-        r.index for r in buffer.iter_between(1002.0, 1005.0, batch=2)
-    ] == [3, 4, 5, 6]
+    assert [r.index for r in buffer.iter_between(1002.0, 1005.0, batch=2)] == [3, 4, 5, 6]
     assert [r.index for r in buffer.iter_between(1002.0, 1005.0)] == [3, 4, 5, 6]
     assert [r.index for r in buffer.iter_between(start=1007.0)] == [8, 9, 10]
     assert [r.index for r in buffer.iter_between(end=1001.0)] == [1, 2]
@@ -223,9 +213,7 @@ def test_wait_new() -> None:
     buffer = AlignmentBuffer(capacity=4)
     assert buffer.wait_new(0, timeout=0.1) is None, "空缓冲应超时返回 None"
 
-    writer = threading.Thread(
-        target=lambda: (time.sleep(0.1), buffer.put(make_sample(1000.0)))
-    )
+    writer = threading.Thread(target=lambda: (time.sleep(0.1), buffer.put(make_sample(1000.0))))
     writer.start()
     record = buffer.wait_new(0, timeout=5.0)
     writer.join(timeout=2.0)
@@ -236,14 +224,14 @@ def test_wait_new() -> None:
         buffer.put(make_sample(1000.0 + i))
     # 之前已有 1 号，共 6 条，容量 4 → 保留 3..6
     assert buffer.indices() == (3, 6)
-    # 游标落后到已被驱逐的记录：返回当前保留的**最早**一条（不会被死等，
+    # 游标落后到已被驱逐的记录：返回当前保留的最早一条（不会被无休止等待，
     # 但中间被驱逐的 1、2 在此路径上不可见——需要完整消费请用 iter_between）
     lagging = buffer.wait_new(1, timeout=0.2)
     assert lagging is not None and lagging.index == 3
 
 
 # ----------------------------------------------------------------------
-# 拉流源 → 缓冲的接线
+# 拉流源 → 缓冲的装配
 # ----------------------------------------------------------------------
 def test_alignment_writer() -> None:
     """AlignmentWriter：正常帧全写，取不到遥测才跳过。"""
@@ -261,9 +249,7 @@ def test_alignment_writer() -> None:
     base = time.time() - 1.0
     for i in range(10):
         broker._history.append(
-            TelemetrySnapshot(
-                timestamp=base + i * 0.1, latitude_deg=47.0 + i * 0.001
-            )
+            TelemetrySnapshot(timestamp=base + i * 0.1, latitude_deg=47.0 + i * 0.001)
         )
     frames = [make_frame(base + 0.9 + i * 0.02) for i in range(5)]
     for frame in frames:

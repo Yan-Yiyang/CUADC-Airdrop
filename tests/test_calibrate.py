@@ -1,21 +1,22 @@
 """tools/calibrate.py 标定流水线的合成自洽验证（P6 验收口径之一）。
 
-做法：用**已知**内参 / 已知 Δt / 已知 R_bc 生成合成棋盘格视图与机体姿态，
+做法：用已知内参 / 已知 Δt / 已知 R_bc 生成合成棋盘格视图与机体姿态，
 再让流水线去把它们解回来，逐项比对。
 
 链路顺序（与真实采集一致）
 --------------------------
 相机（棋盘格在相机系下的位姿）由"机体在世界里的位姿 + 真值 X=R_bc/t_bc"导出，
-因此流水线拿到的像素数据里**天然含有**真值外参——解不回来说明算法或约定错了。
+因此流水线拿到的像素数据里天然含有真值外参——解不回来说明算法或约定错了。
 """
+
 from __future__ import annotations
 
 import json
 import math
 import shutil
 import uuid
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Sequence
 
 import cv2
 import numpy as np
@@ -59,9 +60,7 @@ SQUARE = 0.03
 
 
 def true_camera_matrix() -> np.ndarray:
-    return np.array(
-        [[TRUE_FX, 0.0, TRUE_CX], [0.0, TRUE_FY, TRUE_CY], [0.0, 0.0, 1.0]]
-    )
+    return np.array([[TRUE_FX, 0.0, TRUE_CX], [0.0, TRUE_FY, TRUE_CY], [0.0, 0.0, 1.0]])
 
 
 def true_r_bc() -> np.ndarray:
@@ -80,7 +79,7 @@ def _board_pose_in_camera(
 ) -> tuple[np.ndarray, np.ndarray]:
     """给定机体位姿与真值外参，返回棋盘格在相机系下的 (rvec, tvec)。
 
-    棋盘格固定在世界原点（板面 z=0），机体位姿在**世界系**里给。
+    棋盘格固定在世界原点（板面 z=0），机体位姿在世界系里给。
     ``T_cam_board = X^{-1} · T_body_world``，其中 ``X = [R_bc | t_bc]``。
     """
     body_world = np.eye(4)
@@ -110,8 +109,13 @@ def _render_views(count: int, distance: float = 0.55) -> tuple[list[np.ndarray],
         )
         frames.append(
             render_board(
-                rvec, tvec, true_camera_matrix(), TRUE_DIST, TRUE_SIZE,
-                pattern_size=PATTERN, square_size=SQUARE,
+                rvec,
+                tvec,
+                true_camera_matrix(),
+                TRUE_DIST,
+                TRUE_SIZE,
+                pattern_size=PATTERN,
+                square_size=SQUARE,
             )
         )
         poses.append((rvec, tvec))
@@ -121,7 +125,7 @@ def _render_views(count: int, distance: float = 0.55) -> tuple[list[np.ndarray],
 def _sample_body_poses(count: int, seed: int = 3) -> list[tuple[np.ndarray, np.ndarray]]:
     """生成有足够姿态多样性的机体位姿（棋盘格固定在世界原点）。
 
-    机体位置要让**棋盘格中心落在像面中心附近**并占据足够像素：``X`` 的杆臂很小，
+    机体位置要让棋盘格中心落在像面中心附近并占据足够像素：``X`` 的杆臂很小，
     所以机体的 ``(north, east)`` 基本就是"相机相对棋盘格的横向偏移"，
     把它设成 0 才让板子居中（板子中心=棋盘原点）。
     """
@@ -151,9 +155,7 @@ def _sample_body_poses(count: int, seed: int = 3) -> list[tuple[np.ndarray, np.n
 def test_intrinsics_recovered_from_synthetic_views() -> None:
     """合成多视图 → 内参应当能解回真值（相对误差 < 2%）。"""
     frames, _ = _render_views(20)
-    result = run_intrinsics(
-        frames, pattern_size=PATTERN, square_size=SQUARE, min_views=5
-    )
+    result = run_intrinsics(frames, pattern_size=PATTERN, square_size=SQUARE, min_views=5)
     assert result.views >= 5, f"只检出 {result.views} 个视图"
     assert result.rms < 1.0, f"重投影 RMS 过大: {result.rms}"
     assert result.camera_matrix[0, 0] == pytest.approx(TRUE_FX, rel=0.02)
@@ -188,16 +190,10 @@ def test_rendered_board_projects_inside_frame() -> None:
 
 def test_look_at_board_centers_the_board() -> None:
     """板子几何中心应当投影到主点附近（对准了才不会被裁）。"""
-    board = board_object_points(PATTERN, SQUARE)
     cols, rows = PATTERN
-    center = np.array(
-        [[[(cols - 1) * SQUARE / 2, (rows - 1) * SQUARE / 2, 0.0]]], dtype=np.float64
-    )
-    rvec, tvec = look_at_board(
-        0.55, true_camera_matrix(), pattern_size=PATTERN, square_size=SQUARE
-    )
-    projected, _ = cv2.projectPoints(center, rvec, tvec, true_camera_matrix(),
-                                     np.zeros(5))
+    center = np.array([[[(cols - 1) * SQUARE / 2, (rows - 1) * SQUARE / 2, 0.0]]], dtype=np.float64)
+    rvec, tvec = look_at_board(0.55, true_camera_matrix(), pattern_size=PATTERN, square_size=SQUARE)
+    projected, _ = cv2.projectPoints(center, rvec, tvec, true_camera_matrix(), np.zeros(5))
     assert float(projected[0, 0, 0]) == pytest.approx(TRUE_CX, abs=1.0)
     assert float(projected[0, 0, 1]) == pytest.approx(TRUE_CY, abs=1.0)
 
@@ -214,15 +210,19 @@ def test_lag_recovered_from_shifted_series() -> None:
     step = 0.01
     times = np.arange(0.0, 3.0, step)
     # 一段有明显起伏的角速度（避免常数序列相关为 0）
-    body_speed = 20.0 + 15.0 * np.sin(2 * math.pi * 1.5 * times) + 5.0 * np.sin(
-        2 * math.pi * 5.0 * times
+    body_speed = (
+        20.0 + 15.0 * np.sin(2 * math.pi * 1.5 * times) + 5.0 * np.sin(2 * math.pi * 5.0 * times)
     )
     true_lag = 0.12
-    camera_times = times + true_lag          # 画面比姿态晚 true_lag
+    camera_times = times + true_lag  # 画面比姿态晚 true_lag
     camera_speed = body_speed.copy()
     result = estimate_lag_by_correlation(
-        camera_times, camera_speed, times, body_speed,
-        search_s=0.5, step_s=0.005,
+        camera_times,
+        camera_speed,
+        times,
+        body_speed,
+        search_s=0.5,
+        step_s=0.005,
     )
     assert result.ok
     assert result.lag_s == pytest.approx(true_lag, abs=0.02), f"解出 {result.lag_s}"
@@ -236,8 +236,12 @@ def test_lag_recovers_various_offsets(true_lag: float) -> None:
     body_speed = 25.0 + 18.0 * np.sin(2 * math.pi * 1.2 * times)
     camera_times = times + true_lag
     result = estimate_lag_by_correlation(
-        camera_times, body_speed.copy(), times, body_speed,
-        search_s=0.5, step_s=0.005,
+        camera_times,
+        body_speed.copy(),
+        times,
+        body_speed,
+        search_s=0.5,
+        step_s=0.005,
     )
     assert result.lag_s == pytest.approx(true_lag, abs=0.02)
 
@@ -251,8 +255,10 @@ def test_lag_reports_failure_on_flat_series() -> None:
 
 def test_lag_reports_failure_on_too_few_samples() -> None:
     result = estimate_lag_by_correlation(
-        np.array([0.0, 0.1]), np.array([1.0, 2.0]),
-        np.array([0.0, 0.1]), np.array([1.0, 2.0]),
+        np.array([0.0, 0.1]),
+        np.array([1.0, 2.0]),
+        np.array([0.0, 0.1]),
+        np.array([1.0, 2.0]),
     )
     assert not result.ok
 
@@ -263,14 +269,18 @@ def test_angular_speed_from_poses_matches_constant_rate() -> None:
     step = 0.02
     times = np.arange(0.0, 1.0, step)
     rotations = [rotation_z(rate * t) for t in times]
-    out_times, speeds = angular_speed_from_poses(times, rotations)
+    out_times, speeds = angular_speed_from_poses(times, rotations)  # pyright: ignore[reportArgumentType]
     assert out_times.size == times.size - 1
     assert np.allclose(speeds, rate, atol=1e-6)
 
 
 def test_rotation_angle_and_log_round_trip() -> None:
-    for axis in (np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0]),
-                 np.array([1.0, 2.0, -0.5]) / np.linalg.norm([1.0, 2.0, -0.5])):
+    for axis in (
+        np.array([1.0, 0, 0]),
+        np.array([0, 1.0, 0]),
+        np.array([0, 0, 1.0]),
+        np.array([1.0, 2.0, -0.5]) / np.linalg.norm([1.0, 2.0, -0.5]),
+    ):
         for angle_deg in (0.1, 5.0, 45.0, 179.0):
             vector = axis * math.radians(angle_deg)
             matrix = _axis_angle_to_matrix(vector)
@@ -283,9 +293,7 @@ def _axis_angle_to_matrix(vector: np.ndarray) -> np.ndarray:
     if theta < 1e-12:
         return np.eye(3)
     axis = vector / theta
-    k = np.array(
-        [[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]]
-    )
+    k = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
     return np.eye(3) + math.sin(theta) * k + (1 - math.cos(theta)) * (k @ k)
 
 
@@ -311,10 +319,10 @@ def body_pose_from_board(board_pose: np.ndarray, x_true: np.ndarray) -> np.ndarr
     """由"棋盘格在相机系"的位姿导出"机体在世界系"的位姿。
 
     棋盘格固定在世界原点（``C = T_world_board = I``），于是
-    ``G X P = C`` ⇒ **``G = P⁻¹ X⁻¹``**。
+    ``G X P = C`` ⇒ ``G = P⁻¹ X⁻¹``。
 
     ⚠ 这里只有一个正确方向。写成 ``G = X·P``（等价于把"棋盘格在机体系"当成机体位姿）
-    就等于是**拿未知量当已知量用**：相对运动里那个常量会被整体消掉，
+    就等于是拿未知量当已知量用：相对运动里那个常量会被整体消掉，
     方程退化成"求与所有 R 可交换的矩阵"，真值根本不在解空间里。
     回归用例 ``test_body_pose_must_come_from_telemetry`` 把它钉死。
     """
@@ -350,8 +358,13 @@ def _board_views(count: int = 24, distance: float = 0.55):
         )
         frames.append(
             render_board(
-                rvec, tvec, true_camera_matrix(), TRUE_DIST, TRUE_SIZE,
-                pattern_size=PATTERN, square_size=SQUARE,
+                rvec,
+                tvec,
+                true_camera_matrix(),
+                TRUE_DIST,
+                TRUE_SIZE,
+                pattern_size=PATTERN,
+                square_size=SQUARE,
             )
         )
         poses.append(pose_of(rvec, tvec))
@@ -379,7 +392,7 @@ def test_solver_recovers_known_transform(seed: int) -> None:
     for rotation in _random_rotations(12, seed):
         matrix = np.eye(4)
         matrix[:3, :3] = rotation
-        matrix[:3, 3] = rng.normal(scale=0.3, size=3)          # 机体位置是独立量
+        matrix[:3, 3] = rng.normal(scale=0.3, size=3)  # 机体位置是独立量
         bodies.append(matrix)
     cameras = [np.linalg.inv(x_true) @ np.linalg.inv(g) for g in bodies]
     a_list, b_list = _motion_pairs(bodies, cameras)
@@ -395,7 +408,7 @@ def test_solver_recovers_known_transform(seed: int) -> None:
 def test_body_pose_must_come_from_telemetry() -> None:
     """反例固化：机体位姿若由棋盘格位姿左乘常量导出，就解不出真值。
 
-    这不是"板子没转"（板子固定、飞机在动时姿态当然在变），而是**把未知量当已知量用**。
+    这不是"板子没转"（板子固定、飞机在动时姿态当然在变），而是把未知量当已知量用。
     """
     x_true = true_x_matrix()
     rng = np.random.default_rng(7)
@@ -405,7 +418,7 @@ def test_body_pose_must_come_from_telemetry() -> None:
         matrix[:3, :3] = rotation
         matrix[:3, 3] = rng.normal(scale=0.3, size=3)
         cameras.append(matrix)
-    bodies = [x_true @ p for p in cameras]          # 错误方向：G = X·P
+    bodies = [x_true @ p for p in cameras]  # 错误方向：G = X·P
     a_list, b_list = _motion_pairs(bodies, cameras)
     rotation, *_ = solve_hand_eye(a_list, b_list)
     error = rotation_angle_deg(rotation.T @ true_r_bc())
@@ -423,20 +436,19 @@ def test_extrinsics_rejects_single_rotation_axis() -> None:
     bodies = []
     for index in range(12):
         matrix = np.eye(4)
-        matrix[:3, :3] = rotation_z(7.0 * index)           # 只绕 z 转
+        matrix[:3, :3] = rotation_z(7.0 * index)  # 只绕 z 转
         matrix[:3, 3] = np.array([0.01 * index, 0.0, -0.45])
         bodies.append(matrix)
     cameras = [np.linalg.inv(x_true) @ np.linalg.inv(g) for g in bodies]
     board_poses = [
-        (float(index), cv2.Rodrigues(p[:3, :3])[0], p[:3, 3])
-        for index, p in enumerate(cameras)
+        (float(index), cv2.Rodrigues(p[:3, :3])[0], p[:3, 3]) for index, p in enumerate(cameras)
     ]
     with pytest.raises(ValueError, match="旋转轴过于单一"):
         run_extrinsics(board_poses=board_poses, body_poses=bodies)
 
 
 def _bodies_with_real_translation(seed: int, count: int = 14) -> list[np.ndarray]:
-    """一批**位置真的在动**的遥测位姿（室内无 GPS 时拿不到的就是这个）。"""
+    """一批位置真的在动的遥测位姿（室内无 GPS 时取不到的就是这个）。"""
     rng = np.random.default_rng(seed)
     bodies = []
     for rotation in _random_rotations(count, seed):
@@ -452,13 +464,12 @@ def _board_poses_from_cameras(
 ) -> list[tuple[float, np.ndarray, np.ndarray]]:
     """PnP 位姿 → ``run_extrinsics`` 要的 ``(时刻, rvec, tvec)``。"""
     return [
-        (float(index), cv2.Rodrigues(p[:3, :3])[0], p[:3, 3])
-        for index, p in enumerate(cameras)
+        (float(index), cv2.Rodrigues(p[:3, :3])[0], p[:3, 3]) for index, p in enumerate(cameras)
     ]
 
 
 def test_extrinsics_estimates_lever_arm_from_real_telemetry_positions() -> None:
-    """遥测位置可信时杆臂估计值应当回到真值——这正是它拿来和尺量值对表的意义。"""
+    """遥测位置可信时杆臂估计值应当回到真值——这正是它拿来和尺量值比对的意义。"""
     x_true = true_x_matrix()
     bodies = _bodies_with_real_translation(5)
     cameras = [np.linalg.inv(x_true) @ np.linalg.inv(g) for g in bodies]
@@ -473,10 +484,10 @@ def test_extrinsics_estimates_lever_arm_from_real_telemetry_positions() -> None:
 
 
 def test_extrinsics_flags_lever_arm_estimate_from_fake_telemetry_positions() -> None:
-    """无 GPS 时遥测位置恒零：**旋转照样解得对，杆臂却估不准**，必须被标为不可信。
+    """无 GPS 时遥测位置恒零：旋转照样解得对，杆臂却估不准，必须被标为不可信。
 
     照抄真实采集的失效模式：PnP 看到的相机位移是真的、遥测报的机体位置是假的，
-    于是平移方程 ``(R_a−I)t_x = R_x t_b − t_a`` 本身不自洽。判据必须落在**残差**上——
+    于是平移方程 ``(R_a−I)t_x = R_x t_b − t_a`` 本身不自洽。判据必须落在残差上——
     ``t_a`` 是真是假都解得出一个 ``t_x``，光看数字大小分辨不出来。
     """
     x_true = true_x_matrix()
@@ -485,7 +496,7 @@ def test_extrinsics_flags_lever_arm_estimate_from_fake_telemetry_positions() -> 
     lying = []
     for pose in bodies:
         copy = pose.copy()
-        copy[:3, 3] = 0.0                       # 位置恒零（室内无 GPS 的典型表现）
+        copy[:3, 3] = 0.0  # 位置恒零（室内无 GPS 的典型表现）
         lying.append(copy)
 
     result = run_extrinsics(
@@ -520,7 +531,7 @@ def test_extrinsics_can_skip_lever_arm_estimate() -> None:
 
 
 def test_lever_arm_report_pairs_estimate_with_measured_value() -> None:
-    """报告里**尺量值是 authoritative**，估计值只用于对表（逐轴差 + 欧氏距离）。"""
+    """报告里尺量值是 authoritative，估计值只用于比对（逐轴差 + 欧氏距离）。"""
     result = ExtrinsicsResult(
         r_bc=true_r_bc(),
         t_bc=np.array([0.07, -0.02, 0.08]),
@@ -549,9 +560,7 @@ def test_lever_arm_report_keeps_measured_value_without_estimate() -> None:
     assert empty["delta_m"] is None
     assert empty["estimated_reliable"] is False
 
-    skipped = ExtrinsicsResult(
-        r_bc=true_r_bc(), t_bc=None, pairs=9, residual_rotation_deg=0.2
-    )
+    skipped = ExtrinsicsResult(r_bc=true_r_bc(), t_bc=None, pairs=9, residual_rotation_deg=0.2)
     assert lever_arm_report(skipped)["estimated"] is None
 
 
@@ -561,8 +570,7 @@ def test_extrinsics_requires_one_body_pose_per_board_pose() -> None:
     frames, poses = _board_views(6)
     bodies = [body_pose_from_board(p, x_true) for p in poses]
     board_poses = [
-        (float(index), cv2.Rodrigues(p[:3, :3])[0], p[:3, 3])
-        for index, p in enumerate(poses)
+        (float(index), cv2.Rodrigues(p[:3, :3])[0], p[:3, 3]) for index, p in enumerate(poses)
     ]
     with pytest.raises(ValueError, match="数量不一致"):
         run_extrinsics(board_poses=board_poses, body_poses=bodies[:3])
@@ -575,9 +583,13 @@ def _yaw_snapshot(stamp: float, yaw_deg: float, down: float = -0.45) -> Telemetr
     half = math.radians(yaw_deg) / 2.0
     return TelemetrySnapshot(
         timestamp=stamp,
-        north_m=0.0, east_m=0.0, down_m=down,
-        quaternion_w=math.cos(half), quaternion_x=0.0,
-        quaternion_y=0.0, quaternion_z=math.sin(half),
+        north_m=0.0,
+        east_m=0.0,
+        down_m=down,
+        quaternion_w=math.cos(half),
+        quaternion_x=0.0,
+        quaternion_y=0.0,
+        quaternion_z=math.sin(half),
     )
 
 
@@ -586,29 +598,27 @@ def test_telemetry_pose_at_interpolates_and_refuses_extrapolation() -> None:
     pose = telemetry_pose_at(snapshots, 0.05)
     assert pose is not None
     assert rotation_angle_deg(pose[:3, :3].T @ rotation_z(5.0)) < 1e-9
-    assert telemetry_pose_at(snapshots, -0.1) is None       # 不外推
+    assert telemetry_pose_at(snapshots, -0.1) is None  # 不外推
     assert telemetry_pose_at(snapshots, 10.0) is None
 
 
 def test_align_body_poses_applies_lag_with_the_right_sign() -> None:
-    """``lag > 0`` 表示画面滞后 ⇒ 该帧查的是**更早**的遥测。
+    """``lag > 0`` 表示画面滞后 ⇒ 该帧查的是更早的遥测。
 
     造一段匀速偏航的遥测，让棋盘格位姿对应 ``capture_timestamp − lag`` 时刻的机体姿态；
     带上 lag 配对应当精确复原，不带就有 ``lag·ω`` 的固定偏差。
     """
-    rate, step, lag = 40.0, 0.02, 0.10            # °/s, s, s
+    rate, step, lag = 40.0, 0.02, 0.10  # °/s, s, s
     snapshots = [_yaw_snapshot(index * step, rate * index * step) for index in range(60)]
     x_true = true_x_matrix()
     board_poses = []
     for index in range(5, 50):
         stamp = index * step
         body = np.eye(4)
-        body[:3, :3] = rotation_z(rate * (stamp - lag))       # 真实拍摄时刻的机体姿态
+        body[:3, :3] = rotation_z(rate * (stamp - lag))  # 真实拍摄时刻的机体姿态
         body[:3, 3] = np.array([0.0, 0.0, -0.45])
         camera = np.linalg.inv(x_true) @ np.linalg.inv(body)
-        board_poses.append(
-            (stamp, cv2.Rodrigues(camera[:3, :3])[0], camera[:3, 3])
-        )
+        board_poses.append((stamp, cv2.Rodrigues(camera[:3, :3])[0], camera[:3, 3]))
 
     paired_board, paired_body = align_body_poses(board_poses, snapshots, lag_s=lag)
     assert len(paired_board) == len(paired_body) > 20
@@ -625,9 +635,9 @@ def test_align_body_poses_applies_lag_with_the_right_sign() -> None:
 # 渲染链路的自洽性（棋盘格相位）
 # ----------------------------------------------------------------------
 def test_rendered_board_matches_requested_pose() -> None:
-    """渲染出来的棋盘格必须与给定位姿**同相位**。
+    """渲染出来的棋盘格必须与给定位姿同相位。
 
-    回归用例：`to_board` 少减一个 `tile` 时，棋盘格相对对象点整体错开一整格，
+    回归用例：to_board 少减一个 tile 时，棋盘格相对对象点整体错开一整格，
     检测出的角点落在"板子真实点 +1 格"处——重投影误差仍然只有 0.1 px，
     但位姿差 180°，手眼标定直接报废，靠重投影根本发现不了。只有方格相位能发现
     （实测错格时相符率 < 0.5，正确时 1.000）。
@@ -644,33 +654,50 @@ def test_rendered_board_matches_requested_pose() -> None:
             square_size=SQUARE,
         )
         frame = render_board(
-            rvec, tvec, true_camera_matrix(), TRUE_DIST, TRUE_SIZE,
-            pattern_size=PATTERN, square_size=SQUARE,
+            rvec,
+            tvec,
+            true_camera_matrix(),
+            TRUE_DIST,
+            TRUE_SIZE,
+            pattern_size=PATTERN,
+            square_size=SQUARE,
         )
         ratio = pattern_phase_ok(
-            frame, rvec, tvec, true_camera_matrix(), TRUE_DIST,
-            pattern_size=PATTERN, square_size=SQUARE,
+            frame,
+            rvec,
+            tvec,
+            true_camera_matrix(),
+            TRUE_DIST,
+            pattern_size=PATTERN,
+            square_size=SQUARE,
         )
         assert ratio > 0.9, f"第 {index} 帧相位相符率只有 {ratio:.2f}：棋盘格与对象点错格了"
 
         pose = solve_board_poses(
-            [frame], board, true_camera_matrix(), TRUE_DIST,
-            pattern_size=PATTERN, square_size=SQUARE,
+            [frame],
+            board,
+            true_camera_matrix(),
+            TRUE_DIST,
+            pattern_size=PATTERN,
+            square_size=SQUARE,
         )[0]
         assert pose is not None, f"第 {index} 帧应当能解出位姿"
         corners = detect_corners(frame, PATTERN)
-        projected, _ = cv2.projectPoints(
-            board, pose[0], pose[1], true_camera_matrix(), TRUE_DIST
-        )
-        rms = float(np.sqrt(np.mean(np.sum((projected - corners) ** 2, axis=2))))
+        assert corners is not None
+        projected, _ = cv2.projectPoints(board, pose[0], pose[1], true_camera_matrix(), TRUE_DIST)
+        # cv2 的类型桩把 projectPoints 的结果标成可能为 None，运行时它总是 ndarray；
+        # 这里显式收窄，顺带让后面那行减法/平方有明确类型。
+        assert projected is not None
+        residual = (projected - corners) ** 2
+        rms = float(np.sqrt(np.mean(np.sum(residual, axis=2))))
         assert rms < 0.5, f"第 {index} 帧解出的位姿重投影残差 {rms:.3f} px"
 
 
 def test_pattern_phase_is_blind_to_label_ambiguity() -> None:
-    """记录一条边界：相位**分不出**正序/反序标签——两支的相位相符率都是 1.000。
+    """记录一条边界：相位分不出正序/反序标签——两支的相位相符率都是 1.000。
 
     棋盘格绕板面法向转 180° 后图像一模一样，单帧图像里没有信息能定下"哪个角点是 0 号"。
-    这正是 :func:solve_board_poses 必须靠**相邻帧连续性**定支的原因。
+    这正是 :func:`solve_board_poses` 必须靠相邻帧连续性定支的原因。
     """
     frames, camera_poses = _board_views(8)
     frame = frames[3]
@@ -678,22 +705,38 @@ def test_pattern_phase_is_blind_to_label_ambiguity() -> None:
     tvec = camera_poses[3][:3, 3]
     board = board_object_points(PATTERN, SQUARE)
     corners = detect_corners(frame, PATTERN)
+    assert corners is not None
     good = pattern_phase_ok(
-        frame, rvec, tvec, true_camera_matrix(), TRUE_DIST,
-        pattern_size=PATTERN, square_size=SQUARE,
+        frame,
+        rvec,
+        tvec,
+        true_camera_matrix(),
+        TRUE_DIST,
+        pattern_size=PATTERN,
+        square_size=SQUARE,
     )
     # 另一个标签支：把检测到的角点顺序整体反过来的那个解
     ok, other_rvec, other_tvec = cv2.solvePnP(
-        board, corners[::-1], true_camera_matrix(), TRUE_DIST,
+        board,
+        corners[::-1],
+        true_camera_matrix(),
+        TRUE_DIST,
         flags=cv2.SOLVEPNP_IPPE,
     )
     assert ok
-    assert rotation_angle_deg(
-        pose_of(other_rvec, other_tvec)[:3, :3].T @ pose_of(rvec, tvec)[:3, :3]
-    ) > 170.0, "反序解应当与正序解差 180°"
+    assert other_rvec is not None and other_tvec is not None
+    assert (
+        rotation_angle_deg(pose_of(other_rvec, other_tvec)[:3, :3].T @ pose_of(rvec, tvec)[:3, :3])
+        > 170.0
+    ), "反序解应当与正序解差 180°"
     flipped = pattern_phase_ok(
-        frame, other_rvec, other_tvec, true_camera_matrix(), TRUE_DIST,
-        pattern_size=PATTERN, square_size=SQUARE,
+        frame,
+        other_rvec,
+        other_tvec,
+        true_camera_matrix(),
+        TRUE_DIST,
+        pattern_size=PATTERN,
+        square_size=SQUARE,
     )
     assert good > 0.9, f"正确位姿的相位相符率只有 {good:.2f}"
     assert flipped > 0.9, f"另一支的相位本该也是 1.0，实际 {flipped:.2f}"
@@ -703,7 +746,7 @@ def test_pattern_phase_is_blind_to_label_ambiguity() -> None:
 # 三步串起来：渲染 → 检测（含相位消解）→ 配对 → 解外参
 # ----------------------------------------------------------------------
 def test_full_pipeline_recovers_extrinsics_from_synthetic_views() -> None:
-    """端到端：像素数据里**含有**真值外参，整条链路要能把它解回来。
+    """端到端：像素数据里含有真值外参，整条链路要能把它解回来。
 
     链路：渲染棋盘格 → 检测 + 相位消解标签 → PnP 得 ``P`` → 由 ``G = P⁻¹X⁻¹`` 得
     机体位姿（模拟"板子固定、飞机在动"的采集）→ ``AX=XB`` 解 ``X``。
@@ -712,15 +755,17 @@ def test_full_pipeline_recovers_extrinsics_from_synthetic_views() -> None:
     board = board_object_points(PATTERN, SQUARE)
     frames, camera_poses = _board_views(24)
 
-    intrinsics = run_intrinsics(
-        frames, pattern_size=PATTERN, square_size=SQUARE, min_views=8
-    )
+    intrinsics = run_intrinsics(frames, pattern_size=PATTERN, square_size=SQUARE, min_views=8)
     assert intrinsics.rms < 1.0
     assert intrinsics.camera_matrix[0, 0] == pytest.approx(TRUE_FX, rel=0.02)
 
     solved_raw = solve_board_poses(
-        frames, board, intrinsics.camera_matrix, intrinsics.dist_coeffs,
-        pattern_size=PATTERN, square_size=SQUARE,
+        frames,
+        board,
+        intrinsics.camera_matrix,
+        intrinsics.dist_coeffs,
+        pattern_size=PATTERN,
+        square_size=SQUARE,
     )
     solved: list[tuple[float, np.ndarray, np.ndarray]] = []
     branches: set[bool] = set()
@@ -772,16 +817,16 @@ def test_full_pipeline_rejects_insufficient_rotation_excitation() -> None:
 
 
 # ----------------------------------------------------------------------
-# 标定 JSON 的输出契约（杆臂：尺量为准 + 估计值对表）
+# 标定 JSON 的输出契约（杆臂：尺量为准 + 估计值比对）
 # ----------------------------------------------------------------------
 CALIB_TMP_ROOT = Path(__file__).resolve().parents[1] / ".calibrate-test-tmp"
 
 
 @pytest.fixture
-def workdir() -> Path:
+def workdir() -> Iterator[Path]:
     """工作区内的临时目录；用例结束整棵删掉。
 
-    **不用 ``tmp_path``**：部分受限执行环境里 pytest 的 basetemp 目录建好后不可枚举、
+    不用 ``tmp_path``：部分受限执行环境里 pytest 的 basetemp 目录建好后不可枚举、
     不可删除（``PermissionError: [WinError 5]``）。
     """
     CALIB_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -800,28 +845,35 @@ def _write_calibration_flight(flight_dir: Path, count: int = 30) -> None:
     ``G = P⁻¹X⁻¹``（棋盘格固定在世界原点，``C = I``）——与合成用例同一套约定，
     遥测里因此天然含真值外参，解不回来就是流水线错了。
 
-    遥测在首末各多写一条把帧区间**包住**：``telemetry_pose_at`` 只做范围内内插、
+    遥测在首末各多写一条把帧区间包住：``telemetry_pose_at`` 只做范围内内插、
     拒绝外推，不包住的话首末帧会整帧被丢。
     """
     (flight_dir / "frames").mkdir(parents=True)
     t0 = 1_000_000.0
     frame_dt = 1.0 / 30.0
-    lag = 0.15                                  # 与 VideoConfig.telemetry_lag 默认值一致
+    lag = 0.15  # 与 VideoConfig.telemetry_lag 默认值一致
     x_true = true_x_matrix()
     index_lines: list[str] = []
     entries: list[tuple[float, np.ndarray]] = []
 
     for index in range(count):
         rvec, tvec = look_at_board(
-            0.55, true_camera_matrix(),
+            0.55,
+            true_camera_matrix(),
             tilt_deg=15.0 * math.sin(index * 0.9),
             yaw_deg=12.0 * math.cos(index * 0.6),
             rim_roll_deg=10.0 * math.sin(index * 1.7),
-            pattern_size=PATTERN, square_size=SQUARE,
+            pattern_size=PATTERN,
+            square_size=SQUARE,
         )
         image = render_board(
-            rvec, tvec, true_camera_matrix(), TRUE_DIST, TRUE_SIZE,
-            pattern_size=PATTERN, square_size=SQUARE,
+            rvec,
+            tvec,
+            true_camera_matrix(),
+            TRUE_DIST,
+            TRUE_SIZE,
+            pattern_size=PATTERN,
+            square_size=SQUARE,
         )
         name = f"{index:06d}.jpg"
         ok, buffer = cv2.imencode(".jpg", image)
@@ -829,21 +881,23 @@ def _write_calibration_flight(flight_dir: Path, count: int = 30) -> None:
         payload = buffer.tobytes()
         (flight_dir / "frames" / name).write_bytes(payload)
         capture = t0 + index * frame_dt
-        index_lines.append(json.dumps({
-            "index": index,
-            "filename": name,
-            "capture_timestamp": capture,
-            "received_timestamp": capture + lag,     # 与 VideoFrame.timestamp 同义
-            "lag": lag,
-            "extrapolated": False,
-            "offset": 0.0,
-            "bytes": len(payload),
-        }))
+        index_lines.append(
+            json.dumps(
+                {
+                    "index": index,
+                    "filename": name,
+                    "capture_timestamp": capture,
+                    "received_timestamp": capture + lag,  # 与 VideoFrame.timestamp 同义
+                    "lag": lag,
+                    "extrapolated": False,
+                    "offset": 0.0,
+                    "bytes": len(payload),
+                }
+            )
+        )
         entries.append((capture, body_pose_from_board(pose_of(rvec, tvec), x_true)))
 
-    (flight_dir / "frames_index.jsonl").write_text(
-        "\n".join(index_lines) + "\n", encoding="utf-8"
-    )
+    (flight_dir / "frames_index.jsonl").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
 
     timeline = [(entries[0][0] - 0.3, entries[0][1])]
     timeline += entries
@@ -851,31 +905,36 @@ def _write_calibration_flight(flight_dir: Path, count: int = 30) -> None:
 
     lines = []
     for stamp, pose in timeline:
-        quaternion = Rotation.from_matrix(pose[:3, :3]).as_quat()    # scipy 是 (x,y,z,w)
+        quaternion = Rotation.from_matrix(pose[:3, :3]).as_quat()  # scipy 是 (x,y,z,w)
         w, x, y, z = (
-            float(quaternion[3]), float(quaternion[0]),
-            float(quaternion[1]), float(quaternion[2]),
+            float(quaternion[3]),
+            float(quaternion[0]),
+            float(quaternion[1]),
+            float(quaternion[2]),
         )
         # 钉住约定：写进遥测的 (w,x,y,z) 反解回来必须就是这个旋转矩阵
-        assert np.allclose(
-            quaternion_to_matrix_local((w, x, y, z)), pose[:3, :3], atol=1e-9
+        assert np.allclose(quaternion_to_matrix_local((w, x, y, z)), pose[:3, :3], atol=1e-9)
+        lines.append(
+            json.dumps(
+                TelemetrySnapshot(
+                    timestamp=stamp,
+                    north_m=float(pose[0, 3]),
+                    east_m=float(pose[1, 3]),
+                    down_m=float(pose[2, 3]),
+                    quaternion_w=w,
+                    quaternion_x=x,
+                    quaternion_y=y,
+                    quaternion_z=z,
+                ).as_dict()
+            )
         )
-        lines.append(json.dumps(TelemetrySnapshot(
-            timestamp=stamp,
-            north_m=float(pose[0, 3]),
-            east_m=float(pose[1, 3]),
-            down_m=float(pose[2, 3]),
-            quaternion_w=w, quaternion_x=x, quaternion_y=y, quaternion_z=z,
-        ).as_dict()))
-    (flight_dir / "telemetry.jsonl").write_text(
-        "\n".join(lines) + "\n", encoding="utf-8"
-    )
+    (flight_dir / "telemetry.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def test_calibrate_payload_records_lever_arm_against_measured_value(
     workdir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """输出契约：``t_bc`` 恒为**尺量值**，标定估计值进 ``meta`` 供对比校验。
+    """输出契约：``t_bc`` 恒为尺量值，标定估计值进 ``meta`` 供对比校验。
 
     这条同时盯住"改了文件顶部的 ``MEASURED_T_BC``，输出必须跟着变"——该常量曾是
     ``lever_arm_report`` 的默认参数（定义时绑定），那样改常量不会生效。

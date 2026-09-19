@@ -18,8 +18,9 @@ import operator
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import fields
-from typing import Any, Callable
+from typing import Any
 
 from .models import TelemetrySnapshot
 
@@ -76,13 +77,13 @@ def _slerp_fields(
     if any(value is None for value in q0 + q1):
         return None
 
-    dot = sum(a * b for a, b in zip(q0, q1))
+    dot = sum(a * b for a, b in zip(q0, q1, strict=True))
     if dot < 0.0:  # 取反其中一端，保证走最短路径
         q1 = [-value for value in q1]
         dot = -dot
 
     if dot > 0.9995:  # 夹角极小：线性混合后重新归一化即可
-        blended = [a + (b - a) * ratio for a, b in zip(q0, q1)]
+        blended = [a + (b - a) * ratio for a, b in zip(q0, q1, strict=True)]
         norm = math.sqrt(sum(value * value for value in blended))
         return tuple(value / norm for value in blended)
 
@@ -90,7 +91,7 @@ def _slerp_fields(
     sin_theta = math.sin(theta)
     scale0 = math.sin((1.0 - ratio) * theta) / sin_theta
     scale1 = math.sin(ratio * theta) / sin_theta
-    return tuple(scale0 * a + scale1 * b for a, b in zip(q0, q1))
+    return tuple(scale0 * a + scale1 * b for a, b in zip(q0, q1, strict=True))
 
 
 class TelemetryBroker:
@@ -156,10 +157,7 @@ class TelemetryBroker:
                 return copy.copy(self._nearest_snapshot_locked(timestamp))
 
             if mode != "interpolate":
-                raise ValueError(
-                    f"不支持的查询模式: {mode}，可选 "
-                    f"{sorted(SUPPORTED_QUERY_MODES)}"
-                )
+                raise ValueError(f"不支持的查询模式: {mode}，可选 {sorted(SUPPORTED_QUERY_MODES)}")
 
             return copy.copy(self._evaluate_snapshot_locked(timestamp))
 
@@ -271,9 +269,7 @@ class TelemetryBroker:
         self, position_ned: Any, velocity_ned: Any
     ) -> TelemetrySnapshot:
         """发布一个 MAVSDK 本地位置 + 速度更新。"""
-        return self._update(
-            lambda s: s.update_local_position_velocity(position_ned, velocity_ned)
-        )
+        return self._update(lambda s: s.update_local_position_velocity(position_ned, velocity_ned))
 
     def update_attitude_euler(self, euler: Any) -> TelemetrySnapshot:
         """发布一个 MAVSDK 欧拉角姿态更新。"""
@@ -331,10 +327,11 @@ class TelemetryBroker:
         for callback in subscribers:
             try:
                 callback(copy.copy(record))
-            except Exception:  # noqa: BLE001 - 订阅者异常不能影响代理继续工作
+            except Exception:
                 LOGGER.exception("遥测订阅回调执行失败")
 
         return record
+
     def _update(
         self,
         mutator: Callable[[TelemetrySnapshot], None],
@@ -345,10 +342,7 @@ class TelemetryBroker:
             snapshot.timestamp = time.time()
             self._latest = snapshot
             # 历史按固定采样率写入：各条高频遥测流在此合并成均匀序列
-            if (
-                snapshot.timestamp - self._last_history_timestamp
-                >= self._history_interval
-            ):
+            if snapshot.timestamp - self._last_history_timestamp >= self._history_interval:
                 self._history.append(snapshot)
                 self._last_history_timestamp = snapshot.timestamp
             # 锁内复制订阅者列表，避免遍历时与 subscribe/unsubscribe 竞态。
@@ -358,7 +352,7 @@ class TelemetryBroker:
         for callback in subscribers:
             try:
                 callback(copy.copy(snapshot))
-            except Exception:  # noqa: BLE001 - 订阅者异常不能影响代理继续工作
+            except Exception:
                 LOGGER.exception("遥测订阅回调执行失败")
 
         return snapshot

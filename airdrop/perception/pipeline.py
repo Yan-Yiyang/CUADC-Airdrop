@@ -6,12 +6,12 @@ import logging
 import queue
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
-from ..telemetry.models import TelemetrySnapshot
 from ..video.buffer import AlignmentBuffer, BufferedFrame
 from .cropproc import OcrEngineConfig
 from .detector import Detector, DetectorConfig
@@ -59,15 +59,15 @@ class PerceptionConfigLike:
 class PerceptionStats:
     """感知统计（运行中可随时取）。"""
 
-    frames: int = 0                # 已处理帧数
-    detections: int = 0            # 累计检测到的目标数
-    with_code: int = 0             # 其中读出了编号的
-    submitted: int = 0             # 送 OCR 的裁剪图数
-    deduped: int = 0               # 被去重挡下的送检数
-    results: int = 0               # 收到的 OCR 结果数
-    invalid_side: int = 0          # 像素边长超出有效区间而被丢弃的
-    ocr_dropped: int = 0           # OCR 队列满而丢掉的请求数
-    lag_frames: int = 0            # 处理落后最新帧多少帧
+    frames: int = 0  # 已处理帧数
+    detections: int = 0  # 累计检测到的目标数
+    with_code: int = 0  # 其中读出了编号的
+    submitted: int = 0  # 送 OCR 的裁剪图数
+    deduped: int = 0  # 被去重挡下的送检数
+    results: int = 0  # 收到的 OCR 结果数
+    invalid_side: int = 0  # 像素边长超出有效区间而被丢弃的
+    ocr_dropped: int = 0  # OCR 队列满而丢掉的请求数
+    lag_frames: int = 0  # 处理落后最新帧多少帧
     last_error: str | None = None
 
 
@@ -115,7 +115,8 @@ class PerceptionWorker:
         self._cursor = self._start_index
         # 去重表：[(拍摄时刻, u, v)]，按时间自然有序，过期从头部丢掉
         self._recent: list[tuple[float, float, float]] = []
-        self._pending: dict[int, tuple[float, float, float, float, TelemetrySnapshot, Any]] = {}
+        #: 送检中的 OCR 请求：request_id → 该帧的基础 Detection（结果回来时回填编号）
+        self._pending: dict[int, Detection] = {}
         self._on_detection: Callable[[Detection], None] | None = None
 
     # ------------------------------------------------------------------
@@ -187,9 +188,7 @@ class PerceptionWorker:
             self._detector.load()
 
         self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run, name="perception", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name="perception", daemon=True)
         self._thread.start()
         LOGGER.info(
             "感知线程已启动（mode=%s，buffer 现有 %d 帧）",
@@ -264,12 +263,12 @@ class PerceptionWorker:
                 self._cursor = frame.index
                 try:
                     self._process_frame(frame)
-                except Exception as exc:  # noqa: BLE001 - 单帧失败不打断整条链路
+                except Exception as exc:
                     LOGGER.exception("处理帧 #%d 失败", frame.index)
                     with self._stats_lock:
                         self._stats.last_error = f"{type(exc).__name__}: {exc}"
                 self._collect_remaining(timeout=0.0)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             LOGGER.exception("感知线程异常退出")
             with self._stats_lock:
                 self._stats.last_error = f"{type(exc).__name__}: {exc}"
@@ -286,9 +285,7 @@ class PerceptionWorker:
         with self._stats_lock:
             self._stats.frames += 1
             self._stats.detections += len(batch.detections)
-            self._stats.lag_frames = max(
-                self._buffer.latest_index() - frame.index, 0
-            )
+            self._stats.lag_frames = max(self._buffer.latest_index() - frame.index, 0)
 
         if self._config.mode == "cls12":
             # 编号已由类别给出，直接产出
@@ -443,5 +440,5 @@ class PerceptionWorker:
         if callback is not None:
             try:
                 callback(detection)
-            except Exception:  # noqa: BLE001 - 回调异常不影响主循环
+            except Exception:
                 LOGGER.exception("检测结果回调异常")

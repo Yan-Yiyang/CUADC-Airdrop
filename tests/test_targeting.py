@@ -1,6 +1,6 @@
 """targeting 离线单测：DBSCAN 聚类、编号众数、median/max 筛选、噪声与边界。
 
-**全部离线**：合成点云，不碰 GPU / 飞控 / 相机。
+全部离线：合成点云，不碰 GPU / 飞控 / 相机。
 验收口径来自计划 P7：众数 / median / max / 均值 / eps 边界 / 噪声剔除。
 """
 
@@ -84,7 +84,7 @@ def test_empty_input_is_safe() -> None:
 
 
 def test_eps_boundary_is_inclusive() -> None:
-    """eps 边界实测为**闭区间**（sklearn 1.9.1）：恰好 eps 距离算邻居，差一点就不算。
+    """eps 边界实测为闭区间（sklearn 1.9.1）：恰好 eps 距离算邻居，差一点就不算。
 
     这条钉住的是"eps=0.75 到底含不含 0.75"——它决定相邻目标会不会被并成一个。
     """
@@ -148,7 +148,7 @@ def test_require_label_drops_unlabeled_clusters_from_output() -> None:
 # 跨类筛选：median / max
 # ----------------------------------------------------------------------
 def test_median_rule_picks_lower_median_for_even_labels() -> None:
-    """三个目标 10/20/30 取中位 20；四个 10/20/30/40 取**下中位** 20。"""
+    """三个目标 10/20/30 取中位 20；四个 10/20/30/40 取下中位 20。"""
     odd = _cloud(0.0, 0.0, 10, 2) + _cloud(50.0, 0.0, 20, 2) + _cloud(100.0, 0.0, 30, 2)
     assert analyze(odd, TargetingConfig(selection_rule="median")).code == 20
 
@@ -178,8 +178,12 @@ def test_unknown_selection_rule_raises() -> None:
     """未知规则必须显式报错——计划 Q8 明说"代码不做隐式回退"。"""
     clusters = [
         Cluster(
-            label=0, members=(_point(0.0, 0.0, 56),),
-            north_m=0.0, east_m=0.0, code=56, confidence=1.0,
+            label=0,
+            members=(_point(0.0, 0.0, 56),),
+            north_m=0.0,
+            east_m=0.0,
+            code=56,
+            confidence=1.0,
         )
     ]
     with pytest.raises(ValueError, match="selection_rule"):
@@ -208,7 +212,7 @@ def test_weighted_centroid_follows_confidence() -> None:
 
 
 def test_weighted_clustering_still_counts_detections() -> None:
-    """回归：sklearn 的 sample_weight 是**绝对权重**，直接用置信度会把真实目标打成噪声。
+    """回归：sklearn 的 sample_weight 是绝对权重，直接用置信度会把真实目标打成噪声。
 
     实测（1.9.1）：权重 [1.0, 0.1]、min_samples=2 时那一对双双成为噪声。所以本实现把
     权重按均值归一到 1（总质量 = 点数），min_samples 仍是"至少看到几次"。

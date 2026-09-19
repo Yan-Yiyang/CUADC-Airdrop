@@ -2,7 +2,7 @@
 
 模块划分
 --------
-* :mod:`~airdrop.georef.camera`：相机模型（内参 / 畸变 / **标定产出的相机→机体外参**）；
+* :mod:`~airdrop.georef.camera`：相机模型（内参 / 畸变 / 标定产出的相机→机体外参）；
 * :mod:`~airdrop.georef.project`：像素 + 遥测 → 地面交点（视线与 ``z=ground_z`` 求交），
   以及边长法深度的交叉验证；
 * :mod:`~airdrop.georef.geo`：NED ↔ WGS84（pyproj，移植自 旧版，已过 Geod 真值验证）。
@@ -10,7 +10,7 @@
 坐标约定见 :mod:`~airdrop.georef.camera` 的模块 docstring——相机系与机体系的轴
 定义、``R_bc`` 的方向（相机→机体）都在那里写死了，改之前先读它。
 
-⚠ **惰性导出**（见 :mod:`airdrop._lazy`）：`import airdrop.georef` 只执行本文件。
+⚠ 惰性导出（见 :mod:`airdrop._lazy`）：import airdrop.georef 只执行本文件。
 ``project`` 会拉 cv2，所以它排在最后——标定脚本只要 ``rotation_z`` 这类几何工具，
 不该顺带加载 OpenCV。
 """

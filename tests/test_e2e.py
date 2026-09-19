@@ -27,17 +27,18 @@ from __future__ import annotations
 import json
 import math
 import shutil
-import threading
 import time
 import uuid
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import cv2
 import numpy as np
 import pytest
 
 from airdrop import (
+    MAV_CMD_NAV_LAND,
     AlignmentBuffer,
     AlignmentWriter,
     Config,
@@ -45,7 +46,6 @@ from airdrop import (
     DetectionBatch,
     FrameTelemetryAligner,
     GroundConfig,
-    MAV_CMD_NAV_LAND,
     MissionConfig,
     MissionRunner,
     MissionState,
@@ -58,9 +58,8 @@ from airdrop import (
     PreflightConfig,
     ReplayVideoSource,
     RoutesConfig,
-    TargetTracker,
     TargetingConfig,
-    TelemetryBroker,
+    TargetTracker,
     TelemetrySnapshot,
     Waypoint,
     default_camera_model,
@@ -76,7 +75,7 @@ POSE_NORTH = 100.0
 POSE_EAST = 200.0
 POSE_DOWN = -50.0
 ORIGIN_ALT = 500.0
-GROUND_ALT = 500.0     # 地面点与原点的**高差为 0** ⇒ ground_z = 0
+GROUND_ALT = 500.0  # 地面点与原点的**高差为 0** ⇒ ground_z = 0
 
 
 # ----------------------------------------------------------------------
@@ -159,9 +158,7 @@ def _write_flight(
                 }
             )
         )
-    (flight_dir / "frames_index.jsonl").write_text(
-        "\n".join(index_lines) + "\n", encoding="utf-8"
-    )
+    (flight_dir / "frames_index.jsonl").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
 
     span = (len(images) - 1) * frame_dt + 0.5
     stamps = [start - 0.2 + k * tlm_dt for k in range(int(span / tlm_dt) + 1)]
@@ -173,7 +170,7 @@ def _write_flight(
 
 
 @pytest.fixture
-def workdir() -> Path:
+def workdir() -> Iterator[Path]:
     """工作区内的临时目录；用例结束整棵删掉（不用 ``tmp_path``：见 AGENTS）。"""
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     path = WORK_ROOT / uuid.uuid4().hex[:8]
@@ -279,7 +276,7 @@ class Chain:
         self.worker.start()
         self.source.add_sink(self.writer)
         self.source.start()
-        thread = self.source._thread  # noqa: SLF001 - 只等播放线程结束
+        thread = self.source._thread
         assert thread is not None
         thread.join(timeout)
         assert not thread.is_alive(), "回放线程没在超时内结束"
@@ -380,9 +377,9 @@ class StepClock:
 # ----------------------------------------------------------------------
 def _advance(runner: MissionRunner, controller: "StubController", clock: StepClock) -> None:
     """推到 LAND（或 DONE）：先让看门狗看到一次"任务在跑"，再报侦查航线飞完。"""
-    runner.update()                  # INIT → RECON
-    runner.update()                  # RECON：``mission_finished()`` 先回一次 False
-    controller.finished = True       # 侦查航线飞完
+    runner.update()  # INIT → RECON
+    runner.update()  # RECON：``mission_finished()`` 先回一次 False
+    controller.finished = True  # 侦查航线飞完
     for _ in range(60):
         runner.update()
         clock.sleep(0.05)
@@ -423,7 +420,7 @@ def test_replay_drives_full_chain_to_target_coordinates(workdir: Path) -> None:
         chain.broker,
         target_result=chain.source_obj.result,
         target_busy=chain.source_obj.busy,
-        release_judge=None,      # 这一条验的是坐标链路，投放判据由 P8/P9 各自覆盖
+        release_judge=None,  # 这一条验的是坐标链路，投放判据由 P8/P9 各自覆盖
         on_event=lambda kind, data: events.append((kind, data)),
         clock=clock,
         sleep=clock.sleep,
@@ -454,7 +451,9 @@ def test_replay_drives_full_chain_to_target_coordinates(workdir: Path) -> None:
 def test_chain_reports_no_result_when_target_is_never_labelled(workdir: Path) -> None:
     """一帧编号都没读出来时 → targeting 不给结果，状态机走**备用点**分支。"""
     flight_dir = _write_flight(workdir)
-    chain = Chain(flight_dir, ScriptedDetector({1: None, 2: None, 3: None, 4: None}), config=_config())
+    chain = Chain(
+        flight_dir, ScriptedDetector({1: None, 2: None, 3: None, 4: None}), config=_config()
+    )
     chain.play()
     chain.consumed()
 
@@ -475,8 +474,8 @@ def test_chain_reports_no_result_when_target_is_never_labelled(workdir: Path) ->
         clock=clock,
         sleep=clock.sleep,
     )
-    runner.update()                  # INIT → RECON
-    runner.update()                  # 先看到一次"任务在跑"
+    runner.update()  # INIT → RECON
+    runner.update()  # 先看到一次"任务在跑"
     controller.finished = True
     for _ in range(80):
         runner.update()
@@ -492,10 +491,10 @@ def test_tracker_skips_points_without_attitude_and_without_position() -> None:
     tracker = TargetTracker(config, camera=CAMERA)
     good = _pose_snapshot(time.time())
 
-    euler_only = _pose_snapshot(time.time())      # 只有欧拉角（四元数缺失）→ 用兜底路径
+    euler_only = _pose_snapshot(time.time())  # 只有欧拉角（四元数缺失）→ 用兜底路径
     for field in ("quaternion_w", "quaternion_x", "quaternion_y", "quaternion_z"):
         setattr(euler_only, field, None)
-    no_attitude = _pose_snapshot(time.time())     # 两种姿态都没有 → 无法解算
+    no_attitude = _pose_snapshot(time.time())  # 两种姿态都没有 → 无法解算
     for field in (
         "quaternion_w",
         "quaternion_x",

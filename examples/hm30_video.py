@@ -1,7 +1,7 @@
 """思翼 HM30 图传拉流示例：拉流并统计链路质量，可选预览 / 存盘。
 
-接线（Windows 上位机）：
-1. 网线插 HM30 **地面端** LAN 口；
+装配（Windows 上位机）：
+1. 网线插 HM30 地面端 LAN 口；
 2. 电脑网卡配静态地址 ``192.168.144.20`` / 掩码 ``255.255.255.0``（同网段任意空闲地址）；
 3. 先确认能 ping 通机载相机 ``192.168.144.25``。
 
@@ -9,17 +9,17 @@
 
     ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f null -
 
-运行（**集中式入口在 `airdrop/run.py`**）::
+运行（集中式入口在 airdrop/run.py）::
 
     ./.venv/Scripts/python.exe -m airdrop.run hm30-video
     ./.venv/Scripts/python.exe -m airdrop.run hm30-video --rtsp-url rtsp://192.168.144.25:8554/main.264
 
-本文件是**纯库模块**：顶部常量是默认值，`build_config(**覆盖)` / `main(**kwargs)` 按需传值；
-命令行由 `airdrop/run.py` 解析。cv2 只在"预览/存盘"那两条分支里导入，`--help` 不加载它。
+本文件是纯库模块：顶部常量是默认值，build_config(**覆盖) / main(**kwargs) 按需传值；
+命令行由 airdrop/run.py 解析。cv2 只在"预览/存盘"那两条分支里导入，--help 不加载它。
 
 拉流失败会在日志里直接给出 ffmpeg 的输出，不做地址探测、不轮询猜测。
 
-注意本示例消费的是**实时**画面（``read()``）：它保证你看到的是当前一帧，但不保证
+注意本示例消费的是实时画面（``read()``）：它保证你看到的是当前一帧，但不保证
 每一帧都被处理过。要"一帧都不能丢"（目标可能只出现一瞬），看
 ``examples/video_telemetry_sync.py``——那里把 ``AlignmentWriter`` 挂在拉流源上，
 采集线程每读一帧就写一帧进缓冲。
@@ -94,7 +94,9 @@ def run(
 
                 writer = cv2.VideoWriter(
                     save_path,
-                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    # OpenCV 4/5 都有这个常量；typeshed 给 cv2 的桩里没列全，
+                    # 所以类型检查会报 unknown attribute（运行时正常）
+                    cv2.VideoWriter_fourcc(*"mp4v"),  # pyright: ignore[reportAttributeAccessIssue]
                     max(source.stats.fps, 10.0),
                     (frame.width, frame.height),
                 )
@@ -159,9 +161,7 @@ def main(
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    config = build_config(
-        url=url, width=width, height=height, transport=transport, decoder=decoder
-    )
+    config = build_config(url=url, width=width, height=height, transport=transport, decoder=decoder)
     LOGGER.info(
         "拉流 %s（%dx%d transport=%s）",
         config.url,

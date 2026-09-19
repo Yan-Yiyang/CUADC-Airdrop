@@ -1,20 +1,20 @@
-"""投放判据：实时预测落点 → 触发投放；飞过目标后保底投放（计划 4.6）。
+"""投放判据：实时预测落点 → 触发投放；飞过目标后强制投放（计划 4.6）。
 
-两条判据（**都在同一个入口里**，实飞与回放走同一条路）：
+两条判据（都在同一个入口里，实飞与回放走同一条路）：
 
-1. **预测判据**：把飞机状态前推 ``delay_s``（补偿"指令→离机"延迟），用
+1. 预测判据：把飞机状态前推 ``delay_s``（补偿"指令→离机"延迟），用
    :class:`~airdrop.ballistics.model.BallisticsModel` 预测落点，落点与目标的水平距离
    ≤ ``radius_m`` 就投；
-2. **保底判据**：``dot(飞机位置 − 目标, 飞掠航向) > 0``——已经沿飞掠方向越过目标却还没投，
+2. 强制投放判据（越过目标后）：``dot(飞机位置 − 目标, 飞掠航向) > 0``——已经沿飞掠方向越过目标却还没投，
    立刻投。目标点与备用点用同一套判据。
 
-一次投放即**锁存**（一次性防抖）：之后任何调用都只回 ``already_released``，绝不重复投。
+一次投放即锁存（一次性防抖）：之后任何调用都只回 ``already_released``，绝不重复投。
 
 日志与事件
 ----------
-判据按调用方的节拍评估（``DropConfig.evaluation_hz``，默认 20Hz），但**摘要按 5Hz 落
-事件日志**（``summary_hz``）——20Hz 全量写盘只会把事件日志淹掉，而 5Hz 足够复盘。
-触发那一瞬间写**完整预测**（落点/飞行时间/水平误差/前推后的状态）。
+判据按调用方的节拍评估（``DropConfig.evaluation_hz``，默认 20Hz），但摘要按 5Hz 落
+事件日志（``summary_hz``）——20Hz 全量写盘只会把事件日志淹没，而 5Hz 足够复盘。
+触发那一瞬间写完整预测（落点/飞行时间/水平误差/前推后的状态）。
 ``on_event`` 的签名是 ``(kind, data)``，接到 recorder 上是
 ``lambda kind, data: recorder.events.emit(kind, **data)``。
 """
@@ -24,12 +24,13 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from ..config import DropConfig
 from ..telemetry.models import TelemetrySnapshot
-from .model import ZERO_WIND, BallisticsModel, Impact, wind_from_snapshot
+from .model import ZERO_WIND, BallisticsModel, Impact, as_float_triple, wind_from_snapshot
 
 LOGGER = logging.getLogger(__name__)
 
@@ -49,13 +50,13 @@ def heading_unit_vector(heading_deg: float) -> tuple[float, float]:
 class ReleaseDecision:
     """一次判据评估的结果。``reason`` 说明为什么投/不投。
 
-    ``delay_s`` 是这一拍用的**状态前推量**（``DropConfig.delay_s``）。它必须跟着决策
-    一起走：投放记录（:class:`~airdrop.ballistics.drops.DropRecord`）要用**判据当时
-    真正用的值**，否则事后反演会把"延迟填错"算到阻力系数头上。
+    ``delay_s`` 是这一拍用的状态前推量（``DropConfig.delay_s``）。它必须跟着决策
+    一起走：投放记录（:class:`~airdrop.ballistics.drops.DropRecord`）要用判据当时
+    真正用的值，否则事后反演会把"延迟填错"算到阻力系数头上。
     """
 
     should_release: bool
-    reason: str                      # predict / fallback / waiting / already_released / ...
+    reason: str  # predict / fallback / waiting / already_released / ...
     timestamp: float = 0.0
     predicted: Impact | None = None
     horizontal_error_m: float | None = None
@@ -138,17 +139,17 @@ class ReleaseJudge:
         position = self._position(snapshot)
         velocity = self._velocity(snapshot)
         if position is None or velocity is None:
-            return self._decide(
-                ReleaseDecision(False, "unknown_position", stamp), stamp
-            )
+            return self._decide(ReleaseDecision(False, "unknown_position", stamp), stamp)
         if len(target_ned) != 3:
             raise ValueError("target_ned 必须是 3 维 NED 矢量")
 
         # 1) 状态前推 delay_s：一阶近似（位置 += 速度×delay）。
         #    这里刻意不做二次项——延迟是几十毫秒量级，加速度项贡献在厘米级以下。
         delay = max(float(self.config.delay_s), 0.0)
-        release_position = tuple(
-            position[i] + velocity[i] * delay for i in range(3)
+        release_position: tuple[float, float, float] = (
+            position[0] + velocity[0] * delay,
+            position[1] + velocity[1] * delay,
+            position[2] + velocity[2] * delay,
         )
 
         wind = self._resolve_wind(snapshot, wind_ned)
@@ -164,21 +165,16 @@ class ReleaseJudge:
         if impact.ok and impact.ned is not None:
             error = math.hypot(impact.ned[0] - target[0], impact.ned[1] - target[1])
 
-        # 2) 保底判据：沿飞掠航向已经越过目标
+        # 2) 强制投放判据：沿飞掠航向已经越过目标
         north, east = heading_unit_vector(self.overfly_heading_deg)
         passed = (
-            (release_position[0] - target[0]) * north
-            + (release_position[1] - target[1]) * east
+            (release_position[0] - target[0]) * north + (release_position[1] - target[1]) * east
         ) > 0.0
 
         if error is not None and error <= self.config.radius_m:
-            return self._release(
-                "predict", stamp, impact, error, passed, release_position, delay
-            )
+            return self._release("predict", stamp, impact, error, passed, release_position, delay)
         if passed and self.config.force_after_pass:
-            return self._release(
-                "fallback", stamp, impact, error, passed, release_position, delay
-            )
+            return self._release("fallback", stamp, impact, error, passed, release_position, delay)
 
         reason = "waiting" if impact.ok else f"no_prediction:{impact.reason}"
         return self._decide(
@@ -203,7 +199,7 @@ class ReleaseJudge:
     ) -> tuple[float, float, float]:
         """这一拍用哪个风：显式入参 > 快照（按 ``wind_source``）> 零风降级。
 
-        "没有风估计"只记**一次**日志（20Hz 每拍都记会把日志淹掉）。
+        "没有风估计"只记一次日志（20Hz 每拍都记会把日志淹没）。
         """
         if override is not None:
             return (float(override[0]), float(override[1]), float(override[2]))
@@ -215,25 +211,19 @@ class ReleaseJudge:
         if not self._wind_warned:
             self._wind_warned = True
             LOGGER.warning(
-                "遥测里没有风估计（wind_source=%s），本次投放按**零风**预测——"
+                "遥测里没有风估计（wind_source=%s），本次投放按零风预测——"
                 "风会平移落点，需要风补偿时先确认飞控的风估计流可用",
                 self.ballistics.config.wind_source,
             )
         return ZERO_WIND
 
     def _position(self, snapshot: TelemetrySnapshot) -> tuple[float, float, float] | None:
-        values = (snapshot.north_m, snapshot.east_m, snapshot.down_m)
-        if any(value is None for value in values):
-            return None
-        return (float(values[0]), float(values[1]), float(values[2]))
+        return as_float_triple((snapshot.north_m, snapshot.east_m, snapshot.down_m))
 
     def _velocity(self, snapshot: TelemetrySnapshot) -> tuple[float, float, float] | None:
-        values = (snapshot.vx_m_s, snapshot.vy_m_s, snapshot.vz_m_s)
-        if any(value is None for value in values):
-            return None
-        return (float(values[0]), float(values[1]), float(values[2]))
+        return as_float_triple((snapshot.vx_m_s, snapshot.vy_m_s, snapshot.vz_m_s))
 
-    def _release(
+    def _release(  # noqa: PLR0917 - 内部方法，参数顺序与 ReleaseDecision 字段一致
         self,
         reason: str,
         stamp: float,
@@ -286,5 +276,5 @@ class ReleaseJudge:
         payload["evaluated_at"] = stamp
         try:
             self.on_event(kind, payload)
-        except Exception:  # noqa: BLE001 - 事件写盘失败不能影响投放判据
+        except Exception:
             LOGGER.exception("写入投放事件失败（判据继续）")

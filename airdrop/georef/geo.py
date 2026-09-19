@@ -1,13 +1,13 @@
 """NED ↔ WGS84 坐标换算（纯函数）。
 
-**直接移植 旧版 ``drone/coordinates.py`` 的这两段**（计划 4.4 明确要求）：
+直接移植 旧版 ``drone/coordinates.py`` 的这两段（计划 4.4 明确要求）：
 它已过 pyproj ``Geod`` 大地线真值验证（方位/距离/往返互逆），没有理由重写。
 
 约定
 ----
 ``ned`` 是 ``(north, east, down)``，单位米，相对 ``lla_ref`` 定义的 NED 原点；
-``lla`` / ``lla_ref`` 是 ``(lon, lat, alt)``，经纬度单位**度**、高度米——
-注意顺序是**经度在前**（与 pyproj 的 ``always_xy=True`` 一致，也与
+``lla`` / ``lla_ref`` 是 ``(lon, lat, alt)``，经纬度单位度、高度米——
+注意顺序是经度在前（与 pyproj 的 ``always_xy=True`` 一致，也与
 :meth:`airdrop.telemetry.models.TelemetrySnapshot` 里的经纬度字段分开存不同，
 这里刻意成对传递以免搞混）。
 
@@ -24,17 +24,13 @@ from typing import NamedTuple
 import numpy as np
 import pyproj
 
-__all__ = ["LLARef", "ned_to_wgs84", "wgs84_to_ned", "ned_distance"]
+__all__ = ["LLARef", "ned_distance", "ned_to_wgs84", "wgs84_to_ned"]
 
 # ECEF ↔ 大地坐标的坐标框架（模块级建一次，pyproj 的 Transformer 构造不便宜）
 _ECEF = pyproj.Proj(proj="geocent", ellps="WGS84", datum="WGS84")
 _LLA = pyproj.Proj(proj="latlong", ellps="WGS84", datum="WGS84")
-_LLA_TO_ECEF = pyproj.Transformer.from_proj(
-    proj_from=_LLA, proj_to=_ECEF, always_xy=True
-).transform
-_ECEF_TO_LLA = pyproj.Transformer.from_proj(
-    proj_from=_ECEF, proj_to=_LLA, always_xy=True
-).transform
+_LLA_TO_ECEF = pyproj.Transformer.from_proj(proj_from=_LLA, proj_to=_ECEF, always_xy=True).transform
+_ECEF_TO_LLA = pyproj.Transformer.from_proj(proj_from=_ECEF, proj_to=_LLA, always_xy=True).transform
 
 
 class LLARef(NamedTuple):

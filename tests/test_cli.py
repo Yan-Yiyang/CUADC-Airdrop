@@ -1,14 +1,14 @@
-"""集中式运行模块（`airdrop/run.py`）的离线验收。
+"""集中式运行模块（airdrop/run.py）的离线验收。
 
 全部离线：不连飞控、不开相机、不碰 GPU，也没有一个用例真的去跑任务——跑的都是
 ``--help``、参数校验与"选项 → 关键字"的翻译。
 
 三条核心口径：
 
-1. **子命令注册表完整**：每个子命令都有 parser 与 handler；
-2. **帮助信息不加载重库**：``--help``（顶层与每个子命令）跑在**干净子进程**里，
+1. 子命令注册表完整：每个子命令都有 parser 与 handler；
+2. 帮助信息不加载重库：``--help``（顶层与每个子命令）跑在干净子进程里，
    跑完 ``sys.modules`` 里不许有 torch / cv2 / mavsdk / ultralytics / rapidocr；
-3. **选项真的进了配置**：``run.resolve_kwargs()`` 给出的关键字交给各入口的
+3. 选项真的进了配置：``run.resolve_kwargs()`` 给出的关键字交给各入口的
    ``build_config()``，配置里确实变了（``dataclasses.replace`` 那条路）。
 """
 
@@ -31,7 +31,7 @@ HEAVY_MODULES = ("torch", "cv2", "mavsdk", "ultralytics", "rapidocr", "onnxrunti
 
 
 def _run_in_subprocess(code: str) -> subprocess.CompletedProcess[str]:
-    """在**干净解释器**里跑一段代码（重库是否被加载只能这样量）。"""
+    """在干净解释器里跑一段代码（重库是否被加载只能这样量）。"""
     return subprocess.run(
         [sys.executable, "-c", code],
         cwd=str(REPO_ROOT),
@@ -40,6 +40,7 @@ def _run_in_subprocess(code: str) -> subprocess.CompletedProcess[str]:
         encoding="utf-8",
         errors="replace",
         timeout=300,
+        check=False,  # 非零退出由调用方按退出码断言
     )
 
 
@@ -50,12 +51,12 @@ def test_every_subcommand_has_a_parser_and_a_handler() -> None:
     parser = run.build_parser()
     # argparse 把子命令注册在 _SubParsersAction.choices 里（名字 -> 子解析器）
     actions = [
-        action
-        for action in parser._actions  # noqa: SLF001 - argparse 只此一个入口
-        if action.__class__.__name__ == "_SubParsersAction"
+        action for action in parser._actions if action.__class__.__name__ == "_SubParsersAction"
     ]
     assert len(actions) == 1, "顶层解析器应当只有一个子命令动作"
     registered = actions[0].choices
+    # choices 在桩里是 Iterable | None；这里断言它确实注册过（上面已确认只有一个动作）
+    assert registered is not None
     assert set(registered) == set(run.SUBCOMMANDS), "注册表与解析器必须一一对应"
 
     for name, spec in run.SUBCOMMANDS.items():
@@ -122,7 +123,7 @@ def test_help_does_not_load_heavy_libraries(argv: list[str]) -> None:
     assert result.returncode == 0, result.stderr
     assert "EXIT 0" in result.stdout, result.stdout + result.stderr
     assert "HEAVY NONE" in result.stdout, (
-        f"`--help`（{' '.join(argv)}）加载了重库：{result.stdout.strip()}"
+        f"--help（{' '.join(argv)}）加载了重库：{result.stdout.strip()}"
     )
 
 
@@ -206,11 +207,16 @@ def test_full_mission_options_override_the_config() -> None:
     kwargs = run.resolve_kwargs(
         "full-mission",
         [
-            "--system-address", "udpin://0.0.0.0:14550",
-            "--rtsp-url", "rtsp://127.0.0.1:8554/test",
-            "--telemetry-lag", "0.25",
-            "--land-plan", "routes/land.plan",
-            "--recon-upload", "auto",
+            "--system-address",
+            "udpin://0.0.0.0:14550",
+            "--rtsp-url",
+            "rtsp://127.0.0.1:8554/test",
+            "--telemetry-lag",
+            "0.25",
+            "--land-plan",
+            "routes/land.plan",
+            "--recon-upload",
+            "auto",
             "--no-video",
             "--no-preflight",
             "--no-require-airborne",
@@ -298,7 +304,7 @@ def test_fit_ballistics_options_override_the_config() -> None:
 
 
 def test_defaults_come_from_the_module_constants() -> None:
-    """不带选项时，关键字必须**等于**入口模块的常量（默认值不写第二遍）。"""
+    """不带选项时，关键字必须等于入口模块的常量（默认值不写第二遍）。"""
     from examples import full_mission, sitl_mission
     from tools import calibrate
 

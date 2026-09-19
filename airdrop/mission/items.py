@@ -54,8 +54,8 @@ __all__ = [
     "MAV_FRAME_GLOBAL_RELATIVE_ALT",
     "MAV_FRAME_GLOBAL_TERRAIN_ALT",
     "MAV_FRAME_MISSION",
-    "MissionItem",
     "UNSET",
+    "MissionItem",
     "command_name",
 ]
 

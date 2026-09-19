@@ -32,13 +32,13 @@ import numpy as np
 LOGGER = logging.getLogger(__name__)
 
 __all__ = [
-    "CameraModel",
     "DEFAULT_R_BC",
+    "CameraModel",
+    "euler_to_matrix",
     "load_camera_model",
     "rotation_x",
     "rotation_y",
     "rotation_z",
-    "euler_to_matrix",
 ]
 
 
@@ -85,11 +85,11 @@ class CameraModel:
     """
 
     camera_matrix: np.ndarray
-    dist_coeffs: np.ndarray = field(
-        default_factory=lambda: np.zeros(5, dtype=np.float64)
-    )
+    dist_coeffs: np.ndarray = field(default_factory=lambda: np.zeros(5, dtype=np.float64))
     #: 相机系 → 机体系
-    r_bc: np.ndarray = field(default_factory=lambda: DEFAULT_R_BC.copy())
+    # default_factory 要的就是"可调用对象"：写 DEFAULT_R_BC.copy 与 lambda 等价，
+    # 但 lambda 更能看出"每个实例各拿一份拷贝"，故保留。
+    r_bc: np.ndarray = field(default_factory=lambda: DEFAULT_R_BC.copy())  # noqa: PLW0108
     #: 相机光心在机体系中的位置（杆臂），米
     t_bc: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
     #: 标定时的图像尺寸 (width, height)；用于"帧尺寸不符就跳过去畸变"
@@ -110,9 +110,7 @@ class CameraModel:
 
         rotation = np.asarray(self.r_bc, dtype=np.float64).reshape(3, 3)
         if not _is_rotation(rotation):
-            raise ValueError(
-                "R_bc 不是合法旋转矩阵（需正交且 det=+1）: " f"{rotation.tolist()}"
-            )
+            raise ValueError(f"R_bc 不是合法旋转矩阵（需正交且 det=+1）: {rotation.tolist()}")
         object.__setattr__(self, "r_bc", rotation)
 
         offset = np.asarray(self.t_bc, dtype=np.float64).reshape(3)
@@ -189,9 +187,7 @@ def default_camera_model(width: int = 1280, height: int = 720) -> CameraModel:
     必须先标定——所以 :func:`load_camera_model` 找不到文件时会 warning。
     """
     fx = width / (2.0 * math.tan(math.radians(60.0) / 2.0))
-    matrix = np.array(
-        [[fx, 0.0, width / 2.0], [0.0, fx, height / 2.0], [0.0, 0.0, 1.0]]
-    )
+    matrix = np.array([[fx, 0.0, width / 2.0], [0.0, fx, height / 2.0], [0.0, 0.0, 1.0]])
     return CameraModel(
         camera_matrix=matrix,
         image_size=(int(width), int(height)),
@@ -236,9 +232,7 @@ def load_camera_model(
         size = payload.get("image_size")
         model = CameraModel(
             camera_matrix=np.asarray(payload["camera_matrix"], dtype=np.float64),
-            dist_coeffs=np.asarray(
-                payload.get("dist_coeffs", [0.0] * 5), dtype=np.float64
-            ),
+            dist_coeffs=np.asarray(payload.get("dist_coeffs", [0.0] * 5), dtype=np.float64),
             r_bc=(
                 np.asarray(payload["R_bc"], dtype=np.float64)
                 if payload.get("R_bc") is not None

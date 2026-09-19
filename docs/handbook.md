@@ -32,9 +32,9 @@
      → 感知（YOLO 检测 + OCR 读编号）→ 像素→NED 坐标解算 → 目标统计（聚类 + 选唯一）
      ├─ 有结果 → 飞掠航点（航向/高度/段长按配置）+ 降落航线，合并上传
      └─ 无结果 → 以备用点为目标生成同样航点
-     → 飞掠段：弹道实时预测落点，距目标 ≤R 触发 gripper 投放；飞过目标未投则保底投放
+     → 飞掠段：弹道实时预测落点，距目标 ≤R 触发 gripper 投放；飞过目标未投则强制投放
      → 沿降落航线返航降落
-全程：飞行目录（文本日志/遥测/检测/事件/投放/视频帧）落盘，飞后可回放迭代
+全程：飞行目录（文本日志/遥测/检测/事件/投放/视频帧）写入磁盘，飞后可回放迭代
 投放后：量出实际落点 → 反演弹道参数（质量是称出来的，反演识别的是 κ=Cd·A/m）
 ```
 
@@ -70,7 +70,7 @@
 | --- | --- | --- |
 | `airdrop/telemetry/` | 遥测与控制：MAVSDK 工作线程、线程安全代理、任务级控制器 | `MavsdkThread`、`TelemetryBroker`、`TelemetrySnapshot`、`DroneController`、`MissionController`、`NedOrigin` |
 | `airdrop/video/` | 图传接收：ffmpeg 拉流、帧-遥测时间对齐、环形缓冲 | `Hm30VideoSource`、`FrameTelemetryAligner`、`AlignedSample`、`AlignmentBuffer`、`AlignmentWriter`、`BufferedFrame` |
-| `airdrop/record/` | 记录与回放：飞行目录落盘、按原时间轴重放 | `FlightRecorder`、`EventLog`、`DropWriter`、`DetectionWriter`、`ReplayVideoSource`、`TelemetryPacer`、`FlightLog` |
+| `airdrop/record/` | 记录与回放：飞行目录写入磁盘、按原时间轴重放 | `FlightRecorder`、`EventLog`、`DropWriter`、`DetectionWriter`、`ReplayVideoSource`、`TelemetryPacer`、`FlightLog` |
 | `airdrop/perception/` | 视频处理：YOLO 检测 +（OCR 读编号 \| 12 类直出） | `Detector`、`DetectionBatch`、`OpenCvPostProcess`、`OcrEngine`、`OcrWorkerPool`、`PerceptionWorker`、`Detection` |
 | `airdrop/georef/` | 坐标处理：像素 → NED（视线与地面求交）→ WGS84 | `CameraModel`、`pixel_to_ned`、`cross_check_by_side`、`LLARef`、`wgs84_to_ned` |
 | `airdrop/targeting/` | 目标统计：DBSCAN 聚类 + 按编号选唯一结果 | `TargetPoint`、`Cluster`、`TargetingResult`、`analyze` |
@@ -149,7 +149,7 @@
         │ mission.MissionRunner（INIT→PREFLIGHT→WAIT_AIRBORNE→RECON→…→DONE）│
         │  · mission.planner: 侦查航线 / 飞掠 [entry,exit] + 降落航线合并上传 │
         │  · telemetry.controller.DroneController: 上传/启动/hold/rtl/投放   │
-        │  · ballistics.ReleaseJudge: 每拍预测落点 ≤R 即投；越过目标保底投    │
+        │  · ballistics.ReleaseJudge: 每拍预测落点 ≤R 即投；越过目标则强制投  │
         │  · on_drop → record.DropWriter: drops.jsonl（投放瞬间状态）        │
         └───────────────────────────────────────────────────────────────┘
                         │ （事后）
@@ -233,7 +233,7 @@
 
 每节给出：职责与关键类型 → **调用方法（签名）** → **最小可运行示例**（离线、不碰硬件；
 本节所有示例都在 `tests/test_handbook.py` 里逐条真跑，11/11 通过）→ 注入点/协议 →
-失败语义 → 坑与指针。
+失败语义 → 易错点与指针。
 
 ### 3.1 `airdrop.telemetry` —— 遥测与控制
 
@@ -256,7 +256,7 @@ TelemetryBroker(history_maxlen: int = 1200, history_interval: float = 0.1)
 | `wait_history_until(timestamp, timeout=None)` | 阻塞直到历史覆盖到该时刻（对齐器用它等遥测追上） |
 | `wait_next_snapshot(timeout=None, predicate=None)` | 阻塞等到满足 `predicate` 的下一条快照 |
 | `subscribe(callback)` / `unsubscribe(callback)` | 新快照推送（回调在**发布线程**里调用，必须快） |
-| `update_local_position_velocity(position_ned, velocity_ned)` 等 `update_*` | 喂一条 MAVSDK 风格的更新，返回合并后的快照 |
+| `update_local_position_velocity(position_ned, velocity_ned)` 等 `update_*` | 送入一条 MAVSDK 风格的更新，返回合并后的快照 |
 | `publish(snapshot)` | 直接发布一条**完整快照**（保留它自己的 `timestamp`、不节流）——回放用它 |
 | `reset` | 清空快照与历史（重连前调用） |
 
@@ -272,14 +272,14 @@ position = SimpleNamespace(north_m=100.0, east_m=200.0, down_m=-50.0)
 velocity = SimpleNamespace(north_m_s=15.0, east_m_s=0.0, down_m_s=0.0)
 snapshot = broker.update_local_position_velocity(position, velocity)
 
-print(snapshot.north_m, snapshot.east_m, snapshot.vx_m_s)     # 100.0 200.0 15.0
+print(snapshot.north_m, snapshot.east_m, snapshot.vx_m_s)  # 100.0 200.0 15.0
 print(broker.get_snapshot_at(snapshot.timestamp, mode="nearest").north_m)  # 100.0
 ```
 
 **失败语义**：不抛错。历史为空 → `history_span()` 返回 None、`get_snapshot_at` 返回 None、
 `wait_*` 返回 False/None。**没有数据就是 None，不编一个默认值**。
 
-**坑**：`history_interval` 是**入库节流**（默认 0.1s ≈ 10Hz），历史最多 `history_maxlen`
+**易错点**：`history_interval` 是**入库节流**（默认 0.1s ≈ 10Hz），历史最多 `history_maxlen`
 条（默认 1200 条 ≈ 2 分钟）；最新快照与订阅推送不受节流影响。查询用
 `bisect(key=operator.attrgetter("timestamp"))` 直接探测 deque（§7 第 2 条）。
 
@@ -308,7 +308,7 @@ MavsdkThread(broker=None, system_address="udpin://0.0.0.0:14540", *,
 **6 条核心流**：position / home / position_velocity_ned / attitude_euler /
 attitude_quaternion / gps_global_origin，用 `asyncio.TaskGroup` 并行采集，**任一核心流结束即视为
 断连**，交给 supervisor 重连。**两条"可选流"**（`mission_raw.mission_progress()` 任务进度、
-`telemetry.flight_mode()` 飞行模式）：结束或报错只记日志、不影响会话——它们分别喂快照的
+`telemetry.flight_mode()` 飞行模式）：结束或报错只记日志、不影响会话——它们分别送入快照的
 `mission_current`/`mission_total` 与 `flight_mode`，状态机靠这二者判断"任务是否飞完""是否真在任务模式"。
 风估计也是可选流（没有它时投放判据按零风降级并记一次日志），但它是 MAVSDK `telemetry.wind()`。
 
@@ -377,7 +377,7 @@ open_hm30_video(config=None, *, autostart=True) -> Hm30VideoSource
 | `iter_frames(timeout=1.0)` | 迭代新帧，连续超时即结束 |
 | `stats` | `airdrop.video.source.VideoStats`：`state` / `frames` / `dropped` / `reconnects` / `fps` / `last_error` |
 
-**两条路别混用**：推理与落盘要接 `add_sink`（经 `AlignmentWriter` 进缓冲）；`read()`/`latest()`
+**两条路别混用**：推理与写入磁盘要接 `add_sink`（经 `AlignmentWriter` 进缓冲）；`read()`/`latest()`
 只保证"当前这一帧"，慢消费者会丢中间帧。
 
 #### 3.2.2 `FrameTelemetryAligner`（按拍摄时刻取遥测）
@@ -400,7 +400,13 @@ align(frame: VideoFrame | None) -> AlignedSample | None
 import time
 import numpy as np
 from types import SimpleNamespace
-from airdrop import AlignmentBuffer, AlignmentWriter, FrameTelemetryAligner, TelemetryBroker, VideoFrame
+from airdrop import (
+    AlignmentBuffer,
+    AlignmentWriter,
+    FrameTelemetryAligner,
+    TelemetryBroker,
+    VideoFrame,
+)
 
 broker = TelemetryBroker()
 broker.update_local_position_velocity(
@@ -409,13 +415,17 @@ broker.update_local_position_velocity(
 )
 aligner = FrameTelemetryAligner(broker, max_wait=0.5)
 buffer = AlignmentBuffer(capacity=8, storage="jpeg")
-writer = AlignmentWriter(buffer, aligner)          # 标准 sink 接法
+writer = AlignmentWriter(buffer, aligner)  # 标准 sink 接法
 
-frame = VideoFrame(index=1, image=np.zeros((180, 320, 3), dtype=np.uint8),
-                   timestamp=broker.get_snapshot().timestamp + 0.15, lag=0.15)
-writer(frame)                                       # 逐帧回调里被调用
+frame = VideoFrame(
+    index=1,
+    image=np.zeros((180, 320, 3), dtype=np.uint8),
+    timestamp=broker.get_snapshot().timestamp + 0.15,
+    lag=0.15,
+)
+writer(frame)  # 逐帧回调里被调用
 record = buffer.latest()
-print(record.index, record.snapshot.north_m, writer.stats())   # 1 100.0 (1, 0)
+print(record.index, record.snapshot.north_m, writer.stats())  # 1 100.0 (1, 0)
 ```
 
 #### 3.2.3 `AlignmentBuffer` / `AlignmentWriter`（环形缓冲）
@@ -431,7 +441,7 @@ AlignmentWriter(buffer, aligner)      # 可调用对象：__call__(frame)
 | `latest()` / `at(index)` / `latest_index()` / `indices()` | 取最新 / 按序号取 / 序号范围 |
 | `iter_between(start=None, end=None, *, batch=16)` | **按时间区间分批迭代**（回看历史的正道） |
 | `wait_new(after_index=0, timeout=None)` | 等一条更新记录，返回**最早**满足条件的那条（读者各自持游标） |
-| `read_jpeg_bytes(index)` | 内部 API：取原始 jpeg 字节（`FlightRecorder` 零重编码落盘用） |
+| `read_jpeg_bytes(index)` | 内部 API：取原始 jpeg 字节（`FlightRecorder` 零重编码写入磁盘用） |
 | `clear()` | 清空（不影响已发出的记录对象） |
 | `AlignmentWriter.stats()` | `(written, skipped)`：`skipped` 只因"该时刻取不到遥测"增加 |
 | `BufferStats` | `storage` / `capacity` / `max_bytes` / `frames` / `put` / `evicted` / `bytes` / `last_index` |
@@ -441,13 +451,13 @@ AlignmentWriter(buffer, aligner)      # 可调用对象：__call__(frame)
 `capacity_for(fps=30.0, seconds=180.0)` 做换算；`raw_frame_bytes(width, height, channels=3)`
 算未压缩一帧的字节数。
 
-**坑**：ffmpeg 后端的 `VideoFrame.image` 是**复用管道缓冲区的视图**——
+**易错点**：ffmpeg 后端的 `VideoFrame.image` 是**复用管道缓冲区的视图**——
 `AlignmentBuffer` 内部已拷贝，但你若自己跨帧保存必须 `.copy()`；`raw` 模式读到的 image 是
 只读视图。
 
 ### 3.3 `airdrop.record` —— 记录与回放
 
-#### 3.3.1 `FlightRecorder`（飞行目录落盘）
+#### 3.3.1 `FlightRecorder`（飞行目录写入磁盘）
 
 ```python
 FlightRecorder(config: Config, *, base_dir: str | Path | None = None)
@@ -471,11 +481,18 @@ flight_dir  -> Path | None
 import json, shutil, time, uuid
 from pathlib import Path
 import cv2, numpy as np
-from airdrop import (AlignmentBuffer, Config, FlightLog, FlightRecorder,
-                     ReplayVideoSource, TelemetryBroker, TelemetrySnapshot,
-                     load_broker_from_log)
+from airdrop import (
+    AlignmentBuffer,
+    Config,
+    FlightLog,
+    FlightRecorder,
+    ReplayVideoSource,
+    TelemetryBroker,
+    TelemetrySnapshot,
+    load_broker_from_log,
+)
 
-work = Path(".fit-test-tmp") / uuid.uuid4().hex[:8]      # 任意可写目录
+work = Path(".fit-test-tmp") / uuid.uuid4().hex[:8]  # 任意可写目录
 work.mkdir(parents=True, exist_ok=True)
 config = Config()
 
@@ -483,35 +500,50 @@ recorder = FlightRecorder(config, base_dir=work)
 recorder.start(broker=TelemetryBroker(), buffer=AlignmentBuffer(capacity=4))
 recorder.events.emit("state", from_state="RECON", to_state="HOLD")
 recorder.stop()
-flight_dir = recorder.flight_dir                 # work/<时间戳>/
+flight_dir = recorder.flight_dir  # work/<时间戳>/
 print(sorted(p.name for p in flight_dir.iterdir()))
 # ['config_snapshot.json', 'detections.jsonl', 'drops.jsonl', 'events.jsonl',
 #  'flight.log', 'frames', 'frames_index.jsonl', 'telemetry.jsonl']
 
 # 手工补一份最小素材（真飞时由写盘线程产出）：1 帧 + 3 条遥测
-frames_dir = flight_dir / "frames"; frames_dir.mkdir(exist_ok=True)
+frames_dir = flight_dir / "frames"
+frames_dir.mkdir(exist_ok=True)
 base = time.time()
 snapshots = []
 for i, north in enumerate((0.0, 10.0, 20.0)):
-    snap = TelemetrySnapshot(timestamp=base + i * 0.1); snap.north_m = north
+    snap = TelemetrySnapshot(timestamp=base + i * 0.1)
+    snap.north_m = north
     snapshots.append(snap)
 (flight_dir / "telemetry.jsonl").write_text(
-    "\n".join(json.dumps(s.as_dict()) for s in snapshots) + "\n", encoding="utf-8")
+    "\n".join(json.dumps(s.as_dict()) for s in snapshots) + "\n", encoding="utf-8"
+)
 jpeg = cv2.imencode(".jpg", np.zeros((180, 320, 3), dtype=np.uint8))[1].tobytes()
 (frames_dir / "000001.jpg").write_bytes(jpeg)
-(flight_dir / "frames_index.jsonl").write_text(json.dumps({
-    "index": 1, "filename": "000001.jpg", "capture_timestamp": base,
-    "received_timestamp": base + 0.15, "lag": 0.15,
-    "extrapolated": False, "offset": 0.0, "bytes": len(jpeg)}) + "\n", encoding="utf-8")
+(flight_dir / "frames_index.jsonl").write_text(
+    json.dumps(
+        {
+            "index": 1,
+            "filename": "000001.jpg",
+            "capture_timestamp": base,
+            "received_timestamp": base + 0.15,
+            "lag": 0.15,
+            "extrapolated": False,
+            "offset": 0.0,
+            "bytes": len(jpeg),
+        }
+    )
+    + "\n",
+    encoding="utf-8",
+)
 
 log = FlightLog.open(flight_dir)
-print(len(log.frames), sum(1 for _ in log.iter_telemetry()))     # 1 3
-broker, pacer = load_broker_from_log(flight_dir)                 # 遥测尚未灌入
+print(len(log.frames), sum(1 for _ in log.iter_telemetry()))  # 1 3
+broker, pacer = load_broker_from_log(flight_dir)  # 遥测尚未灌入
 pacer.publish_until(snapshots[-1].timestamp)
-print(broker.get_snapshot().north_m)                             # 20.0
+print(broker.get_snapshot().north_m)  # 20.0
 
 received = []
-source = ReplayVideoSource(flight_dir, speed=0.0)                # 0 = 全速
+source = ReplayVideoSource(flight_dir, speed=0.0)  # 0 = 全速
 source.add_sink(received.append)
 source.start()
 try:
@@ -662,19 +694,27 @@ OpenCvPostProcess(color='blue', ocr_conf_threshold=0.6, *, engine=None,
 
 ```python
 """五边形定位（纯几何，不需要 OCR 权重）。"""
+
 import cv2
 import numpy as np
 from airdrop.perception import OpenCvPostProcess
 
 image = np.zeros((320, 320, 3), dtype=np.uint8)
-side, left, top = 100, 110, 180                    # 正方形左上角
-apex_y = int(top - side * (3 ** 0.5) / 2)          # 等边三角形顶角
-pentagon = np.array([[left, top + side], [left + side, top + side],
-                     [left + side, top], [left + side // 2, apex_y], [left, top]],
-                    dtype=np.int32)
-cv2.fillPoly(image, [pentagon], (255, 0, 0))       # BGR：纯蓝
+side, left, top = 100, 110, 180  # 正方形左上角
+apex_y = int(top - side * (3**0.5) / 2)  # 等边三角形顶角
+pentagon = np.array(
+    [
+        [left, top + side],
+        [left + side, top + side],
+        [left + side, top],
+        [left + side // 2, apex_y],
+        [left, top],
+    ],
+    dtype=np.int32,
+)
+cv2.fillPoly(image, [pentagon], (255, 0, 0))  # BGR：纯蓝
 post = OpenCvPostProcess(color="blue")
-post.image = image                                 # edge_detection 用 self.image
+post.image = image  # edge_detection 用 self.image
 approx, ok = post.edge_detection()
 print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_min))
 ```
@@ -749,10 +789,18 @@ PerceptionWorker(config: PerceptionConfigLike, *, buffer: AlignmentBuffer,
 
 ```python
 """感知主循环（cls12 模式 + 注入假检测器）：缓冲 → 检测 → Detection。"""
+
 import time
 import numpy as np
-from airdrop import (AlignedSample, AlignmentBuffer, Detection, DetectionBatch,
-                     PixelBox, TelemetrySnapshot, VideoFrame)
+from airdrop import (
+    AlignedSample,
+    AlignmentBuffer,
+    Detection,
+    DetectionBatch,
+    PixelBox,
+    TelemetrySnapshot,
+    VideoFrame,
+)
 from airdrop.perception import PerceptionConfigLike, PerceptionWorker
 
 buffer = AlignmentBuffer(capacity=4, storage="raw")
@@ -760,23 +808,46 @@ snapshot = TelemetrySnapshot(timestamp=time.time())
 snapshot.north_m, snapshot.east_m, snapshot.down_m = 100.0, 200.0, -50.0
 snapshot.vx_m_s = snapshot.vy_m_s = snapshot.vz_m_s = 0.0
 for index in (1, 2, 3):
-    frame = VideoFrame(index=index, image=np.zeros((180, 320, 3), dtype=np.uint8),
-                       timestamp=time.time(), lag=0.15)
-    buffer.put(AlignedSample(frame=frame, snapshot=snapshot, timestamp=frame.timestamp,
-                             lag=0.15, mode="interpolate"))
+    frame = VideoFrame(
+        index=index, image=np.zeros((180, 320, 3), dtype=np.uint8), timestamp=time.time(), lag=0.15
+    )
+    buffer.put(
+        AlignedSample(
+            frame=frame, snapshot=snapshot, timestamp=frame.timestamp, lag=0.15, mode="interpolate"
+        )
+    )
 
-class _FakeDetector:                                  # 真项目里换成 Detector()
+
+class _FakeDetector:  # 真项目里换成 Detector()
     def load(self):
         return self
-    def detect(self, image, *, frame_index=0, capture_timestamp=0.0,
-               telemetry=None, mode="", undistort=None):
-        detection = Detection(frame_index=frame_index, capture_timestamp=capture_timestamp,
-                              pixel=(160.0, 90.0), box=PixelBox(150.0, 80.0, 170.0, 100.0),
-                              confidence=0.9, telemetry=telemetry, code=7, mode=mode)
+
+    def detect(
+        self,
+        image,
+        *,
+        frame_index=0,
+        capture_timestamp=0.0,
+        telemetry=None,
+        mode="",
+        undistort=None,
+    ):
+        detection = Detection(
+            frame_index=frame_index,
+            capture_timestamp=capture_timestamp,
+            pixel=(160.0, 90.0),
+            box=PixelBox(150.0, 80.0, 170.0, 100.0),
+            confidence=0.9,
+            telemetry=telemetry,
+            code=7,
+            mode=mode,
+        )
         return DetectionBatch(image=image, detections=(detection,), undistorted=False)
 
-worker = PerceptionWorker(PerceptionConfigLike(mode="cls12"), buffer=buffer,
-                          detector=_FakeDetector())
+
+worker = PerceptionWorker(
+    PerceptionConfigLike(mode="cls12"), buffer=buffer, detector=_FakeDetector()
+)
 worker.start()
 try:
     deadline, results = time.time() + 5.0, []
@@ -856,19 +927,28 @@ CameraModel(camera_matrix, dist_coeffs=<全零>, r_bc=<DEFAULT_R_BC>, t_bc=<零�
 
 ```python
 """坐标解算：水平朝下看 + 主点像素 ⇒ 目标就在飞机正下方。"""
+
 from airdrop import cross_check_by_side, default_camera_model, pixel_to_ned
 
 camera = default_camera_model(320, 180)
-result = pixel_to_ned(camera.principal_point(), camera=camera, ground_z=0.0,
-                      position_ned=(100.0, 200.0, -50.0),
-                      quaternion=(1.0, 0.0, 0.0, 0.0))
+result = pixel_to_ned(
+    camera.principal_point(),
+    camera=camera,
+    ground_z=0.0,
+    position_ned=(100.0, 200.0, -50.0),
+    quaternion=(1.0, 0.0, 0.0, 0.0),
+)
 print("地面交点 NED:", result.ned, "深度 %.1f m" % result.depth_m)
 
 # 边长法独立估深度：取与 50 m 自洽的像素边长做交叉验证
 side_px = float(camera.camera_matrix[0, 0]) * 1.0 / result.depth_m
-check = cross_check_by_side(side_px=side_px, side_m=1.0,
-                            depth_by_intersection_m=result.depth_m, camera=camera,
-                            quaternion=(1.0, 0.0, 0.0, 0.0))
+check = cross_check_by_side(
+    side_px=side_px,
+    side_m=1.0,
+    depth_by_intersection_m=result.depth_m,
+    camera=camera,
+    quaternion=(1.0, 0.0, 0.0, 0.0),
+)
 print("边长法 ok=%s 相对误差 %.4f（side_px=%.2f）" % (check.ok, check.relative_error, side_px))
 ```
 
@@ -908,6 +988,7 @@ select_cluster(clusters, config) -> Cluster | None
 
 ```python
 """目标统计：DBSCAN 聚类 + 类内编号众数。"""
+
 from airdrop import TargetPoint, TargetingConfig, analyze
 
 points = [
@@ -918,8 +999,10 @@ points = [
 ]
 result = analyze(points, TargetingConfig(eps_m=0.75, min_samples=2))
 print("选中编号 %s @ NED (%.2f, %.2f)" % (result.code, result.north_m, result.east_m))
-print("候选类 %d 个，噪声 %d，剔除 %d"
-      % (len(result.clusters), len(result.noise), len(result.rejected)))
+print(
+    "候选类 %d 个，噪声 %d，剔除 %d"
+    % (len(result.clusters), len(result.noise), len(result.rejected))
+)
 ```
 
 实测输出：`选中编号 56 @ NED (10.10, 20.00)`；`候选类 1 个，噪声 1，剔除 0`（第四点离得太远，成了噪声；读 12 的那帧投给了 56，众数生效）。
@@ -965,7 +1048,7 @@ reset()
 判定逻辑：
 
 1. 每拍用当前快照预测落点，**水平误差 ≤ `radius_m` 即投**（`reason='predict'`）；
-2. 已越过目标且 `force_after_pass=True` 时保底投放（`reason` 里标明是保底）；
+2. 已越过目标且 `force_after_pass=True` 时，越过目标后强制投放判据（`force_after_pass`）生效并执行强制投放（`reason` 里标明是强制投放）；
 3. **一次投放即锁存**：投过之后不再触发，`reset()` 才能重新武装；
 4. `delay_s` 的状态前推是一阶近似（位置 += 速度 × 延迟），不做加速度二次项；
 5. 摘要按 `SUMMARY_HZ`（5 Hz）落事件日志，触发瞬间写完整预测（落点/飞行时间/水平误差/前推后位置）。`on_event` 签名 `(kind, data)`，接 recorder 的标准写法是 `lambda kind, data: recorder.events.emit(kind, **data)`；事件写盘失败**不影响判据**。
@@ -1017,7 +1100,8 @@ FIT_PARAMETERS = ('drag_coefficient', 'cross_area_m2', 'release_delay_s', 'wind_
 运行入口：`python -m airdrop.run fit-ballistics`（见 §6.2；`tools/fit_ballistics.py` 里的常量就是默认值）。
 
 ```python
-"""弹道 + 投放判据：预测落点、越过目标保底投放。"""
+"""弹道 + 投放判据：预测落点、越过目标后强制投放。"""
+
 import time
 from airdrop import BallisticsModel, Config, DropConfig, ReleaseJudge, TelemetrySnapshot
 
@@ -1030,25 +1114,40 @@ snapshot = TelemetrySnapshot(timestamp=time.time())
 snapshot.north_m, snapshot.east_m, snapshot.down_m = 0.0, -35.0, -20.0
 snapshot.vx_m_s, snapshot.vy_m_s, snapshot.vz_m_s = 0.0, 18.0, 0.0
 decision = judge.update(snapshot, (0.0, 0.0, 0.0), now=snapshot.timestamp)
-print("判据: should_release=%s reason=%s 误差 %.2f m"
-      % (decision.should_release, decision.reason, decision.horizontal_error_m or -1.0))
+print(
+    "判据: should_release=%s reason=%s 误差 %.2f m"
+    % (decision.should_release, decision.reason, decision.horizontal_error_m or -1.0)
+)
 ```
 
 实测输出：`落点 (34.5662493172948, 0.0, 0.0)，飞行时间 2.07s`；`判据: should_release=True reason=predict 误差 0.43 m`（同时 stderr 会有一条"遥测里没有风估计…按零风预测"的提示，属预期）。
 
 ```python
 """投放记录 + 反演：合成两条样本，反演出 Cd。"""
-from dataclasses import replace
-from airdrop import (BallisticsModel, Config, DropRecord, DropSample, FitConfig,
-                     fit_ballistics, predict_record_impact)
 
-truth = replace(Config().ballistics, drag_coefficient=0.8)     # 真值 Cd=0.8
+from dataclasses import replace
+from airdrop import (
+    BallisticsModel,
+    Config,
+    DropRecord,
+    DropSample,
+    FitConfig,
+    fit_ballistics,
+    predict_record_impact,
+)
+
+truth = replace(Config().ballistics, drag_coefficient=0.8)  # 真值 Cd=0.8
 true_model = BallisticsModel(truth)
 records = [
-    DropRecord(index=i, timestamp=1000.0 + i,
-               position_ned=(100.0, 200.0, -height), velocity_ned=(speed, 0.0, -1.0),
-               ground_z=0.0, delay_s=0.05,
-               ballistics=Config().ballistics)                 # 记录里存的是占位参数
+    DropRecord(
+        index=i,
+        timestamp=1000.0 + i,
+        position_ned=(100.0, 200.0, -height),
+        velocity_ned=(speed, 0.0, -1.0),
+        ground_z=0.0,
+        delay_s=0.05,
+        ballistics=Config().ballistics,
+    )  # 记录里存的是占位参数
     for i, (height, speed) in enumerate([(25.0, 12.0), (45.0, 20.0)], start=1)
 ]
 samples = []
@@ -1059,8 +1158,10 @@ for record in records:
 
 result = fit_ballistics(samples, FitConfig())
 print("ok=%s reliable=%s（拟合参数 %s）" % (result.ok, result.reliable, list(result.fitted)))
-print("Cd=%.4f（真值 0.8），κ=Cd·A/m=%.5f，RMS=%.1e m"
-      % (result.parameters["drag_coefficient"], result.drag_k_per_m, result.rms_error_m))
+print(
+    "Cd=%.4f（真值 0.8），κ=Cd·A/m=%.5f，RMS=%.1e m"
+    % (result.parameters["drag_coefficient"], result.drag_k_per_m, result.rms_error_m)
+)
 ```
 
 实测输出：`ok=True reliable=True（拟合参数 ['drag_coefficient']）`；`Cd=0.8000（真值 0.8），κ=Cd·A/m=0.00877，RMS=4.5e-13 m`。
@@ -1166,7 +1267,7 @@ FW_DEFAULT_LAND_ANGLE_DEG = 8.0       # PX4 FW_LND_ANG 出厂默认
   `NAV_WAYPOINT` 或 `NAV_LOITER_TO_ALT`；`LOITER_TO_ALT` 进场时落点必须在盘旋圈**外**。
   `preceding` 用来说明"`items` 之前还有一项"（飞掠段插在降落段前面时就是飞掠段的 exit）。
 - 不合格的航线在**规划阶段**就带着原因失败（`PlanningError`），而不是上传后被飞控整条拒掉、
-  飞机原地盘旋——2026-09 的 SITL 演练里为此白等了 15 分钟。
+  飞机原地盘旋——2026-09 的 SITL 演练里为此空等了 15 分钟。
 
 #### 3.8.4 `planner` —— 纯函数航线规划
 
@@ -1186,7 +1287,7 @@ build_drop_mission(config, *, origin, target_ned=None) -> DropMissionPlan
   - 降落段：`RoutesConfig.land_plan`（QGC `.plan`，**飞掠段插在它前面**）或 `RoutesConfig.landing_route`
     （配置航点，`land_last=True` 时末项做成 `MissionItem.land`）。
 - plan 模式下**不自动补**起飞/降落项：plan 里没有起飞项就只告警（飞控不会自动起飞，需要操作手先起飞）；
-  补出来的项是"看着能飞"的隐患。
+  补出来的项会留下"表面上能飞"的隐患。
 - 降落段一定先过 `check_fixed_wing_landing`（`preceding` = 飞掠段 exit）：不合格抛 `PlanningError`。
 - `build_drop_mission` 的目标来源：`target_ned` 给出时 `source='target'`；否则用 `RoutesConfig.backup_point`
   （`source='backup'`）；两者都没有 → `PlanningError`（**不猜**）。任务项 = 飞掠 2 项 + 降落段。
@@ -1208,7 +1309,7 @@ TargetTracker(config, camera, undistort=None, side_check_tolerance=0.25,
   .ground_z(snapshot) -> float
 
 PerceptionTargetSource(worker, tracker)
-  .pump() -> int        # 抽干 worker 结果队列并喂给 tracker
+  .pump() -> int        # 抽干 worker 结果队列并送入 tracker
   .result() -> TargetingResult
   .busy() -> bool       # worker 或 tracker 还有活
 ```
@@ -1254,14 +1355,14 @@ MissionRunner(config, controller, broker, *, target_result=None, target_busy=Non
 **启动确认（`_confirm_started`）**：`upload_mission` + `start_mission` 之后，状态机在**有限时间**
 （`MissionConfig.mission_start_timeout_s`，默认 20s）内要求 `in_mission_mode()` 为真；确认成功记一条
 `mission_confirmed` 事件，超时则 `ABORT("mission_not_started")`。**"命令回成功"不等于"飞控进了任务模式"**
-——飞控可能拒绝模式切换却仍然回 ACK，飞机继续盘旋（2026-09 SITL 里因此白等 15 分钟）。模式流不可用时
+——飞控可能拒绝模式切换却仍然回 ACK，飞机继续盘旋（2026-09 SITL 里因此空等 15 分钟）。模式流不可用时
 （`in_mission_mode()` 抛 `ControllerError`）**退化为不做确认**并只记一次日志：宁可退回旧行为，也不要
-因为拿不到模式就把任务判失败。
+因为读不到模式就把任务判失败。
 
 失败语义分五类（这条是审查重点）：
 
 1. **命令失败**（上传/启动/hold/rtl/投放）→ 直接进 `ABORT`，原因写事件日志（`_fail` → `abort("<where>_failed")`）。
-2. **查询失败**（`mission_finished`、`in_mission_mode`、`request_origin`）→ 只报**一次**日志与事件，然后照常继续，由状态超时兜底（20 Hz 每拍都报会把真原因埋掉）。
+2. **查询失败**（`mission_finished`、`in_mission_mode`、`request_origin`）→ 只报**一次**日志与事件，然后照常继续，由状态超时兜底（20 Hz 每拍都报会掩盖真正原因）。
 3. **启动未确认**（模式在 `mission_start_timeout_s` 内没进 `MISSION`）→ `ABORT`（`mission_not_started`）；模式流不可用时**不做这项判断**（只记一次告警）。
 4. **链路异常**（遥测无效，或陈旧超过 `telemetry_stale_s`）→ `ABORT`（`telemetry_lost`）。
 5. **投放记录失败不影响状态**：投放已经发生，记录写不进去只记日志与 `error` 事件（见 `_record_drop`）。
@@ -1271,7 +1372,7 @@ MissionRunner(config, controller, broker, *, target_result=None, target_busy=Non
 其他要点：
 
 - `release_judge=None` 时不自动投放：记 `drop_skipped`（`reason='no_judge'`）直接转 `LAND`——只飞航线。
-- 投放成功时把**判据看到的那份快照**一起写进 `DropRecord`（不是重新取一份），免得记录与决策之间插进一拍遥测导致残差归因错位；记录经 `on_drop` 回调交给 recorder 落盘（`on_drop=recorder.drops.append`）。
+- 投放成功时把**判据看到的那份快照**一起写进 `DropRecord`（不是重新取一份），免得记录与决策之间插进一拍遥测导致残差归因错位；记录经 `on_drop` 回调交给 recorder 写入磁盘（`on_drop=recorder.drops.append`）。
 - `MissionMonitor` 要求"**先见到一次 `False` 再认 `True`**"：任务进度是飞控侧的**状态**而不是"本次启动之后的事件"——新任务刚上传、还没启动时，它可能仍是上一条任务留下的"已飞完"（`current == total`）。
 - 状态是**在某一拍结束时**进入的：测试里"进入新状态后要发生的事"需要再调一次 `update()`。
 - 事件类型（runner 产生）：`origin`、`targeting`、`drop_plan`、`mission_confirmed`、`drop`、`drop_record`、`drop_skipped`、`abort_action`、`error`、`preflight_skipped`、`airborne`、`recon_waiting_operator`，加上状态机自己的 `state`（逐项检查的 `preflight` 事件由 `Preflight` 自己发，见 §5.2）。
@@ -1279,14 +1380,27 @@ MissionRunner(config, controller, broker, *, target_result=None, target_busy=Non
 
 ```python
 """航线规划（纯函数）：侦查任务项 + 飞掠/降落合并任务。"""
-from airdrop import (Config, GroundConfig, LLARef, MissionConfig, OverflyConfig,
-                     PreflightConfig, RoutesConfig, Waypoint,
-                     build_drop_mission, build_recon_mission, command_name)
+
+from airdrop import (
+    Config,
+    GroundConfig,
+    LLARef,
+    MissionConfig,
+    OverflyConfig,
+    PreflightConfig,
+    RoutesConfig,
+    Waypoint,
+    build_drop_mission,
+    build_recon_mission,
+    command_name,
+)
 
 config = Config(
     routes=RoutesConfig(
-        recon_route=(Waypoint(lat=47.0, lon=8.0, alt_m=60.0),
-                     Waypoint(lat=47.001, lon=8.0, alt_m=60.0)),
+        recon_route=(
+            Waypoint(lat=47.0, lon=8.0, alt_m=60.0),
+            Waypoint(lat=47.001, lon=8.0, alt_m=60.0),
+        ),
         backup_point=Waypoint(lat=47.05, lon=8.05, alt_m=0.0),
         landing_route=(Waypoint(lat=46.999, lon=8.01, alt_m=0.0),),
     ),
@@ -1295,16 +1409,19 @@ config = Config(
     # 离线示例：侦查航线由示例自己上传（auto）；正式任务用默认的 operator（操作手在 QGC 启动）
     mission=MissionConfig(recon_upload="auto"),
     # 自检四项全关（示例里没有相机/模型）：**关掉 ≠ 通过**，只是离线跑通
-    preflight=PreflightConfig(load_detector=False, load_ocr=False, load_camera=False,
-                              check_video=False),
+    preflight=PreflightConfig(
+        load_detector=False, load_ocr=False, load_camera=False, check_video=False
+    ),
 ).validated()
 
 items = build_recon_mission(config)
 print("  侦查任务项 %d 个，首项命令 %s" % (len(items), command_name(items[0].command)))
 origin = LLARef(lon_deg=8.0, lat_deg=47.0, alt_m=500.0)
 plan = build_drop_mission(config, origin=origin, target_ned=(300.0, 0.0, 0.0))
-print("  投放任务：来源 %s，任务项 %d 个，目标 NED %s"
-      % (plan.source, len(plan.items), plan.target_ned))
+print(
+    "  投放任务：来源 %s，任务项 %d 个，目标 NED %s"
+    % (plan.source, len(plan.items), plan.target_ned)
+)
 print("  飞掠 entry/exit: %.6f / %.6f" % (plan.entry.lat, plan.exit.lat))
 ```
 
@@ -1312,35 +1429,51 @@ print("  飞掠 entry/exit: %.6f / %.6f" % (plan.entry.lat, plan.exit.lat))
 
 ```python
 """主循环：假控制器 + 假时钟（分钟级任务在毫秒级跑完）。"""
+
 import time
 from types import SimpleNamespace
 from airdrop import MissionRunner, NedOrigin, TelemetryBroker
 
+
 class _FakeClock:
     def __init__(self):
         self.now = time.time()
+
     def __call__(self):
         return self.now
 
-class _FakeController:                     # 按 MissionController 协议实现
+
+class _FakeController:  # 按 MissionController 协议实现
     def __init__(self):
         self.calls, self.finished = [], False
+
     def upload_mission(self, items, /):
-        self.calls.append("upload_mission"); return len(items)
+        self.calls.append("upload_mission")
+        return len(items)
+
     def start_mission(self):
-        self.calls.append("start_mission"); self.finished = False
-    def in_mission_mode(self):             # 启动确认读它（真控制器读快照 flight_mode）
+        self.calls.append("start_mission")
+        self.finished = False
+
+    def in_mission_mode(self):  # 启动确认读它（真控制器读快照 flight_mode）
         return True
+
     def hold(self):
         self.calls.append("hold")
+
     def rtl(self):
         self.calls.append("rtl")
+
     def gripper_release(self):
-        self.calls.append("gripper_release"); return True
+        self.calls.append("gripper_release")
+        return True
+
     def request_origin(self):
         return NedOrigin(lat_deg=47.0, lon_deg=8.0, alt_m=500.0)
+
     def mission_finished(self):
         return self.finished
+
 
 clock = _FakeClock()
 controller = _FakeController()
@@ -1349,17 +1482,20 @@ broker.update_local_position_velocity(
     SimpleNamespace(north_m=0.0, east_m=-200.0, down_m=-40.0),
     SimpleNamespace(north_m_s=0.0, east_m_s=18.0, down_m_s=0.0),
 )
-broker.update_in_air(True)                 # 假飞控报告"已离地"（WAIT_AIRBORNE 那道门读它）
+broker.update_in_air(True)  # 假飞控报告"已离地"（WAIT_AIRBORNE 那道门读它）
 runner = MissionRunner(config, controller, broker, clock=clock, sleep=lambda _s: None)
-for _ in range(4):                         # 4 拍走完 INIT → RECON
+for _ in range(4):  # 4 拍走完 INIT → RECON
     runner.update()
     clock.now += 0.05
-controller.finished = True                 # 假飞控报告侦查任务飞完
+controller.finished = True  # 假飞控报告侦查任务飞完
 runner.update()
-print("  状态 %s，上传 %d 次，历史 %d 条"
-      % (runner.state, runner.stats.uploads, len(runner.history)))
-print("  最后一次转移: %s → %s (%s)"
-      % (runner.history[-1].from_state, runner.history[-1].to_state, runner.history[-1].reason))
+print(
+    "  状态 %s，上传 %d 次，历史 %d 条" % (runner.state, runner.stats.uploads, len(runner.history))
+)
+print(
+    "  最后一次转移: %s → %s (%s)"
+    % (runner.history[-1].from_state, runner.history[-1].to_state, runner.history[-1].reason)
+)
 ```
 
 实测输出（`config` 沿用 3.8.4 那份）：
@@ -1398,9 +1534,9 @@ print("  最后一次转移: %s → %s (%s)"
 `Config` 是唯一的参数集合：全部 frozen dataclass，15 个分块字段（`telemetry`、`video`、`align`、`perception`、`camera`、`ground`、`targeting`、`ballistics`、`drop`、`overfly`、`gripper`、`routes`、`mission`、`preflight`、`record`），逐字段说明见 §4。
 
 ```python
-Config(...)                      # 直接构造；分块各自有默认值
-config.validated()               # 返回校验通过的同一个对象；不合法抛 ValueError
-config.replace(**changes)        # 派生一个变体（改哪个传哪个，如 drop=DropConfig(radius_m=3.0)）
+Config(...)  # 直接构造；分块各自有默认值
+config.validated()  # 返回校验通过的同一个对象；不合法抛 ValueError
+config.replace(**changes)  # 派生一个变体（改哪个传哪个，如 drop=DropConfig(radius_m=3.0)）
 ```
 
 `validated()` 的校验清单（`airdrop/config.py` 的 `Config.validated`，行 381–462）：枚举字段取值（`mode`、`target_color`、`selection_rule`、`on_timeout`、`wind_source`、`abort_action`）、`ocr_workers >= 1`、`ocr_queue_size >= 1`、`imgsz >= 32`、`min_side_px < max_side_px`、去重参数 `>= 0`、`eps_m > 0`、`radius_m > 0`、各任务时长/频率为正、`hold_process_min_s <= hold_process_max_s`、gripper 参数 `>= 0`，最后调 `self.video.validated()`（传输方式与编码参数）。**校验只在调用 `validated()` 时发生**：直接构造的 `Config()` 不校验，装配函数里记得调。
@@ -1436,18 +1572,25 @@ config.replace(**changes)        # 派生一个变体（改哪个传哪个，如
 from airdrop import Preflight, PreflightCheck, PreflightConfig, PreflightError
 
 preflight = Preflight(
-    PreflightConfig(load_detector=True, load_ocr=True, load_camera=True,
-                    check_video=True, video_probe_s=5.0, video_min_frames=10, max_s=120.0),
-    model_loaders={                  # 键 = CHECK_NAMES = ("detector", "ocr", "camera")
+    PreflightConfig(
+        load_detector=True,
+        load_ocr=True,
+        load_camera=True,
+        check_video=True,
+        video_probe_s=5.0,
+        video_min_frames=10,
+        max_s=120.0,
+    ),
+    model_loaders={  # 键 = CHECK_NAMES = ("detector", "ocr", "camera")
         "detector": lambda: detector.load(),
         "ocr": lambda: worker.start(),
-        "camera": lambda: config.camera.load_model(),   # CameraConfig.load_model()
+        "camera": lambda: config.camera.load_model(),  # CameraConfig.load_model()
     },
-    video_source=source,             # 任何有 stats.frames（以及可选 latest()）的对象
-    camera_model=camera,             # 有 width/height 时核对画面分辨率与标定一致
+    video_source=source,  # 任何有 stats.frames（以及可选 latest()）的对象
+    camera_model=camera,  # 有 width/height 时核对画面分辨率与标定一致
     on_event=lambda kind, data: recorder.events.emit(kind, **data),
 )
-checks = preflight.run()             # (PreflightCheck,)；幂等；失败抛 PreflightError
+checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightError
 ```
 
 | 名字 | 作用 |
@@ -1459,11 +1602,11 @@ checks = preflight.run()             # (PreflightCheck,)；幂等；失败抛 Pr
 
 行为细节：
 
-- **开着却没注入回调 = 接线错误**：那一项直接判失败并抛 `PreflightError`（绝不静默当成通过）；
+- **开着却没注入回调 = 装配错误**：那一项直接判失败并抛 `PreflightError`（绝不静默当成通过）；
 - **关掉的项**记一条 `preflight` 事件（`detail='配置里关掉了（未检查）'`、`ok=null`）后跳过；
 - 视频自检 = 在 `video_probe_s` 窗口内等够 `video_min_frames` 帧；若给了 `camera_model`，
   再核对最新帧尺寸与标定一致（`Hm30VideoSource` 与回放源都满足 `stats.frames` / `latest()`）；
-- **每一项都发一条 `preflight` 事件**，正式任务起飞前核一眼就知道哪几项没有把关。
+- **每一项都发一条 `preflight` 事件**，正式任务起飞前逐项核对即可知道哪几项没有把关。
 
 ⚠ 复盘口径：**"关掉"与"通过"必须分得开**——`ok=None` 是"没把关"，`ok=True` 才是"查过且合格"。
 
@@ -1561,7 +1704,7 @@ checks = preflight.run()             # (PreflightCheck,)；幂等；失败抛 Pr
 | `ocr_queue_size` | int | `500` | OCR 请求队列长度（≥ 1） |
 | `ocr_dedupe_s` | float | `0.8` | 去重时间窗（秒） |
 | `ocr_dedupe_px` | float | `30.0` | 去重位移门限（像素） |
-| `save_crops` | bool | `False` | 裁剪图落盘开关（⚠ 当前无消费者，见 4.17） |
+| `save_crops` | bool | `False` | 裁剪图写入磁盘开关（⚠ 当前无消费者，见 4.17） |
 | `crop_dir` | str | `'log/target'` | 裁剪图目录（⚠ 同上） |
 | `max_crops` | int | `5000` | 裁剪图上限（⚠ 同上） |
 | `lag_warn_frames` | int | `900` | 落后告警帧数（⚠ 同上） |
@@ -1616,7 +1759,7 @@ checks = preflight.run()             # (PreflightCheck,)；幂等；失败抛 Pr
 | --- | --- | --- | --- |
 | `radius_m` | float | `2.0` | 投放半径：预测落点水平误差 ≤ 它就投（需 > 0） |
 | `delay_s` | float | `0.0` | 从判据触发到弹离开的延迟（状态前推用） |
-| `force_after_pass` | bool | `True` | 越过目标后保底投放 |
+| `force_after_pass` | bool | `True` | 越过目标后的强制投放 |
 | `evaluation_hz` | float | `20.0` | 评估节拍口径（实际节拍来自 `MissionConfig.tick_hz`，默认也是 20 Hz） |
 
 ### 4.10 `OverflyConfig` —— 飞掠段
@@ -1663,7 +1806,7 @@ checks = preflight.run()             # (PreflightCheck,)；幂等；失败抛 Pr
 | `mission_start_timeout_s` | float | `20.0` | 上传启动后确认"真进了 MISSION"的窗口；超时 → `ABORT('mission_not_started')` |
 | `airborne_timeout_s` | float | `1800.0` | `WAIT_AIRBORNE` 等"飞机在空中"的上限（起飞由操作手决定，这里只是兜底）；超时 → `ABORT('airborne_timeout')` |
 | `airborne_alt_m` | float | `5.0` | `in_air` 取不到时的兜底判据：`relative_altitude_m >= airborne_alt_m` 也算在空中 |
-| `require_airborne` | bool | `True` | **地面演练/测试开关**：`False` 时 `WAIT_AIRBORNE` 这道门**立即放行**（飞机停在地面也进侦查），并记 `airborne_skipped` 事件 + WARNING。**正式任务必须保持 `True`**——在停机坪上进侦查会让 PX4 在地面"追"第一个航点 |
+| `require_airborne` | bool | `True` | **地面演练/测试开关**：`False` 时 `WAIT_AIRBORNE` 的等待起飞检查**立即放行**（飞机停在地面也进侦查），并记 `airborne_skipped` 事件 + WARNING。**正式任务必须保持 `True`**——在停机坪上进侦查会让 PX4 在地面"追"第一个航点 |
 | `recon_upload` | str | `'operator'` | 侦查航线谁上传：`'operator'`（默认，正式任务 = 操作手在 QGC 上传并启动）/ `'auto'`（本包上传并启动，**只用于自动测试**）（`RECON_UPLOAD_MODES`） |
 | `abort_action` | str | `'hold'` | ABORT 时下的安全动作 `hold` / `rtl` / `none`（`ABORT_ACTIONS`） |
 | `takeoff_first` | bool | `True` | 侦查任务首项带起飞动作（**只对 `recon_route` 生效**；plan 不自动补） |
@@ -1695,7 +1838,7 @@ checks = preflight.run()             # (PreflightCheck,)；幂等；失败抛 Pr
 | --- | --- | --- | --- |
 | `dir` | str | `'flights'` | 飞行目录根（**已进 .gitignore**，见 §1.3） |
 | `video` | bool | `True` | 是否记录视频（⚠ 当前无消费者，见 4.18） |
-| `telemetry_hz` | float | `10.0` | 遥测落盘节流 |
+| `telemetry_hz` | float | `10.0` | 遥测写入磁盘节流 |
 | `event_eval_hz` | float | `5.0` | ⚠ 当前无消费者（判据摘要频率实际取 `SUMMARY_HZ`） |
 
 ### 4.16 `Waypoint` —— 航点
@@ -1766,7 +1909,7 @@ checks = preflight.run()             # (PreflightCheck,)；幂等；失败抛 Pr
 
 | 字段 | 现状 |
 | --- | --- |
-| `save_crops` / `crop_dir` / `max_crops` | 裁剪图落盘功能未接线，改它们没有任何效果 |
+| `save_crops` / `crop_dir` / `max_crops` | 裁剪图写入磁盘的功能尚未接入，改这些参数没有效果 |
 | `lag_warn_frames` | 落后告警改用别的口径计数（`PerceptionStats.lag_frames` 仍会统计） |
 | `undistort`（相机分块） | 去畸变由检测器内参与坐标解算决定，该开关不生效 |
 | `flat` / `ground_point_lat` / `ground_point_lon` | 地面高程只用 `ground_point_alt`；平地假设是隐含的 |
@@ -1787,7 +1930,7 @@ checks = preflight.run()             # (PreflightCheck,)；幂等；失败抛 Pr
 | `detections.jsonl` | `PerceptionWorker` → `recorder.detections.append(Detection)` | `Detection.as_dict()`：`frame_index`、`capture_timestamp`、`pixel`、`box`、`confidence`、`code`、`side_px`、`raw_text`、`ocr_confidence`、`mode`、`extra`（含 `undistorted`/`ocr_stage`/`ocr_worker`）+ 精简遥测字段 | 人、脚本 | ✅ 追加字段不影响解析 |
 | `events.jsonl` | 各模块经 `recorder.events.emit(kind, **data)`（线程安全、写完即 flush） | `{timestamp, kind, ...}`，`kind` 目录见 §5.2 | 人、复盘脚本 | ⚠ 建议只读（这是任务时间线） |
 | `drops.jsonl` | `MissionRunner(on_drop=…)` → `recorder.drops.append(DropRecord)` | 投放瞬间**原始状态**：位置/速度/姿态（欧拉角+四元数）/风/离地高度/NED 原点/目标点/判据前推位置与预测落点（**数值不四舍五入**） | `tools/fit_ballistics.py`、人 | ⚠ 只读；实测落点写在 `impacts.jsonl`，别改这个文件 |
-| `frames/%06d.jpg` | recorder 的 frame writer 线程（**零重编码**：直接落缓冲里的 jpeg 字节） | 逐帧 JPEG，文件名 = 缓冲序号 | `record.replay.ReplayVideoSource` | ⚠ 删帧会让回放 `strict=True` 报错 |
+| `frames/%06d.jpg` | recorder 的 frame writer 线程（**零重编码**：把缓冲里的 jpeg 字节直接写入磁盘） | 逐帧 JPEG，文件名 = 缓冲序号 | `record.replay.ReplayVideoSource` | ⚠ 删帧会让回放 `strict=True` 报错 |
 | `frames_index.jsonl` | 同上 | `index`、`filename`、`capture_timestamp`、`received_timestamp`、`lag`、`extrapolated`、`offset`、`bytes` | `record.replay.FlightLog` | ⚠ 只读（时间戳必须递增） |
 | `config_snapshot.json` | `start()` 时立刻写 | `asdict(Config)` 全量（含视频地址、标定文件路径） | 人、审查 | ⚠ 只读（"当时怎么配的"证据） |
 | `impacts.jsonl` / `impacts.csv` | **人**（现场量完落点后填） | `index` + 经纬度（`lat_deg`/`lon_deg`/`alt_m`）**或** NED（`north_m`/`east_m`/`down_m`） | `tools/fit_ballistics.py` | ✅ 本来就要手填（模板见 `write_impact_template`） |
@@ -1888,7 +2031,7 @@ checks = preflight.run()             # (PreflightCheck,)；幂等；失败抛 Pr
 fixture 上——这是**环境限制不是代码问题**，`--basetemp` 指向工作区内也绕不开。上表目录都已在 `.gitignore` 里。
 
 ⚠ **同一时刻只能有一个 `mavsdk_server`**（它固定占用 gRPC 50051）：一边跑示例/演练，一边想再起一个
-`System()` 去查状态会去抢端口。调试时用
+`System()` 去查状态会争抢端口。调试时用
 `System(mavsdk_server_address="localhost", port=50051)` **接已有的 server**（不再拉起第二个进程）。
 
 ---
@@ -1975,7 +2118,7 @@ HOLD_PROCESS → OVERFLY（飞掠 + 投放）→ LAND → DONE
 | **正式任务** | `'operator'`（默认） | 全开（载入模型 + 视频自检） | **操作手**（QGC） | `examples/full_mission.py` |
 | 自动测试 / SITL | `'auto'` | 全关或按需关（无相机、无模型、飞机不起飞） | 本包 | `examples/sitl_mission.py` |
 
-⚠ SITL/地面演练还会关掉"等起飞"那道门：`examples/sitl_mission.py` 的 `REQUIRE_AIRBORNE = False`
+⚠ SITL/地面演练还会关掉"等起飞"的检查：`examples/sitl_mission.py` 的 `REQUIRE_AIRBORNE = False`
 （即 `MissionConfig.require_airborne=False`，见 §4.13）——飞机停在停机坪上也能把状态机整条跑完，
 不必等到 `airborne_timeout_s`（默认 1800s）才失败。放行**留痕**：一条 `airborne_skipped`
 事件 + 一条 WARNING；正式任务必须保持默认的 `True`。
@@ -1983,7 +2126,7 @@ HOLD_PROCESS → OVERFLY（飞掠 + 投放）→ LAND → DONE
 ⚠ 关掉的自检项**不算通过**：每项都会落一条 `preflight` 事件（`ok=null`），
 正式任务起飞前请核对该事件；`preflight_skipped` 则表示根本没注入预检对象。
 
-### 6.4 改配置的三种姿势
+### 6.4 改配置的三种方式
 
 ```python
 # ① 改默认值（影响所有入口）：airdrop/config.py 对应字段
@@ -1991,11 +2134,12 @@ HOLD_PROCESS → OVERFLY（飞掠 + 投放）→ LAND → DONE
 # ③ 程序化派生（写脚本/测试时推荐）：
 from dataclasses import replace
 from airdrop import Config
+
 base = Config()
 config = Config(
     video=replace(base.video, telemetry_lag=0.18),
     drop=replace(base.drop, radius_m=1.5),
-).validated()          # ⚠ 直接构造不会校验，必须调 validated()
+).validated()  # ⚠ 直接构造不会校验，必须调 validated()
 ```
 
 ### 6.4 测试怎么跑
@@ -2014,15 +2158,15 @@ config = Config(
 | `tests/test_alignment.py` | 对齐器 lag 语义、等待上限、外推标记、超时策略 | 否 |
 | `tests/test_buffer.py` | 环形缓冲容量/驱逐、复用缓冲区必须拷贝、`AlignmentWriter` 逐帧入库 | 否 |
 | `tests/test_video.py` | ffmpeg 拉流：无效地址显式报错、sink 每帧不落、`stats.dropped` 语义 | 起 ffmpeg 子进程 |
-| `tests/test_recorder.py` | 飞行目录七件套齐全、帧零重编码、事件/检测/投放写入、幂等启停 | 否（**沙箱里挂 `tmp_path`**） |
+| `tests/test_recorder.py` | 飞行目录七个文件齐全、帧零重编码、事件/检测/投放写入、幂等启停 | 否（**沙箱里挂 `tmp_path`**） |
 | `tests/test_replay.py` | 回放对齐结果与"直接从日志查询"的参考 broker 完全一致 | 否 |
 | `tests/test_perception.py` | pipeline 逻辑（假 detector / 假 OCR 池）、去重、编号不被覆盖 | 否 |
 | `tests/test_perception_realdata.py` | 真 YOLO + 真 OCR 在 旧版 素材上读对编号（56/56/56） | ✅ GPU + 素材绝对路径 |
 | `tests/test_georef.py` | 相机模型加载/回退、像素→NED、边长法交叉验证（**沙箱里挂 `tmp_path`**） | 否 |
 | `tests/test_calibrate.py` | 标定三步合成链路（含整个 `calibrate()` 的输出契约） | 否 |
 | `tests/test_targeting.py` | DBSCAN 语义（eps 闭区间、样本权重是绝对权重）、众数、median/max | 否 |
-| `tests/test_ballistics.py` | 无阻力/有阻力对照解析解、终端速度、风平移、判据触发/保底/锁存 | 否 |
-| `tests/test_mission.py` | 状态机、航线规划、主循环（假控制器 + 假时钟，分钟级任务毫秒级跑完）；起飞前自检（真 `Preflight` 的四项检查/接线错误/视频帧数/分辨率核对）与等起飞 | 否 |
+| `tests/test_ballistics.py` | 无阻力/有阻力对照解析解、终端速度、风平移、判据触发/越过目标后的强制投放/锁存 | 否 |
+| `tests/test_mission.py` | 状态机、航线规划、主循环（假控制器 + 假时钟，分钟级任务毫秒级跑完）；起飞前自检（真 `Preflight` 的四项检查/装配错误/视频帧数/分辨率核对）与等起飞 | 否 |
 | `tests/test_plan.py` | QGC `.plan` 解析与复杂项展开、固定翼降落预检逐条判据、plan↔配置航点二选一 | 否 |
 | `tests/test_e2e.py` | 回放驱动全链路：帧 → 感知 → 坐标 → 统计 → 航线（另有 `realdata` 变体） | 否（变体需 GPU） |
 | `tests/test_fit.py` | 投放记录读写、反演真值回收、退化/不可辨识必拒、工具现场流程 | 否 |
@@ -2051,7 +2195,7 @@ config = Config(
 | --- | --- | --- | --- |
 | 1 | `mavsdk` 没有公开 `close()`，会话结束必须显式释放 | `telemetry/mavsdk_thread.py` 的 `stop()` / `_release_drone()` | mavsdk_server 子进程（固定 gRPC 端口 50051）变僵尸，新会话连上它并级联断连 |
 | 2 | 历史按时间查询用 `bisect(key=attrgetter("timestamp"))` 直接探 deque | `telemetry/broker.py` | 每次查询重建整张时间表（曾 22µs → 0.42µs） |
-| 3 | 留存（`add_sink` 逐帧）与实时（`read()`/`latest()`）是两条路 | `video/source.py`、`video/buffer.py` | 用 `read()` 喂推理＝把丢帧引回来 |
+| 3 | 留存（`add_sink` 逐帧）与实时（`read()`/`latest()`）是两条路 | `video/source.py`、`video/buffer.py` | 用 `read()` 送入推理＝把丢帧引回来 |
 | 4 | 跨帧持有画面必须 copy | `video/source.py` 的 `VideoFrame.copy()`、`video/buffer.py` | ffmpeg 后端复用管道缓冲，历史帧全变成"最新那一张" |
 | 5 | 取遥测用 `frame.capture_timestamp`（= 收到时间 − `telemetry_lag`） | `video/source.py`、`video/align.py` | 目标坐标顺航迹偏一个链路延时（10 m/s → 1.5 m） |
 | 6 | 快照是"最新可用值合并"，字段间无严格时间同步 | `telemetry/models.py`、`broker.py` | 误以为同一瞬间 → 解算误差归因错 |
@@ -2066,30 +2210,30 @@ config = Config(
 | 15 | `Cd` 与迎风面积只能固定一个（只以乘积可辨识） | `ballistics/fit.py` 的 `_DEGENERATE_PAIR` | 无穷多解 |
 | 16 | 条件数超限 / 欠定 / 常数偏差 → 拒绝或单列，不硬给结论 | `ballistics/fit.py`、`tools/fit_ballistics.py` | 用户照抄不可信的参数 |
 | 17 | 投放记录写盘失败**不改变任务状态**（弹已经出去了） | `mission/runner.py` 的 `_record_drop` | 因为磁盘满把任务判失败 |
-| 18 | 命令失败 → `ABORT`；查询失败 → 只记一次日志继续（由超时兜底） | `mission/runner.py` 的 `_command`/`_query`/`_fail` | 20Hz 刷屏；或该失败时不失败 |
+| 18 | 命令失败 → `ABORT`；查询失败 → 只记一次日志继续（由超时兜底） | `mission/runner.py` 的 `_command`/`_query`/`_fail` | 20 Hz 反复记录同一条日志；或该失败时不失败 |
 | 19 | 任务进度是**飞控侧状态**，"已飞完"的陈旧读数不算数（先见 False 再认 True） | `mission/runner.py` 的 `MissionMonitor` | 刚起飞就以为飞完了 |
 | 20 | 降落项是**一项** `NAV_LAND`（`MissionItem.land`），且紧前一项必须高于落点 | `mission/planner.py`、`mission/items.py` | 拆成两项或被 PX4 判"进场点不在落点之上" ⇒ 整条任务被拒 |
 | 21 | 未指定 = `NaN`（`UNSET`），**0 是有意义的值** | `mission/items.py` | 用 0 冒充"不指定"，飞控生成多余行为（接受半径 0 = 用 `NAV_ACC_RAD`） |
 | 22 | 航点高度是**相对起飞点**；备用点换算 NED 时海拔 = 原点海拔 + 相对高度 | `mission/planner.py` | 几百米高度差 → 厘米级水平偏差 |
 | 23 | 链路看门狗 `telemetry_stale_s`（默认 5s）与对齐的 1s 分开 | `mission/runner.py` 的 `_link_ok` | 单帧同步不上把整条任务判失败 |
-| 24 | `ABORT` 只下**一条**安全动作 | `mission/runner.py` 的 `_do_abort_action` | 与飞控 failsafe 打架 |
+| 24 | `ABORT` 只下**一条**安全动作 | `mission/runner.py` 的 `_do_abort_action` | 与飞控 failsafe 冲突 |
 | 25 | 状态在**某一拍结束时**进入 | `mission/runner.py`、`mission/states.py` | 测试断言写成"进了状态就已经调用过" |
 | 26 | `DroneController` 不在导入期读 `config` | `telemetry/controller.py`（装配走 `from_config`） | `config → video.source → telemetry` 成环 |
-| 27 | 事件写入失败绝不影响控制流 | `mission/states.py` 的 `emit_event` | recorder 关闭后抛 RuntimeError 把状态机带崩 |
+| 27 | 事件写入失败绝不影响控制流 | `mission/states.py` 的 `emit_event` | recorder 关闭后抛 RuntimeError 使状态机崩溃 |
 | 28 | 权重必须 `best2.pt`；`cls12` 无 12 类权重（编号恒 1） | `config.py`、`docs/perception_ocr.md` | 换了废弃权重 → 零检出 |
-| 29 | 转正形态门限 60°±15° 是**量出来的** | `perception/cropproc.py` 的 `HOUSE_APEX_ANGLE_DEG/TOL` | 拍脑袋调门限 → 误转正（曾把 56 读成 95） |
+| 29 | 转正形态门限 60°±15° 是**量出来的** | `perception/cropproc.py` 的 `HOUSE_APEX_ANGLE_DEG/TOL` | 凭主观判断调门限 → 误转正（曾把 56 读成 95） |
 | 30 | 方向判别器只是**提示器**，不能当裁判 | `perception/cropproc.py`、`docs/perception_ocr.md` | 它会把目视正立的图判成倒置（帧 1160 实测 P(正立)=0.186） |
 | 31 | 任务项一律走 **`mission_raw`**，不用 MAVSDK 的 `vehicle_action` 翻译 | `mission/items.py`、`telemetry/controller.py` 的 `to_raw_item`/`_upload` | `vehicle_action=LAND` 被拆成"同坐标航点 + `NAV_LAND`"⇒ PX4 固定翼拒**整条任务**，而 `start_mission()` 仍回成功 |
 | 32 | 降落段必须过 `check_fixed_wing_landing`：紧前一项**严格高于**落点，且下滑角 ≤ `tan(FW_LND_ANG+0.1°)` | `mission/plan_file.py`、`mission/planner.py` | 上传后被飞控整条拒掉（`No valid mission available, loitering`），飞机原地盘旋 |
-| 33 | 上传启动后**必须确认**飞控真进了 `MISSION`（`mission_start_timeout_s`） | `mission/runner.py` 的 `_confirm_started`、`telemetry/controller.py` 的 `in_mission_mode` | "命令回成功"当成"在飞"⇒ 白等到状态超时（实测 15 分钟） |
+| 33 | 上传启动后**必须确认**飞控真进了 `MISSION`（`mission_start_timeout_s`） | `mission/runner.py` 的 `_confirm_started`、`telemetry/controller.py` 的 `in_mission_mode` | "命令回成功"当成"在飞"⇒ 空等到状态超时（实测 15 分钟） |
 | 34 | 完成判定读快照 `mission_current == mission_total`（`mission_raw` 进度流） | `telemetry/controller.py` 的 `mission_finished`、`mavsdk_thread.py` 的 `_stream_mission_progress` | 用 MAVSDK `mission.is_mission_finished()`：raw 上传下**永远回 False**，状态机卡在 RECON |
 | 35 | 上传前**先 `set_current_mission_item(0)`** 再启动 | `telemetry/controller.py` 的 `start_mission` | 同 CRC 的任务再启动时飞控不清"已飞完"锁存 ⇒ 停在 `HOLD` |
 | 36 | 每条腿的航线来源**二选一**（waypoint 配置 / QGC `.plan`），同时给两个直接报错 | `config.py` 的 `validated`、`mission/planner.py` | 飞的可能不是你以为的那条航线 |
 | 37 | `.plan` 复杂项按 QGC 的展开逻辑在本地展开；不支持的复杂项**显式报错** | `mission/plan_file.py` | 猜着展开 ⇒ 上传一条 QGC 里根本没画过的航线 |
-| 38 | 同一时刻只允许一个 `mavsdk_server`；调试要接**已有** server | mavsdk 库（固定 gRPC 50051） | 第二个 `System()` 去抢端口，两个客户端互相打架 |
-| 39 | 正式流程 `INIT → PREFLIGHT → WAIT_AIRBORNE → RECON`：先自检（载入模型 + 视频自检），再等"在空中"，最后才进侦查；等起飞那道门的**逃生开关**是 `MissionConfig.require_airborne`（默认 `True`），置 `False`（**只给地面演练/离线测试**）时该门立即放行，且**必须留痕**——记 `airborne_skipped` 事件（带 `reason`）+ WARNING 日志，绝不静默通过 | `mission/runner.py` 的 `_tick_preflight`/`_tick_airborne`、`config.py` 的 `MissionConfig.require_airborne`、`airdrop/preflight.py` | 在停机坪上就进侦查：PX4 会在地面"追"第一个航点，或因任务不可行直接盘旋；演练则相反——飞不飞都白等到 `airborne_timeout_s`（1800s）才失败 |
+| 38 | 同一时刻只允许一个 `mavsdk_server`；调试要接**已有** server | mavsdk 库（固定 gRPC 50051） | 第二个 `System()` 争抢端口，两个客户端互相冲突 |
+| 39 | 正式流程 `INIT → PREFLIGHT → WAIT_AIRBORNE → RECON`：先自检（载入模型 + 视频自检），再等"在空中"，最后才进侦查；等待起飞的检查有**临时放行开关** `MissionConfig.require_airborne`（默认 `True`），置 `False`（**只给地面演练/离线测试**）时该检查立即放行，且**必须留痕**——记 `airborne_skipped` 事件（带 `reason`）+ WARNING 日志，绝不静默通过 | `mission/runner.py` 的 `_tick_preflight`/`_tick_airborne`、`config.py` 的 `MissionConfig.require_airborne`、`airdrop/preflight.py` | 在停机坪上就进侦查：PX4 会在地面"追"第一个航点，或因任务不可行直接盘旋；演练则相反——飞不飞都空等到 `airborne_timeout_s`（1800s）才失败 |
 | 40 | 侦查航线**默认由操作手在 QGC 上传并启动**（`MissionConfig.recon_upload='operator'`）；`'auto'` 只用于自动测试 | `config.py` 的 `RECON_UPLOAD_MODES`、`runner._begin_recon` | 自动上传会覆盖操作手刚画好的航线 |
-| 41 | 自检**关掉 ≠ 通过**：关掉的项记 `preflight` 事件（`ok=null`）；**开着却没注入回调 = 接线错误**，直接判失败 | `airdrop/preflight.py` 的 `PreflightCheck.skipped` / `PreflightError` | 把"忘了接线"当成"检查通过"，正式任务带着没自检的系统起飞 |
+| 41 | 自检**关掉 ≠ 通过**：关掉的项记 `preflight` 事件（`ok=null`）；**开着却没注入回调 = 装配错误**，直接判失败 | `airdrop/preflight.py` 的 `PreflightCheck.skipped` / `PreflightError` | 把"漏了装配"当成"检查通过"，正式任务带着没自检的系统起飞 |
 
 ### 7.2 失败语义一览（"到底怎么算失败"）
 
@@ -2148,7 +2292,7 @@ config = Config(
 - [ ] 是否碰了 §7.1 里 38 条不变量中的任何一条？改了哪条就要同步 `AGENTS.md` 与对应专题笔记。
 - [ ] 碰了任务项 / 航线来源 / 启动与完成判定（§7 第 31~35 条）时，除了离线用例，**跑一次 SITL 演练**（`examples/sitl_mission.py`）——这四条都是"离线测不出来、真飞控才暴露"的。
 - [ ] 回归用例加了吗（`tests/` 是回归落点）？跑过 `pytest -m "not stream"` 吗？
-- [ ] 文档三件套是否同步：`README.md`（怎么用）、`AGENTS.md`（约定与坑）、本手册（目录/参数/产物）？
+- [ ] 三份文档是否同步：`README.md`（怎么用）、`AGENTS.md`（约定与易错点）、本手册（目录/参数/产物）？
 
 ---
 
@@ -2158,7 +2302,7 @@ config = Config(
 | --- | --- | --- |
 | pytest 报 `PermissionError: [WinError 5]`（20 个 error） | 受限沙箱里 pytest basetemp 目录不可枚举/删除 | 环境限制，不是代码问题；忽略这 20 个 error，其余用例有效（§5.6） |
 | 图传一帧都没有，`stats.last_error` 有 ffmpeg 输出 | 地址/网络不对（HM30 网段 `192.168.144.0/24`，相机 `192.168.144.25`） | `ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f null -` 手工核对；地址**不探测**，写错就报错 |
-| 断了流仍在读旧画面 / `read()` 卡死 | ffmpeg 后端靠 `-timeout` 判死链路；cv2 后端 `read()` 30s 不可中断 | 用 `Hm30VideoSource`（可杀子进程）；`VideoConfig.read_timeout` 调小；详见 `docs/video_hm30_ffmpeg.md` |
+| 断了流仍在读旧画面 / `read()` 阻塞不返回 | ffmpeg 后端靠 `-timeout` 判死链路；cv2 后端 `read()` 30s 不可中断 | 用 `Hm30VideoSource`（可杀子进程）；`VideoConfig.read_timeout` 调小；详见 `docs/video_hm30_ffmpeg.md` |
 | 新会话连不上飞控 / 端口 50051 被占 | 旧 mavsdk_server 僵尸进程 | 必须走 `MavsdkThread.stop()`（内部 `_release_drone()`）；必要时手动结束残留进程 |
 | ONNX/TORCH 报 CUDA 不可用，静默退回 CPU | 进程里没有先 `import torch`（cuDNN/cuBLAS DLL 不在搜索路径） | 本项目 det/rec 走 TORCH 天然满足；`OcrEngine._report_cls_device()` 会告警——看日志 |
 | OCR 读出 `95` 而目视是 `56` | 转正差 180°（形态门限被绕过） | 已修（形态判据 + `house_ok` 优先）；别改 60°±15°，要改先重新量分布（`docs/perception_ocr.md`） |
@@ -2170,19 +2314,19 @@ config = Config(
 | 任务进 `ABORT` 后飞机没有动作 | `abort_action="none"`，或链路断了指令发不出去 | 看 `events.jsonl` 的 `abort_action`；链路断时交给飞控 failsafe |
 | 刚起飞就以为任务飞完 | 任务进度是飞控侧状态，新任务刚上传时仍可能是上一条的"已飞完" | 已由 `MissionMonitor`（先见 False 再认 True）挡住；若自写循环要照做 |
 | 任务"上传成功"飞机却原地盘旋 | 降落剖面被 PX4 可行性检查拒了整条任务（`mission_result.valid=0` ⇒ `No valid mission available, loitering`），而 `start_mission()` 仍回成功 | 看 ulog 的 `mission_feasibility_checker` 消息；本地先跑 `check_fixed_wing_landing`；降落段优先用 QGC `.plan`（§7 第 31/32 条） |
-| 状态机卡在 `RECON`，进度显示已到末项 | 完成判定用了 MAVSDK `mission.is_mission_finished()`——**raw 上传下它永远回 False** | 用快照的 `mission_current`/`mission_total`（`current == total` 即飞完，§7 第 34 条） |
+| 状态机停在 `RECON`，进度显示已到末项 | 完成判定用了 MAVSDK `mission.is_mission_finished()`——**raw 上传下它永远回 False** | 用快照的 `mission_current`/`mission_total`（`current == total` 即飞完，§7 第 34 条） |
 | 启动后飞机停在 `HOLD` 不进任务 | 新任务与上一条**内容相同**（同一 CRC）时，飞控不清"已飞完"锁存 | `start_mission()` 已先 `set_current_mission_item(0)`；用 `in_mission_mode()` 确认（§7 第 33/35 条） |
 | QGC 里"任务没在进行" | QGC 的活动任务视图按**它自己上传/下载**的任务同步，raw 上传的它不认 | 以 `events.jsonl` 的 `state`/`mission_confirmed` 与遥测 `mission_current` 为准；需要 QGC 显示就先在 QGC 里 download 一次 |
-| 第二个脚本连不上飞控 / 抢 50051 | 同一时刻只允许一个 `mavsdk_server` | 调试脚本用 `System(mavsdk_server_address="localhost", port=50051)` 接已有 server（§5.6） |
-| `mavsdk_server --version` 卡住不动 | 那个二进制没有 `--version`，它会去起服务并阻塞 | 版本看日志首行 `mavsdk_server: MAVSDK version: vX.Y.Z`（与 Python 包版本一致） |
+| 第二个脚本连不上飞控 / 争抢 50051 | 同一时刻只允许一个 `mavsdk_server` | 调试脚本用 `System(mavsdk_server_address="localhost", port=50051)` 接已有 server（§5.6） |
+| `mavsdk_server --version` 长时间不返回 | 那个二进制没有 `--version`，它会去起服务并阻塞 | 版本看日志首行 `mavsdk_server: MAVSDK version: vX.Y.Z`（与 Python 包版本一致） |
 | 目标坐标整体偏一段距离 | 没标定（默认外参）、或 `telemetry_lag` 是旧值 | 跑标定并把 `telemetry_lag` 回填；核对 `camera_calib.json` 的 `R_bc`/`t_bc` |
 | `models/best2.pt` 找不到 | 没取权重 | `python -m airdrop.run fetch-models`（`--source-dir` 可覆盖文件内常量） |
 | `examples.full_mission` 起不来 | 缺 `camera_calib.json`/航线为空/RTSP 地址不对 | 看 `flight.log`；`Config().validated()` 会提前挡掉取值域错误 |
 | 状态机停在 `INIT` | 没等到遥测位置或 NED 原点（`INIT` 本身不上传任何任务） | 看 `flight.log`；`init_max_s` 超时会 `ABORT(init_no_telemetry` / `init_no_origin)` |
-| 状态机停在 `PREFLIGHT` | 模型载入卡住/抛异常，或视频自检没等到足够的帧 | 看 `preflight` 事件与 `flight.log`：任一项失败 → `ABORT(preflight_failed:<check>)`；超 `preflight.max_s` → `preflight_timeout`；没有相机就把 `PreflightConfig.check_video` 关掉 |
+| 状态机停在 `PREFLIGHT` | 模型载入无响应/抛异常，或视频自检没等到足够的帧 | 看 `preflight` 事件与 `flight.log`：任一项失败 → `ABORT(preflight_failed:<check>)`；超 `preflight.max_s` → `preflight_timeout`；没有相机就把 `PreflightConfig.check_video` 关掉 |
 | 状态机停在 `WAIT_AIRBORNE` | 飞控没报 `in_air`，相对高度也没超过 `airborne_alt_m` | 这是**正常**的等起飞；`airborne_timeout_s`（默认 1800s）超时会 `ABORT(airborne_timeout)`；核对 `in_air` 可选流是否就绪 |
 | `preflight` 事件里某项 `ok=null` | 该项在 `PreflightConfig` 里被关掉了——**"没把关"不等于"通过"** | 正式任务前打开它并注入对应 `model_loaders`；若是 `preflight_skipped`，说明整个自检对象都没注入（离线/演练档） |
-| 侦查段一直不开始（`RECON` 里干等） | `recon_upload='operator'` 时本包**不上传**，要操作手在 QGC 上传并启动 | 让操作手在 QGC 里上传并 start；或自动测试档设 `recon_upload='auto'` |
+| 侦查段一直不开始（`RECON` 里空等） | `recon_upload='operator'` 时本包**不上传**，要操作手在 QGC 上传并启动 | 让操作手在 QGC 里上传并 start；或自动测试档设 `recon_upload='auto'` |
 | `Config(...)` 构造后参数没生效 | 忘了 `.validated()` / 派生时漏了某一层 | 用 `dataclasses.replace` 逐层派生，最后 `.validated()` |
 
 ---

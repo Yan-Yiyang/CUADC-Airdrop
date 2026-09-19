@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
+from itertools import pairwise
 
 import numpy as np
 import pytest
@@ -49,10 +50,8 @@ def test_stream_basic(live_source) -> None:
     assert image.dtype == np.uint8
     assert image.flags.writeable, "管道帧应当是可直接写入的数组"
     assert image.std() > 10, f"画面不是彩色内容 std={image.std():.1f}"
-    assert all(b.index > a.index for a, b in zip(frames, frames[1:])), "帧序号未递增"
-    assert all(
-        b.timestamp >= a.timestamp for a, b in zip(frames, frames[1:])
-    ), "时间戳未递增"
+    assert all(a.index < b.index for a, b in pairwise(frames)), "帧序号未递增"
+    assert all(a.timestamp <= b.timestamp for a, b in pairwise(frames)), "时间戳未递增"
 
     drain_for(source, 1.6)
     stats = source.stats
@@ -135,9 +134,7 @@ def test_stream_reconnect(make_source, sender, stream_config) -> None:
     ``-timeout`` 是让 ffmpeg 在断流时退出的关键 flag；缺了它，管道读会
     永久阻塞，拉流线程既检测不到断流，stop() 也退不掉。
     """
-    config = replace(
-        stream_config, read_timeout=2.0, reconnect_delay=1.0, max_reconnect_delay=2.0
-    )
+    config = replace(stream_config, read_timeout=2.0, reconnect_delay=1.0, max_reconnect_delay=2.0)
     source = make_source(config)
     source.start()
     time.sleep(0.8)
@@ -147,8 +144,7 @@ def test_stream_reconnect(make_source, sender, stream_config) -> None:
     sender.stop(process)  # 掐掉流：UDP 没有 EOF，只能靠 -timeout 判定
     wait_reconnect(source)
     assert source.stats.reconnects >= 1, (
-        f"未检测到断流 reconnects={source.stats.reconnects} "
-        f"state={source.stats.state}"
+        f"未检测到断流 reconnects={source.stats.reconnects} state={source.stats.state}"
     )
 
     sender.start()

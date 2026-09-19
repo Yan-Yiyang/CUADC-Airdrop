@@ -55,8 +55,9 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -143,11 +144,7 @@ class FitConfig:
     @property
     def fitted_names(self) -> tuple[str, ...]:
         """本次要拟合的参数名（顺序同 :data:`FIT_PARAMETERS`）。"""
-        return tuple(
-            name
-            for name in FIT_PARAMETERS
-            if getattr(self, f"fit_{name}")
-        )
+        return tuple(name for name in FIT_PARAMETERS if getattr(self, f"fit_{name}"))
 
     def bounds_for(self, name: str) -> tuple[float, float]:
         table = {
@@ -169,12 +166,15 @@ class FitConfig:
         return float(getattr(self.base, name))
 
     def with_parameters(self, values: Mapping[str, float]) -> BallisticsConfig:
-        """把拟合值写回 ``base``（只认 :data:`FIT_PARAMETERS` 里的名）。"""
+        """把拟合值写回 ``base``（只认 :data:`FIT_PARAMETERS` 里的名）。
+
+        ``release_delay_s`` 与 ``wind_scale`` 不属于 ``BallisticsConfig``——它们是
+        逐次投放的判据参数，由调用方单独传给落点预测函数，所以这里要滤掉。
+        """
         updates = {
             name: float(value)
             for name, value in values.items()
-            if name in FIT_PARAMETERS and name != "release_delay_s"
-            and name != "wind_scale"
+            if name in FIT_PARAMETERS and name not in {"release_delay_s", "wind_scale"}
         }
         return replace(self.base, **updates) if updates else self.base
 
@@ -282,43 +282,27 @@ class FitResult:
             "at_bound": list(self.at_bound),
             "release_delay_s": round(self.release_delay_s, 6),
             "wind_scale": round(self.wind_scale, 6),
-            "drag_area_m2": (
-                None if self.drag_area_m2 is None else round(self.drag_area_m2, 8)
-            ),
+            "drag_area_m2": (None if self.drag_area_m2 is None else round(self.drag_area_m2, 8)),
             "drag_area_sigma_m2": (
-                None
-                if self.drag_area_sigma_m2 is None
-                else round(self.drag_area_sigma_m2, 8)
+                None if self.drag_area_sigma_m2 is None else round(self.drag_area_sigma_m2, 8)
             ),
-            "drag_k_per_m": (
-                None if self.drag_k_per_m is None else round(self.drag_k_per_m, 8)
-            ),
+            "drag_k_per_m": (None if self.drag_k_per_m is None else round(self.drag_k_per_m, 8)),
             "ballistics": asdict(self.ballistics),
             "n_samples": self.n_samples,
             "n_equations": self.n_equations,
             "dof": self.dof,
             "rms_error_m": None if self.rms_error_m is None else round(self.rms_error_m, 4),
             "max_error_m": None if self.max_error_m is None else round(self.max_error_m, 4),
-            "bias_north_m": (
-                None if self.bias_north_m is None else round(self.bias_north_m, 4)
-            ),
-            "bias_east_m": (
-                None if self.bias_east_m is None else round(self.bias_east_m, 4)
-            ),
+            "bias_north_m": (None if self.bias_north_m is None else round(self.bias_north_m, 4)),
+            "bias_east_m": (None if self.bias_east_m is None else round(self.bias_east_m, 4)),
             "per_drop": [item.as_dict() for item in self.per_drop],
             "leave_one_out_rms_m": (
-                None
-                if self.leave_one_out_rms_m is None
-                else round(self.leave_one_out_rms_m, 4)
+                None if self.leave_one_out_rms_m is None else round(self.leave_one_out_rms_m, 4)
             ),
             "leave_one_out_max_m": (
-                None
-                if self.leave_one_out_max_m is None
-                else round(self.leave_one_out_max_m, 4)
+                None if self.leave_one_out_max_m is None else round(self.leave_one_out_max_m, 4)
             ),
-            "leave_one_out_errors_m": [
-                round(value, 4) for value in self.leave_one_out_errors_m
-            ],
+            "leave_one_out_errors_m": [round(value, 4) for value in self.leave_one_out_errors_m],
             "nfev": self.nfev,
             "warnings": list(self.warnings),
         }
@@ -378,7 +362,7 @@ def _numeric_jacobian(
     values: list[float],
 ) -> np.ndarray:
     """中心差分雅可比 ``∂r/∂θ``（m×n）。贴边时自动退成单侧差分。"""
-    point = dict(zip(names, values))
+    point = dict(zip(names, values, strict=True))
     n_equations = 2 * len(samples)
     jacobian = np.zeros((n_equations, len(names)), dtype=np.float64)
     for column, name in enumerate(names):
@@ -397,8 +381,7 @@ def _numeric_jacobian(
         forward = dict(point, **{name: high})
         backward = dict(point, **{name: low})
         jacobian[:, column] = (
-            _residual_vector(samples, config, forward)
-            - _residual_vector(samples, config, backward)
+            _residual_vector(samples, config, forward) - _residual_vector(samples, config, backward)
         ) / (high - low)
     return jacobian
 
@@ -481,8 +464,8 @@ def _identified(
     """
     drag_area = float(ballistics.drag_coefficient) * float(ballistics.cross_area_m2)
     if "drag_coefficient" in parameters and "drag_coefficient" in sigma:
-        sigma_area: float | None = (
-            float(sigma["drag_coefficient"]) * float(ballistics.cross_area_m2)
+        sigma_area: float | None = float(sigma["drag_coefficient"]) * float(
+            ballistics.cross_area_m2
         )
     elif "cross_area_m2" in parameters and "cross_area_m2" in sigma:
         sigma_area = float(sigma["cross_area_m2"]) * float(ballistics.drag_coefficient)
@@ -496,7 +479,7 @@ def _identified(
 # ----------------------------------------------------------------------
 # 主入口
 # ----------------------------------------------------------------------
-def fit_ballistics(
+def fit_ballistics(  # noqa: PLR0911, PLR0912, PLR0915 - 一次反演要把"取数→拟合→诊断→结论"走完
     samples: Sequence[DropSample],
     config: FitConfig | None = None,
 ) -> FitResult:
@@ -574,9 +557,7 @@ def fit_ballistics(
         )
 
     # 4) 初值必须在边界内、且每条样本都能预测出来
-    initial = {
-        name: settings.initial_for(name, data) for name in names
-    }
+    initial = {name: settings.initial_for(name, data) for name in names}
     for name in names:
         low, high = settings.bounds_for(name)
         if not low < initial[name] < high:
@@ -604,12 +585,10 @@ def fit_ballistics(
 
     lower = np.array([settings.bounds_for(name)[0] for name in names])
     upper = np.array([settings.bounds_for(name)[1] for name in names])
-    scales = np.array(
-        [max(abs(initial[name]), _PARAMETER_SCALES[name]) for name in names]
-    )
+    scales = np.array([max(abs(initial[name]), _PARAMETER_SCALES[name]) for name in names])
 
     def residuals(point: np.ndarray) -> np.ndarray:
-        values = dict(zip(names, (float(v) for v in point)))
+        values = dict(zip(names, (float(v) for v in point), strict=True))
         return _residual_vector(data, settings, values)
 
     solution = least_squares(
@@ -642,7 +621,8 @@ def fit_ballistics(
             n_samples=len(data),
             n_equations=n_equations,
             per_drop=per_drop,
-            iterations=int(solution.nfev),
+            # 字段名是 nfev（= 函数评估次数，不是迭代次数）——见 FitResult.nfev
+            nfev=int(solution.nfev),
         )
 
     errors = [item.error_m for item in per_drop]
@@ -653,9 +633,7 @@ def fit_ballistics(
     # ---- 诊断：雅可比 → 条件数 / σ / 相关性 ----
     jacobian = _numeric_jacobian(data, settings, names, list(solution.x))
     scaled = jacobian * scales.reshape(1, -1)
-    condition = (
-        float(np.linalg.cond(scaled)) if len(names) > 1 else 1.0
-    )
+    condition = float(np.linalg.cond(scaled)) if len(names) > 1 else 1.0
     dof = n_equations - len(names)
     sigma: dict[str, float] = {}
     correlation: dict[str, dict[str, float]] = {}
@@ -678,22 +656,17 @@ def fit_ballistics(
         weights[keep] = 1.0 / np.square(singular[keep])
         covariance = (right.T * weights) @ right * variance
         errors_scaled = np.sqrt(np.abs(np.diag(covariance)))
-        sigma = {
-            name: float(errors_scaled[i] * scales[i]) for i, name in enumerate(names)
-        }
+        sigma = {name: float(errors_scaled[i] * scales[i]) for i, name in enumerate(names)}
         std = errors_scaled
         with np.errstate(divide="ignore", invalid="ignore"):
             corr = covariance / np.outer(std, std)
         correlation = {
-            name: {
-                other: float(corr[i, j]) for j, other in enumerate(names)
-            }
+            name: {other: float(corr[i, j]) for j, other in enumerate(names)}
             for i, name in enumerate(names)
         }
     else:
         warnings.append(
-            f"自由度 {dof} ≤ 0：把参数调到残差为零总能做到，σ 无从谈起——"
-            "至少要多一次投放的测量"
+            f"自由度 {dof} ≤ 0：把参数调到残差为零总能做到，σ 无从谈起——至少要多一次投放的测量"
         )
 
     at_bound: list[str] = []

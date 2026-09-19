@@ -28,7 +28,8 @@ import concurrent.futures
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Protocol, Sequence, runtime_checkable
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
 
 from mavsdk.mission_raw import MissionItem as RawMissionItem
 
@@ -237,7 +238,7 @@ class DroneController:
                 f"上传后回读：飞控上有 {len(stored)} 项，我们发了 {len(specs)} 项"
             )
         problems: list[str] = []
-        for index, (sent, got) in enumerate(zip(specs, stored)):
+        for index, (sent, got) in enumerate(zip(specs, stored, strict=True)):
             if int(got.command) != int(sent.command):
                 problems.append(
                     f"第 {index} 项命令 {sent.command}({command_name(sent.command)}) "
@@ -356,9 +357,7 @@ class DroneController:
         ``enabled=False`` 时只记日志并返回 False——调用方（状态机）据此判失败。
         """
         if not self._gripper_enabled:
-            LOGGER.warning(
-                "gripper 未启用（GripperConfig.enabled=False），本次不投放"
-            )
+            LOGGER.warning("gripper 未启用（GripperConfig.enabled=False），本次不投放")
             self._emit("gripper_skipped", {"reason": "disabled"})
             return False
         with self._lock:
@@ -405,13 +404,13 @@ class DroneController:
         """把协程投到 MAVSDK 线程并等结果；任何失败翻译成 :class:`ControllerError`。"""
         try:
             future = self._thread.submit(factory())
-        except Exception as exc:  # noqa: BLE001 - 线程/事件循环不可用
+        except Exception as exc:
             raise ControllerError(f"{what}：无法提交到 MAVSDK 线程（{exc}）") from exc
         try:
             return future.result(timeout=self._timeout)
         except concurrent.futures.TimeoutError as exc:
             raise ControllerError(f"{what}：{self._timeout:.0f}s 内没有结果") from exc
-        except Exception as exc:  # noqa: BLE001 - MAVSDK 异常统一成 ControllerError
+        except Exception as exc:
             raise ControllerError(f"{what}：{exc}") from exc
 
     def _emit(self, kind: str, data: dict[str, Any]) -> None:
@@ -419,7 +418,7 @@ class DroneController:
             return
         try:
             self._on_event(kind, data)
-        except Exception:  # noqa: BLE001 - 事件写盘失败不影响控制
+        except Exception:
             LOGGER.exception("写入控制事件失败（控制继续）")
 
 
@@ -476,6 +475,6 @@ class DryRunController:
         if self._on_event is not None:
             try:
                 self._on_event("drop_dry_run", {"count": self.releases})
-            except Exception:  # noqa: BLE001
+            except Exception:
                 LOGGER.exception("写入演练事件失败（控制继续）")
         return True

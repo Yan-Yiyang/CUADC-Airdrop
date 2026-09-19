@@ -1,11 +1,11 @@
 """P9 离线单测：状态机、航线规划、任务主循环（假控制器驱动）。
 
-**全部离线**：控制器是假对象（按 :class:`~airdrop.telemetry.MissionController` 协议
-实现），遥测走真实 :class:`~airdrop.telemetry.TelemetryBroker`（喂本地 NED 位置），
+全部离线：控制器是假对象（按 :class:`~airdrop.telemetry.MissionController` 协议
+实现），遥测走真实 :class:`~airdrop.telemetry.TelemetryBroker`（传入本地 NED 位置），
 时钟与节拍都是注入的假时钟——于是分钟级的任务可以确定性地压成毫秒级跑完，
 不存在"睡一会儿看看状态对不对"这种用例。
 
-验收口径来自计划 P9：**fake controller 状态机单测（含无目标 → 备用点分支）**。
+验收口径来自计划 P9：fake controller 状态机单测（含无目标 → 备用点分支）。
 """
 
 from __future__ import annotations
@@ -14,12 +14,17 @@ import asyncio
 import concurrent.futures
 import math
 import time
+from collections.abc import Callable, Sequence
 from types import SimpleNamespace
-from typing import Any, Callable, Sequence
+from typing import Any
 
 import pytest
 
 from airdrop import (
+    MAV_CMD_NAV_LAND,
+    MAV_CMD_NAV_TAKEOFF,
+    MAV_CMD_NAV_WAYPOINT,
+    MAV_FRAME_GLOBAL_RELATIVE_ALT,
     BallisticsConfig,
     BallisticsModel,
     Config,
@@ -32,10 +37,6 @@ from airdrop import (
     GripperConfig,
     GroundConfig,
     InvalidTransition,
-    MAV_CMD_NAV_LAND,
-    MAV_CMD_NAV_TAKEOFF,
-    MAV_CMD_NAV_WAYPOINT,
-    MAV_FRAME_GLOBAL_RELATIVE_ALT,
     MissionConfig,
     MissionItem,
     MissionMonitor,
@@ -44,29 +45,24 @@ from airdrop import (
     MissionStateMachine,
     NedOrigin,
     OverflyConfig,
-    PlanError,
     PlanningError,
     Preflight,
     PreflightCheck,
     PreflightConfig,
     PreflightError,
     PreflightLike,
-    QgcPlan,
     ReleaseDecision,
     ReleaseJudge,
     RoutesConfig,
-    TargetPoint,
     TargetingConfig,
+    TargetPoint,
     TelemetryBroker,
     TelemetrySnapshot,
-    UNSET,
     Waypoint,
     analyze,
     build_drop_mission,
     build_recon_mission,
-    check_fixed_wing_landing,
     llaref_of,
-    load_plan,
     overfly_positions,
     overfly_waypoints,
     to_raw_item,
@@ -122,7 +118,7 @@ class FakeController:
         #: 飞控是否在任务模式（启动确认用；``False`` 模拟"启动没生效"）
         self.mission_mode = True
         self.fail_on: set[str] = set()
-        #: True 时 ``start_mission`` **不**复位 ``finished``——模拟"新任务上传后
+        #: True 时 ``start_mission`` 不复位 ``finished``——模拟"新任务上传后
         #: 飞控仍回上一次的 True"这种陈旧读数
         self.sticky_finished = sticky_finished
 
@@ -194,9 +190,7 @@ class FakeJudge:
         now: float | None = None,
     ) -> ReleaseDecision:
         self.updates += 1
-        self.targets.append(
-            (float(target_ned[0]), float(target_ned[1]), float(target_ned[2]))
-        )
+        self.targets.append((float(target_ned[0]), float(target_ned[1]), float(target_ned[2])))
         self.ground_z = ground_z
         self.now = now
         if self._decisions:
@@ -208,7 +202,7 @@ class FakeJudge:
 
 
 class FakeBroker:
-    """只实现 runner 用到的 ``get_snapshot()``：返回一份**可以很旧/无效**的快照。"""
+    """只实现 runner 用到的 ``get_snapshot()``：返回一份可以很旧/无效的快照。"""
 
     def __init__(
         self,
@@ -245,7 +239,7 @@ def _live_broker() -> TelemetryBroker:
         SimpleNamespace(north_m=0.0, east_m=0.0, down_m=-100.0),
         SimpleNamespace(north_m_s=15.0, east_m_s=0.0, down_m_s=0.0),
     )
-    broker.update_in_air(True)      # 离线用例默认"已经起飞"（等起飞门另有专门用例）
+    broker.update_in_air(True)  # 离线用例默认"已经起飞"（等待起飞另有专门用例）
     return broker
 
 
@@ -278,8 +272,7 @@ def _config(
             landing_route=landing_route,
         ),
         overfly=overfly or OverflyConfig(heading_deg=90.0, altitude_m=20.0, leg_length_m=200.0),
-        mission=mission
-        or MissionConfig(tick_hz=20.0, recon_upload="auto"),
+        mission=mission or MissionConfig(tick_hz=20.0, recon_upload="auto"),
         # 起飞前自检默认全关（离线测试没有 GPU/相机）；预检本身由 test_preflight_* 覆盖
         preflight=preflight
         or PreflightConfig(
@@ -344,7 +337,7 @@ def _drive_until(
 ) -> bool:
     """推进到进入目标状态（或终态）为止；返回是否命中目标状态。
 
-    ⚠ 状态是在某一拍**结束时**进入的，所以命中之后那一拍还没跑过——
+    ⚠ 状态是在某一拍结束时进入的，所以命中之后那一拍还没跑过——
     需要"新状态里跑一拍"的断言要自己再调一次 :func:`_drive`。
     """
     for _ in range(limit):
@@ -441,7 +434,7 @@ def test_emit_event_swallows_callback_failures() -> None:
         raise RuntimeError("EventLog 已关闭")
 
     emit_event(boom, "state", {"to_state": "RECON"})  # 不该抛
-    emit_event(None, "state", {})                     # 没有回调也无所谓
+    emit_event(None, "state", {})  # 没有回调也无所谓
     machine = MissionStateMachine(on_event=boom)
     # 同样不该抛：连跳三拍（自检 → 等起飞 → 侦查），每一跳的事件回调都在抛
     machine.transition(MissionState.PREFLIGHT, reason="ok")
@@ -457,8 +450,8 @@ def test_runner_confirms_the_mission_actually_started() -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     runner = _runner(clock, controller, judge=FakeJudge(), events=events)
 
-    _drive(runner, clock, ticks=1)      # INIT → RECON（上传+启动）
-    _drive(runner, clock, ticks=1)      # RECON 第一拍：确认
+    _drive(runner, clock, ticks=1)  # INIT → RECON（上传+启动）
+    _drive(runner, clock, ticks=1)  # RECON 第一拍：确认
 
     assert runner.state is MissionState.RECON
     assert _events_of(events, "mission_confirmed") == [{"mode": "MISSION"}]
@@ -467,8 +460,8 @@ def test_runner_confirms_the_mission_actually_started() -> None:
 def test_runner_aborts_when_the_mission_never_enters_mission_mode() -> None:
     """``start_mission`` 回成功 ≠ 真的在飞：确认窗口内没进 MISSION 就显式失败。
 
-    这是 2026-09 SITL 演练暴露的坑：飞控拒绝了模式切换却仍然回 ACK，飞机继续盘旋，
-    状态机等到 `recon_max_s`（600s）才失败。现在有一个短的确认窗口。
+    这是 2026-09 SITL 演练暴露的易错点：飞控拒绝了模式切换却仍然回 ACK，飞机继续盘旋，
+    状态机等到 recon_max_s（600s）才失败。现在有一个短的确认窗口。
     """
     clock = FakeClock()
     controller = FakeController()
@@ -492,7 +485,7 @@ def test_runner_aborts_when_the_mission_never_enters_mission_mode() -> None:
 
 
 def test_runner_without_a_flight_mode_stream_skips_the_confirmation() -> None:
-    """模式流不可用时退化为不确认（只告警），不能因为拿不到模式就把任务判失败。"""
+    """模式流不可用时退化为不确认（只告警），不能因为取不到模式就把任务判失败。"""
     clock = FakeClock()
     controller = FakeController()
     controller.fail_on = {"in_mission_mode"}
@@ -504,7 +497,7 @@ def test_runner_without_a_flight_mode_stream_skips_the_confirmation() -> None:
     for _ in range(10):
         runner.update()
         clock.advance(1.0)
-    assert runner.state is MissionState.RECON, "拿不到模式就继续等（由状态超时兜底）"
+    assert runner.state is MissionState.RECON, "取不到模式就继续等（由状态超时兜底）"
 
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.HOLD_PROCESS)
@@ -535,9 +528,7 @@ class FakePreflight:
 class FakeVideoSource:
     """假图传源：只提供预检会读的两样东西（``stats.frames`` 与 ``latest()``）。"""
 
-    def __init__(
-        self, *, frames: int = 12, size: tuple[int, int] | None = (1280, 720)
-    ) -> None:
+    def __init__(self, *, frames: int = 12, size: tuple[int, int] | None = (1280, 720)) -> None:
         self.stats = SimpleNamespace(frames=frames)
         self._size = size
 
@@ -558,7 +549,7 @@ def _preflight(
     clock: FakeClock | None = None,
     sleep: Callable[[float], None] | None = None,
 ) -> Preflight:
-    """按正式入口的接法装配一个**真** :class:`~airdrop.Preflight`（时钟/节拍可注入）。"""
+    """按正式入口的接法装配一个真 :class:`~airdrop.Preflight`（时钟/节拍可注入）。"""
     clock = clock or FakeClock()
     return Preflight(
         config,
@@ -574,13 +565,13 @@ def _preflight(
 def test_real_preflight_checks_models_and_video_and_marks_disabled_items() -> None:
     """真预检：四项顺序（detector → ocr → camera → video），关掉的项记 ``ok=None``。
 
-    **关掉 ≠ 通过**：事件里那个 ``null`` 就是"这一项没把关"，正式任务起飞前要核对。
+    关掉 ≠ 通过：事件里那个 ``null`` 就是"这一项没把关"，正式任务起飞前要核对。
     """
     events: list[tuple[str, dict[str, Any]]] = []
     config = PreflightConfig(
         load_detector=True,
-        load_ocr=False,          # 关掉
-        load_camera=False,       # 关掉
+        load_ocr=False,  # 关掉
+        load_camera=False,  # 关掉
         check_video=True,
         video_probe_s=0.5,
         video_min_frames=5,
@@ -604,10 +595,10 @@ def test_real_preflight_checks_models_and_video_and_marks_disabled_items() -> No
 
 
 def test_real_preflight_fails_loudly_when_a_switch_is_on_without_a_loader() -> None:
-    """**开着却没给载入回调 = 接线错误**：直接判失败，绝不静默当成通过。"""
+    """开着却没给载入回调 = 装配错误：直接判失败，绝不静默当成通过。"""
     config = PreflightConfig(
         load_detector=False,
-        load_ocr=True,           # 开着
+        load_ocr=True,  # 开着
         load_camera=False,
         check_video=False,
     )
@@ -650,7 +641,7 @@ def test_real_preflight_video_check_needs_enough_frames() -> None:
 
     def sleep(seconds: float) -> None:
         clock.sleep(seconds)
-        growing.stats.frames += 10      # 这一觉睡来了 10 帧
+        growing.stats.frames += 10  # 这一觉睡来了 10 帧
 
     checks = _preflight(config, source=growing, clock=clock, sleep=sleep).run()
     assert checks[-1].name == "video" and checks[-1].ok is True
@@ -677,7 +668,7 @@ def test_real_preflight_video_check_rejects_a_resolution_mismatch() -> None:
 
 
 def test_preflight_passes_then_waits_for_airborne_and_enters_recon() -> None:
-    """顺序：INIT（遥测/原点，**不上传任务**）→ PREFLIGHT → WAIT_AIRBORNE → RECON。"""
+    """顺序：INIT（遥测/原点，不上传任务）→ PREFLIGHT → WAIT_AIRBORNE → RECON。"""
     clock = FakeClock()
     controller = FakeController()
     events: list[tuple[str, dict[str, Any]]] = []
@@ -746,10 +737,10 @@ def test_missing_preflight_is_skipped_and_recorded() -> None:
 
 
 def test_operator_mode_never_uploads_the_recon_mission() -> None:
-    """正式任务（``recon_upload="operator"``）：**不上传**，只等操作手在 QGC 启动。"""
+    """正式任务（``recon_upload="operator"``）：不上传，只等操作手在 QGC 启动。"""
     clock = FakeClock()
     controller = FakeController()
-    controller.mission_mode = False          # 操作手还没启动
+    controller.mission_mode = False  # 操作手还没启动
     events: list[tuple[str, dict[str, Any]]] = []
     config = _config(
         mission=MissionConfig(tick_hz=20.0, recon_upload="operator"),
@@ -764,7 +755,7 @@ def test_operator_mode_never_uploads_the_recon_mission() -> None:
     _drive(runner, clock, ticks=2)
     assert runner.state is MissionState.RECON, "任务没启动就继续等"
 
-    controller.mission_mode = True           # 操作手启动了任务
+    controller.mission_mode = True  # 操作手启动了任务
     _drive(runner, clock, ticks=1)
     assert runner.state is MissionState.RECON
 
@@ -818,7 +809,7 @@ def test_airborne_falls_back_to_altitude_when_in_air_is_missing() -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     broker = FakeBroker(clock)
     broker.in_air = None
-    broker.altitude_m = 1.0          # 低于 airborne_alt_m（默认 5m）
+    broker.altitude_m = 1.0  # 低于 airborne_alt_m（默认 5m）
     runner = _runner(clock, FakeController(), broker=broker, judge=FakeJudge(), events=events)
 
     _drive(runner, clock, ticks=2)
@@ -835,14 +826,14 @@ def test_airborne_falls_back_to_altitude_when_in_air_is_missing() -> None:
 def test_require_airborne_false_passes_the_gate_without_waiting() -> None:
     """``require_airborne=False``（地面演练）：INIT 之后不等起飞，一拍进 RECON。
 
-    放行必须**留痕**：记一条带 ``reason`` 的 ``airborne_skipped`` 事件，而不是静默通过
-    （否则"正式任务忘了打开这道门"就再也查不出来了）。
+    放行必须留痕：记一条带 ``reason`` 的 ``airborne_skipped`` 事件，而不是静默通过
+    （否则"正式任务忘了打开该检查"就再也查不出来了）。
     """
     clock = FakeClock()
     controller = FakeController()
     events: list[tuple[str, dict[str, Any]]] = []
     broker = FakeBroker(clock)
-    broker.in_air = False                    # 飞机停在停机坪上
+    broker.in_air = False  # 飞机停在停机坪上
     config = _config(
         mission=MissionConfig(tick_hz=20.0, recon_upload="auto", require_airborne=False)
     )
@@ -850,9 +841,9 @@ def test_require_airborne_false_passes_the_gate_without_waiting() -> None:
         clock, controller, config=config, broker=broker, judge=FakeJudge(), events=events
     )
 
-    _drive(runner, clock, ticks=1)           # 一拍走完 INIT → PREFLIGHT → WAIT_AIRBORNE → RECON
+    _drive(runner, clock, ticks=1)  # 一拍走完 INIT → PREFLIGHT → WAIT_AIRBORNE → RECON
 
-    assert runner.state is MissionState.RECON, "关了等起飞门就该当场进侦查"
+    assert runner.state is MissionState.RECON, "关闭等待起飞后应当立即进入侦查"
     assert [str(record.to_state) for record in runner.history] == [
         "PREFLIGHT",
         "WAIT_AIRBORNE",
@@ -860,19 +851,19 @@ def test_require_airborne_false_passes_the_gate_without_waiting() -> None:
     ]
     assert runner.history[-1].reason == "airborne_skipped"
     skipped = _events_of(events, "airborne_skipped")
-    assert len(skipped) == 1, "放过这道门要记事件，绝不能静默"
+    assert len(skipped) == 1, "放行必须记事件，不得无提示通过"
     assert skipped[0].get("reason"), "事件里要说清为什么放行"
     assert _events_of(events, "airborne") == [], "没检测到起飞就不该有 airborne 事件"
 
 
 def test_require_airborne_true_still_waits_on_the_ground() -> None:
-    """默认（``require_airborne=True``）行为不变：没起飞就等，且**不**记 ``airborne_skipped``。"""
+    """默认（``require_airborne=True``）行为不变：没起飞就等，且不记 ``airborne_skipped``。"""
     clock = FakeClock()
     controller = FakeController()
     events: list[tuple[str, dict[str, Any]]] = []
     broker = FakeBroker(clock)
     broker.in_air = False
-    config = _config()                       # 默认档：require_airborne 保持 True
+    config = _config()  # 默认档：require_airborne 保持 True
     runner = _runner(
         clock, controller, config=config, broker=broker, judge=FakeJudge(), events=events
     )
@@ -882,9 +873,9 @@ def test_require_airborne_true_still_waits_on_the_ground() -> None:
 
     assert runner.state is MissionState.WAIT_AIRBORNE
     assert controller.uploads == [], "等起飞期间什么都不上传"
-    assert _events_of(events, "airborne_skipped") == [], "默认档不走逃生开关"
+    assert _events_of(events, "airborne_skipped") == [], "默认档不走临时放行开关"
 
-    broker.in_air = True                     # 飞机真的起飞了
+    broker.in_air = True  # 飞机真的起飞了
     _drive(runner, clock, ticks=1)
 
     assert runner.state is MissionState.RECON
@@ -897,9 +888,12 @@ def test_airborne_timeout_aborts_explicitly() -> None:
     clock = FakeClock()
     broker = FakeBroker(clock)
     broker.in_air = False
-    config = _config(mission=MissionConfig(tick_hz=20.0, recon_upload="auto", airborne_timeout_s=5.0))
-    runner = _runner(clock, config=config, controller=FakeController(), broker=broker,
-                     judge=FakeJudge())
+    config = _config(
+        mission=MissionConfig(tick_hz=20.0, recon_upload="auto", airborne_timeout_s=5.0)
+    )
+    runner = _runner(
+        clock, config=config, controller=FakeController(), broker=broker, judge=FakeJudge()
+    )
 
     for _ in range(20):
         runner.update()
@@ -943,7 +937,7 @@ def test_raw_item_uses_mavlink_fields_and_sets_current_on_first_only() -> None:
 
 
 def test_takeoff_and_land_are_single_items_not_expanded() -> None:
-    """``NAV_TAKEOFF`` / ``NAV_LAND`` 各是**一项**，不被翻译层拆开。
+    """``NAV_TAKEOFF`` / ``NAV_LAND`` 各是一项，不被翻译层拆开。
 
     这是 2026-09 SITL 演练的根因：MAVSDK 会把 ``vehicle_action=LAND`` 拆成
     "同坐标航点 + ``NAV_LAND``"，PX4 固定翼的降落判据（紧前一项必须高于落点）
@@ -970,7 +964,7 @@ def test_waypoint_acceptance_radius_defaults_to_three_metres() -> None:
 
 
 @pytest.mark.parametrize(
-    "kwargs, message",
+    ("kwargs", "message"),
     [
         ({"command": -1}, "MAV_CMD"),
         ({"lat": 91.0}, "纬度"),
@@ -1004,7 +998,7 @@ def test_overfly_positions_are_symmetric_about_the_target() -> None:
     entry, exit_ = overfly_positions(target, heading_deg=90.0, leg_length_m=200.0)
 
     assert entry[0] == pytest.approx(100.0) and exit_[0] == pytest.approx(100.0)
-    assert entry[1] == pytest.approx(-50.0)      # 航向 90°（正东）：entry 在西侧
+    assert entry[1] == pytest.approx(-50.0)  # 航向 90°（正东）：entry 在西侧
     assert exit_[1] == pytest.approx(150.0)
     assert math.dist(entry[:2], exit_[:2]) == pytest.approx(200.0)
     midpoint = ((entry[0] + exit_[0]) / 2, (entry[1] + exit_[1]) / 2)
@@ -1021,9 +1015,7 @@ def test_overfly_waypoints_round_trip_through_wgs84() -> None:
     )
 
     assert entry.alt_m == 20.0 and exit_.alt_m == 20.0, "高度是相对起飞点的高度"
-    expected_entry, expected_exit = overfly_positions(
-        target, heading_deg=45.0, leg_length_m=400.0
-    )
+    expected_entry, expected_exit = overfly_positions(target, heading_deg=45.0, leg_length_m=400.0)
     # 换算回 NED 时海拔要按"原点海拔 + 相对高度"给，否则切平面对不准（米级以下的小偏）
     entry_ned = wgs84_to_ned(entry.lon, entry.lat, origin.alt_m + entry.alt_m, origin)
     exit_ned = wgs84_to_ned(exit_.lon, exit_.lat, origin.alt_m + exit_.alt_m, origin)
@@ -1036,7 +1028,7 @@ def test_overfly_waypoints_round_trip_through_wgs84() -> None:
 
 
 @pytest.mark.parametrize(
-    "kwargs, message",
+    ("kwargs", "message"),
     [
         ({"heading_deg": float("nan")}, "航向"),
         ({"leg_length_m": 0.0}, "段长"),
@@ -1074,9 +1066,7 @@ def test_build_recon_mission_marks_takeoff_on_first_item() -> None:
     assert all(item.command == MAV_CMD_NAV_WAYPOINT for item in items[1:])
     assert [item.alt_m for item in items] == [60.0, 60.0, 60.0]
 
-    plain = build_recon_mission(
-        _config(recon=3, mission=MissionConfig(takeoff_first=False))
-    )
+    plain = build_recon_mission(_config(recon=3, mission=MissionConfig(takeoff_first=False)))
     assert all(item.command == MAV_CMD_NAV_WAYPOINT for item in plain)
 
 
@@ -1135,16 +1125,12 @@ def test_build_drop_mission_requires_origin_and_landing_route() -> None:
     with pytest.raises(PlanningError, match="NED 原点"):
         build_drop_mission(_config(), origin=None, target_ned=(0.0, 0.0, 0.0))
     with pytest.raises(PlanningError, match="降落段为空"):
-        build_drop_mission(
-            _config(landing=0), origin=llaref_of(ORIGIN), target_ned=(0.0, 0.0, 0.0)
-        )
+        build_drop_mission(_config(landing=0), origin=llaref_of(ORIGIN), target_ned=(0.0, 0.0, 0.0))
 
 
 def test_build_drop_mission_rejects_non_finite_target() -> None:
     with pytest.raises(PlanningError, match="有限值"):
-        build_drop_mission(
-            _config(), origin=llaref_of(ORIGIN), target_ned=(float("nan"), 0.0, 0.0)
-        )
+        build_drop_mission(_config(), origin=llaref_of(ORIGIN), target_ned=(float("nan"), 0.0, 0.0))
 
 
 # ----------------------------------------------------------------------
@@ -1168,7 +1154,7 @@ def test_runner_completes_full_mission() -> None:
     _drive(runner, clock, ticks=1)
     assert runner.state is MissionState.RECON, "遥测与原点就绪后立刻上传并启动侦查航线"
 
-    _drive(runner, clock, ticks=1)     # 侦查段跑一拍：让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=1)  # 侦查段跑一拍：让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.HOLD_PROCESS)
     assert runner.state is MissionState.HOLD_PROCESS
@@ -1181,7 +1167,7 @@ def test_runner_completes_full_mission() -> None:
     assert runner.state is MissionState.LAND
     assert controller.count("gripper_release") == 1
 
-    _drive(runner, clock, ticks=1)     # 让看门狗在 LAND 里先看到一次"任务在跑"
+    _drive(runner, clock, ticks=1)  # 让看门狗在 LAND 里先看到一次"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.DONE)
 
@@ -1209,7 +1195,7 @@ def test_runner_uploads_recon_then_merged_drop_mission() -> None:
     controller = FakeController()
     runner = _runner(clock, controller, judge=FakeJudge([ReleaseDecision(True, "predict")]))
 
-    _drive(runner, clock, ticks=2)     # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.OVERFLY)
 
@@ -1272,10 +1258,10 @@ def test_runner_feeds_targeting_result_to_the_judge() -> None:
         target_result=lambda: result,
         target_busy=lambda: False,
     )
-    _drive(runner, clock, ticks=2)     # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.OVERFLY)
-    _drive(runner, clock, ticks=1)     # 飞掠段的第一拍才会问判据
+    _drive(runner, clock, ticks=1)  # 飞掠段的第一拍才会问判据
 
     assert judge.targets == [(100.0, 50.0, 0.0)]
     assert judge.ground_z == 0.0, "原点海拔 500 = 地面点海拔 500 → ground_z=0"
@@ -1292,7 +1278,7 @@ def test_runner_treats_future_snapshot_timestamp_as_fresh() -> None:
 
 
 class MovingBroker:
-    """让飞机沿航向匀速前进的假 broker——给**真**投放判据喂动态快照。
+    """让飞机沿航向匀速前进的假 broker——给真投放判据传入动态快照。
 
     :class:`FakeBroker` 是静止的，弹道判据在静止状态下的预测落点永远在原地，
     测不出"飞到某个位置才该投"。这里让位置随时间推进，判据才会在正确的时刻触发。
@@ -1323,7 +1309,7 @@ class MovingBroker:
     def get_snapshot(self) -> TelemetrySnapshot:
         now = self._clock()
         snapshot = TelemetrySnapshot(timestamp=now)
-        snapshot.in_air = True      # 离线用例默认"已经起飞"（等起飞门另有专门用例）
+        snapshot.in_air = True  # 离线用例默认"已经起飞"（等待起飞另有专门用例）
         snapshot.north_m = self._north
         snapshot.east_m = self._east0 + self._speed * (now - self._started_at)
         snapshot.down_m = self._down
@@ -1351,14 +1337,14 @@ class MovingBroker:
 def test_runner_drops_with_the_real_ballistics_judge() -> None:
     """真判据接进状态机（P8 × P9 的接缝）：飞过目标前触发，并把完整预测落进事件。
 
-    这一条刻意**不用假判据**：假判据只模仿接口，签名/参数一旦对不上它照样通过。
+    这一条刻意不用假判据：假判据只模仿接口，签名/参数一旦对不上它照样通过。
     """
     clock = FakeClock()
     controller = FakeController()
     judge = ReleaseJudge(
         DropConfig(radius_m=2.0),
         BallisticsModel(BallisticsConfig()),
-        overfly_heading_deg=90.0,      # 正东，与假 broker 的飞行方向一致
+        overfly_heading_deg=90.0,  # 正东，与假 broker 的飞行方向一致
         ground_z=0.0,
     )
     # 目标在正东 0m（飞机从 -200m 处往东飞）、北向 0m
@@ -1398,7 +1384,7 @@ def test_runner_drops_with_the_real_ballistics_judge() -> None:
 
 
 def test_runner_records_the_drop_state_for_the_ballistics_fit() -> None:
-    """投放瞬间的飞机状态（位置/速度/**姿态**/风）必须当场记下来。
+    """投放瞬间的飞机状态（位置/速度/姿态/风）必须当场记下来。
 
     这份数据事后无法重建，而 :func:`~airdrop.ballistics.fit.fit_ballistics` 反演弹道
     参数只能靠它——所以这里断言的是"记录内容与判据看到的快照一致"，而不是"回调被调过"。
@@ -1469,15 +1455,13 @@ def test_runner_records_the_drop_state_for_the_ballistics_fit() -> None:
     assert record.predicted_error_m is not None and record.predicted_error_m <= 2.0
     assert record.release_position_ned is not None
     # 前推位置 = 记录位置 + 速度 × delay（一阶，与判据同款）
-    assert record.release_position_ned[1] == pytest.approx(
-        record.position_ned[1] + 18.0 * 0.08
-    )
-    # 落盘/回读一致（drops.jsonl 走的就是 as_dict/from_dict）
+    assert record.release_position_ned[1] == pytest.approx(record.position_ned[1] + 18.0 * 0.08)
+    # 写入磁盘与回读一致（drops.jsonl 走的就是 as_dict/from_dict）
     assert DropRecord.from_dict(record.as_dict()) == record
 
 
 def test_runner_records_a_drop_even_when_the_callback_fails() -> None:
-    """回调抛异常只记日志：**弹已经出去了**，不能因为写不进记录就改变任务状态。"""
+    """回调抛异常只记日志：弹已经出去了，不能因为写不进记录就改变任务状态。"""
     clock = FakeClock()
     controller = FakeController()
     judge = ReleaseJudge(
@@ -1513,25 +1497,29 @@ def test_runner_records_a_drop_even_when_the_callback_fails() -> None:
     _drive_until(runner, clock, MissionState.OVERFLY)
     _drive_until(runner, clock, MissionState.LAND, step=0.1, limit=2000)
 
-    assert runner.state is MissionState.LAND          # 没有因为回调抛错而 ABORT
+    assert runner.state is MissionState.LAND  # 没有因为回调抛错而 ABORT
     assert controller.count("gripper_release") == 1
-    assert len(runner.drops) == 1                     # 内存里那份仍然记下了
+    assert len(runner.drops) == 1  # 内存里那份仍然记下了
     assert _events_of(events, "drop_record")[0]["index"] == 1
 
 
 def test_record_drop_reports_a_broken_snapshot_without_touching_the_state() -> None:
-    """快照缺位置/速度时：记一条 error 事件、不写记录、**不改变任务状态**。"""
+    """快照缺位置/速度时：记一条 error 事件、不写记录、不改变任务状态。"""
     clock = FakeClock()
     controller = FakeController()
     events: list[tuple[str, dict[str, Any]]] = []
     runner = _runner(clock, controller, events=events)
     decision = ReleaseDecision(
-        should_release=True, reason="predict", timestamp=clock(),
-        predicted=None, horizontal_error_m=0.1, passed_target=True,
+        should_release=True,
+        reason="predict",
+        timestamp=clock(),
+        predicted=None,
+        horizontal_error_m=0.1,
+        passed_target=True,
         release_position=(1.0, 2.0, -3.0),
     )
-    snapshot = TelemetrySnapshot(timestamp=clock())     # 什么都没有的空快照
-    runner._record_drop(decision, snapshot)             # 白盒：直接喂坏快照
+    snapshot = TelemetrySnapshot(timestamp=clock())  # 什么都没有的空快照
+    runner._record_drop(decision, snapshot)  # 白盒：直接传入坏快照
 
     assert runner.drops == ()
     errors = _events_of(events, "error")
@@ -1571,7 +1559,7 @@ def test_runner_without_target_uses_backup_point() -> None:
         events=events,
     )
 
-    _drive(runner, clock, ticks=2)     # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.OVERFLY)
     _drive(runner, clock, ticks=1)
@@ -1597,11 +1585,11 @@ def test_runner_waits_full_timeout_while_processing_is_busy() -> None:
         controller,
         judge=FakeJudge([ReleaseDecision(True, "fallback")]),
         target_result=lambda: empty,
-        target_busy=lambda: True,          # 永远"还在处理"
+        target_busy=lambda: True,  # 永远"还在处理"
         events=events,
     )
 
-    _drive(runner, clock, ticks=2)     # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.OVERFLY, step=0.25, limit=200)
 
@@ -1624,14 +1612,14 @@ def test_runner_keeps_waiting_for_a_result_up_to_the_limit() -> None:
         controller,
         judge=FakeJudge([ReleaseDecision(True, "predict")]),
         target_result=lambda: good if ready["value"] else empty,
-        target_busy=lambda: True,          # 不给"处理完了"的信号 → 只能等结果或超时
+        target_busy=lambda: True,  # 不给"处理完了"的信号 → 只能等结果或超时
         events=events,
     )
 
-    _drive(runner, clock, ticks=2)     # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.HOLD_PROCESS)
-    _drive(runner, clock, ticks=20, step=0.25)     # 5s：仍然没有结果
+    _drive(runner, clock, ticks=20, step=0.25)  # 5s：仍然没有结果
     assert runner.state is MissionState.HOLD_PROCESS
     assert _events_of(events, "targeting") == []
 
@@ -1651,7 +1639,7 @@ def test_runner_survives_a_failing_target_reader() -> None:
     events: list[tuple[str, dict[str, Any]]] = []
 
     def boom() -> Any:
-        raise RuntimeError("聚类炸了")
+        raise RuntimeError("聚类抛出异常了")
 
     runner = _runner(
         clock,
@@ -1661,7 +1649,7 @@ def test_runner_survives_a_failing_target_reader() -> None:
         target_busy=lambda: True,
         events=events,
     )
-    _drive(runner, clock, ticks=2)     # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.OVERFLY, step=0.25, limit=200)
 
@@ -1702,7 +1690,7 @@ def test_runner_aborts_when_start_fails() -> None:
     assert len(controller.uploads) == 1
 
 
-@pytest.mark.parametrize("action, expected", [("rtl", "rtl"), ("none", None)])
+@pytest.mark.parametrize(("action", "expected"), [("rtl", "rtl"), ("none", None)])
 def test_runner_abort_action_is_configurable(action: str, expected: str | None) -> None:
     clock = FakeClock()
     controller = FakeController()
@@ -1710,9 +1698,7 @@ def test_runner_abort_action_is_configurable(action: str, expected: str | None) 
     runner = _runner(
         clock,
         controller,
-        config=_config(
-            mission=MissionConfig(abort_action=action, recon_upload="auto")
-        ),
+        config=_config(mission=MissionConfig(abort_action=action, recon_upload="auto")),
     )
     _drive(runner, clock, ticks=2)
 
@@ -1729,7 +1715,7 @@ def test_runner_aborts_when_telemetry_goes_stale() -> None:
     controller = FakeController()
     events: list[tuple[str, dict[str, Any]]] = []
     runner = _runner(clock, controller, broker=FakeBroker(clock, age_s=30.0), events=events)
-    _drive(runner, clock, ticks=2)     # INIT 只看有没有位置，RECON 才看看门狗
+    _drive(runner, clock, ticks=2)  # INIT 只看有没有位置，RECON 才看看门狗
 
     assert runner.state is MissionState.ABORT
     assert runner.history[-1].reason == "telemetry_lost"
@@ -1756,9 +1742,7 @@ def test_runner_aborts_when_telemetry_never_arrives() -> None:
 def test_runner_waits_for_origin_then_aborts_on_timeout() -> None:
     clock = FakeClock()
     controller = FakeController(origin=None)
-    runner = _runner(
-        clock, controller, config=_config(mission=MissionConfig(init_max_s=1.0))
-    )
+    runner = _runner(clock, controller, config=_config(mission=MissionConfig(init_max_s=1.0)))
 
     _drive(runner, clock, ticks=3, step=0.25)
     assert runner.state is MissionState.INIT, "原点没就绪时应当停在 INIT 反复重试"
@@ -1800,8 +1784,8 @@ def test_runner_reports_a_repeating_query_failure_only_once() -> None:
         config=_config(mission=MissionConfig(recon_max_s=600.0)),
         events=events,
     )
-    _drive(runner, clock, ticks=2)      # 进 RECON
-    _drive(runner, clock, ticks=20)     # 20 拍全都查失败
+    _drive(runner, clock, ticks=2)  # 进 RECON
+    _drive(runner, clock, ticks=20)  # 20 拍全都查失败
 
     errors = _events_of(events, "error")
     assert len(errors) == 1 and errors[0]["where"] == "mission_finished"
@@ -1810,10 +1794,8 @@ def test_runner_reports_a_repeating_query_failure_only_once() -> None:
 
 def test_runner_aborts_when_recon_times_out() -> None:
     clock = FakeClock()
-    controller = FakeController()          # 永远不报"飞完"
-    runner = _runner(
-        clock, controller, config=_config(mission=MissionConfig(recon_max_s=2.0))
-    )
+    controller = FakeController()  # 永远不报"飞完"
+    runner = _runner(clock, controller, config=_config(mission=MissionConfig(recon_max_s=2.0)))
     _drive(runner, clock, ticks=20, step=0.25)
 
     assert runner.state is MissionState.ABORT
@@ -1824,10 +1806,8 @@ def test_runner_does_not_trust_a_stale_finished_flag() -> None:
     """回归：新任务刚上传时飞控可能仍报上一次的 True —— 不能就此判定侦查结束。"""
     clock = FakeClock()
     controller = FakeController(sticky_finished=True)
-    controller.finished = True             # 一直回 True，从未出现过 False
-    runner = _runner(
-        clock, controller, config=_config(mission=MissionConfig(recon_max_s=2.0))
-    )
+    controller.finished = True  # 一直回 True，从未出现过 False
+    runner = _runner(clock, controller, config=_config(mission=MissionConfig(recon_max_s=2.0)))
     _drive(runner, clock, ticks=20, step=0.25)
 
     assert runner.state is MissionState.ABORT
@@ -1838,17 +1818,17 @@ def test_runner_does_not_trust_a_stale_finished_flag() -> None:
 def test_runner_aborts_when_the_mission_ends_without_a_release() -> None:
     clock = FakeClock()
     controller = FakeController()
-    judge = FakeJudge()                    # 永远 waiting
+    judge = FakeJudge()  # 永远 waiting
     events: list[tuple[str, dict[str, Any]]] = []
     runner = _runner(clock, controller, judge=judge, events=events)
 
-    _drive(runner, clock, ticks=2)     # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.OVERFLY)
-    _drive(runner, clock, ticks=2)         # 飞掠段里跑两拍：判据评估过、且看到任务在跑
+    _drive(runner, clock, ticks=2)  # 飞掠段里跑两拍：判据评估过、且看到任务在跑
     assert judge.updates >= 1
 
-    controller.finish_mission()            # 整条任务飞完却没投出去
+    controller.finish_mission()  # 整条任务飞完却没投出去
     _drive(runner, clock, ticks=3)
 
     assert runner.state is MissionState.ABORT
@@ -1861,7 +1841,7 @@ def test_runner_aborts_when_gripper_release_is_refused() -> None:
     clock = FakeClock()
     controller = FakeController(release_ok=False)
     runner = _runner(clock, controller, judge=FakeJudge([ReleaseDecision(True, "predict")]))
-    _drive(runner, clock, ticks=2)     # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.OVERFLY)
     _drive(runner, clock, ticks=2)
@@ -1884,7 +1864,7 @@ def test_runner_aborts_when_planning_fails() -> None:
         target_busy=lambda: False,
         events=events,
     )
-    _drive(runner, clock, ticks=2)     # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive(runner, clock, ticks=20, step=0.25)
 
@@ -1901,13 +1881,13 @@ def test_runner_without_judge_skips_the_drop_and_lands() -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     runner = _runner(clock, controller, judge=None, events=events)
 
-    _drive(runner, clock, ticks=2)     # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.LAND)
     assert runner.state is MissionState.LAND
     assert _events_of(events, "drop_skipped")[0]["reason"] == "no_judge"
 
-    _drive(runner, clock, ticks=1)     # LAND 里先看到一次"任务在跑"
+    _drive(runner, clock, ticks=1)  # LAND 里先看到一次"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.DONE)
     assert runner.state is MissionState.DONE
@@ -1927,7 +1907,7 @@ def test_abort_is_idempotent_and_ignored_after_done() -> None:
 
     done_clock = FakeClock()
     done_controller = FakeController()
-    done = _runner(done_clock, done_controller, judge=None)   # 演练模式 → 一路到 DONE
+    done = _runner(done_clock, done_controller, judge=None)  # 演练模式 → 一路到 DONE
     _drive(done, done_clock, ticks=2)
     done_controller.finish_mission()
     _drive_until(done, done_clock, MissionState.LAND)
@@ -1976,7 +1956,7 @@ class FakeThread:
         future: concurrent.futures.Future = concurrent.futures.Future()
         try:
             future.set_result(asyncio.run(coro))
-        except BaseException as exc:  # noqa: BLE001 - 与 run_coroutine_threadsafe 一致
+        except BaseException as exc:  # noqa: BLE001 - 与 run_coroutine_threadsafe 一致：BaseException 一起转交
             future.set_exception(exc)
         return future
 
@@ -2099,12 +2079,12 @@ def test_drone_controller_translates_mavsdk_failures() -> None:
 
 def test_drone_controller_times_out_waiting_for_the_future() -> None:
     class DeadThread:
-        def require_drone(self) -> Any:      # pragma: no cover - 不该被调到
+        def require_drone(self) -> Any:  # pragma: no cover - 不该被调到
             raise AssertionError
 
         def submit(self, coro: Any) -> concurrent.futures.Future:
             coro.close()
-            return concurrent.futures.Future()   # 永远不会有结果
+            return concurrent.futures.Future()  # 永远不会有结果
 
     controller = DroneController(DeadThread(), timeout=0.01)
     with pytest.raises(ControllerError, match="没有结果"):
@@ -2179,7 +2159,8 @@ def test_drone_controller_origin_and_finished_queries() -> None:
     assert drone.origin_calls == 1
 
     with pytest.raises(ControllerError, match="任务进度"):
-        controller.mission_finished(), "进度流还没数据就显式失败，不猜"
+        # 进度流还没数据就显式失败，不猜（原来的写法把说明写成了表达式语句，等于没有断言）
+        controller.mission_finished()
 
     thread.mission_progress = (1, 3)
     assert controller.mission_finished() is False
@@ -2194,9 +2175,7 @@ def test_drone_controller_from_config_reads_gripper_section() -> None:
     drone = FakeDrone()
     sleeps: list[float] = []
     config = _config().replace(gripper=GripperConfig(enabled=False, instance=3))
-    controller = DroneController.from_config(
-        config, FakeThread(drone), sleep=sleeps.append
-    )
+    controller = DroneController.from_config(config, FakeThread(drone), sleep=sleeps.append)
     assert controller.gripper_release() is False
     assert drone.releases == []
 
@@ -2276,9 +2255,7 @@ def test_runner_reaches_done_with_a_dry_run_controller() -> None:
 class TimedController(FakeController):
     """按假时钟自动推进"任务进度"的假控制器（把分钟级任务压成毫秒级）。"""
 
-    def __init__(
-        self, clock: FakeClock, *, recon_s: float = 60.0, drop_s: float = 120.0
-    ) -> None:
+    def __init__(self, clock: FakeClock, *, recon_s: float = 60.0, drop_s: float = 120.0) -> None:
         super().__init__()
         self._clock = clock
         self._recon_s = recon_s

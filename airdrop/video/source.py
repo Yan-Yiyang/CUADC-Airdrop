@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
-from typing import Callable, Iterator
 
 import numpy as np
 
@@ -65,8 +66,7 @@ class VideoConfig:
     def validated(self) -> "VideoConfig":
         if self.transport not in SUPPORTED_TRANSPORTS:
             raise ValueError(
-                f"不支持的传输层: {self.transport}，可选 "
-                f"{sorted(SUPPORTED_TRANSPORTS)}"
+                f"不支持的传输层: {self.transport}，可选 {sorted(SUPPORTED_TRANSPORTS)}"
             )
         if self.width <= 0 or self.height <= 0:
             raise ValueError(
@@ -160,7 +160,7 @@ def _find_ffmpeg(explicit: str | None = None) -> str | None:
         import imageio_ffmpeg
 
         return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:  # noqa: BLE001 - 任何失败都退回 PATH 查找
+    except Exception:  # noqa: BLE001 - 取不到就记日志，任何失败都退回 PATH 查找
         return shutil.which("ffmpeg")
 
 
@@ -356,10 +356,7 @@ class Hm30VideoSource:
             self._ffmpeg_executable = _find_ffmpeg(self._config.ffmpeg_executable)
         if self._ffmpeg_executable is None:
             # 环境问题，重连多少次都没用：直接说明白并停下
-            self._fail(
-                "找不到 ffmpeg 可执行文件（imageio-ffmpeg 与 PATH 里都没有），"
-                "无法拉流"
-            )
+            self._fail("找不到 ffmpeg 可执行文件（imageio-ffmpeg 与 PATH 里都没有），无法拉流")
             self._set_state("stopped")
             return
 
@@ -368,7 +365,7 @@ class Hm30VideoSource:
             try:
                 self._stream_ffmpeg()
                 delay = self._config.reconnect_delay
-            except Exception as exc:  # noqa: BLE001 - 线程不能因单次失败而死
+            except Exception as exc:
                 LOGGER.exception("图传拉流异常")
                 self._fail(str(exc))
             if self._stop_event.is_set():
@@ -393,7 +390,8 @@ class Hm30VideoSource:
         self._set_state("connecting")
         # stderr 落到临时文件而不是管道：管道写满会让 ffmpeg 阻塞在日志上、
         # 连带卡死解码；临时文件既能保留错误信息，又不会反压。
-        stderr_file = tempfile.TemporaryFile()
+        # SIM115：句柄交给 _terminate(process, stderr_file) 关闭，不能在这里 with 掉。
+        stderr_file = tempfile.TemporaryFile()  # noqa: SIM115
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -416,9 +414,7 @@ class Hm30VideoSource:
                         f"{_read_stderr(process, stderr_file)}"
                     )
                     return
-                image = np.frombuffer(buffer, dtype=np.uint8).reshape(
-                    height, width, 3
-                )
+                image = np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 3)
                 # 注意：image 是 buffer 的视图（零拷贝），下一轮 readinto 会覆盖
                 # 它。要保留画面必须 copy —— 见 VideoFrame.copy()。
                 self._publish(image)
@@ -426,9 +422,7 @@ class Hm30VideoSource:
             _terminate(process, stderr_file)
             self._process = None
 
-    def _build_ffmpeg_command(
-        self, executable: str, width: int, height: int
-    ) -> list[str]:
+    def _build_ffmpeg_command(self, executable: str, width: int, height: int) -> list[str]:
         config = self._config
         # -hide_banner -nostdin：别让 ffmpeg 抢标准输入，日志也压到最少
         command = [executable, "-hide_banner", "-nostdin", "-loglevel", "error"]
@@ -489,7 +483,7 @@ class Hm30VideoSource:
         for sink in sinks:
             try:
                 sink(frame)
-            except Exception:  # noqa: BLE001 - 单个 sink 失败不能打断拉流
+            except Exception:
                 LOGGER.exception("图传帧 sink 执行失败")
 
     def _set_state(self, state: str) -> None:
@@ -535,7 +529,7 @@ def _read_stderr(process: subprocess.Popen, stderr_file) -> str:
     try:
         stderr_file.seek(0)
         text = stderr_file.read().decode("utf-8", "replace").strip()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - 日志读不出来只影响报错信息
         return "无法读取 ffmpeg 日志"
     return text or f"ffmpeg 异常退出，returncode={process.poll()}"
 
@@ -550,15 +544,12 @@ def _terminate(process: subprocess.Popen, stderr_file=None) -> None:
             process.kill()
             process.wait(timeout=2.0)
     if process.stdout is not None:
-        try:
+        # 关闭失败不能影响重连/停止流程，所以刻意吞掉异常
+        with contextlib.suppress(Exception):
             process.stdout.close()
-        except Exception:  # noqa: BLE001
-            pass
     if stderr_file is not None:
-        try:
+        with contextlib.suppress(Exception):
             stderr_file.close()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def open_hm30_video(

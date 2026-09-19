@@ -15,7 +15,7 @@ from .models import Detection, PixelBox
 
 LOGGER = logging.getLogger(__name__)
 
-__all__ = ["Detector", "DetectorConfig", "DetectionBatch"]
+__all__ = ["DetectionBatch", "Detector", "DetectorConfig"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,10 +24,10 @@ class DetectorConfig:
 
     # 实测可用的权重是 best2.pt（best.pt/best1.pt 对现目标形态零检出，见 config.py）
     model_path: str = "models/best2.pt"
-    device: str = "0"                 # 显式指定：见模块 docstring
+    device: str = "0"  # 显式指定：见模块 docstring
     conf_threshold: float = 0.25
     iou_threshold: float = 0.45
-    imgsz: int = 1280                 # best2.pt 训练 imgsz=640；实测 640/1280 检出一致
+    imgsz: int = 1280  # best2.pt 训练 imgsz=640；实测 640/1280 检出一致
     max_detections: int = 300
     # 目标框外扩比例（裁剪时保留完整轮廓）
     crop_expand_ratio: float = 0.2
@@ -128,7 +128,7 @@ class Detector:
                 verbose=False,
             )
             return True
-        except Exception:  # noqa: BLE001 - 预热失败不致命
+        except Exception:
             LOGGER.exception("YOLO 预热失败（不影响后续真实检测）")
             return False
 
@@ -247,7 +247,7 @@ class Detector:
                 xyxy = boxes.xyxy.cpu().numpy()
                 confs = boxes.conf.cpu().numpy()
                 classes = boxes.cls.cpu().numpy().astype(int)
-                for (x1, y1, x2, y2), conf, cls in zip(xyxy, confs, classes):
+                for (x1, y1, x2, y2), conf, cls in zip(xyxy, confs, classes, strict=True):
                     box = PixelBox(float(x1), float(y1), float(x2), float(y2)).clipped(
                         width, height
                     )
@@ -279,9 +279,7 @@ class Detector:
             undistorted=rectified,
         )
 
-    def crop(
-        self, batch: DetectionBatch, detection: Detection
-    ) -> np.ndarray:
+    def crop(self, batch: DetectionBatch, detection: Detection) -> np.ndarray:
         """按检测框裁出目标图（含外扩，保留完整五边形轮廓）。"""
         box = detection.box.expanded(self._config.crop_expand_ratio).clipped(
             batch.image.shape[1], batch.image.shape[0]

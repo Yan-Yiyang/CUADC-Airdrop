@@ -9,9 +9,9 @@
 * :mod:`~airdrop.perception.ocr_worker`：OCR 独立工作进程；
 * :mod:`~airdrop.perception.pipeline`：主循环（缓冲 → 检测 → 送检/直出 → Detection）。
 
-重依赖（``ultralytics`` / ``rapidocr`` / ``torch``）都在**使用时**才导入，
+重依赖（``ultralytics`` / ``rapidocr`` / ``torch``）都在使用时才导入，
 所以 ``import airdrop.perception`` 在没有 GPU 栈的机器上也能成功——离线单测
-依赖这一点。**导出同样是惰性的**（见 :mod:`airdrop._lazy`）：``cropproc`` / ``detector``
+依赖这一点。导出同样是惰性的（见 :mod:`airdrop._lazy`）：``cropproc`` / ``detector``
 会拉 cv2，第一次取名字时才加载。
 """
 

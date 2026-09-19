@@ -1,7 +1,8 @@
 """P5 真实素材端到端验证（转成用例）：视频帧 → YOLO → 裁剪 → OCR。
 
-素材：旧版 实战视频 `flight.mp4` 的目标段。
+素材：旧版 实战视频 flight.mp4 的目标段。
 """
+
 from __future__ import annotations
 
 import os
@@ -25,14 +26,15 @@ def _read_frame(capture: cv2.VideoCapture, index: int):
 
 @pytest.mark.skipif(not VIDEO.is_file(), reason="缺少 旧版 实战视频素材")
 @pytest.mark.skipif(not WEIGHTS.is_file(), reason="缺少 YOLO 权重 models/best2.pt")
-@pytest.mark.skipif(not (MODELS_DIR / "PP-OCRv6_det_medium.pth").is_file(),
-                    reason="缺少 PP-OCR 权重")
+@pytest.mark.skipif(
+    not (MODELS_DIR / "PP-OCRv6_det_medium.pth").is_file(), reason="缺少 PP-OCR 权重"
+)
 def test_real_video_reads_target_codes() -> None:
     """实战视频的目标段：检出的真目标必须读出正确编号（56/95）。
 
-    刻意**不要 ``tmp_path`` 参数**：受限沙箱里该 fixture 建目录会
+    刻意不要 ``tmp_path`` 参数：受限沙箱里该 fixture 建目录会
     ``PermissionError: [WinError 5]``（``--basetemp`` 也绕不开，pytest 收尾时
-    自己也要枚举它）。本用例本来就不落盘，去掉参数才能在沙箱里跑。
+    自己也要枚举它）。本用例本来就不写入磁盘，去掉参数才能在沙箱里跑。
     """
     pytest.importorskip("ultralytics")
     pytest.importorskip("rapidocr")
@@ -44,13 +46,10 @@ def test_real_video_reads_target_codes() -> None:
 
     detector = Detector(DetectorConfig(model_path=str(WEIGHTS), device="0"))
     detector.load()
-    post = OpenCvPostProcess(
-        color="blue", ocr_conf_threshold=0.6, engine_config=OcrEngineConfig()
-    )
+    post = OpenCvPostProcess(color="blue", ocr_conf_threshold=0.6, engine_config=OcrEngineConfig())
 
     capture = cv2.VideoCapture(str(VIDEO))
     assert capture.isOpened()
-    total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     results: dict[int, list[int | None]] = {}
     try:
         for index in (924, 1535, 1840):
@@ -67,7 +66,7 @@ def test_real_video_reads_target_codes() -> None:
         capture.release()
 
     # 每帧最高置信度的那个框应当读出编号；三帧都是 56。
-    # ⚠ 1840 原本记的是 **95**——那是错的：该帧物理目标就是 56，"56" 绕图心转 180°
+    # ⚠ 1840 原本记的是 95——那是错的：该帧物理目标就是 56，"56" 绕图心转 180°
     # 恰好读成 "95"，而饱和度过严那一级的假房子（掩码只圈到编号底板）抢先返回了
     # 那个翻转结果。转正补上"顶角≈60°"的形态门限后恢复正常。别把 95 改回去。
     expected = {924: 56, 1535: 56, 1840: 56}
@@ -96,7 +95,7 @@ def test_weights_reject_junk_crop() -> None:
 # 转正交叉验证：几何（形状）vs 方向判别（学出来的笔画方向）
 # ----------------------------------------------------------------------
 def _upright_probability(engine, strip) -> float:
-    """这张数字条**正立**的概率。
+    """这张数字条正立的概率。
 
     ``TextClassifier`` 的 score 是 softmax 概率（实测两类之和恒为 1.0000），
     所以 ``label=="180"`` 时正立概率是 ``1 - score``。
@@ -108,7 +107,7 @@ def _upright_probability(engine, strip) -> float:
 def _number_strip(engine, rectified):
     """转正图里所有数字框的并集（当一条文本行用）。
 
-    按**单个数字框**逐个问判别器噪声很大（一位数字的朝向信息本来就少），
+    按单个数字框逐个问判别器噪声很大（一位数字的朝向信息本来就少），
     并成一条更接近这个模型的训练分布。
     """
     import numpy as np
@@ -133,26 +132,28 @@ def _number_strip(engine, rectified):
 
 @pytest.mark.skipif(not VIDEO.is_file(), reason="缺少 旧版 实战视频素材")
 @pytest.mark.skipif(not WEIGHTS.is_file(), reason="缺少 YOLO 权重 models/best2.pt")
-@pytest.mark.skipif(not (MODELS_DIR / "ch_ppocr_mobile_v2.0_cls_mobile.onnx").is_file(),
-                    reason="缺少 Cls 权重（跑 python -m tools.fetch_models）")
+@pytest.mark.skipif(
+    not (MODELS_DIR / "ch_ppocr_mobile_v2.0_cls_mobile.onnx").is_file(),
+    reason="缺少 Cls 权重（跑 python -m tools.fetch_models）",
+)
 def test_rectification_cross_checked_by_orientation_cls() -> None:
-    """几何转正 vs 学习式方向判别：两条**信息完全不同**的判据互相对表。
+    """几何转正 vs 学习式方向判别：两条信息完全不同的判据互相比对。
 
     * 几何转正只用形状（正方形 + 上边一个等边三角形）决定转向；
     * 方向判别（``ch_ppocr_mobile_v2.0_cls``）用的是学出来的笔画方向。
 
-    裁决用**两向对比**而不是门限：同一块数字条，分别问"它正立吗"与"把它转 180°
+    裁决用两向对比而不是门限：同一块数字条，分别问"它正立吗"与"把它转 180°
     后正立吗"，取正立概率更大的一向。真实低分素材上判别置信度很低（0.19~0.86，
-    干净合成图是 0.98），``cls_thresh=0.9`` 那种门限会**漏判**——帧 1840 的倒立条
+    干净合成图是 0.98），``cls_thresh=0.9`` 那种门限会漏判——帧 1840 的倒立条
     只有 0.7538，两向对比才判得对。
 
     这条用例当初就是这样抓到"帧 1840 转正差 180°"的（那时标 xfail）；转正补上
     "顶角 ≈60°"的形态门限后修好，标记随之摘掉。
 
-    ⚠ **为什么不硬断言"全局零冲突"**：判别器在真实小目标上会**误报**——帧 1160
+    ⚠ 为什么不硬断言"全局零冲突"：判别器在真实小目标上会误报——帧 1160
     的转正图目视明确正立、"56" 正读，它却给出 P(正立)=0.186（= 倒置 0.81）。
-    所以这里只对**已经目视核对过**的三帧硬断言，其余全部打印出来供人复核；
-    把它当"提示器"而不是"裁判"。顺带一提，0.9 门限在**动作**路径上正好挡住了
+    所以这里只对已经目视核对过的三帧硬断言，其余全部打印出来供人复核；
+    把它当"提示器"而不是"裁判"。顺带一提，0.9 门限在动作路径上正好挡住了
     这种误报：0.81 < 0.9，生产里的自动转正不会因它而动图。
     """
     pytest.importorskip("ultralytics")
@@ -164,7 +165,7 @@ def test_rectification_cross_checked_by_orientation_cls() -> None:
     from airdrop.perception.detector import Detector, DetectorConfig
 
     engine = OcrEngine(OcrEngineConfig())
-    engine.ensure()                      # cls_providers() 只在加载后才有内容
+    engine.ensure()  # cls_providers() 只在加载后才有内容
     if not engine.cls_providers():
         pytest.skip("方向分类未就绪")
     detector = Detector(DetectorConfig(model_path=str(WEIGHTS), device="0"))
@@ -178,7 +179,7 @@ def test_rectification_cross_checked_by_orientation_cls() -> None:
     capture = cv2.VideoCapture(str(VIDEO))
     assert capture.isOpened()
     # 顺序读、隔一段处理一张：反复 seek 在长 GOP 上很慢。
-    # 采样集里**必须**含 1840 与 1180——翻转就发生在那里，隔 30 帧取样会正好漏掉。
+    # 采样集里必须含 1840 与 1180——翻转就发生在那里，隔 30 帧取样会正好漏掉。
     sample = set(range(900, 1901, 20)) | verified
     rows: list[str] = []
     checked = 0
@@ -201,9 +202,7 @@ def test_rectification_cross_checked_by_orientation_cls() -> None:
                     if strip is None:
                         continue
                     forward = _upright_probability(engine, strip)
-                    backward = _upright_probability(
-                        engine, cv2.rotate(strip, cv2.ROTATE_180)
-                    )
+                    backward = _upright_probability(engine, cv2.rotate(strip, cv2.ROTATE_180))
                     verdict = "0" if forward >= backward else "180"
                     checked += 1
                     if verdict == "180" and index in verified:
@@ -219,8 +218,10 @@ def test_rectification_cross_checked_by_orientation_cls() -> None:
 
     report = "\n".join(rows) if rows else "  （一张都没查成）"
     flipped = [row for row in rows if row.rstrip().endswith("→ 180")]
-    print(f"\n转正交叉验证：查了 {checked} 个编号，判为 180° 的有 {len(flipped)} 个"
-          f"（其中已目视核对的帧 {sorted(verified_conflicts)}）\n{report}")
+    print(
+        f"\n转正交叉验证：查了 {checked} 个编号，判为 180° 的有 {len(flipped)} 个"
+        f"（其中已目视核对的帧 {sorted(verified_conflicts)}）\n{report}"
+    )
     assert checked > 0, f"没有可交叉验证的样本，检查素材是否可用\n{report}"
     assert not verified_conflicts, (
         f"已目视核对过的帧 {sorted(verified_conflicts)} 被判为 180°——"

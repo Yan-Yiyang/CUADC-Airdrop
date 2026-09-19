@@ -37,9 +37,10 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import cv2
 import numpy as np
@@ -53,9 +54,9 @@ LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "FlightLog",
-    "FrameRecord",
-    "FrameIndexError",
     "FlightLogError",
+    "FrameIndexError",
+    "FrameRecord",
     "ReplayStats",
     "ReplayVideoSource",
     "TelemetryPacer",
@@ -183,9 +184,9 @@ class FlightLog:
         if not path.is_file():
             raise FlightLogError(f"缺少遥测日志: {path}")
         expected = set(TelemetrySnapshot.__dataclass_fields__)
-        with open(path, "r", encoding="utf-8") as handle:
-            for line_no, line in enumerate(handle, start=1):
-                line = line.strip()
+        with open(path, encoding="utf-8") as handle:
+            for line_no, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
@@ -211,9 +212,9 @@ def _read_frame_index(path: Path) -> list[FrameRecord]:
         raise FlightLogError(f"缺少帧索引: {path}")
     records: list[FrameRecord] = []
     last_capture: float | None = None
-    with open(path, "r", encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            line = line.strip()
+    with open(path, encoding="utf-8") as handle:
+        for line_no, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
             if not line:
                 continue
             try:
@@ -267,9 +268,7 @@ class TelemetryPacer:
         if ahead_s < 0:
             raise ValueError(f"ahead_s 不能为负: {ahead_s}")
         self._broker = broker
-        self._snapshots: list[TelemetrySnapshot] = sorted(
-            snapshots, key=lambda s: s.timestamp
-        )
+        self._snapshots: list[TelemetrySnapshot] = sorted(snapshots, key=lambda s: s.timestamp)
         self._timestamps = [s.timestamp for s in self._snapshots]
         self._ahead_s = ahead_s
         self._tail_warn_s = tail_warn_s
@@ -420,9 +419,13 @@ def load_broker_from_log(
     """
     if history_maxlen < 0:
         raise ValueError(f"history_maxlen 不能为负: {history_maxlen}")
-    target = broker if broker is not None else TelemetryBroker(
-        history_maxlen=history_maxlen or 100_000,
-        history_interval=0.0,
+    target = (
+        broker
+        if broker is not None
+        else TelemetryBroker(
+            history_maxlen=history_maxlen or 100_000,
+            history_interval=0.0,
+        )
     )
     log = FlightLog.open(flight_dir)
     if not log.has_telemetry:
@@ -430,7 +433,9 @@ def load_broker_from_log(
     snapshots = list(log.iter_telemetry())
     pacer = TelemetryPacer(target, snapshots, ahead_s=ahead_s)
     span = (snapshots[0].timestamp, snapshots[-1].timestamp) if snapshots else None
-    LOGGER.info("遥测回填就绪：%d 条%s", pacer.total, f"（{span[0]:.3f} → {span[1]:.3f}）" if span else "")
+    LOGGER.info(
+        "遥测回填就绪：%d 条%s", pacer.total, f"（{span[0]:.3f} → {span[1]:.3f}）" if span else ""
+    )
     return target, pacer
 
 
@@ -443,16 +448,16 @@ class ReplayStats:
     便于直接把回放源当作实飞源使用；另外多了几个回放专有的量。"""
 
     state: str = "idle"
-    frames: int = 0                   # 已投递帧数（sink 逐帧，一帧不落）
-    dropped: int = 0                  # read() 实时路径跳过的帧（sink 路径不受影响）
-    reconnects: int = 0               # 回放无链路：恒为 0
-    fps: float = 0.0                  # 按回放墙钟统计的实际播放帧率
+    frames: int = 0  # 已投递帧数（sink 逐帧，一帧不落）
+    dropped: int = 0  # read() 实时路径跳过的帧（sink 路径不受影响）
+    reconnects: int = 0  # 回放无链路：恒为 0
+    fps: float = 0.0  # 按回放墙钟统计的实际播放帧率
     last_error: str | None = None
-    total: int = 0                    # 索引里的总帧数
-    skipped: int = 0                  # 素材缺文件/解码失败而跳过的帧
-    telemetry_snapshots: int = 0      # 已灌进 broker 的遥测条数
-    tail_extended: int = 0            # 为覆盖素材末尾而延伸的遥测条数
-    duration_s: float = 0.0           # 素材自身的时间跨度（拍摄时刻之差）
+    total: int = 0  # 索引里的总帧数
+    skipped: int = 0  # 素材缺文件/解码失败而跳过的帧
+    telemetry_snapshots: int = 0  # 已灌进 broker 的遥测条数
+    tail_extended: int = 0  # 为覆盖素材末尾而延伸的遥测条数
+    duration_s: float = 0.0  # 素材自身的时间跨度（拍摄时刻之差）
 
 
 # ----------------------------------------------------------------------
@@ -525,8 +530,8 @@ class ReplayVideoSource:
         self._sinks: list[Callable[[VideoFrame], None]] = []
 
         self._frame: VideoFrame | None = None
-        self._delivered = 0          # read() 的投递游标
-        self._produced = 0           # 已投递帧数（sink 逐帧）
+        self._delivered = 0  # read() 的投递游标
+        self._produced = 0  # 已投递帧数（sink 逐帧）
         self._skipped = 0
         self._telemetry_published = 0
         self._stats = ReplayStats(
@@ -698,7 +703,7 @@ class ReplayVideoSource:
             # 看到 finished 就返回 None，最后一帧会被静默丢掉。生产速度快于
             # 消费速度（全速回放很常见）时，这里就是唯一的补救点。
             self._wait_for_consumer()
-        except Exception as exc:  # noqa: BLE001 - 线程不能因单次失败静默死掉
+        except Exception as exc:
             LOGGER.exception("回放异常")
             with self._condition:
                 self._stats.last_error = str(exc)
@@ -757,9 +762,7 @@ class ReplayVideoSource:
         # 后结束"是常态，而这里补完之后，每一帧都能内插命中、对齐器一次都不用等
         # （补的只是结尾那段没有任何真实遥测的空白，见 TelemetryPacer.finish）。
         if self._telemetry is not None:
-            self._telemetry_published += self._telemetry.finish(
-                records[-1].capture_timestamp
-            )
+            self._telemetry_published += self._telemetry.finish(records[-1].capture_timestamp)
         for record in records:
             if self._stop_event.is_set():
                 return
@@ -774,9 +777,7 @@ class ReplayVideoSource:
                     return
                 last_wall = time.monotonic()
             if self._telemetry is not None:
-                self._telemetry_published += self._telemetry.publish_until(
-                    record.capture_timestamp
-                )
+                self._telemetry_published += self._telemetry.publish_until(record.capture_timestamp)
             image = self._read_image(record)
             if image is None:
                 self._skip(record, "帧文件缺失或无法解码")
@@ -814,9 +815,7 @@ class ReplayVideoSource:
             if record.index not in expected:
                 continue
             if self._telemetry is not None:
-                self._telemetry_published += self._telemetry.publish_until(
-                    record.capture_timestamp
-                )
+                self._telemetry_published += self._telemetry.publish_until(record.capture_timestamp)
             frame = VideoFrame(
                 index=record.index,
                 image=record.image,
@@ -863,7 +862,7 @@ class ReplayVideoSource:
         for sink in sinks:
             try:
                 sink(frame)
-            except Exception:  # noqa: BLE001 - 单个 sink 失败不能打断回放
+            except Exception:
                 if self._strict:
                     # strict 模式下不吞：sink 抛异常通常意味着配置/接线错了，
                     # 静默跳过只会让人以为"回放跑通了"。

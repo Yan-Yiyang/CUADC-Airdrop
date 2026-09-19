@@ -1,11 +1,11 @@
-"""QGC ``.plan`` 解析与**固定翼降落预检**的离线用例。
+"""QGC ``.plan`` 解析与固定翼降落预检的离线用例。
 
 判据不是"照文档抄的"，是照 PX4 1.17
 ``src/modules/navigator/MissionFeasibility/FeasibilityChecker.cpp`` 的实际规则写的：
 ``NAV_LAND`` 的紧前一项必须严格高于落点、下滑角不超过 ``tan(FW_LND_ANG+0.1°)``、
 进场项只能是 ``NAV_WAYPOINT`` / ``NAV_LOITER_TO_ALT``、落点必须在盘旋圈外。
 
-2026-09 的 SITL 演练里，正是因为降落剖面不满足这套判据，飞控把**整条任务**判为
+2026-09 的 SITL 演练里，正是因为降落剖面不满足这套判据，飞控把整条任务判为
 不可行（``No valid mission available, loitering``），飞机原地盘旋 15 分钟才被
 状态机的超时抓出来——所以这套判据值得逐条钉住。
 """
@@ -17,6 +17,7 @@ import logging
 import math
 import shutil
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +38,6 @@ from airdrop import (
     Config,
     GroundConfig,
     MissionItem,
-    MissionConfig,
     NedOrigin,
     OverflyConfig,
     PlanError,
@@ -47,8 +47,8 @@ from airdrop import (
     build_drop_mission,
     build_recon_mission,
     check_fixed_wing_landing,
-    load_plan,
     llaref_of,
+    load_plan,
 )
 
 WORK_ROOT = Path(__file__).resolve().parents[1] / ".plan-test-tmp"
@@ -63,7 +63,7 @@ STEEP_TOUCHDOWN = (46.99835, 8.000, 0.0)
 
 
 @pytest.fixture
-def workdir() -> Path:
+def workdir() -> Iterator[Path]:
     """工作区内的临时目录；用例结束整棵删掉（不用 ``tmp_path``：见 AGENTS）。"""
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     path = WORK_ROOT / uuid.uuid4().hex[:8]
@@ -75,7 +75,7 @@ def workdir() -> Path:
 
 
 # ----------------------------------------------------------------------
-# 造 .plan（字段与 QGC 实际落盘一致：params[4..6] = 纬度/经度/高度）
+# 造 .plan（字段与 QGC 实际写入磁盘一致：params[4..6] = 纬度/经度/高度）
 # ----------------------------------------------------------------------
 def _item(
     command: int,
@@ -102,7 +102,9 @@ def _item(
     }
 
 
-def _plan(items: list[dict[str, Any]], *, vehicle_type: int = 1, firmware_type: int = 12) -> dict[str, Any]:
+def _plan(
+    items: list[dict[str, Any]], *, vehicle_type: int = 1, firmware_type: int = 12
+) -> dict[str, Any]:
     return {
         "fileType": "Plan",
         "groundStation": "QGroundControl",
@@ -232,7 +234,7 @@ def _landing_pattern(
     relative: bool = True,
     complex_type: str = "fwLandingPattern",
 ) -> dict[str, Any]:
-    """QGC 的"固定翼降落航线"复杂项（字段名与 QGC 实际落盘一致）。"""
+    """QGC 的"固定翼降落航线"复杂项（字段名与 QGC 实际写入磁盘一致）。"""
     return {
         "type": "ComplexItem",
         "complexItemType": complex_type,
@@ -390,10 +392,10 @@ def test_precheck_reports_mixed_altitude_frames() -> None:
 
 
 # ----------------------------------------------------------------------
-# 与规划器/配置的接线
+# 与规划器/配置的装配
 # ----------------------------------------------------------------------
 def test_build_drop_mission_puts_overfly_before_the_plan(workdir: Path) -> None:
-    """运营方式：操作手画好降落段，飞掠段插在它**前面**，合成一条任务上传。"""
+    """运营方式：操作手画好降落段，飞掠段插在它前面，合成一条任务上传。"""
     path = _write(workdir, _plan(_landing_items()))
     config = _config(landing_route=(), land_plan=str(path))
 
@@ -412,7 +414,7 @@ def test_build_drop_mission_puts_overfly_before_the_plan(workdir: Path) -> None:
 
 
 def test_build_drop_mission_refuses_a_plan_px4_would_reject(workdir: Path) -> None:
-    """不合规的 plan 在**规划阶段**就带着原因失败，而不是上传后干等。"""
+    """不合规的 plan 在规划阶段就带着原因失败，而不是上传后干等。"""
     path = _write(workdir, _plan(_landing_items(touchdown=STEEP_TOUCHDOWN)))
     config = _config(landing_route=(), land_plan=str(path))
 
@@ -420,7 +422,9 @@ def test_build_drop_mission_refuses_a_plan_px4_would_reject(workdir: Path) -> No
         build_drop_mission(config, origin=llaref_of(ORIGIN), target_ned=(300.0, 0.0, 0.0))
 
 
-def test_build_drop_mission_refuses_a_plan_without_landing_but_keeps_other_routes(workdir: Path) -> None:
+def test_build_drop_mission_refuses_a_plan_without_landing_but_keeps_other_routes(
+    workdir: Path,
+) -> None:
     """plan 里没有降落项时不报错（操作手自己落地），但几何问题仍会被报出来。"""
     path = _write(workdir, _plan([_item(MAV_CMD_NAV_WAYPOINT, *APPROACH)]))
     config = _config(landing_route=(), land_plan=str(path))
@@ -437,8 +441,10 @@ def test_build_drop_mission_rejects_unreadable_plan(workdir: Path) -> None:
         build_drop_mission(config, origin=llaref_of(ORIGIN), target_ned=(300.0, 0.0, 0.0))
 
 
-def test_build_recon_mission_uses_plan_verbatim(workdir: Path, caplog: pytest.LogCaptureFixture) -> None:
-    """侦查段来自 plan 时**原样使用**；缺起飞项只告警（不悄悄补一项进去）。"""
+def test_build_recon_mission_uses_plan_verbatim(
+    workdir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """侦查段来自 plan 时原样使用；缺起飞项只告警（不悄悄补一项进去）。"""
     items = [
         _item(MAV_CMD_NAV_WAYPOINT, 47.0, 8.0, 50.0, do_jump_id=1),
         _item(MAV_CMD_NAV_WAYPOINT, 47.002, 8.0, 50.0, do_jump_id=2),

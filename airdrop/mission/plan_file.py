@@ -1,12 +1,12 @@
-"""QGC ``.plan`` 航线文件的解析与**固定翼降落预检**（纯 JSON，离线可测）。
+"""QGC ``.plan`` 航线文件的解析与固定翼降落预检（纯 JSON，离线可测）。
 
 运营方式
 --------
 航线由操作手在 QGroundControl 里画好、另存为 ``.plan``（放 ``routes/``），项目只负责
-**读进来**，必要时把飞掠段插在它前面（见 :func:`airdrop.mission.planner.build_drop_mission`）。
+读进来，必要时把飞掠段插在它前面（见 :func:`airdrop.mission.planner.build_drop_mission`）。
 这样"降落剖面"这类必须让飞控认可的几何，由画航线的人（QGC）负责，而不是由本包拼出来。
 
-QGC 会把航线里的**复杂项**（如"固定翼降落航线"）存成一个 ``ComplexItem`` 对象，
+QGC 会把航线里的复杂项（如"固定翼降落航线"）存成一个 ``ComplexItem`` 对象，
 上传时才展开成 MAVLink 项。本包照 QGC 的展开逻辑（``LandingComplexItem::
 appendMissionItems``）在本地展开——所以 ``load_plan`` 是纯文件解析，不需要连飞控。
 目前支持 ``fwLandingPattern``（固定翼降落航线）；VTOL 降落、测绘/结构航线显式报错，
@@ -15,17 +15,17 @@ appendMissionItems``）在本地展开——所以 ``load_plan`` 是纯文件解
 为什么需要预检
 --------------
 PX4 固定翼上传任务时会跑可行性检查（``MissionFeasibility/FeasibilityChecker.cpp``），
-不合规就**整条任务被拒**；而被拒之后导航器只会"没有可用任务，盘旋"
+不合规就整条任务被拒；而被拒之后导航器只会"没有可用任务，盘旋"
 （``No valid mission available, loitering``），``start_mission()`` 依然返回成功——
 2026-09 的 SITL 演练里，飞机就这么原地盘旋了 15 分钟才被状态机超时抓出来。
 
-:func:`check_fixed_wing_landing` 把同一套判据在**本地**做一遍，让"必然被拒"的任务
+:func:`check_fixed_wing_landing` 把同一套判据在本地做一遍，让"必然被拒"的任务
 在加载/规划阶段就带着原因失败：
 
-1. ``NAV_LAND`` 的紧前一项必须**严格高于**落点（PX4 用的是 ``< FLT_EPSILON`` 判据）；
+1. ``NAV_LAND`` 的紧前一项必须严格高于落点（PX4 用的是 ``< FLT_EPSILON`` 判据）；
 2. 下滑角 ``(前项高 − 落点高) / 水平距离`` 不得超过 ``tan(FW_LND_ANG + 0.1°)``；
 3. 进场点类型只能是 ``NAV_WAYPOINT`` 或 ``NAV_LOITER_TO_ALT``（绕圈下降到高度）；
-4. ``NAV_LOITER_TO_ALT`` 进场时，落点必须在盘旋圈**之外**。
+4. ``NAV_LOITER_TO_ALT`` 进场时，落点必须在盘旋圈之外。
 
 ⚠ 这是"照抄判据"而不是"调用飞控"，所以它只覆盖上面四条几何规则；飞控那边还有
 别的检查（空域、第一条航点距离 ``MIS_DIST_1WP`` 等）。真机首飞仍要有人看着。
@@ -127,7 +127,11 @@ def _simple_item_from_json(entry: dict[str, Any], index: int, path: Path) -> Mis
     frame = entry.get("frame")
     if not isinstance(frame, int):
         mode = entry.get("AltitudeMode")
-        frame = {0: MAV_FRAME_GLOBAL, 1: MAV_FRAME_GLOBAL_RELATIVE_ALT, 2: MAV_FRAME_GLOBAL_TERRAIN_ALT}.get(
+        frame = {
+            0: MAV_FRAME_GLOBAL,
+            1: MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            2: MAV_FRAME_GLOBAL_TERRAIN_ALT,
+        }.get(
             mode if isinstance(mode, int) else 1,
             MAV_FRAME_GLOBAL_RELATIVE_ALT,
         )
@@ -149,15 +153,18 @@ def _simple_item_from_json(entry: dict[str, Any], index: int, path: Path) -> Mis
         do_jump_id=int(entry.get("doJumpId") or 0),
     )
     altitude = entry.get("Altitude")
-    if isinstance(altitude, (int, float)) and not isinstance(altitude, bool):
-        if abs(float(altitude) - item.alt_m) > 1e-6:
-            LOGGER.warning(
-                "%s：第 %d 项的 Altitude=%.3f 与 params[6]=%.3f 不一致，按 params[6] 取",
-                path,
-                index,
-                float(altitude),
-                item.alt_m,
-            )
+    if (
+        isinstance(altitude, (int, float))
+        and not isinstance(altitude, bool)
+        and abs(float(altitude) - item.alt_m) > 1e-6
+    ):
+        LOGGER.warning(
+            "%s：第 %d 项的 Altitude=%.3f 与 params[6]=%.3f 不一致，按 params[6] 取",
+            path,
+            index,
+            float(altitude),
+            item.alt_m,
+        )
     return item
 
 
@@ -180,7 +187,7 @@ def _expand_landing_pattern(
 ) -> tuple[MissionItem, ...]:
     """把 QGC 的"固定翼降落航线"复杂项展开成 MAVLink 项。
 
-    顺序与参数**照抄** QGC ``LandingComplexItem::appendMissionItems``
+    顺序与参数照抄 QGC ``LandingComplexItem::appendMissionItems``
     （``src/MissionManager/LandingComplexItem.cc``）：
 
     1. ``DO_LAND_START``——PX4 的 ``specifiesCoordinate=false``，所以不带坐标、
@@ -326,7 +333,7 @@ def _items_from_json(entry: Any, index: int, path: Path) -> tuple[MissionItem, .
 
 
 def load_plan(path: str | Path) -> QgcPlan:
-    """读一份 QGC ``.plan``（**纯文件解析**，不连飞控、不需要 MAVSDK）。"""
+    """读一份 QGC ``.plan``（纯文件解析，不连飞控、不需要 MAVSDK）。"""
     file_path = Path(path)
     try:
         text = file_path.read_text(encoding="utf-8")
@@ -407,7 +414,7 @@ def check_fixed_wing_landing(
     preceding: MissionItem | None = None,
     land_angle_deg: float = FW_DEFAULT_LAND_ANGLE_DEG,
 ) -> tuple[str, ...]:
-    """按 PX4 固定翼的判据预检降落剖面；返回**问题列表**（空 = 通过）。
+    """按 PX4 固定翼的判据预检降落剖面；返回问题列表（空 = 通过）。
 
     只检查 ``NAV_LAND`` 及其紧前一项——这正是被拒的那条规则。``preceding`` 用来告诉
     本函数"``items`` 之前还有一项"（比如飞掠段插在降落段前面时，降落段的紧前一项是

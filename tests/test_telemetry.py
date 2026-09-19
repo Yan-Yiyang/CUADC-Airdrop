@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -17,7 +18,16 @@ from airdrop.config import TelemetryConfig
 
 
 class Fake:
-    """最小 MAVSDK 对象替身。"""
+    """最小 MAVSDK 对象替身。
+
+    字段是随手挂上去的（``p.latitude_deg = ...``），所以显式声明成"任意属性"，
+    类型检查器才不会把未声明的赋值判成错误。
+    """
+
+    if TYPE_CHECKING:
+
+        def __getattr__(self, name: str) -> Any: ...
+        def __setattr__(self, name: str, value: Any) -> None: ...
 
 
 def make_position(lat, lon, abs_alt, rel_alt):
@@ -87,8 +97,7 @@ def test_wind_fields_survive_json_round_trip() -> None:
     assert payload["wind_north_m_s"] == pytest.approx(3.0)
     assert payload["wind_east_m_s"] == pytest.approx(4.0)
     restored = TelemetrySnapshot(
-        **{k: v for k, v in payload.items()
-           if k in TelemetrySnapshot.__dataclass_fields__}
+        **{k: v for k, v in payload.items() if k in TelemetrySnapshot.__dataclass_fields__}
     )
     assert restored.wind_north_m_s == pytest.approx(3.0)
 
@@ -108,7 +117,7 @@ def test_in_air_stream_is_published_to_the_snapshot(broker: TelemetryBroker) -> 
     assert broker.get_snapshot().in_air is True
     assert broker._history[-1].in_air is True, "也要进历史，回放/按时刻查询才看得到"
 
-    broker.update_in_air(0)      # 飞控侧偶尔给 0/1，统一按 bool 归一
+    broker.update_in_air(0)  # 飞控侧偶尔给 0/1，统一按 bool 归一
     assert broker.get_snapshot().in_air is False
     nearest = broker.get_snapshot_at(time.time(), mode="nearest")
     assert nearest is not None and nearest.in_air is False
@@ -125,15 +134,12 @@ def test_in_air_survives_json_round_trip() -> None:
     payload = json.loads(json.dumps(snapshot.as_dict()))
     assert payload["in_air"] is True
     restored = TelemetrySnapshot(
-        **{k: v for k, v in payload.items()
-           if k in TelemetrySnapshot.__dataclass_fields__}
+        **{k: v for k, v in payload.items() if k in TelemetrySnapshot.__dataclass_fields__}
     )
     assert restored.in_air is True
 
 
-def test_broker_snapshot_interpolation_subscribe(
-    broker: TelemetryBroker, received: list
-) -> None:
+def test_broker_snapshot_interpolation_subscribe(broker: TelemetryBroker, received: list) -> None:
     s1 = broker.update_global_position(make_position(47.0, 8.0, 500.0, 10.0))
 
     snap = broker.get_snapshot()
@@ -232,8 +238,7 @@ def test_quaternion_slerp() -> None:
     assert snap.quaternion_w == pytest.approx(math.sqrt(0.5), abs=0.01)
     assert snap.quaternion_z == pytest.approx(math.sqrt(0.5), abs=0.01)
     norm = math.sqrt(
-        snap.quaternion_w**2 + snap.quaternion_x**2
-        + snap.quaternion_y**2 + snap.quaternion_z**2
+        snap.quaternion_w**2 + snap.quaternion_x**2 + snap.quaternion_y**2 + snap.quaternion_z**2
     )
     assert norm == pytest.approx(1.0, abs=1e-6)
 
@@ -256,9 +261,7 @@ def test_history_bisect_at_scale() -> None:
     """
     broker = TelemetryBroker(history_maxlen=1200, history_interval=0.0)
     for i in range(1500):
-        broker.update_global_position(
-            make_position(40.0 + i * 0.001, 8.0, 500.0 + i, 10.0)
-        )
+        broker.update_global_position(make_position(40.0 + i * 0.001, 8.0, 500.0 + i, 10.0))
         time.sleep(0.0002)
     assert len(broker._history) == 1200
 
@@ -278,9 +281,7 @@ def test_history_bisect_at_scale() -> None:
     # 两端外推：早出/晚出历史范围都应给出结果而不是报错
     assert broker.get_snapshot_at(broker._history[0].timestamp - 10.0) is not None
     assert broker.get_snapshot_at(broker._history[-1].timestamp + 10.0) is not None
-    near_first = broker.get_snapshot_at(
-        broker._history[0].timestamp - 10.0, mode="nearest"
-    )
+    near_first = broker.get_snapshot_at(broker._history[0].timestamp - 10.0, mode="nearest")
     assert near_first.latitude_deg == broker._history[0].latitude_deg
 
 
@@ -329,24 +330,31 @@ def test_drone_released_on_session_end(monkeypatch) -> None:
     assert released, "会话结束后未显式终止 mavsdk_server 子进程"
 
 
-
-
 # ----------------------------------------------------------------------
 # P2：连接就绪后下发遥测速率（set_rate_*）
 # ----------------------------------------------------------------------
 def test_apply_telemetry_rates_calls_set_rate_with_configured_hz() -> None:
     """用 MAVSDK 的 FakeSystem：_apply_telemetry_rates 应按配置下发各字段的速率。"""
     import asyncio
+
     import airdrop.telemetry.mavsdk_thread as mt
 
     calls: dict[str, float] = {}
 
     def make_fake_telemetry() -> "object":
         class _T:
-            async def set_rate_position(self, rate): calls["position"] = rate
-            async def set_rate_position_velocity_ned(self, rate): calls["pvn"] = rate
-            async def set_rate_attitude_euler(self, rate): calls["euler"] = rate
-            async def set_rate_attitude_quaternion(self, rate): calls["quat"] = rate
+            async def set_rate_position(self, rate):
+                calls["position"] = rate
+
+            async def set_rate_position_velocity_ned(self, rate):
+                calls["pvn"] = rate
+
+            async def set_rate_attitude_euler(self, rate):
+                calls["euler"] = rate
+
+            async def set_rate_attitude_quaternion(self, rate):
+                calls["quat"] = rate
+
         return _T()
 
     class FakeDrone:
@@ -358,7 +366,7 @@ def test_apply_telemetry_rates_calls_set_rate_with_configured_hz() -> None:
         attitude_rate_hz=33.0,
     )
     mav = mt.MavsdkThread.from_config(config, broker=TelemetryBroker())
-    asyncio.run(mav._apply_telemetry_rates(FakeDrone()))
+    asyncio.run(mav._apply_telemetry_rates(FakeDrone()))  # pyright: ignore[reportArgumentType] - 替身只实现被调到的那几个 setter
 
     assert calls["position"] == 10.0
     assert calls["pvn"] == 12.0
@@ -366,42 +374,55 @@ def test_apply_telemetry_rates_calls_set_rate_with_configured_hz() -> None:
     assert calls["quat"] == 33.0  # 姿态用同一速率覆盖四元数与欧拉
 
 
-
 def test_apply_telemetry_rates_skips_when_rate_is_none() -> None:
     """默认 None 时不下发（飞控沿用默认速率，不主动覆盖）。"""
     import asyncio
+
     import airdrop.telemetry.mavsdk_thread as mt
 
     calls: list[str] = []
 
     class _T:
-        async def set_rate_position(self, rate): calls.append("position")
-        async def set_rate_position_velocity_ned(self, rate): calls.append("pvn")
-        async def set_rate_attitude_euler(self, rate): calls.append("euler")
-        async def set_rate_attitude_quaternion(self, rate): calls.append("quat")
+        async def set_rate_position(self, rate):
+            calls.append("position")
+
+        async def set_rate_position_velocity_ned(self, rate):
+            calls.append("pvn")
+
+        async def set_rate_attitude_euler(self, rate):
+            calls.append("euler")
+
+        async def set_rate_attitude_quaternion(self, rate):
+            calls.append("quat")
 
     class FakeDrone:
         telemetry = _T()
 
     mav = mt.MavsdkThread()  # 全部 rate=None
-    asyncio.run(mav._apply_telemetry_rates(FakeDrone()))
+    asyncio.run(mav._apply_telemetry_rates(FakeDrone()))  # pyright: ignore[reportArgumentType] - 替身只实现被调到的那几个 setter
     assert calls == []
-
 
 
 def test_apply_telemetry_rates_swallows_individual_failures() -> None:
     """单条 set_rate 失败不应影响其它流（飞控/固件可能不支持个别流）。"""
     import asyncio
+
     import airdrop.telemetry.mavsdk_thread as mt
 
     calls: list[str] = []
 
     class _T:
-        async def set_rate_position(self, rate): calls.append("position")
+        async def set_rate_position(self, rate):
+            calls.append("position")
+
         async def set_rate_position_velocity_ned(self, rate):
             raise RuntimeError("firmware not supported")
-        async def set_rate_attitude_euler(self, rate): calls.append("euler")
-        async def set_rate_attitude_quaternion(self, rate): calls.append("quat")
+
+        async def set_rate_attitude_euler(self, rate):
+            calls.append("euler")
+
+        async def set_rate_attitude_quaternion(self, rate):
+            calls.append("quat")
 
     class FakeDrone:
         telemetry = _T()
@@ -412,5 +433,5 @@ def test_apply_telemetry_rates_swallows_individual_failures() -> None:
         attitude_rate_hz=30.0,
     )
     mav = mt.MavsdkThread.from_config(config, broker=TelemetryBroker())
-    asyncio.run(mav._apply_telemetry_rates(FakeDrone()))  # 不应抛
+    asyncio.run(mav._apply_telemetry_rates(FakeDrone()))  # pyright: ignore[reportArgumentType] - 替身只实现被调到的那几个 setter  # 不应抛
     assert "position" in calls and "euler" in calls

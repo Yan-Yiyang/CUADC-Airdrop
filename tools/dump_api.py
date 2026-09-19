@@ -1,20 +1,20 @@
-"""自省导出**接口清单**：把全部公开签名与默认值写成一份 Markdown。
+"""自省导出接口清单：把全部公开签名与默认值写成一份 Markdown。
 
-用法（**命令行解析在 `airdrop/run.py`**）::
+用法（命令行解析在 airdrop/run.py）::
 
     ./.venv/Scripts/python.exe -m airdrop.run dump-api
     ./.venv/Scripts/python.exe -m airdrop.run dump-api --out docs/api_reference.md
 
 为什么要有它
 ------------
-`docs/handbook.md`（项目手册）里所有签名与默认值都声称"来自机器自省、不是手抄"。
-这个工具就是那句话的**出处**：它遍历 `airdrop` 各子包的 `__all__`，把"定义在本模块里"的
-类/函数/常量的真实签名、dataclass 字段默认值、方法列表导出成 `docs/api_reference.md`，
+docs/handbook.md（项目手册）里所有签名与默认值都声称"来自机器自省、不是手抄"。
+这个工具就是那句话的出处：它遍历 airdrop 各子包的 __all__，把"定义在本模块里"的
+类/函数/常量的真实签名、dataclass 字段默认值、方法列表导出成 docs/api_reference.md，
 供人工逐行比对，或给审查者当一份"这个包到底对外承诺了什么"的清单。
 
-⚠ 生成物是**派生产物**：它随代码变，不随文档变。默认写进 `docs/` 但**不进 git**
-（`.gitignore` 已忽略），要核对时现跑一次即可；真正需要长期维护的是
-`docs/handbook.md`，一致性由 `tools/check_docs.py` 把关。
+⚠ 生成物是派生产物：它随代码变，不随文档变。默认写进 docs/ 但不进 git
+（.gitignore 已忽略），要核对时现跑一次即可；真正需要长期维护的是
+docs/handbook.md，一致性由 tools/check_docs.py 把关。
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from typing import Any
 # ----------------------------------------------------------------------
 OUTPUT_PATH = Path("docs/api_reference.md")
 
-#: 要导出的模块（顺序即输出顺序；`airdrop` 顶层单独处理）
+#: 要导出的模块（顺序即输出顺序；airdrop 顶层单独处理）
 MODULES: tuple[str, ...] = (
     "airdrop.config",
     "airdrop.telemetry.models",
@@ -91,7 +91,7 @@ def _summary(obj: Any) -> str:
 def _signature(obj: Any) -> str:
     try:
         return str(inspect.signature(obj))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return "(?)"
 
 
@@ -101,7 +101,7 @@ def _default_of(field: dataclasses.Field) -> str:
     if field.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
         try:
             return f"factory={field.default_factory()!r}"  # type: ignore[misc]
-        except Exception:  # noqa: BLE001 - 工厂函数可能需要参数
+        except Exception:  # noqa: BLE001 - 工厂函数可能需要参数，取不到就标 <?>
             return "factory=<?>"
     return "<required>"
 
@@ -131,18 +131,17 @@ def _describe(name: str, obj: Any) -> list[str]:
 
 
 def exported_names(module: Any, module_name: str) -> list[str]:
-    """模块的公开名字，且**只保留定义在本模块里的**（避免把 import 进来的重复列一遍）。"""
-    names = getattr(module, "__all__", None) or [
-        n for n in vars(module) if not n.startswith("_")
-    ]
+    """模块的公开名字，且只保留定义在本模块里的（避免把 import 进来的重复列一遍）。"""
+    names = getattr(module, "__all__", None) or [n for n in vars(module) if not n.startswith("_")]
     kept: list[str] = []
     for name in names:
         obj = getattr(module, name, None)
         if obj is None:
             continue
-        if inspect.isclass(obj) or inspect.isfunction(obj):
-            if getattr(obj, "__module__", module_name) != module_name:
-                continue
+        if (inspect.isclass(obj) or inspect.isfunction(obj)) and (
+            getattr(obj, "__module__", module_name) != module_name
+        ):
+            continue
         kept.append(name)
     return sorted(kept)
 
@@ -207,8 +206,7 @@ def main(**overrides) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(report, encoding="utf-8")
     print(
-        f"已写出 {output_path}：{len(report.splitlines())} 行 / "
-        f"{len(report.encode('utf-8'))} 字节"
+        f"已写出 {output_path}：{len(report.splitlines())} 行 / {len(report.encode('utf-8'))} 字节"
     )
     print("提示：该文件是派生产物（不进 git）。核对文档一致性请跑 python -m airdrop.run check-docs")
     return 0

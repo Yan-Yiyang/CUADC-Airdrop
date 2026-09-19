@@ -1,25 +1,25 @@
 """回放全链路示例：一份素材反复迭代"识别 → 坐标 → 统计 → 航线"，全程不碰硬件。
 
-用法（**集中式入口在 `airdrop/run.py`**）::
+用法（集中式入口在 airdrop/run.py）::
 
     ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/20260913-185512
     ./.venv/Scripts/python.exe -m airdrop.run replay --speed 2.0
 
-本文件是**纯库模块**：顶部常量是默认值，`build_config(**覆盖)` / `main(**kwargs)` 可按需传值；
-命令行由 `airdrop/run.py` 解析，重依赖都在函数体内导入（`--help` 不加载它们）。
+本文件是纯库模块：顶部常量是默认值，build_config(**覆盖) / main(**kwargs) 可按需传值；
+命令行由 airdrop/run.py 解析，重依赖都在函数体内导入（--help 不加载它们）。
 
 把 ``FLIGHT_DIR`` 指向 ``FlightRecorder`` 录出来的飞行目录（或指向 ``flights/``
-自动取最新一次）。脚本按原时间轴重放帧与遥测，然后走**与实飞完全相同**的那条链路::
+自动取最新一次）。脚本按原时间轴重放帧与遥测，然后走与实飞完全相同的那条链路::
 
     回放源 → 帧-遥测对齐 → 环形缓冲 → PerceptionWorker（YOLO + OCR）
            → TargetTracker（像素 → NED）→ targeting（聚类 + 选唯一）
-           → 航线规划（飞掠 + 降落，**只生成不上传**）→ 打印结果坐标（WGS84）
+           → 航线规划（飞掠 + 降落，只生成不上传）→ 打印结果坐标（WGS84）
 
 为什么要用回放迭代
 ------------------
-算法改动要在**固定输入**上比较才有意义。回放时每一帧仍带着录制时的原始
+算法改动要在固定输入上比较才有意义。回放时每一帧仍带着录制时的原始
 ``capture_timestamp``、遥测仍按原始时间戳进 broker，于是对齐、坐标解算、目标统计
-**一行都不用改**。换一批参数再跑一遍，输出可以直接与上一次（以及原
+一行都不用改。换一批参数再跑一遍，输出可以直接与上一次（以及原
 ``detections.jsonl``）对比。
 
 速度
@@ -39,13 +39,13 @@ from airdrop import Config
 # 配置（改这里）
 # ----------------------------------------------------------------------
 FLIGHT_DIR = Path("flights")  # 指向具体某次 flights/20260913-185512，或 flights/ 取最新
-SPEED = 0.0                   # 0=全速 / 1.0=原速 / 2.0=两倍速
+SPEED = 0.0  # 0=全速 / 1.0=原速 / 2.0=两倍速
 BUFFER_SECONDS = 180.0
 BUFFER_FPS = 30.0
-PLAN_DROP_MISSION = True      # 出了结果就生成飞掠+降落航线（不上传，只打印）
-STRICT = True                 # 回放异常（缺帧/sink 抛异常）就让本次以 error 结束
-PERCEPTION_MODE: str | None = None   # None = 用 Config 默认（ocr）
-SELECTION_RULE: str | None = None    # None = 用 Config 默认（median）
+PLAN_DROP_MISSION = True  # 出了结果就生成飞掠+降落航线（不上传，只打印）
+STRICT = True  # 回放异常（缺帧/sink 抛异常）就让本次以 error 结束
+PERCEPTION_MODE: str | None = None  # None = 用 Config 默认（ocr）
+SELECTION_RULE: str | None = None  # None = 用 Config 默认（median）
 
 LOGGER = logging.getLogger("replay_flight")
 
@@ -57,7 +57,7 @@ def build_config(
 ) -> Config:
     """回放用的配置（感知模式/选唯一规则可覆盖；其余用 :class:`Config` 默认值）。
 
-    ``None`` = **不覆盖**（沿用 `airdrop/config.py` 里的默认值），而不是"设成 None"。
+    ``None`` = 不覆盖（沿用 airdrop/config.py 里的默认值），而不是"设成 None"。
     """
     base = Config()
     if perception_mode is not None:
@@ -148,7 +148,8 @@ def main(
         if not source.wait_ready(timeout=30.0):
             LOGGER.error("回放没有出帧：%s", source.stats.last_error or "未知原因")
             return 1
-        thread = source._thread  # noqa: SLF001 - 示例里只等播放结束
+        # 示例里只等播放线程结束；直接碰私有属性是刻意的（没有公开的 join 接口）
+        thread = source._thread  # noqa: SLF001
         if thread is not None:
             thread.join()
     finally:
@@ -168,10 +169,12 @@ def main(
     )
     LOGGER.info("感知：%s", worker.stats)
 
-    # 4) 结果坐标 →（可选）航线规划。**不上传**：这是离线迭代，不是飞任务。
+    # 4) 结果坐标 →（可选）航线规划。不上传：这是离线迭代，不是飞任务。
     added = targets.pump()
     result = targets.result()
-    LOGGER.info("目标点 %d 个（本次抽干 %d 条），统计：%s", len(tracker.points), added, tracker.stats)
+    LOGGER.info(
+        "目标点 %d 个（本次抽干 %d 条），统计：%s", len(tracker.points), added, tracker.stats
+    )
     if not result.ok:
         LOGGER.warning("没有可用结果（没看到目标 / 没有带编号的类）——实飞时走备用点分支")
         return 0

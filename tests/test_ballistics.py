@@ -1,7 +1,7 @@
 """P8 离线单测：弹道积分（解析解对照 / 终端速度 / 风平移）与投放判据。
 
-**全部离线**：纯数值与假遥测快照，不碰飞控。
-验收口径来自计划 P8：零阻力抛物线对照、终端速度渐近、风平移、保底触发。
+全部离线：纯数值与假遥测快照，不碰飞控。
+验收口径来自计划 P8：零阻力抛物线对照、终端速度渐近、风平移、强制投放触发。
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ def test_zero_drag_matches_analytic_parabola() -> None:
 def test_zero_drag_with_initial_climb() -> None:
     """带向上的初速时，解析解仍然对得上（先去最高点再落回来）。"""
     model = _model(drag_coefficient=0.0)
-    vz_up, height = -8.0, 30.0                       # NED 里"向上"是负 z
+    vz_up, height = -8.0, 30.0  # NED 里"向上"是负 z
     impact = model.predict_impact((0.0, 0.0, -height), (0.0, 5.0, vz_up))
 
     assert impact.ok
@@ -80,8 +80,9 @@ def _analytic_vertical_drop(drop_height_m: float, terminal: float) -> tuple[floa
 
     ``h(t) = (v_t²/g)·ln(cosh(g t / v_t))``、``v(t) = v_t·tanh(g t / v_t)``。
     """
+
     def fallen(t: float) -> float:
-        return (terminal ** 2 / GRAVITY) * math.log(math.cosh(GRAVITY * t / terminal))
+        return (terminal**2 / GRAVITY) * math.log(math.cosh(GRAVITY * t / terminal))
 
     low, high = 0.0, 10.0 * terminal / GRAVITY + 10.0
     for _ in range(200):
@@ -107,12 +108,16 @@ def test_drag_fall_matches_analytic_vertical_solution() -> None:
 
 
 def test_terminal_velocity_asymptote() -> None:
-    """终端速度：落下速度永远不超过 v_t，且高度翻倍后只是**逼近**它。"""
+    """终端速度：落下速度永远不超过 v_t，且高度翻倍后只是逼近它。"""
     model = _model()
     terminal = model.terminal_velocity(0.0)
     assert terminal == pytest.approx(
-        math.sqrt(2 * model.config.mass_kg * GRAVITY
-                  / (1.225 * model.config.drag_coefficient * model.config.cross_area_m2)),
+        math.sqrt(
+            2
+            * model.config.mass_kg
+            * GRAVITY
+            / (1.225 * model.config.drag_coefficient * model.config.cross_area_m2)
+        ),
         rel=1e-9,
     )
 
@@ -142,9 +147,9 @@ def test_isa_density_monotone_and_nominal() -> None:
 # 弹道：风
 # ----------------------------------------------------------------------
 def test_wind_shifts_impact_downwind() -> None:
-    """顺风落点向下风偏移，且偏移量**不可能超过**风把它完全吹走的上限 W·t。"""
+    """顺风落点向下风偏移，且偏移量不可能超过风把它完全吹走的上限 W·t。"""
     model = _model()
-    position, velocity = (0.0, 0.0, -60.0), (0.0, 0.0, 0.0)      # 悬停投放
+    position, velocity = (0.0, 0.0, -60.0), (0.0, 0.0, 0.0)  # 悬停投放
     still = model.predict_impact(position, velocity)
     windy = model.predict_impact(position, velocity, wind=(5.0, 0.0, 0.0))
 
@@ -158,7 +163,7 @@ def test_wind_shifts_impact_downwind() -> None:
 def test_headwind_shortens_range() -> None:
     """逆风让水平射程变短（同一次投放，只改风向）。"""
     model = _model()
-    position, velocity = (0.0, 0.0, -60.0), (15.0, 0.0, 0.0)     # 向北平飞投放
+    position, velocity = (0.0, 0.0, -60.0), (15.0, 0.0, 0.0)  # 向北平飞投放
     still = model.predict_impact(position, velocity)
     head = model.predict_impact(position, velocity, wind=(-8.0, 0.0, 0.0))
     tail = model.predict_impact(position, velocity, wind=(8.0, 0.0, 0.0))
@@ -200,7 +205,7 @@ def _judge(**drop_overrides):
     judge = ReleaseJudge(
         config=config,
         ballistics=model,
-        overfly_heading_deg=0.0,                  # 向北飞掠
+        overfly_heading_deg=0.0,  # 向北飞掠
         on_event=lambda kind, data: events.append((kind, data)),
     )
     return judge, model, events
@@ -237,10 +242,10 @@ def test_no_release_while_far_and_not_passed() -> None:
 
 
 def test_fallback_after_passing_target() -> None:
-    """沿飞掠方向越过目标却还没投 → 保底投放（落点判据够不着时）。"""
+    """沿飞掠方向越过目标却还没投 → 强制投放（落点判据够不着时）。"""
     judge, _, events = _judge(force_after_pass=True)
     snapshot = _snapshot(position=(100.0, 0.0, -50.0), velocity=(12.0, 0.0, 0.0))
-    target = (0.0, 300.0, 0.0)                    # 已经越过（北向 100 > 0），但横向很远
+    target = (0.0, 300.0, 0.0)  # 已经越过（北向 100 > 0），但横向很远
 
     decision = judge.update(snapshot, target, now=100.0)
     assert decision.should_release and decision.reason == "fallback"
@@ -255,7 +260,7 @@ def test_fallback_can_be_disabled() -> None:
     decision = judge.update(snapshot, (0.0, 300.0, 0.0), now=100.0)
 
     assert not decision.should_release
-    assert decision.passed_target, "越过了但配置禁止保底"
+    assert decision.passed_target, "越过了但配置禁止强制投放"
 
 
 def test_release_is_latched_once() -> None:
@@ -306,7 +311,7 @@ def test_delay_advances_the_release_state() -> None:
 
 def test_ground_z_and_wind_can_be_overridden_per_call() -> None:
     judge, _, _ = _judge()
-    snapshot = _snapshot(position=(0.0, 0.0, 0.0))          # 已经在地面以下（z=0）
+    snapshot = _snapshot(position=(0.0, 0.0, 0.0))  # 已经在地面以下（z=0）
     decision = judge.update(
         snapshot, (0.0, 0.0, 0.0), ground_z=-10.0, wind_ned=(3.0, 0.0, 0.0), now=100.0
     )
@@ -318,7 +323,7 @@ def test_summary_events_are_throttled_to_5hz() -> None:
     """判据每拍都算，但摘要按 5Hz 落事件日志（0.2s 一条）。"""
     judge, _, events = _judge()
     snapshot = _snapshot()
-    for step in range(10):                      # 0.00 ~ 0.45s，每 0.05s 一次
+    for step in range(10):  # 0.00 ~ 0.45s，每 0.05s 一次
         judge.update(snapshot, (9999.0, 9999.0, 0.0), now=100.0 + step * 0.05)
 
     summaries = [kind for kind, _ in events if kind == "drop_check"]
@@ -328,7 +333,7 @@ def test_summary_events_are_throttled_to_5hz() -> None:
 
 def test_release_event_carries_full_prediction() -> None:
     judge, model, events = _judge()
-    # ⚠ 预测与判据必须用**同一套状态**：这里速度要和 _snapshot 一致，否则落点对不上、
+    # ⚠ 预测与判据必须用同一套状态：这里速度要和 _snapshot 一致，否则落点对不上、
     # 判据不会触发（第一版就是栽在这儿）。
     state = ((0.0, 0.0, -50.0), (12.0, 0.0, 0.0))
     predicted = model.predict_impact(state[0], state[1])
@@ -336,8 +341,15 @@ def test_release_event_carries_full_prediction() -> None:
     judge.update(_snapshot(position=state[0], velocity=state[1]), predicted.ned, now=100.0)
 
     payload = next(data for kind, data in events if kind == "release")
-    for key in ("impact_ned", "flight_time_s", "horizontal_error_m", "radius_m",
-                "release_position", "overfly_heading_deg", "reason"):
+    for key in (
+        "impact_ned",
+        "flight_time_s",
+        "horizontal_error_m",
+        "radius_m",
+        "release_position",
+        "overfly_heading_deg",
+        "reason",
+    ):
         assert key in payload, f"触发事件里应当有 {key}"
     assert payload["reason"] == "predict"
 
@@ -360,7 +372,7 @@ def test_event_callback_failure_does_not_break_judging() -> None:
 # 风来源（快照 → 弹道）
 # ----------------------------------------------------------------------
 def test_wind_from_snapshot_distinguishes_missing_from_zero() -> None:
-    """"没有风估计"必须是 None，不能和"风确实是 0"混为一谈。"""
+    """ "没有风估计"必须是 None，不能和"风确实是 0"混为一谈。"""
     from airdrop.ballistics import wind_from_snapshot
 
     config = BallisticsConfig(wind_source="telemetry")
@@ -381,7 +393,7 @@ def test_wind_from_snapshot_rejects_unknown_source() -> None:
 
 def test_judge_uses_snapshot_wind_when_available() -> None:
     """快照里有风就用它：落点会被吹偏，因此触发点与零风时不同。"""
-    judge, model, _ = _judge()                    # wind_ned 默认 None → 走快照
+    judge, model, _ = _judge()  # wind_ned 默认 None → 走快照
     state = ((0.0, 0.0, -50.0), (12.0, 0.0, 0.0))
     still = model.predict_impact(state[0], state[1])
 
@@ -389,14 +401,14 @@ def test_judge_uses_snapshot_wind_when_available() -> None:
     snapshot.wind_north_m_s, snapshot.wind_east_m_s, snapshot.wind_down_m_s = -6.0, 0.0, 0.0
     decision = judge.update(snapshot, still.ned, now=100.0)
 
-    # 目标点按**零风**落点摆的，实际用了逆风 → 落点变近 → 误差变大、不该触发
+    # 目标点按零风落点摆的，实际用了逆风 → 落点变近 → 误差变大、不该触发
     assert decision.predicted is not None and decision.predicted.ok
     assert decision.predicted.north_m < still.north_m
     assert not decision.should_release
 
 
 def test_judge_degrades_to_zero_wind_and_warns_once(caplog) -> None:
-    """没有风估计时按零风算，并且**只记一次**日志（20Hz 每拍都记会淹掉日志）。"""
+    """没有风估计时按零风算，并且只记一次日志（20Hz 每拍都记会淹没日志）。"""
     import logging
 
     judge, model, _ = _judge()
@@ -405,8 +417,7 @@ def test_judge_degrades_to_zero_wind_and_warns_once(caplog) -> None:
     caplog.set_level(logging.WARNING, logger="airdrop.ballistics.release")
 
     for step in range(5):
-        judge.update(_snapshot(velocity=(12.0, 0.0, 0.0)), (9999.0, 9999.0, 0.0),
-                     now=100.0 + step)
+        judge.update(_snapshot(velocity=(12.0, 0.0, 0.0)), (9999.0, 9999.0, 0.0), now=100.0 + step)
     warnings = [r for r in caplog.records if "没有风估计" in r.getMessage()]
     assert len(warnings) == 1, f"应当只记一次，实际 {len(warnings)} 次"
 

@@ -5,9 +5,9 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
@@ -15,8 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from airdrop import TelemetryBroker  # noqa: E402
-from airdrop.video.source import Hm30VideoSource, VideoConfig, _find_ffmpeg  # noqa: E402
+from airdrop import TelemetryBroker
+from airdrop.video.source import Hm30VideoSource, VideoConfig, _find_ffmpeg
 
 # 本地测试流的参数（多个模块共用）
 STREAM_PORT = 51234
@@ -39,13 +39,28 @@ class StreamSender:
     def start(self) -> subprocess.Popen:
         process = subprocess.Popen(
             [
-                self._executable, "-hide_banner", "-loglevel", "error",
+                self._executable,
+                "-hide_banner",
+                "-loglevel",
+                "error",
                 "-re",
-                "-f", "lavfi",
-                "-i", f"testsrc=size={SRC_W}x{SRC_H}:rate={SRC_FPS}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                "-g", "15", "-pix_fmt", "yuv420p",
-                "-f", "mpegts", STREAM_URL,
+                "-f",
+                "lavfi",
+                "-i",
+                f"testsrc=size={SRC_W}x{SRC_H}:rate={SRC_FPS}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-g",
+                "15",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "mpegts",
+                STREAM_URL,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -75,7 +90,7 @@ def ffmpeg_exe() -> str:
 
 
 @pytest.fixture
-def sender(ffmpeg_exe: str) -> StreamSender:
+def sender(ffmpeg_exe: str) -> Iterator[StreamSender]:
     """本地测试流发送端，用例结束后自动清理全部子进程。"""
     helper = StreamSender(ffmpeg_exe)
     yield helper
@@ -121,7 +136,7 @@ def make_source():
 def live_source(make_source, sender: StreamSender, stream_config: VideoConfig):
     """起好本地流、并等到首帧的拉流源工厂。
 
-    ``configure`` 回调在 ``start()`` **之前**执行，因此可以在第一帧到来之前挂上
+    ``configure`` 回调在 ``start()`` 之前执行，因此可以在第一帧到来之前挂上
     sink（"每帧都经过 sink"那组需要这个时序）。
     """
 
@@ -137,8 +152,7 @@ def live_source(make_source, sender: StreamSender, stream_config: VideoConfig):
         time.sleep(BIND_GRACE)
         sender.start()
         assert source.wait_ready(timeout=FIRST_FRAME_TIMEOUT), (
-            f"首帧未到达: state={source.stats.state} "
-            f"err={source.stats.last_error}"
+            f"首帧未到达: state={source.stats.state} err={source.stats.last_error}"
         )
         return source
 

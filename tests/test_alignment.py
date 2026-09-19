@@ -1,12 +1,12 @@
 """帧-遥测时间对齐的单元测试。
 
-不依赖飞控与图传硬件：直接在 broker 的历史里注入**确定性**时间戳，再用手工构造
+不依赖飞控与图传硬件：直接在 broker 的历史里注入确定性时间戳，再用手工构造
 的 :class:`~airdrop.video.VideoFrame` 验证整条链路——
 
     收到帧的时间 - 链路固定延时（150ms） → 按该时刻取遥测快照
 
 覆盖内插、nearest、外推标记、``max_extrapolation`` 保护、延时优先级
-（帧自带 / 显式覆盖 / 0 不补偿）、参数校验，以及 P2 引入的**等待语义**：
+（帧自带 / 显式覆盖 / 0 不补偿）、参数校验，以及 P2 引入的等待语义：
 ``max_wait`` 让遥测追上拍摄时刻再内插，超时则按 ``on_timeout="drop"`` 丢弃。
 """
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
@@ -29,7 +30,16 @@ from airdrop import (
 
 
 class Fake:
-    """最小 MAVSDK 对象替身。"""
+    """最小 MAVSDK 对象替身。
+
+    字段是随手挂上去的（``p.latitude_deg = ...``），所以显式声明成"任意属性"，
+    类型检查器才不会把未声明的赋值判成错误。
+    """
+
+    if TYPE_CHECKING:
+
+        def __getattr__(self, name: str) -> Any: ...
+        def __setattr__(self, name: str, value: Any) -> None: ...
 
 
 def make_position(lat, lon=8.0, abs_alt=500.0, rel_alt=10.0):
@@ -91,16 +101,14 @@ def test_frame_capture_timestamp() -> None:
     assert frame.capture_timestamp == pytest.approx(999.85)
     # 拍摄至今 = 收到至今 + 链路延时（time.time() 量级下减法有 ~1e-7 的浮点误差）
     assert frame.capture_age > frame.age
-    assert frame.capture_age - frame.age == pytest.approx(
-        DEFAULT_TELEMETRY_LAG, abs=1e-5
-    )
+    assert frame.capture_age - frame.age == pytest.approx(DEFAULT_TELEMETRY_LAG, abs=1e-5)
 
     # lag=0：拍摄时刻就是收到时刻（不做补偿）
     raw = make_frame(1000.0, lag=0.0)
     assert raw.capture_timestamp == 1000.0
     assert raw.capture_age == pytest.approx(raw.age)
 
-    assert DEFAULT_TELEMETRY_LAG == pytest.approx(0.15)
+    assert pytest.approx(0.15) == DEFAULT_TELEMETRY_LAG
 
 
 def test_config_lag_reaches_frame(make_source) -> None:
@@ -112,9 +120,7 @@ def test_config_lag_reaches_frame(make_source) -> None:
     frame = source.latest()
     assert frame is not None
     assert frame.lag == pytest.approx(DEFAULT_TELEMETRY_LAG)
-    assert frame.capture_timestamp == pytest.approx(
-        frame.timestamp - DEFAULT_TELEMETRY_LAG
-    )
+    assert frame.capture_timestamp == pytest.approx(frame.timestamp - DEFAULT_TELEMETRY_LAG)
 
     custom = make_source(VideoConfig(url="udp://127.0.0.1:1", telemetry_lag=0.57))
     custom._publish(np.zeros((4, 4, 3), dtype=np.uint8))
@@ -264,9 +270,7 @@ def test_align_follows_live_updates() -> None:
     assert sample is not None
     assert not sample.extrapolated, (sample.extrapolated, sample.offset)
 
-    lo, hi = sorted(
-        (broker._history[0].latitude_deg, broker._history[-1].latitude_deg)
-    )
+    lo, hi = sorted((broker._history[0].latitude_deg, broker._history[-1].latitude_deg))
     assert lo - 1e-9 <= sample.snapshot.latitude_deg <= hi + 1e-9
     assert sample.age < 0.5
 
@@ -289,7 +293,7 @@ def test_align_no_wait_when_history_covers_capture_ts(broker: TelemetryBroker) -
 
     assert sample is not None
     assert not sample.extrapolated
-    assert elapsed < 0.05, f"历史已覆盖却仍然等了 {elapsed*1000:.0f}ms"
+    assert elapsed < 0.05, f"历史已覆盖却仍然等了 {elapsed * 1000:.0f}ms"
     s = aligner.stats
     assert s.waits == 0
     assert s.wait_timeouts == 0
@@ -343,7 +347,7 @@ def test_align_waits_then_interpolates_when_telemetry_catches_up(
 
     assert sample is not None, "应当等到新遥测并产出样本"
     assert not sample.extrapolated, f"应为内插（offset={sample.offset}）"
-    assert 0.04 < elapsed < 0.5, f"等待时长异常: {elapsed*1000:.0f}ms"
+    assert 0.04 < elapsed < 0.5, f"等待时长异常: {elapsed * 1000:.0f}ms"
     s = aligner.stats
     assert s.waits == 1
     assert s.wait_timeouts == 0
@@ -367,7 +371,7 @@ def test_align_times_out_and_drops_when_telemetry_stalls(
     elapsed = time.perf_counter() - t0
 
     assert sample is None
-    assert 0.15 < elapsed < 0.5, f"等待时长异常: {elapsed*1000:.0f}ms"
+    assert 0.15 < elapsed < 0.5, f"等待时长异常: {elapsed * 1000:.0f}ms"
     s = aligner.stats
     assert s.waits == 1
     assert s.wait_timeouts == 1

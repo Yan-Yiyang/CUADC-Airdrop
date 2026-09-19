@@ -26,8 +26,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # 仅类型标注：本模块运行时不依赖 config/video
     from .config import PreflightConfig
@@ -136,7 +137,7 @@ class Preflight:
             raise PreflightError(f"{name}: 这项检查开着但没有注入载入回调")
         try:
             detail = loader()
-        except Exception as exc:  # noqa: BLE001 - 载入失败就是预检失败
+        except Exception as exc:
             self._report(PreflightCheck(name, False, f"{type(exc).__name__}: {exc}"))
             raise PreflightError(f"{name}: {exc}") from exc
         return self._report(PreflightCheck(name, True, "" if detail is None else str(detail)))
@@ -175,7 +176,7 @@ class Preflight:
         stats = getattr(self._video_source, "stats", None)
         try:
             return int(getattr(stats, "frames", 0) or 0)
-        except (TypeError, ValueError):  # pragma: no cover - 防御性
+        except TypeError, ValueError:  # pragma: no cover - 防御性
             return 0
 
     def _expected_size(self) -> tuple[int, int] | None:
@@ -194,7 +195,7 @@ class Preflight:
             return None
         try:
             frame = latest()
-        except Exception:  # noqa: BLE001 - 取不到就不校验分辨率
+        except Exception:
             LOGGER.exception("取最新帧失败（跳过分辨率核对）")
             return None
         if frame is None:
@@ -210,6 +211,6 @@ class Preflight:
         if self._on_event is not None:
             try:
                 self._on_event("preflight", check.as_dict())
-            except Exception:  # noqa: BLE001 - 事件写盘失败不影响自检
+            except Exception:
                 LOGGER.exception("写入 preflight 事件失败（自检继续）")
         return check

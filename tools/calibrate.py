@@ -57,13 +57,14 @@ import json
 import logging
 import math
 from bisect import bisect_left
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import numpy as np
 
-from airdrop.georef import euler_to_matrix, rotation_x, rotation_y, rotation_z
+from airdrop.georef import rotation_z
 from airdrop.telemetry.models import TelemetrySnapshot
 
 LOGGER = logging.getLogger("calibrate")
@@ -71,7 +72,7 @@ LOGGER = logging.getLogger("calibrate")
 # ----------------------------------------------------------------------
 # 配置（改这里，或走命令行）
 # ----------------------------------------------------------------------
-FLIGHT_DIR = Path("flights")          # 标定采集目录（FlightRecorder 产出）
+FLIGHT_DIR = Path("flights")  # 标定采集目录（FlightRecorder 产出）
 OUTPUT_PATH = Path("camera_calib.json")
 #: 棋盘格内角点数（列, 行）——注意是**内角点**，不是方格数
 PATTERN_SIZE = (9, 6)
@@ -151,7 +152,7 @@ class ExtrinsicsResult:
     body_span_m: float = 0.0
     #: 画面（PnP）位置跨度（米）
     camera_span_m: float = 0.0
-    methods: dict[str, float] = field(default_factory=dict)   # 方法名 → 残差（度）
+    methods: dict[str, float] = field(default_factory=dict)  # 方法名 → 残差（度）
 
     @property
     def ok(self) -> bool:
@@ -185,6 +186,7 @@ def detect_corners(
     ``findChessboardCorners`` + ``cornerSubPix``。
     """
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
     gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     found = None
     if hasattr(cv2, "findChessboardCornersSB"):
@@ -203,9 +205,7 @@ def detect_corners(
         found = corners
         if refine:
             criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
-            found = cv2.cornerSubPix(
-                gray, found, (11, 11), (-1, -1), criteria
-            )
+            found = cv2.cornerSubPix(gray, found, (11, 11), (-1, -1), criteria)
     return found.reshape(-1, 1, 2)
 
 
@@ -234,6 +234,7 @@ def pattern_phase_ok(
     阈值取"所有采样点的中值"，所以不依赖绝对灰度（真实照片的曝光差异不影响）。
     """
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
     cols, rows = pattern_size
     centres: list[tuple[float, float, float]] = []
     want_light: list[bool] = []
@@ -245,11 +246,11 @@ def pattern_phase_ok(
     projected, _ = cv2.projectPoints(points, rvec, tvec, camera_matrix, dist_coeffs)
     gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     samples: list[tuple[float, bool]] = []
-    for (u, v), expect_light in zip(projected.reshape(-1, 2), want_light):
+    for (u, v), expect_light in zip(projected.reshape(-1, 2), want_light, strict=True):
         x, y = int(round(float(u))), int(round(float(v)))
         if x < 3 or y < 3 or x >= gray.shape[1] - 4 or y >= gray.shape[0] - 4:
             continue
-        patch = gray[y - 3:y + 4, x - 3:x + 4]
+        patch = gray[y - 3 : y + 4, x - 3 : x + 4]
         samples.append((float(patch.mean()), expect_light))
     if not samples:
         return 0.0
@@ -287,6 +288,7 @@ def solve_board_poses(
     返回与 ``images`` 等长的列表，检不出角点的位置为 ``None``。
     """
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
     poses: list[tuple[np.ndarray, np.ndarray] | None] = []
     previous: np.ndarray | None = None
     for image in images:
@@ -297,7 +299,10 @@ def solve_board_poses(
         candidates: list[tuple[np.ndarray, np.ndarray]] = []
         for candidate_corners in (corners, corners[::-1]):
             ok, rvec, tvec = cv2.solvePnP(
-                object_points, candidate_corners, camera_matrix, dist_coeffs,
+                object_points,
+                candidate_corners,
+                camera_matrix,
+                dist_coeffs,
                 flags=cv2.SOLVEPNP_IPPE,
             )
             if ok:
@@ -338,6 +343,7 @@ def render_board(
 ) -> np.ndarray:
     '把棋盘格按给定位姿渲染成一张图（用于标定流水线的合成自洽验证）。\n\n    实现方式：在棋盘坐标系里先做一次正投影得到"正视模板"，再用\n    ``cv2.getPerspectiveTransform`` 把模板的四角映射到真实位姿下的四角——\n    对 z=0 平面来说这就是精确的透视变换（不是近似）。'
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
     cols, rows = pattern_size
     tile = int(pixels_per_square)
     # 模板**不带外框边距**：模板边界就是棋盘的物理边界（(cols+1)×(rows+1) 个格子）。
@@ -354,8 +360,10 @@ def render_board(
             cv2.rectangle(
                 template,
                 (col * tile, row * tile),
-                (min((col + 1) * tile - 1, template_w - 1),
-                 min((row + 1) * tile - 1, template_h - 1)),
+                (
+                    min((col + 1) * tile - 1, template_w - 1),
+                    min((row + 1) * tile - 1, template_h - 1),
+                ),
                 tile_value,
                 -1,
             )
@@ -382,9 +390,7 @@ def render_board(
         ],
         dtype=np.float64,
     )
-    projected, _ = cv2.projectPoints(
-        template_corners, rvec, tvec, camera_matrix, dist_coeffs
-    )
+    projected, _ = cv2.projectPoints(template_corners, rvec, tvec, camera_matrix, dist_coeffs)
     src = np.array(
         [
             [0.0, 0.0],
@@ -445,23 +451,22 @@ def look_at_board(
     上解出，因此**保证与 OpenCV 的投影约定一致**。
     """
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
     cols, rows = pattern_size
-    center = np.array(
-        [(cols - 1) * square_size / 2.0, (rows - 1) * square_size / 2.0, 0.0]
-    )
+    center = np.array([(cols - 1) * square_size / 2.0, (rows - 1) * square_size / 2.0, 0.0])
     camera_matrix = np.asarray(camera_matrix, dtype=np.float64).reshape(3, 3)
     if target_px is None:
         target_px = (float(camera_matrix[0, 2]), float(camera_matrix[1, 2]))
     base = _base_look_down_pose(
-        distance, camera_matrix, target_px, center,
-        pattern_size=pattern_size, square_size=square_size,
+        distance,
+        camera_matrix,
+        target_px,
+        center,
+        pattern_size=pattern_size,
+        square_size=square_size,
     )
-    disturbance = np.radians(
-        np.array([rim_roll_deg, tilt_deg, yaw_deg], dtype=np.float64)
-    )
-    rotation = cv2.Rodrigues(base[0].reshape(3, 1))[0] @ cv2.Rodrigues(
-        disturbance.reshape(3, 1)
-    )[0]
+    disturbance = np.radians(np.array([rim_roll_deg, tilt_deg, yaw_deg], dtype=np.float64))
+    rotation = cv2.Rodrigues(base[0].reshape(3, 1))[0] @ cv2.Rodrigues(disturbance.reshape(3, 1))[0]
     return cv2.Rodrigues(rotation)[0], base[1]
 
 
@@ -484,6 +489,7 @@ def _base_look_down_pose(
     另一个分支上（实测 4 个视图全部差 180°）。别"顺手改成更直观的"写法。
     """
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
     cols, rows = pattern_size
     # 临时相机：主点设在希望板子中心落在的位置，光轴竖直向下（俯视）
     temp = camera_matrix.copy()
@@ -492,7 +498,7 @@ def _base_look_down_pose(
     board = board_object_points(pattern_size, square_size)
     # 临时视图：板子四角在临时相机下的投影（俯视 → 正视缩放）
     focal = (float(temp[0, 0]) + float(temp[1, 1])) / 2.0
-    scale = focal / float(distance)          # 米 → 像素
+    scale = focal / float(distance)  # 米 → 像素
     image_points = np.zeros((cols * rows, 1, 2), np.float64)
     for index in range(cols * rows):
         bx, by, _ = board[index, 0]
@@ -528,6 +534,7 @@ def run_intrinsics(
     所以这里必须显式转 float32——不转的话内参这步会直接失败。
     """
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
     object_points: list[np.ndarray] = []
     image_points: list[np.ndarray] = []
     size: tuple[int, int] | None = None
@@ -556,11 +563,9 @@ def run_intrinsics(
         object_points, image_points, size, None, None
     )
     per_view: list[float] = []
-    for index, (obj, img) in enumerate(zip(object_points, image_points)):
+    for index, (obj, img) in enumerate(zip(object_points, image_points, strict=True)):
         projected, _ = cv2.projectPoints(obj, rvecs[index], tvecs[index], matrix, dist)
-        error = float(
-            np.sqrt(np.mean(np.sum((projected - img) ** 2, axis=2)))
-        )
+        error = float(np.sqrt(np.mean(np.sum((projected - img) ** 2, axis=2))))
         per_view.append(error)
     return IntrinsicsResult(
         camera_matrix=np.asarray(matrix, dtype=np.float64),
@@ -785,7 +790,7 @@ def solve_hand_eye(
         raise ValueError(f"运动对数量不足: {len(a_list)}")
     rows = []
     axes: list[np.ndarray] = []
-    for a_matrix, b_matrix in zip(a_list, b_list):
+    for a_matrix, b_matrix in zip(a_list, b_list, strict=True):
         rotation_a = a_matrix[:3, :3]
         rotation_b = b_matrix[:3, :3]
         rows.append(np.kron(np.eye(3), rotation_a) - np.kron(rotation_b.T, np.eye(3)))
@@ -808,7 +813,7 @@ def solve_hand_eye(
     if use_translation:
         d_matrix = np.zeros((3, 3))
         d_vector = np.zeros(3)
-        for a_matrix, b_matrix in zip(a_list, b_list):
+        for a_matrix, b_matrix in zip(a_list, b_list, strict=True):
             d_matrix += a_matrix[:3, :3] - np.eye(3)
             d_vector += rotation @ b_matrix[:3, 3] - a_matrix[:3, 3]
         translation, *_ = np.linalg.lstsq(d_matrix, d_vector, rcond=None)
@@ -826,7 +831,7 @@ def _axis_spread_deg(axes: Sequence[np.ndarray]) -> float:
     """一组转轴之间的最大夹角（度）。转轴是双向的，所以正负号不影响结果。"""
     spread = 0.0
     for index, first in enumerate(axes):
-        for second in axes[index + 1:]:
+        for second in axes[index + 1 :]:
             norm = float(np.linalg.norm(first) * np.linalg.norm(second))
             if norm <= 1e-12:
                 continue
@@ -863,7 +868,7 @@ def _translation_residual(
         return float("nan")
     identity = np.eye(3)
     worst = 0.0
-    for a_matrix, b_matrix in zip(a_list, b_list):
+    for a_matrix, b_matrix in zip(a_list, b_list, strict=True):
         offset = (
             (a_matrix[:3, :3] - identity) @ translation
             + a_matrix[:3, 3]
@@ -881,6 +886,19 @@ def relative_transform(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 # ----------------------------------------------------------------------
 # 遥测位姿：与画面**同时刻**的 T_world_body
 # ----------------------------------------------------------------------
+def _quaternion_of(snapshot: TelemetrySnapshot) -> tuple[float, float, float, float] | None:
+    """快照里的姿态四元数 ``(w, x, y, z)``；任一分量缺失就返回 None（**不拿 0 顶上**）。"""
+    w, x, y, z = (
+        snapshot.quaternion_w,
+        snapshot.quaternion_x,
+        snapshot.quaternion_y,
+        snapshot.quaternion_z,
+    )
+    if w is None or x is None or y is None or z is None:
+        return None
+    return (float(w), float(x), float(y), float(z))
+
+
 def body_pose_matrix(snapshot: TelemetrySnapshot) -> np.ndarray | None:
     """遥测快照 → ``T_world_body``（4×4）。位置或姿态缺一不可，否则返回 None。"""
     if (
@@ -896,10 +914,10 @@ def body_pose_matrix(snapshot: TelemetrySnapshot) -> np.ndarray | None:
     matrix = np.eye(4)
     matrix[:3, :3] = quaternion_to_matrix_local(
         (
-            snapshot.quaternion_w,
-            snapshot.quaternion_x,
-            snapshot.quaternion_y,
-            snapshot.quaternion_z,
+            float(snapshot.quaternion_w),
+            float(snapshot.quaternion_x),
+            float(snapshot.quaternion_y),
+            float(snapshot.quaternion_z),
         )
     )
     matrix[:3, 3] = (snapshot.north_m, snapshot.east_m, snapshot.down_m)
@@ -916,12 +934,10 @@ def _slerp(first: Sequence[float], second: Sequence[float], weight: float) -> np
     if dot < 0.0:
         b = -b
         dot = -dot
-    if dot > 0.9995:                    # 夹角太小：线性插值再归一化更稳
+    if dot > 0.9995:  # 夹角太小：线性插值再归一化更稳
         return (1.0 - weight) * a + weight * b
     theta = math.acos(min(1.0, max(-1.0, dot)))
-    return (
-        math.sin((1.0 - weight) * theta) * a + math.sin(weight * theta) * b
-    ) / math.sin(theta)
+    return (math.sin((1.0 - weight) * theta) * a + math.sin(weight * theta) * b) / math.sin(theta)
 
 
 def telemetry_pose_at(
@@ -946,17 +962,13 @@ def telemetry_pose_at(
     lower_pose = body_pose_matrix(lower)
     upper_pose = body_pose_matrix(upper)
     assert lower_pose is not None and upper_pose is not None
-    quaternion = _slerp(
-        (
-            float(lower.quaternion_w), float(lower.quaternion_x),
-            float(lower.quaternion_y), float(lower.quaternion_z),
-        ),
-        (
-            float(upper.quaternion_w), float(upper.quaternion_x),
-            float(upper.quaternion_y), float(upper.quaternion_z),
-        ),
-        weight,
-    )
+    # body_pose_matrix 已保证四个四元数分量非空，这里逐项显式判一次，
+    # 好让类型检查器也按"非空"收窄（属性访问不具备那种传递性）。
+    lower_q = _quaternion_of(lower)
+    upper_q = _quaternion_of(upper)
+    if lower_q is None or upper_q is None:
+        return None
+    quaternion = _slerp(lower_q, upper_q, weight)
     matrix = np.eye(4)
     matrix[:3, :3] = quaternion_to_matrix_local(tuple(quaternion))
     matrix[:3, 3] = (1.0 - weight) * lower_pose[:3, 3] + weight * upper_pose[:3, 3]
@@ -1068,7 +1080,7 @@ def run_extrinsics(
 
     residuals = [
         rotation_angle_deg((a_matrix[:3, :3] @ rotation).T @ (rotation @ b_matrix[:3, :3]))
-        for a_matrix, b_matrix in zip(a_list[:50], b_list[:50])
+        for a_matrix, b_matrix in zip(a_list[:50], b_list[:50], strict=True)
     ]
     mean_residual = float(np.mean(residuals)) if residuals else float("nan")
     body_span = _translation_span(body_poses)
@@ -1112,10 +1124,7 @@ def lever_arm_report(
     ``measured=None`` 时取 :data:`MEASURED_T_BC`——**在调用时取**，不是定义时绑定：
     那个常量是给人改的，写进默认参数会让"改了常量、报告里还是旧值"。
     """
-    measured_list = [
-        float(value)
-        for value in (MEASURED_T_BC if measured is None else measured)
-    ]
+    measured_list = [float(value) for value in (MEASURED_T_BC if measured is None else measured)]
     report: dict[str, Any] = {
         "authoritative": measured_list,
         "source": "measured",
@@ -1151,6 +1160,7 @@ def lever_arm_report(
 
 def _pose_matrix(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
     rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
     matrix = np.eye(4)
     matrix[:3, :3] = rotation
@@ -1171,6 +1181,7 @@ def _pose_matrix_from_rotation(rotation: np.ndarray, translation: Sequence[float
 def load_flight_frames(flight_dir: Path, limit: int = 200) -> list[np.ndarray]:
     """读飞行目录里的帧（``frames_index.jsonl`` + ``frames/``）。"""
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
     index_path = flight_dir / "frames_index.jsonl"
     if not index_path.is_file():
         raise FileNotFoundError(f"缺少帧索引: {index_path}")
@@ -1226,6 +1237,7 @@ def calibrate(
 ) -> dict[str, Any]:
     """跑完三步，返回可写入 ``camera_calib.json`` 的字典。"""
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
     LOGGER.info("读取标定素材: %s", flight_dir)
     frames = load_flight_frames(flight_dir, max_frames)
     if not frames:
@@ -1234,11 +1246,12 @@ def calibrate(
 
     # ---- 步骤一 ----
     LOGGER.info("步骤一：内参标定")
-    intrinsics = run_intrinsics(frames, pattern_size=pattern_size,
-                                square_size=square_size)
+    intrinsics = run_intrinsics(frames, pattern_size=pattern_size, square_size=square_size)
     LOGGER.info(
         "  视图 %d，重投影 RMS %.4f px，fx=%.1f fy=%.1f",
-        intrinsics.views, intrinsics.rms, intrinsics.camera_matrix[0, 0],
+        intrinsics.views,
+        intrinsics.rms,
+        intrinsics.camera_matrix[0, 0],
         intrinsics.camera_matrix[1, 1],
     )
 
@@ -1253,10 +1266,18 @@ def calibrate(
     # 用 solve_board_poses（含相邻帧连续性定支）而不是裸 solvePnP：
     # 检测器的角点顺序可能与我们枚举的对象点相反，单帧无法分辨（见其 docstring），
     # 而**混用两种标签**会让第三步残差飙到几十度。
-    for stamp, pose in zip(timestamps, solve_board_poses(
-        frames, board_points, intrinsics.camera_matrix, intrinsics.dist_coeffs,
-        pattern_size=pattern_size, square_size=square_size,
-    )):
+    for stamp, pose in zip(
+        timestamps,
+        solve_board_poses(
+            frames,
+            board_points,
+            intrinsics.camera_matrix,
+            intrinsics.dist_coeffs,
+            pattern_size=pattern_size,
+            square_size=square_size,
+        ),
+        strict=True,
+    ):
         if pose is None:
             rejected += 1
             continue
@@ -1269,28 +1290,28 @@ def calibrate(
         LOGGER.warning("  丢弃 %d 帧（角点检不出）", rejected)
 
     snapshots = [
-        item for item in load_flight_telemetry(flight_dir)
-        if item.quaternion_w is not None
+        item for item in load_flight_telemetry(flight_dir) if _quaternion_of(item) is not None
     ]
     lag = LagResult(lag_s=0.0, peak=float("nan"), samples=0)
     if len(board_rotations) >= 3 and len(snapshots) >= 3:
         cam_t, cam_w = angular_speed_from_poses(pose_times, board_rotations)
         body_rotations = [
-            quaternion_to_matrix_local(
-                (item.quaternion_w, item.quaternion_x, item.quaternion_y,
-                 item.quaternion_z)
-            )
+            quaternion_to_matrix_local(quaternion)
             for item in snapshots
+            if (quaternion := _quaternion_of(item)) is not None
         ]
         body_t, body_w = angular_speed_from_poses(
             [item.timestamp for item in snapshots], body_rotations
         )
         lag = estimate_lag_by_correlation(
-            cam_t, cam_w, body_t, body_w,
-            search_s=lag_search_s, step_s=lag_step_s,
+            cam_t,
+            cam_w,
+            body_t,
+            body_w,
+            search_s=lag_search_s,
+            step_s=lag_step_s,
         )
-        LOGGER.info("  Δt = %.4f s（相关系数 %.3f，样本 %d）",
-                    lag.lag_s, lag.peak, lag.samples)
+        LOGGER.info("  Δt = %.4f s（相关系数 %.3f，样本 %d）", lag.lag_s, lag.peak, lag.samples)
     else:
         LOGGER.warning("  棋盘格位姿或四元数不足，跳过时间差估计")
 
@@ -1307,12 +1328,11 @@ def calibrate(
         if dropped:
             LOGGER.info("  丢弃 %d 个时刻不在遥测覆盖内的棋盘格位姿", dropped)
         try:
-            extrinsics = run_extrinsics(
-                board_poses=paired_board, body_poses=paired_body
-            )
+            extrinsics = run_extrinsics(board_poses=paired_board, body_poses=paired_body)
             LOGGER.info(
                 "  运动对 %d，旋转残差 %.3f°，旋转轴张角 %.1f°",
-                extrinsics.pairs, extrinsics.residual_rotation_deg,
+                extrinsics.pairs,
+                extrinsics.residual_rotation_deg,
                 extrinsics.axis_spread_deg,
             )
             # 杆臂：**尺量为准**（写进标定文件的是它），标定估计值只用来对表
@@ -1330,16 +1350,20 @@ def calibrate(
                     LOGGER.info(
                         "  估计值可采信（平移残差 %.4f m 在 %.4f m 以内；"
                         "遥测位置跨度 %.2f m vs 画面 %.2f m）",
-                        arm["residual_translation_m"], arm["residual_tolerance_m"],
-                        arm["body_span_m"], arm["camera_span_m"],
+                        arm["residual_translation_m"],
+                        arm["residual_tolerance_m"],
+                        arm["body_span_m"],
+                        arm["camera_span_m"],
                     )
                 else:
                     LOGGER.warning(
                         "  估计值**不可信**（平移残差 %.4f m 超出 %.4f m；遥测位置跨度 "
                         "%.2f m vs 画面 %.2f m）——室内手持无 GPS 时遥测位置不可用，"
                         "以尺量值 %s 为准；两者差得离谱正是这个原因",
-                        arm["residual_translation_m"], arm["residual_tolerance_m"],
-                        arm["body_span_m"], arm["camera_span_m"],
+                        arm["residual_translation_m"],
+                        arm["residual_tolerance_m"],
+                        arm["body_span_m"],
+                        arm["camera_span_m"],
                         list(MEASURED_T_BC),
                     )
         except ValueError as exc:
@@ -1351,9 +1375,7 @@ def calibrate(
         "camera_matrix": intrinsics.camera_matrix.tolist(),
         "dist_coeffs": intrinsics.dist_coeffs.tolist(),
         "image_size": list(intrinsics.image_size),
-        "R_bc": (
-            extrinsics.r_bc.tolist() if extrinsics is not None else _DEFAULT_R_BC_LIST
-        ),
+        "R_bc": (extrinsics.r_bc.tolist() if extrinsics is not None else _DEFAULT_R_BC_LIST),
         "t_bc": list(MEASURED_T_BC),
         "telemetry_lag": float(lag.lag_s) if lag.ok else None,
         "meta": {
@@ -1443,7 +1465,7 @@ def main(**overrides) -> int:
 
     payload = calibrate(
         flight_dir,
-        pattern_size=tuple(settings.pattern_size),
+        pattern_size=settings.pattern_size,
         square_size=settings.square_size,
         lag_search_s=settings.lag_search_s,
         lag_step_s=settings.lag_step_s,
@@ -1451,9 +1473,7 @@ def main(**overrides) -> int:
     )
     out_path = Path(settings.output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     LOGGER.info("标定结果已写入 %s", out_path.resolve())
     if not settings.strict:
         return 0

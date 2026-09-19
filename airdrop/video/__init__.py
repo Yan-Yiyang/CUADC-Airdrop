@@ -4,8 +4,8 @@
 - :mod:`airdrop.video.align`：帧-遥测时间对齐（按拍摄时刻取遥测）；
 - :mod:`airdrop.video.buffer`：对齐结果的 FIFO 环形缓冲（画面 + 拍摄时刻遥测）。
 
-⚠ **惰性导出**（见 :mod:`airdrop._lazy`）：`import airdrop.video` 只执行本文件。
-``buffer`` 会拉 cv2，所以它排在最后——"取个 `VideoConfig`"不该顺带加载 OpenCV。
+⚠ 惰性导出（见 :mod:`airdrop._lazy`）：import airdrop.video 只执行本文件。
+``buffer`` 会拉 cv2，所以它排在最后——"取个 VideoConfig"不该顺带加载 OpenCV。
 """
 
 from .._lazy import lazy_dir, lazy_exports

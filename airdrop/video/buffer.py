@@ -66,8 +66,8 @@ import logging
 import operator
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from typing import Iterator
 
 import cv2
 import numpy as np
@@ -91,9 +91,7 @@ _capture_timestamp = operator.attrgetter("capture_timestamp")
 _index = operator.attrgetter("index")
 
 
-def capacity_for(
-    fps: float = DEFAULT_FPS, seconds: float = DEFAULT_SECONDS
-) -> int:
+def capacity_for(fps: float = DEFAULT_FPS, seconds: float = DEFAULT_SECONDS) -> int:
     """按"帧率 × 秒数"换算容量，例如 30 fps × 180 s → 5400 帧。"""
     if fps <= 0 or seconds <= 0:
         raise ValueError(f"fps/seconds 必须为正: fps={fps} seconds={seconds}")
@@ -206,9 +204,7 @@ class AlignmentBuffer:
         if capacity < 1:
             raise ValueError(f"capacity 至少为 1: {capacity}")
         if storage not in SUPPORTED_STORAGE:
-            raise ValueError(
-                f"不支持的存储方式: {storage}，可选 {sorted(SUPPORTED_STORAGE)}"
-            )
+            raise ValueError(f"不支持的存储方式: {storage}，可选 {sorted(SUPPORTED_STORAGE)}")
         if not 0 < jpeg_quality <= 100:
             raise ValueError(f"jpeg_quality 取值 1~100: {jpeg_quality}")
         if max_bytes is not None and max_bytes < 1:
@@ -385,9 +381,7 @@ class AlignmentBuffer:
                 return
             cursor = records[-1].index
 
-    def wait_new(
-        self, after_index: int = 0, timeout: float | None = None
-    ) -> BufferedFrame | None:
+    def wait_new(self, after_index: int = 0, timeout: float | None = None) -> BufferedFrame | None:
         """阻塞等待比 ``after_index`` 更新的记录，返回**最早**满足条件的那条。
 
         这是给"按序号完整消费"的读者用的——保证不漏中间记录::
@@ -454,9 +448,7 @@ class AlignmentBuffer:
             image = payload.view()
             image.flags.writeable = False
         else:
-            image = cv2.imdecode(
-                np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR
-            )
+            image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
             if image is None:
                 LOGGER.error("缓冲记录 #%d 的 JPEG 解码失败，跳过", stored.index)
                 return None
@@ -501,18 +493,12 @@ class AlignmentBuffer:
                 return 0
             return records[pos - 1].index
 
-    def _records_after(
-        self, after_index: int, batch: int, max_index: int
-    ) -> list[StoredFrame]:
+    def _records_after(self, after_index: int, batch: int, max_index: int) -> list[StoredFrame]:
         """取序号在 ``(after_index, max_index]`` 内、最靠前的至多 ``batch`` 条。"""
         with self._lock:
             records = self._records
             pos = bisect.bisect_right(records, after_index, key=_index)
-            return [
-                stored
-                for stored in records[pos : pos + batch]
-                if stored.index <= max_index
-            ]
+            return [stored for stored in records[pos : pos + batch] if stored.index <= max_index]
 
     def _evict_locked(self) -> None:
         """按帧数上限与字节上限从最旧一端驱逐。"""
@@ -576,9 +562,7 @@ class AlignmentWriter:
     :mod:`airdrop.video.align` 的"关于等待"）。
     """
 
-    def __init__(
-        self, buffer: AlignmentBuffer, aligner: FrameTelemetryAligner
-    ) -> None:
+    def __init__(self, buffer: AlignmentBuffer, aligner: FrameTelemetryAligner) -> None:
         self._buffer = buffer
         self._aligner = aligner
         self._lock = threading.Lock()

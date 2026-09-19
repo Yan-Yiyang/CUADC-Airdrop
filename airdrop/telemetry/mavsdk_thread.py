@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, AsyncIterable, Coroutine, cast
+from collections.abc import AsyncIterable, Coroutine
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from mavsdk import System
 from mavsdk.action import ActionError
@@ -69,7 +71,8 @@ class MavsdkThread:
         重连前的等待时间（秒）。
     """
 
-    SUPPORTED_COMMANDS = {
+    #: 允许经 `submit_command` 下发的指令名（ClassVar：类级常量，不是每个实例一份）
+    SUPPORTED_COMMANDS: ClassVar[set[str]] = {
         "arm",
         "arm_force",
         "disarm",
@@ -86,7 +89,7 @@ class MavsdkThread:
         "get_gps_global_origin",
     }
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - 连接/速率/看门狗参数多，但都有默认值且按名传
         self,
         broker: TelemetryBroker | None = None,
         system_address: str = "udpin://0.0.0.0:14540",
@@ -183,10 +186,9 @@ class MavsdkThread:
         supervisor, self._supervisor = self._supervisor, None
         if supervisor is not None:
             supervisor.cancel()
-            try:
+            # 取消/异常都视为已停止（BLE001 是刻意的：这里不该因为收尾失败而抛出）
+            with contextlib.suppress(Exception):
                 supervisor.result(timeout=timeout)
-            except Exception:  # noqa: BLE001 - 取消/异常都视为已停止
-                pass
 
         if self._loop is not None and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -222,12 +224,10 @@ class MavsdkThread:
             if self._supervisor is None or self._supervisor.done():
                 self._stop_requested.clear()
                 self._ready.clear()
-                self._supervisor = self.submit(
-                    self._serve(system_address or self.system_address)
-                )
+                self._supervisor = self.submit(self._serve(system_address or self.system_address))
 
-        wait = timeout if timeout is not None else (
-            self.connect_timeout + self.health_timeout + 15.0
+        wait = (
+            timeout if timeout is not None else (self.connect_timeout + self.health_timeout + 15.0)
         )
         if not self._ready.wait(wait):
             raise TimeoutError(f"在 {wait:.0f}s 内未能连接飞机")
@@ -279,7 +279,7 @@ class MavsdkThread:
                 success=False,
                 error=f"指令在 {timeout}s 内超时",
             )
-        except Exception as exc:  # noqa: BLE001 - 错误一律回落为失败结果
+        except Exception as exc:  # noqa: BLE001 - MAVSDK 异常统一成 CommandResult 失败
             return CommandResult(
                 id=command.id,
                 name=command.name,
@@ -287,9 +287,7 @@ class MavsdkThread:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
-    def submit(
-        self, coro: Coroutine[Any, Any, Any]
-    ) -> concurrent.futures.Future[Any]:
+    def submit(self, coro: Coroutine[Any, Any, Any]) -> concurrent.futures.Future[Any]:
         """把协程调度到 MAVSDK 事件循环上执行。
 
         调用方可以用 ``future.result(timeout=...)`` 同步等待结果。
@@ -322,9 +320,7 @@ class MavsdkThread:
         for task in pending:
             task.cancel()
         if pending:
-            self._loop.run_until_complete(
-                asyncio.gather(*pending, return_exceptions=True)
-            )
+            self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
     # ------------------------------------------------------------------
     # 内部：监督循环（连接 → 采集 → 断开 → 按配置重连）
@@ -335,7 +331,7 @@ class MavsdkThread:
                 await self._run_session(address)
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - 连接/运行失败后重试
+            except Exception:
                 LOGGER.exception("MAVSDK 连接/运行失败")
 
             if self._stop_requested.is_set() or not self.reconnect:
@@ -401,7 +397,7 @@ class MavsdkThread:
         if callable(stop_server):
             try:
                 stop_server()
-            except Exception:  # noqa: BLE001 - 清理失败不能影响重连/停止流程
+            except Exception:
                 LOGGER.exception("终止 mavsdk_server 子进程失败")
 
     async def _apply_telemetry_rates(self, drone: System) -> None:
@@ -431,23 +427,20 @@ class MavsdkThread:
             try:
                 await setter(rate)
                 LOGGER.info("遥测速率已设置：%s = %.1f Hz", name, rate)
-            except Exception as exc:  # noqa: BLE001 单条失败不应阻塞其它流
-                LOGGER.warning(
-                    "设置遥测速率失败（%s=%.1fHz）：%s", name, rate, exc
-                )
+            except Exception as exc:  # noqa: BLE001 - 单条速率设置失败不阻塞其它流
+                LOGGER.warning("设置遥测速率失败（%s=%.1fHz）：%s", name, rate, exc)
 
     async def _wait_connected(self, drone: System) -> None:
         async def wait() -> None:
-            async for state in cast(
-                AsyncIterable[Any], drone.core.connection_state()
-            ):
+            async for state in cast(AsyncIterable[Any], drone.core.connection_state()):
                 if state.is_connected:
                     return
 
         try:
             await asyncio.wait_for(wait(), timeout=self.connect_timeout)
-        except asyncio.TimeoutError:
-            raise TimeoutError("等待飞控连接状态超时")
+        except TimeoutError:
+            # from None：这是"等超时"的主动重述，底层 TimeoutError 只是实现细节
+            raise TimeoutError("等待飞控连接状态超时") from None
 
     async def _wait_healthy(self, drone: System) -> None:
         async def wait() -> None:
@@ -457,10 +450,8 @@ class MavsdkThread:
 
         try:
             await asyncio.wait_for(wait(), timeout=self.health_timeout)
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                f"飞控健康检查未在 {self.health_timeout:.0f}s 内通过"
-            )
+        except TimeoutError:
+            raise TimeoutError(f"飞控健康检查未在 {self.health_timeout:.0f}s 内通过") from None
 
     # ------------------------------------------------------------------
     # 内部：遥测采集（官方示例写法：每条数据流一个任务）
@@ -477,9 +468,7 @@ class MavsdkThread:
         """
         try:
             async with asyncio.TaskGroup() as tg:
-                tg.create_task(
-                    self._guarded("position", self._stream_position(drone))
-                )
+                tg.create_task(self._guarded("position", self._stream_position(drone)))
                 tg.create_task(self._guarded("home", self._stream_home(drone)))
                 tg.create_task(
                     self._guarded(
@@ -487,37 +476,23 @@ class MavsdkThread:
                         self._stream_position_velocity_ned(drone),
                     )
                 )
-                tg.create_task(
-                    self._guarded(
-                        "attitude_euler", self._stream_attitude_euler(drone)
-                    )
-                )
+                tg.create_task(self._guarded("attitude_euler", self._stream_attitude_euler(drone)))
                 tg.create_task(
                     self._guarded(
                         "attitude_quaternion",
                         self._stream_attitude_quaternion(drone),
                     )
                 )
+                tg.create_task(self._guarded("gps_global_origin", self._refresh_origin_loop(drone)))
+                tg.create_task(self._optional_stream("wind", self._stream_wind(drone)))
                 tg.create_task(
-                    self._guarded(
-                        "gps_global_origin", self._refresh_origin_loop(drone)
-                    )
-                )
-                tg.create_task(
-                    self._optional_stream("wind", self._stream_wind(drone))
-                )
-                tg.create_task(
-                    self._optional_stream(
-                        "mission_progress", self._stream_mission_progress(drone)
-                    )
+                    self._optional_stream("mission_progress", self._stream_mission_progress(drone))
                 )
                 tg.create_task(
                     self._optional_stream("flight_mode", self._stream_flight_mode(drone))
                 )
-                tg.create_task(
-                    self._optional_stream("in_air", self._stream_in_air(drone))
-                )
-        except* Exception as group:
+                tg.create_task(self._optional_stream("in_air", self._stream_in_air(drone)))
+        except* Exception as group:  # noqa: BLE001 - 任务组里任一核心流断掉即视为会话结束
             LOGGER.warning("遥测采集中断：%s", group.exceptions[0])
 
     @staticmethod
@@ -538,7 +513,7 @@ class MavsdkThread:
             await stream
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - 可选流失败不是会话失败
+        except Exception as exc:  # noqa: BLE001 - 可选流失败不是会话失败（见 AGENTS.md 第 3 条）
             LOGGER.info("可选遥测流 %s 不可用（%s），相关功能降级", name, exc)
             return
         LOGGER.info("可选遥测流 %s 已结束，相关功能降级", name)
@@ -554,12 +529,8 @@ class MavsdkThread:
         ``is_mission_finished()`` 只知道它自己上传过的任务，走 raw 之后永远回 False
         （实测）。状态机读快照里的 ``mission_current/mission_total`` 判断飞完。
         """
-        async for progress in cast(
-            AsyncIterable[Any], drone.mission_raw.mission_progress()
-        ):
-            self.broker.update_mission_progress(
-                int(progress.current), int(progress.total)
-            )
+        async for progress in cast(AsyncIterable[Any], drone.mission_raw.mission_progress()):
+            self.broker.update_mission_progress(int(progress.current), int(progress.total))
 
     async def _stream_flight_mode(self, drone: System) -> None:
         """飞行模式 → 快照（状态机用它确认"任务真的启动了"，见 models.py）。"""
@@ -580,21 +551,15 @@ class MavsdkThread:
             self.broker.update_home_position(home)
 
     async def _stream_position_velocity_ned(self, drone: System) -> None:
-        async for pv in cast(
-            AsyncIterable[Any], drone.telemetry.position_velocity_ned()
-        ):
+        async for pv in cast(AsyncIterable[Any], drone.telemetry.position_velocity_ned()):
             self.broker.update_local_position_velocity(pv.position, pv.velocity)
 
     async def _stream_attitude_euler(self, drone: System) -> None:
-        async for euler in cast(
-            AsyncIterable[Any], drone.telemetry.attitude_euler()
-        ):
+        async for euler in cast(AsyncIterable[Any], drone.telemetry.attitude_euler()):
             self.broker.update_attitude_euler(euler)
 
     async def _stream_attitude_quaternion(self, drone: System) -> None:
-        async for quaternion in cast(
-            AsyncIterable[Any], drone.telemetry.attitude_quaternion()
-        ):
+        async for quaternion in cast(AsyncIterable[Any], drone.telemetry.attitude_quaternion()):
             self.broker.update_attitude_quaternion(quaternion)
 
     # ------------------------------------------------------------------
@@ -604,7 +569,7 @@ class MavsdkThread:
         """查询 NED 原点并写入遥测代理；失败时返回 False（保留旧值）。"""
         try:
             origin = await drone.telemetry.get_gps_global_origin()
-        except Exception as exc:  # noqa: BLE001 - 原点可能尚未就绪
+        except Exception as exc:  # noqa: BLE001 - 原点可能尚未就绪，返回 False 保留旧值
             LOGGER.debug("获取 GPS 全局原点失败：%s", exc)
             return False
         self.broker.update_gps_global_origin(origin)
@@ -620,7 +585,7 @@ class MavsdkThread:
         drone = self.require_drone()
         try:
             origin = await drone.telemetry.get_gps_global_origin()
-        except Exception as exc:  # noqa: BLE001 - 统一包装为运行时错误
+        except Exception as exc:
             raise RuntimeError("无法获取 NED 原点（GPS_GLOBAL_ORIGIN）") from exc
         self.broker.update_gps_global_origin(origin)
         return origin
@@ -658,7 +623,7 @@ class MavsdkThread:
                 error=str(exc),
                 data={"result": _error_code(exc)},
             )
-        except Exception as exc:  # noqa: BLE001 - 错误会返回给调用方
+        except Exception as exc:
             LOGGER.exception("指令 %s 执行失败", command.name)
             return CommandResult(
                 id=command.id,
@@ -667,9 +632,7 @@ class MavsdkThread:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
-    async def _dispatch(
-        self, name: str, params: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def _dispatch(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
         drone = self.require_drone()
 
         if name == "get_snapshot_at":
@@ -687,10 +650,7 @@ class MavsdkThread:
         timestamp = float(params["timestamp"])
         mode = str(params.get("mode", "interpolate"))
         if mode not in SUPPORTED_QUERY_MODES:
-            raise ValueError(
-                f"不支持的查询模式: {mode}，可选 "
-                f"{sorted(SUPPORTED_QUERY_MODES)}"
-            )
+            raise ValueError(f"不支持的查询模式: {mode}，可选 {sorted(SUPPORTED_QUERY_MODES)}")
         snapshot = self.broker.get_snapshot_at(timestamp, mode)
         if snapshot is None:
             raise RuntimeError("没有可用于查询的遥测历史")
@@ -710,9 +670,7 @@ class MavsdkThread:
         }
 
     @staticmethod
-    async def _run_action(
-        drone: System, name: str, params: dict[str, Any]
-    ) -> None:
+    async def _run_action(drone: System, name: str, params: dict[str, Any]) -> None:
         action = drone.action
         if name == "arm":
             await action.arm()
@@ -733,9 +691,7 @@ class MavsdkThread:
         elif name == "set_takeoff_altitude":
             await action.set_takeoff_altitude(float(params["altitude_m"]))
         elif name == "set_return_to_launch_altitude":
-            await action.set_return_to_launch_altitude(
-                float(params["relative_altitude_m"])
-            )
+            await action.set_return_to_launch_altitude(float(params["relative_altitude_m"]))
         elif name == "set_current_speed":
             await action.set_current_speed(float(params["speed_m_s"]))
         else:  # 已被 SUPPORTED_COMMANDS 拦截

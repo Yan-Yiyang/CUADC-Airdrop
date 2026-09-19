@@ -4,11 +4,11 @@
 
     ./.venv/Scripts/python.exe -m airdrop.run basic --system-address udpin://0.0.0.0:14540
 
-本文件是**纯库模块**：顶部常量是默认值，`build_config(**覆盖)` / `main(**kwargs)` 按需传值；
-命令行由 `airdrop/run.py` 解析，重依赖（mavsdk）在函数体内导入（`--help` 不加载它）。
+本文件是纯库模块：顶部常量是默认值，build_config(**覆盖) / main(**kwargs) 按需传值；
+命令行由 airdrop/run.py 解析，重依赖（mavsdk）在函数体内导入（--help 不加载它）。
 
 ``DEMO_COMMANDS`` 打开后会依次发 arm -> takeoff -> land，
-**只在安全环境（桨已拆除 / SITL）里用**。
+只在安全环境（桨已拆除 / SITL）里用。
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def main(*, system_address: str = ADDRESS, demo_commands: bool = DEMO_COMMANDS) 
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    build_config(system_address=system_address)   # 先过一遍取值域校验（地址等）
+    build_config(system_address=system_address)  # 先过一遍取值域校验（地址等）
 
     broker = TelemetryBroker()
     broker.subscribe(on_snapshot)
@@ -98,9 +98,7 @@ def main(*, system_address: str = ADDRESS, demo_commands: bool = DEMO_COMMANDS) 
     LOGGER.info("按时间戳查询结果：%s", historical.as_dict())
 
     stop_event = threading.Event()
-    reader = threading.Thread(
-        target=reader_loop, args=(broker, stop_event), daemon=True
-    )
+    reader = threading.Thread(target=reader_loop, args=(broker, stop_event), daemon=True)
     reader.start()
 
     if demo_commands:

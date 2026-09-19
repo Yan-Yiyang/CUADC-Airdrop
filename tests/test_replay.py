@@ -1,7 +1,7 @@
 """回放（P4）离线测试：读飞行目录 → 按原时间轴重放帧与遥测。
 
-这个套件**不起 ffmpeg、不连飞控、不用 tmp_path**：素材由用例自己按
-``FlightRecorder`` 的落盘格式手写（帧索引 + jpeg + telemetry.jsonl），
+这个套件不起 ffmpeg、不连飞控、不用 tmp_path：素材由用例自己按
+``FlightRecorder`` 写入磁盘的格式手写（帧索引 + jpeg + telemetry.jsonl），
 写到工作区下的临时目录里，测完删除。
 
 为什么不用 ``tmp_path``：部分受限执行环境里 pytest 的 basetemp 目录不可枚举
@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import json
 import shutil
-import threading
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -114,9 +115,7 @@ def _write_flight(
                 }
             )
         )
-    (flight_dir / "frames_index.jsonl").write_text(
-        "\n".join(index_lines) + "\n", encoding="utf-8"
-    )
+    (flight_dir / "frames_index.jsonl").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
 
     if telemetry:
         tlm_start = t0 - tlm_lead
@@ -127,19 +126,16 @@ def _write_flight(
         if blank_first_snapshot:
             lines.append(json.dumps(_snapshot(tlm_start - tlm_dt, valid=False).as_dict()))
         lines += [
-            json.dumps(_snapshot(ts, index=k, valid=True).as_dict())
-            for k, ts in enumerate(stamps)
+            json.dumps(_snapshot(ts, index=k, valid=True).as_dict()) for k, ts in enumerate(stamps)
         ]
-        (flight_dir / "telemetry.jsonl").write_text(
-            "\n".join(lines) + "\n", encoding="utf-8"
-        )
+        (flight_dir / "telemetry.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
     else:
         tlm_start, stamps = t0, []
     return flight_dir, captures[0], tlm_start, stamps
 
 
 @pytest.fixture
-def workdir() -> Path:
+def workdir() -> Iterator[Path]:
     """工作区内的临时目录；用例结束整棵删掉。"""
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     path = WORK_ROOT / uuid.uuid4().hex[:8]
@@ -151,9 +147,9 @@ def workdir() -> Path:
 
 
 def _play_to_completion(source: ReplayVideoSource, timeout: float = 20.0) -> None:
-    """启动并等播放线程**自然结束**（不调 stop()，否则 state 会变成 stopped）。"""
+    """启动并等播放线程自然结束（不调 stop()，否则 state 会变成 stopped）。"""
     source.start()
-    thread = source._thread  # noqa: SLF001 - 测试里只等它结束
+    thread = source._thread
     assert thread is not None
     thread.join(timeout)
     assert not thread.is_alive(), "回放线程未在超时内结束"
@@ -220,7 +216,7 @@ def test_flight_log_rejects_missing_field(workdir: Path) -> None:
 def test_flight_log_rejects_time_going_backwards(workdir: Path) -> None:
     """时间戳倒流必须报错，而不是让对齐在内插时拿到乱序历史。"""
     flight_dir, *_ = _write_flight(workdir, frames=3)
-    lines = (flight_dir / "frames_index.jsonl").read_text("utf-8").strip().split("\n")
+    lines = (flight_dir / "frames_index.jsonl").read_text(encoding="utf-8").strip().split("\n")
     records = [json.loads(line) for line in lines]
     records[1]["capture_timestamp"] = records[0]["capture_timestamp"] - 1.0
     (flight_dir / "frames_index.jsonl").write_text(
@@ -245,7 +241,7 @@ def test_iter_telemetry_skips_broken_lines(workdir: Path) -> None:
     """坏行只记 warning 跳过：一段素材不该因为一行损坏而整份作废。"""
     flight_dir, *_ = _write_flight(workdir, frames=3, telemetry=True)
     path = flight_dir / "telemetry.jsonl"
-    lines = path.read_text("utf-8").strip().split("\n")
+    lines = path.read_text(encoding="utf-8").strip().split("\n")
     lines.insert(1, "{坏行")
     lines.insert(2, "[1, 2, 3]")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -323,7 +319,7 @@ def test_pacer_sorts_out_of_order_snapshots() -> None:
 
 
 def test_pacer_finish_covers_material_tail() -> None:
-    """素材末帧晚于最后一条遥测时，finish() 把覆盖补到末帧（否则末帧会白等 1s）。"""
+    """素材末帧晚于最后一条遥测时，finish() 把覆盖补到末帧（否则末帧会空等 1s）。"""
     broker = TelemetryBroker(history_maxlen=100, history_interval=0.0)
     snapshots = [_snapshot(100.0, index=0), _snapshot(100.5, index=1)]
     pacer = TelemetryPacer(broker, snapshots, ahead_s=0.0)
@@ -360,7 +356,7 @@ def test_pacer_finish_flushes_pending_before_extending() -> None:
     added = pacer.finish(105.0)  # 还没 publish_until 过就直接 finish
     assert added > 0
     assert pacer.tail_extended == added, "返回值与 tail_extended 应当一致"
-    history = [s.timestamp for s in broker._history]  # noqa: SLF001 - 校验内部顺序
+    history = [s.timestamp for s in broker._history]
     assert history == sorted(history), f"历史被写乱序: {history}"
     span = broker.history_span()
     assert span is not None
@@ -427,8 +423,12 @@ def test_replay_delivers_every_frame_with_original_timestamps(workdir: Path) -> 
 
     seen: list[tuple[int, float, float]] = []
     images: list[np.ndarray] = []
-    source.add_sink(lambda f: (seen.append((f.index, f.capture_timestamp, f.lag)),
-                               images.append(f.image.copy())))
+    source.add_sink(
+        lambda f: (
+            seen.append((f.index, f.capture_timestamp, f.lag)),
+            images.append(f.image.copy()),
+        )
+    )
     _play_to_completion(source)
 
     stats = source.stats
@@ -614,7 +614,7 @@ def test_replay_strict_raises_on_missing_frame(workdir: Path) -> None:
 
     source = ReplayVideoSource(flight_dir, speed=0.0, strict=True)
     source.start()
-    thread = source._thread  # noqa: SLF001
+    thread = source._thread
     assert thread is not None
     thread.join(10.0)
     try:
@@ -649,7 +649,7 @@ def test_replay_sink_exception_does_not_stop_playback(workdir: Path) -> None:
     good: list[int] = []
 
     def bad_sink(frame) -> None:
-        raise RuntimeError("sink 炸了")
+        raise RuntimeError("sink 抛出异常了")
 
     source.add_sink(bad_sink)
     source.add_sink(lambda f: good.append(f.index))
@@ -663,7 +663,7 @@ def test_replay_strict_sink_exception_fails_fast(workdir: Path) -> None:
     """strict：sink 抛异常直接让回放进入 error，不静默吞掉。"""
     flight_dir, *_ = _write_flight(workdir, frames=4)
     source = ReplayVideoSource(flight_dir, speed=0.0, strict=True)
-    source.add_sink(lambda frame: (_ for _ in ()).throw(RuntimeError("sink 炸了")))
+    source.add_sink(lambda frame: (_ for _ in ()).throw(RuntimeError("sink 抛出异常了")))
     _play_to_completion(source)
     assert source.stats.state == "error"
     assert "sink" in (source.stats.last_error or "")
@@ -673,7 +673,10 @@ def test_replay_remove_sink(workdir: Path) -> None:
     flight_dir, *_ = _write_flight(workdir, frames=3)
     source = ReplayVideoSource(flight_dir, speed=0.0)
     got: list[int] = []
-    sink = lambda f: got.append(f.index)  # noqa: E731
+
+    def sink(frame: Any) -> None:
+        got.append(frame.index)
+
     source.add_sink(sink)
     assert sink in source.sinks
     source.remove_sink(sink)
@@ -698,7 +701,7 @@ def test_replay_feeds_alignment_pipeline(workdir: Path) -> None:
     """回放 + 遥测回填 → FrameTelemetryAligner → AlignmentBuffer。
 
     这是 P4 的验收口径：回放时每一帧都拿到"拍摄时刻"的遥测，且与直接
-    从日志查询的结果**完全一致**（说明回放没有改变时间轴），一帧不落。
+    从日志查询的结果完全一致（说明回放没有改变时间轴），一帧不落。
     """
     flight_dir, first_capture, _, _ = _write_flight(
         workdir, frames=6, frame_dt=0.1, tlm_dt=0.05, tlm_lead=0.2, lag=0.2
@@ -750,10 +753,10 @@ def test_replay_covers_material_tail_without_aligner_timeout(workdir: Path) -> N
     flight_dir, *_ = _write_flight(
         workdir, frames=6, frame_dt=0.1, tlm_dt=0.1, tlm_lead=0.2, lag=0.2
     )
-    # 砍掉日志尾部，让**末帧明显晚于最后一条遥测**（真实素材里通常是几十毫秒，
+    # 砍掉日志尾部，让末帧明显晚于最后一条遥测（真实素材里通常是几十毫秒，
     # 这里放大到几百毫秒，便于确定性断言）
     path = flight_dir / "telemetry.jsonl"
-    lines = path.read_text("utf-8").strip().split("\n")
+    lines = path.read_text(encoding="utf-8").strip().split("\n")
     path.write_text("\n".join(lines[:-7]) + "\n", encoding="utf-8")
     assert max(s.timestamp for s in FlightLog.open(flight_dir).iter_telemetry()) < (
         FlightLog.open(flight_dir).frames[-1].capture_timestamp

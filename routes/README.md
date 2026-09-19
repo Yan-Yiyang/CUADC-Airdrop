@@ -1,6 +1,6 @@
 # routes/ — 操作手的 QGroundControl 航线（`.plan`）
 
-放**在 QGC 里画好、另存为 `.plan`** 的固定翼航线。项目按 `RoutesConfig` 的路径读取它们：
+本目录存放**在 QGC 里画好、另存为 `.plan`** 的固定翼航线。项目按 `RoutesConfig` 的路径读取它们：
 
 | 文件 | 配置项 | 用途 |
 | --- | --- | --- |
@@ -9,9 +9,9 @@
 
 ⚠ **一条腿只能二选一**：给了 `.plan` 就不能再配 `recon_route` / `landing_route`（`Config.validated()` 会报错）——让两个来源静默竞争比报错危险得多。
 
-## 怎么存
+## 保存方式
 
-QGC 里画好航线 → **Save / 另存为** → 选本目录：
+QGC 里画好航线 → **Save / 另存为** → 选择本目录：
 
 ## 对文件内容的要求
 
@@ -29,7 +29,7 @@ QGC 里画好航线 → **Save / 另存为** → 选本目录：
 
 ## 已验证
 
-2026-09 SITL（PX4 1.17 + `gz_rc_cessna`，`routes/land.plan` 就是本目录里那份）：
+2026-09 SITL（PX4 1.17 + `gz_rc_cessna`，`routes/land.plan` 即本目录中的那份）：
 
 ```
 状态轨迹: RECON → HOLD_PROCESS → OVERFLY → LAND → DONE

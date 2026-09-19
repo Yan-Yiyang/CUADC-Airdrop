@@ -1,4 +1,4 @@
-"""目标统计：把一批观测点聚成候选目标，按编号 median/max 选出**唯一**结果。
+"""目标统计：把一批观测点聚成候选目标，按编号 median/max 选出唯一结果。
 
 数据流位置：``Detection`` + georef → :class:`TargetPoint` → 本模块 → 结果坐标
 （→ WGS84 → 飞掠任务）。实飞与回放走同一入口（计划 5 章）。
@@ -9,7 +9,7 @@
 """
 
 from .cluster import analyze, cluster_points, select_cluster
-from .models import Cluster, TargetPoint, TargetingResult
+from .models import Cluster, TargetingResult, TargetPoint
 
 __all__ = [
     "Cluster",

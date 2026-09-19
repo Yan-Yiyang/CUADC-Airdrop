@@ -1,4 +1,4 @@
-'图传帧与遥测的时间对齐。\n\n这个延时不改变数据的含义，但如果不处理，做视觉引导时就会拿"现在的遥测"\n去解释"150ms 前的画面"。无人机以 10 m/s 平飞时，150ms 对应 1.5 米的位移——\n对精准空投来说这是不能忽略的系统性偏差，而且它会随着速度变化伪装成"算法\n不准"。\n\n因此每拿到一帧后，先把它**收到的时间减掉这段固定延时**，得到画面真正的\n拍摄时刻，再用这个时刻去 :class:`~airdrop.broker.TelemetryBroker` 取那一刻\n的遥测（默认在历史之间线性内插）::\n\n    aligner = FrameTelemetryAligner(broker)          # 默认扣 150ms\n    sample = aligner.align(source.read(timeout=1.0))\n    if sample is not None and not sample.extrapolated:\n        aim_at(sample.image, sample.snapshot.latitude_deg, sample.snapshot.yaw_deg)\n\n等价的手写形式（不需要本模块也能做）::\n\n    timestamp = frame.capture_timestamp             # = frame.timestamp - 0.15\n    snapshot = broker.get_snapshot_at(timestamp, mode="interpolate")\n\n延时放在哪里\n------------\n延时是**链路属性**而不是消费者的选择，因此它定义在\n:attr:`airdrop.video.VideoConfig.telemetry_lag` 上，由拉流源写进每一帧\n（:attr:`airdrop.video.VideoFrame.capture_timestamp`）。对齐器默认直接采用\n帧上携带的值，也可以用 ``lag=`` 显式覆盖（换后端做对照、或现场标定出新值\n后临时试探）。\n\n关于等待（``max_wait``）\n------------------------\n正常情况下拍摄时刻（= 收到时间 − 150ms）已经落在历史范围内，直接内插即可。\n但遥测偶尔会比视频慢半拍：那一刻的拍摄时刻比历史最新时间还新，只能外推。\n外推几十毫秒虽不算致命，却是**系统性**的（每次慢半拍都外推同一小段）。\n\n所以给对齐器设 ``max_wait``（计划定稿 1.0s）：先等遥测追上拍摄时刻，\n追上了就内插；等满上限还没追上，说明遥测流本身出了问题——那时按\n``on_timeout="drop"`` **丢弃该帧**（不拿外推凑数），并记 warning 日志与\n:attr:`FrameTelemetryAligner.stats`，让链路故障显式暴露出来。\n\n代价要说清楚：等待发生在调用 :meth:`align` 的线程里。挂成 sink 时就是\n**阻塞采集线程**——正常 10~30Hz 遥测下只有几十毫秒，但遥测真停顿时每帧\n都会等满上限（拉流会随之积压）。这是刻意的取舍：遥测停顿本身就是事故，\n宁可丢帧并报警，也不要"看起来还在工作"。\n\n关于外推\n--------\n查询时刻落在历史范围之外时，代理会做线性外推并返回结果。外推在短距离内\n近似可用，但拉长就失去意义（例如遥测断了 3 秒还在"外推"飞机的姿态）。\n:class:`AlignedSample` 因此如实标记 ``extrapolated`` 与超出边界的秒数\n``offset``；需要硬保证时给对齐器设 ``max_extrapolation``，超限的直接\n返回 None。\n'
+'图传帧与遥测的时间对齐。\n\n这个延时不改变数据的含义，但如果不处理，做视觉引导时就会拿"现在的遥测"\n去解释"150ms 前的画面"。无人机以 10 m/s 平飞时，150ms 对应 1.5 米的位移——\n对精准空投来说这是不能忽略的系统性偏差，而且它会随着速度变化伪装成"算法\n不准"。\n\n因此每拿到一帧后，先把它收到的时间减掉这段固定延时，得到画面真正的\n拍摄时刻，再用这个时刻去 :class:`~airdrop.broker.TelemetryBroker` 取那一刻\n的遥测（默认在历史之间线性内插）::\n\n    aligner = FrameTelemetryAligner(broker)          # 默认扣 150ms\n    sample = aligner.align(source.read(timeout=1.0))\n    if sample is not None and not sample.extrapolated:\n        aim_at(sample.image, sample.snapshot.latitude_deg, sample.snapshot.yaw_deg)\n\n等价的手写形式（不需要本模块也能做）::\n\n    timestamp = frame.capture_timestamp             # = frame.timestamp - 0.15\n    snapshot = broker.get_snapshot_at(timestamp, mode="interpolate")\n\n延时放在哪里\n------------\n延时是链路属性而不是消费者的选择，因此它定义在\n:attr:`airdrop.video.VideoConfig.telemetry_lag` 上，由拉流源写进每一帧\n（:attr:`airdrop.video.VideoFrame.capture_timestamp`）。对齐器默认直接采用\n帧上携带的值，也可以用 ``lag=`` 显式覆盖（换后端做对照、或现场标定出新值\n后临时试探）。\n\n关于等待（``max_wait``）\n------------------------\n正常情况下拍摄时刻（= 收到时间 − 150ms）已经落在历史范围内，直接内插即可。\n但遥测偶尔会比视频慢半拍：那一刻的拍摄时刻比历史最新时间还新，只能外推。\n外推几十毫秒虽不算致命，却是系统性的（每次慢半拍都外推同一小段）。\n\n所以给对齐器设 ``max_wait``（计划定稿 1.0s）：先等遥测追上拍摄时刻，\n追上了就内插；等满上限还没追上，说明遥测流本身出了问题——那时按\n``on_timeout="drop"`` 丢弃该帧（不拿外推凑数），并记 warning 日志与\n:attr:`FrameTelemetryAligner.stats`，让链路故障显式暴露出来。\n\n代价要说清楚：等待发生在调用 :meth:`align` 的线程里。挂成 sink 时就是\n阻塞采集线程——正常 10~30Hz 遥测下只有几十毫秒，但遥测真停顿时每帧\n都会等满上限（拉流会随之积压）。这是刻意的取舍：遥测停顿本身就是事故，\n宁可丢帧并报警，也不要"看起来还在工作"。\n\n关于外推\n--------\n查询时刻落在历史范围之外时，代理会做线性外推并返回结果。外推在短距离内\n近似可用，但拉长就失去意义（例如遥测断了 3 秒还在"外推"飞机的姿态）。\n:class:`AlignedSample` 因此如实标记 ``extrapolated`` 与超出边界的秒数\n``offset``；需要硬保证时给对齐器设 ``max_extrapolation``，超限的直接\n返回 None。\n'
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ from .source import DEFAULT_TELEMETRY_LAG, VideoFrame
 LOGGER = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_TELEMETRY_LAG",
     "AlignStats",
     "AlignedSample",
-    "DEFAULT_TELEMETRY_LAG",
     "FrameTelemetryAligner",
 ]
 
@@ -31,19 +31,19 @@ SUPPORTED_TIMEOUT_ACTIONS = frozenset({"drop"})
 class AlignStats:
     """对齐统计的只读快照（线程安全地取）。"""
 
-    aligned: int = 0            # 成功产出的样本数
-    no_telemetry: int = 0       # 历史为空（一条遥测都还没有）
-    waits: int = 0              # 发生过等待的帧数
-    wait_timeouts: int = 0      # 等到超时、按 on_timeout 丢弃的帧数
+    aligned: int = 0  # 成功产出的样本数
+    no_telemetry: int = 0  # 历史为空（一条遥测都还没有）
+    waits: int = 0  # 发生过等待的帧数
+    wait_timeouts: int = 0  # 等到超时、按 on_timeout 丢弃的帧数
     extrapolation_drops: int = 0  # 超出 max_extrapolation 被丢弃的帧数
-    max_wait_s: float = 0.0     # 单次等待的最长耗时（秒）
+    max_wait_s: float = 0.0  # 单次等待的最长耗时（秒）
 
 
 @dataclass(frozen=True, slots=True)
 class AlignedSample:
     """一帧画面，以及按"该画面的拍摄时刻"取到的遥测快照。
 
-    ``timestamp`` 是**对齐后的采样时刻**，即画面拍摄时刻
+    ``timestamp`` 是对齐后的采样时刻，即画面拍摄时刻
     （``frame.timestamp - lag``），也是实际传给遥测代理的查询时间；它与
     ``frame.timestamp``（收到帧的时间）差一个 ``lag``，别混用。
     """
@@ -87,13 +87,13 @@ class FrameTelemetryAligner:
         历史边界超过该秒数时 :meth:`align` 返回 None（宁可让调用方跳过这一帧，
         也不要拿不可信的遥测去引导）。
     max_wait:
-        **等待上限（秒）**。拍摄时刻比历史最新时间还新时，先等一小会儿让遥测
+        等待上限（秒）。拍摄时刻比历史最新时间还新时，先等一小会儿让遥测
         追上，从而能内插而不是外推；超过该上限仍没等到就按 ``on_timeout``
         处理。默认 0.0 = 不等待（保持旧行为：直接外推）。
     on_timeout:
         等待超时后的动作。目前支持 ``"drop"``：丢弃该帧（返回 None）。
         正常遥测（10~30Hz）下等待只有几十毫秒；真的等到超时说明遥测流本身
-        有问题，那时这些帧本来也无法可信对齐——**丢弃并把问题喊出来**
+        有问题，那时这些帧本来也无法可信对齐——丢弃并把问题喊出来
         （warning 日志 + :attr:`stats` 的 ``wait_timeouts``），而不是外推凑数。
 
     注意 max_wait 会让 :meth:`align` 阻塞（在 sink 里就是阻塞采集线程），
@@ -112,9 +112,7 @@ class FrameTelemetryAligner:
         on_timeout: str = "drop",
     ) -> None:
         if mode not in SUPPORTED_QUERY_MODES:
-            raise ValueError(
-                f"不支持的查询模式: {mode}，可选 {sorted(SUPPORTED_QUERY_MODES)}"
-            )
+            raise ValueError(f"不支持的查询模式: {mode}，可选 {sorted(SUPPORTED_QUERY_MODES)}")
         if lag is not None and lag < 0:
             raise ValueError(f"lag 不能为负: {lag}")
         if max_extrapolation is not None and max_extrapolation < 0:
@@ -123,8 +121,7 @@ class FrameTelemetryAligner:
             raise ValueError(f"max_wait 不能为负: {max_wait}")
         if on_timeout not in SUPPORTED_TIMEOUT_ACTIONS:
             raise ValueError(
-                f"不支持的 on_timeout: {on_timeout}，可选 "
-                f"{sorted(SUPPORTED_TIMEOUT_ACTIONS)}"
+                f"不支持的 on_timeout: {on_timeout}，可选 {sorted(SUPPORTED_TIMEOUT_ACTIONS)}"
             )
         self._broker = broker
         self._lag = lag
@@ -220,10 +217,7 @@ class FrameTelemetryAligner:
             return None
 
         extrapolated, offset = self._classify(timestamp)
-        if (
-            self._max_extrapolation is not None
-            and offset > self._max_extrapolation
-        ):
+        if self._max_extrapolation is not None and offset > self._max_extrapolation:
             LOGGER.debug(
                 "对齐时刻 %.3f 超出历史边界 %.3fs（阈值 %.3fs），跳过该帧",
                 timestamp,
@@ -288,8 +282,7 @@ class FrameTelemetryAligner:
             count = self._wait_timeouts
         if count == 1 or count % _TIMEOUT_LOG_EVERY == 0:
             LOGGER.warning(
-                "遥测未在 %.2fs 内追上拍摄时刻（已累计 %d 帧丢弃）："
-                "遥测流可能已停顿，请检查链路",
+                "遥测未在 %.2fs 内追上拍摄时刻（已累计 %d 帧丢弃）：遥测流可能已停顿，请检查链路",
                 self._max_wait,
                 count,
             )

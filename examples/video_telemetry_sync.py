@@ -1,4 +1,4 @@
-"""图传帧 ↔ 遥测的对齐与留存示例：**每一帧都进缓冲**，随时回看。
+"""图传帧 ↔ 遥测的对齐与留存示例：每一帧都进缓冲，随时回看。
 
 为什么不是"读一帧 → 处理 → 再读一帧"：那样只要有一帧处理慢了，中间帧就被覆盖
 丢掉了。而目标出现的时间可能极短，漏一帧就可能漏掉目标。本项目走"先侦查后空投"，
@@ -6,20 +6,20 @@
 
 1. 建一个环形缓冲（默认 30 fps × 3 分钟 = 5400 帧）；
 2. 把 :class:`~airdrop.buffer.AlignmentWriter` 挂到拉流源上——它在采集线程里
-   **逐帧**被调用，对齐遥测后写进缓冲，一帧不落；
-3. 另起一个线程扮演"其他模块"，从缓冲里按自己的节奏取数据（推理 / 落盘 / 回放），
+   逐帧被调用，对齐遥测后写进缓冲，一帧不落；
+3. 另起一个线程扮演"其他模块"，从缓冲里按自己的节奏取数据（推理 / 写入磁盘 / 回放），
    快慢都不影响第 2 步。
 
-链路延时（默认 150ms）在写入时就已扣掉：缓冲里的每一帧都带着它**拍摄时刻**的
+链路延时（默认 150ms）在写入时就已扣掉：缓冲里的每一帧都带着它拍摄时刻的
 遥测，回看的人不用再自己换算。
 
-用法（**集中式入口在 `airdrop/run.py`**）::
+用法（集中式入口在 airdrop/run.py）::
 
     ./.venv/Scripts/python.exe -m airdrop.run video-sync
     ./.venv/Scripts/python.exe -m airdrop.run video-sync --rtsp-url rtsp://... --telemetry-lag 0.18
 
-本文件是**纯库模块**：顶部常量是默认值，`build_config(**覆盖)` / `main(**kwargs)` 按需传值；
-命令行由 `airdrop/run.py` 解析，重依赖都在函数体内导入（`--help` 不加载它们）。
+本文件是纯库模块：顶部常量是默认值，build_config(**覆盖) / main(**kwargs) 按需传值；
+命令行由 airdrop/run.py 解析，重依赖都在函数体内导入（--help 不加载它们）。
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import logging
 import threading
 import time
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from airdrop import (
     DEFAULT_TELEMETRY_LAG,
@@ -38,6 +39,9 @@ from airdrop import (
     TelemetryBroker,
     VideoConfig,
 )
+
+if TYPE_CHECKING:
+    from airdrop.video.buffer import AlignmentBuffer
 
 # ----------------------------------------------------------------------
 # 配置（改这里）
@@ -72,20 +76,16 @@ def build_config(
     base = Config()
     return Config(
         telemetry=replace(base.telemetry, system_address=system_address),
-        video=VideoConfig(
-            url=video_url, width=width, height=height, telemetry_lag=lag
-        ).validated(),
+        video=VideoConfig(url=video_url, width=width, height=height, telemetry_lag=lag).validated(),
     ).validated()
 
 
-def reader_loop(
-    buffer: AlignmentBuffer, stop_event: threading.Event, pace: float
-) -> None:
+def reader_loop(buffer: AlignmentBuffer, stop_event: threading.Event, pace: float) -> None:
     """扮演"其他模块"：从缓冲里按自己的节奏取帧。
 
     这里刻意放慢节奏（每帧 sleep 一小会儿）——它证明消费端再慢也不会让采集端
     丢帧：慢的只有它自己的游标，缓冲里的历史一帧都不会少。
-    真实场景里这一段就是推理、落盘或回放。
+    真实场景里这一段就是推理、写入磁盘或回放。
     """
     index = 0
     seen = 0
@@ -193,9 +193,7 @@ def main(
 
     LOGGER.info("等待遥测就绪...")
     if broker.wait_next_snapshot(timeout=15.0, predicate=lambda s: s.is_valid()) is None:
-        LOGGER.warning(
-            "15 秒内没收到遥测：拉流不受影响，但对齐拿不到遥测的帧会被计为 skipped"
-        )
+        LOGGER.warning("15 秒内没收到遥测：拉流不受影响，但对齐取不到遥测的帧会被计为 skipped")
 
     aligner = FrameTelemetryAligner(broker, lag=config.video.telemetry_lag)
 

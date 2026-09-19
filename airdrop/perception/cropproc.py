@@ -1,42 +1,42 @@
 """裁剪图后处理：五边形定位 → 几何转正 → 整图 OCR 读编号。
 
 移植自 旧版 ``drone/cvproc.py``（久经实测的目标形态与参数）。目标形态：
-**五边形 = 正方形 + 等边三角形**（边长 1m），编号印在正方形中心的白底方块上
+五边形 = 正方形 + 等边三角形（边长 1m），编号印在正方形中心的白底方块上
 （0.6m，黑字）。
 
 流水线（顺序不可随意改动，每一步都在 旧版 有实测理由）
 --------------------------------------------------------
-1. **JPEG 往返去噪**：DVR 图传的细颗粒噪点会干扰轮廓提取，编解码一次即可抹平；
-2. **等比放大到短边 300px**（上限 10 倍）：小目标识别率显著提升。``side_px``
+1. JPEG 往返去噪：DVR 图传的细颗粒噪点会干扰轮廓提取，编解码一次即可抹平；
+2. 等比放大到短边 300px（上限 10 倍）：小目标识别率显著提升。``side_px``
    最后要除回去，还原成原始像素边长（坐标解算用原始尺度）；
-3. **颜色掩码饱和度逐级回退**：无人机接近时目标褪色（蓝实测 S≈20~30），
+3. 颜色掩码饱和度逐级回退：无人机接近时目标褪色（蓝实测 S≈20~30），
    固定阈值会突然检不到；blue 走 100→60→40→20，red 走 100→80→60→40→20；
-4. **形态学 + 凸包 + approxPolyDP 扫 epsilon=3..40** 找出五边形。扫描 epsilon
+4. 形态学 + 凸包 + approxPolyDP 扫 epsilon=3..40 找出五边形。扫描 epsilon
    而不是 ±1 步进，避免旧的振荡问题；
-5. **转正**：平行边法为主（正方形左右两边是轮廓里唯一互相平行的边对，三角形
+5. 转正：平行边法为主（正方形左右两边是轮廓里唯一互相平行的边对，三角形
    顶角是唯一不与任一平行边共享端点的顶点），失败回退最小内角法（40~130° 门限，
    斜视角会把 60° 投影到这个区间）；
-6. **转正图整图 OCR**。注意用**彩图**——PP-OCRv6 的 det 对灰度图检不出文本框
-   （旧版 实测坑，P5 未复测，保守沿用）；
-7. **候选合并**：单数字框按行聚类拼成两位数；两位结果置信度加权（×1.15）、
+6. 转正图整图 OCR。注意用彩图——PP-OCRv6 的 det 对灰度图检不出文本框
+   （旧版 实测易错点，P5 未复测，保守沿用）；
+7. 候选合并：单数字框按行聚类拼成两位数；两位结果置信度加权（×1.15）、
    单位 ×0.6，防止把 ``"7"`` 误报成 ``07``；
 8. 编号交给 :func:`~airdrop.perception.number.correct_ocr_number` 纠错。
 
 与 旧版 的差异（都是被 rapidocr 3.9.2 的 API 逼的，不是主动改的）
 ------------------------------------------------------------------
 * 旧版 的 ``_rapid_readtext`` 往 ``__call__`` 上传 ``allowlist`` / ``low_text``
-  / ``text_threshold`` / ``batch_size`` 等参数；3.9.2 的 ``__call__`` **只接受
-  图像**，这些参数已不存在。替代方案：
+  / ``text_threshold`` / ``batch_size`` 等参数；3.9.2 的 ``__call__`` 只接受
+  图像，这些参数已不存在。替代方案：
   - 置信度过滤交给 ``Global.text_score``（构造时设定，等价于低阈值放行 +
     自己按 ``ocr_conf_threshold`` 复筛）；
   - ``allowlist`` 没有对应配置项，改由 :func:`correct_ocr_number` 过滤非数字
     （它本来就在做这件事，且更严格）；
   - ``rec_batch_num`` 走 ``Rec.rec_batch_num`` 配置。
-* 方向分类（Cls）**原先关闭，理由是错的**。旧记录写的是"``arch_config.yaml`` 里没有
-  Cls 的 torch 架构条目（只有 det/rec）"，实测**不成立**：TORCH 的 arch_config 里
-  **有** cls 条目（``model_type: cls`` / MobileNetV3 / ClsHead），只是键名被 RapidOCR
+* 方向分类（Cls）原先关闭，理由是错的。旧记录写的是"``arch_config.yaml`` 里没有
+  Cls 的 torch 架构条目（只有 det/rec）"，实测不成立：TORCH 的 arch_config 里
+  有 cls 条目（``model_type: cls`` / MobileNetV3 / ClsHead），只是键名被 RapidOCR
   自己拼错了——写的是 ``ch_ptocr_mobile_v2.0_cls_mobile``（``pt``）而正规模型名是
-  ``ch_ppocr_...``（``pp``）。TORCH 引擎**按文件名 stem 查架构**
+  ``ch_ppocr_...``（``pp``）。TORCH 引擎按文件名 stem 查架构
   （``networks/main.py`` 的 ``_load_arch_config``），所以只要把权重命名成那个拼错的名字
   就能加载（实测：改名成 ``ch_ppocr_...pth`` 立刻 ``ValueError: architecture ... is not
   in arch_config.yaml``，叫 ``ch_ptocr_...pth`` 正常工作、极性也正确）。
@@ -79,18 +79,18 @@ class OcrEngineConfig:
     rec_keys: str = "ppocrv6_dict.txt"
     #: 方向分类（Cls）用哪个引擎：``"onnx"`` / ``"torch"`` / ``"off"``。
     #: 默认 ONNX：本机实测（同权重、6 张一批）ONNX-CUDA 0.96ms/张、ONNX-CPU 1.28、
-    #: TORCH-CUDA 2.28、TORCH-CPU 4.14，而三者**判定逐位相同**（同分数 0.9801/0.9799）。
+    #: TORCH-CUDA 2.28、TORCH-CPU 4.14，而三者判定逐位相同（同分数 0.9801/0.9799）。
     cls_engine: str = "onnx"
     cls_onnx_model: str = "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
-    #: ⚠ 这里的 ``ptocr`` 是 RapidOCR 自己的拼写错误，**不能改名**（理由见模块 docstring）
+    #: ⚠ 这里的 ``ptocr`` 是 RapidOCR 自己的拼写错误，不能改名（理由见模块 docstring）
     cls_torch_model: str = "ch_ptocr_mobile_v2.0_cls_mobile.pth"
-    #: Cls 是否用 CUDA。⚠ ONNX 的 CUDA EP 依赖 **torch 先被 import**
-    #: （torch/lib 里的 cuDNN/cuBLAS 才在进程搜索路径上），否则 onnxruntime 会**静默**
+    #: Cls 是否用 CUDA。⚠ ONNX 的 CUDA EP 依赖 torch 先被 import
+    #: （torch/lib 里的 cuDNN/cuBLAS 才在进程搜索路径上），否则 onnxruntime 会静默
     #: 退回 CPU；本项目 det/rec 走 TORCH 引擎，天然满足，但仍会显式核对并告警。
     cls_use_cuda: bool = True
     #: 判定为 180° 的置信度门限（低置信度不动图，只记录判定）
     cls_thresh: float = 0.9
-    #: 是否让 OCR 流水线按判定**自动旋转**文本行（``Global.use_cls``）。
+    #: 是否让 OCR 流水线按判定自动旋转文本行（``Global.use_cls``）。
     #: 关掉时方向判别仍可用（:meth:`OcrEngine.classify_orientation`），只是不参与识别，
     #: 适合"先只观测、不改结果"的交叉验证。
     cls_autorotate: bool = True
@@ -141,7 +141,7 @@ class OcrOrientation:
 class OcrText:
     """一条 OCR 文本结果（框 + 内容 + 置信度）。"""
 
-    box: np.ndarray      # (4, 2) float
+    box: np.ndarray  # (4, 2) float
     text: str
     score: float
 
@@ -149,7 +149,7 @@ class OcrText:
 class OcrEngine:
     """``rapidocr.RapidOCR`` 的薄封装：显式模型路径 + 统一结果形状。
 
-    为什么不用库的自动下载：起飞前必须**固定模型版本**（否则某次飞行前悄悄换了
+    为什么不用库的自动下载：起飞前必须固定模型版本（否则某次飞行前悄悄换了
     模型，识别率变化无法归因），而 ``default_models.yaml`` 里没有 ``torch`` 段，
     TORCH 引擎只能靠显式 ``model_path`` 指定本地权重（P5 复测结论）。
     """
@@ -193,8 +193,7 @@ class OcrEngine:
         if missing:
             self._failed = True
             raise FileNotFoundError(
-                "OCR 模型文件缺失: " + ", ".join(missing)
-                + "（见 OcrEngineConfig.model_dir）"
+                "OCR 模型文件缺失: " + ", ".join(missing) + "（见 OcrEngineConfig.model_dir）"
             )
         try:
             from rapidocr import EngineType, RapidOCR  # 惰性：重型依赖
@@ -229,8 +228,8 @@ class OcrEngine:
         """方向分类（Cls）的构造参数；``cls_engine="off"`` 只关自动旋转、不加载权重。"""
         config = self._config
         if not config.cls_enabled():
-            # rapidocr 会**无条件**构造 det/cls/rec 三个模块（`Global.use_cls` 只管流水线），
-            # 所以"关掉"也得给它一个本地路径：`Cls.model_path` 为空时它会去 modelscope
+            # rapidocr 会无条件构造 det/cls/rec 三个模块（Global.use_cls 只管流水线），
+            # 所以"关掉"也得给它一个本地路径：Cls.model_path 为空时它会去 modelscope
             # 下载默认 Cls 模型——离线机器上就是启动失败。
             params: dict[str, Any] = {"Global.use_cls": False}
             local = next(
@@ -255,9 +254,7 @@ class OcrEngine:
                 "EngineConfig.torch.use_cuda": config.cls_use_cuda,
             }
         else:
-            raise ValueError(
-                f"未知的 cls_engine: {config.cls_engine!r}（应为 onnx / torch / off）"
-            )
+            raise ValueError(f"未知的 cls_engine: {config.cls_engine!r}（应为 onnx / torch / off）")
         return {
             "Cls.model_path": str(config.cls_path()),
             "Cls.cls_thresh": config.cls_thresh,
@@ -266,9 +263,9 @@ class OcrEngine:
         }
 
     def cls_providers(self) -> tuple[str, ...]:
-        """方向分类会话**实际**拿到的执行提供者（空元组 = 未启用或取不到）。
+        """方向分类会话实际拿到的执行提供者（空元组 = 未启用或取不到）。
 
-        ⚠ 这只是**读取**，不会触发加载：引擎还没 :meth:`ensure` 时必然返回空元组。
+        ⚠ 这只是读取，不会触发加载：引擎还没 :meth:`ensure` 时必然返回空元组。
         要核对设备，先 ``ensure()``（起飞前 :meth:`warmup` 也是这个时机）。
         """
         classifier = getattr(self._engine, "text_cls", None)
@@ -277,11 +274,11 @@ class OcrEngine:
             return ()
         try:
             return tuple(session.get_providers())
-        except Exception:
+        except Exception:  # noqa: BLE001 - 取不到 provider 列表就当空，只用于日志
             return ()
 
     def _report_cls_device(self) -> None:
-        """核对方向分类真正跑在哪——onnxruntime 的 CUDA EP 会**静默**退回 CPU。"""
+        """核对方向分类真正跑在哪——onnxruntime 的 CUDA EP 会静默退回 CPU。"""
         config = self._config
         if not config.cls_enabled():
             return
@@ -312,19 +309,19 @@ class OcrEngine:
         ):
             LOGGER.warning(
                 "方向分类想要 CUDA，实际落在 %s：onnxruntime 的 CUDA EP 依赖进程里"
-                "**先 import torch**（torch/lib 自带 cuDNN/cuBLAS，ORT 才找得到），"
-                "否则它会静默退回 CPU。本项目 det/rec 走 TORCH 引擎，正常顺序下已满足；"
+                "先 import torch（torch/lib 自带 cuDNN/cuBLAS，ORT 才找得到），"
+                "否则它会无提示地退回 CPU。本项目 det/rec 走 TORCH 引擎，正常顺序下已满足；"
                 "看到这条说明加载顺序被改了（功能仍可用，只是慢一些）。",
                 providers[0],
             )
 
     def classify_orientation(self, image: np.ndarray) -> OcrOrientation:
-        """判断一张**文本行**是否倒置——独立于几何转正的第二判据。
+        """判断一张文本行是否倒置——独立于几何转正的第二判据。
 
-        ⚠ 输入应当是文本行（编号框那种扁长条），**不是**整幅转正图：
+        ⚠ 输入应当是文本行（编号框那种扁长条），不是整幅转正图：
         ``ch_ppocr_mobile_v2.0_cls`` 是按文本行训练的（内部缩放到 48×192）。
 
-        用途：给几何转正做**交叉验证**。两条路用的信息完全不同——几何走五边形形状，
+        用途：给几何转正做交叉验证。两条路用的信息完全不同——几何走五边形形状，
         判别走学出来的笔画方向——一致才说明转正可信；不一致的地方就是转正的疑点。
         """
         if not self._config.cls_enabled():
@@ -344,24 +341,24 @@ class OcrEngine:
             blank = np.full((size, size, 3), 255, np.uint8)
             engine(blank)
             return True
-        except Exception:  # noqa: BLE001 - 预热失败只记录
+        except Exception:
             LOGGER.exception("OCR 预热失败（不影响后续识别，但首帧会变慢）")
             return False
 
     def read_text(self, image: np.ndarray) -> list[OcrText]:
         """整图识别，返回文本列表；引擎不可用或识别失败时返回空列表。
 
-        **绝不抛出**：单帧 OCR 失败不该打断整条拉流/处理链路，上层按"没读出
+        绝不抛出：单帧 OCR 失败不该打断整条拉流/处理链路，上层按"没读出
         编号"处理即可（``Detection.code is None``）。
         """
         try:
             engine = self.ensure()
-        except Exception:  # noqa: BLE001
+        except Exception:
             LOGGER.exception("OCR 引擎不可用")
             return []
         try:
             result = engine(image)
-        except Exception:  # noqa: BLE001
+        except Exception:
             LOGGER.exception("OCR 单帧识别失败")
             return []
         if not result:
@@ -396,7 +393,7 @@ class CropResult:
     raw_text: str
     confidence: float
     saturation_level: int = 0
-    stage: str = ""       # "parallel" / "min_angle" / "none"，排故用
+    stage: str = ""  # "parallel" / "min_angle" / "none"，排故用
     #: 五边形是否通过"正方形 + 等边三角形"的形态判据（顶角 ≈60°）。
     #: False 只表示这次"转正"的几何不成立、结果不可尽信，不代表一定读错
     house_ok: bool = False
@@ -416,7 +413,7 @@ class OpenCvPostProcess:
     逻辑按新的 RapidOCR 接口重写，几何部分逐行保留。
     """
 
-    #: "房子"形态判据：**等边三角形的内角恒为 60°**，所以顶角就是 60°
+    #: "房子"形态判据：等边三角形的内角恒为 60°，所以顶角就是 60°
     HOUSE_APEX_ANGLE_DEG = 60.0
     #: 顶角允许的偏差（透视、掩码噪声、approxPolyDP 都会让量出来的角偏离 60°）
     HOUSE_APEX_ANGLE_TOL_DEG = 15.0
@@ -463,9 +460,7 @@ class OpenCvPostProcess:
     @staticmethod
     def _extract_blue(image: np.ndarray, s_min: int) -> np.ndarray:
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(
-            hsv, np.array([90, s_min, 50]), np.array([130, 255, 255])
-        )
+        mask = cv2.inRange(hsv, np.array([90, s_min, 50]), np.array([130, 255, 255]))
         blue = cv2.bitwise_and(image, image, mask=mask)
         return cv2.cvtColor(blue, cv2.COLOR_BGR2GRAY)
 
@@ -498,10 +493,10 @@ class OpenCvPostProcess:
     def _find_min_angle(cls, approx) -> tuple[list[float], float]:
         """最小内角顶点（三角形顶角；目标形态下该角为 60°）。
 
-        **必须用"顶点自身 + 它的前后邻居"来量角度**。原实现写成
+        必须用"顶点自身 + 它的前后邻居"来量角度。原实现写成
         ``_angle(pts[i], pts[i+1], pts[i+2])`` 并把 ``pts[i+1]`` 当作该角所在顶点，
         这看着像"顶点+邻居"，其实不是：``pts[i]`` 与 ``pts[i+2]`` 只是"相隔两个"的
-        点，当它们恰好不是顶点的邻居时会量出一个**根本不属于该顶点的角**。
+        点，当它们恰好不是顶点的邻居时会量出一个根本不属于该顶点的角。
         五边形上这一错会把 60° 的顶角量成 15°（用 ``bl``—``apex``—``tl`` 代替
         真正的 ``tl``—``apex``—``tr``），进而被 40~130° 门限误拒。
         """
@@ -557,9 +552,7 @@ class OpenCvPostProcess:
             e2 += 180.0
         ea = (e1 + e2) / 2.0
         row = ea - 90.0
-        theta = float(
-            np.degrees(np.arctan2(apex[1] - center[1], apex[0] - center[0]))
-        )
+        theta = float(np.degrees(np.arctan2(apex[1] - center[1], apex[0] - center[0])))
         after = cls._angle_norm_deg(theta - row)
         if abs(after - 90.0) < abs(after + 90.0):  # 更接近正下方（+90°）
             row += 180.0
@@ -569,8 +562,8 @@ class OpenCvPostProcess:
     def _find_apex_by_parallel(cls, approx, tol: float = 15.0):
         """平行边法定顶点。
 
-        五边形 = 正方形 + 等边三角形：正方形的左右两边是轮廓中**唯一互相平行**
-        的边对；三角形顶角是**唯一不与任一平行边共享端点**的顶点。
+        五边形 = 正方形 + 等边三角形：正方形的左右两边是轮廓中唯一互相平行
+        的边对；三角形顶角是唯一不与任一平行边共享端点的顶点。
         返回 ``(顶点, 平行边对索引, 平行角差)``，找不到返回 ``(None, None, None)``。
         """
         pts = approx.reshape(-1, 2).astype(np.float64)
@@ -595,7 +588,7 @@ class OpenCvPostProcess:
 
     @classmethod
     def _interior_angles_deg(cls, approx) -> list[float]:
-        """每个顶点的**真实内角**（顶点 + 它的真实前后邻居）。"""
+        """每个顶点的真实内角（顶点 + 它的真实前后邻居）。"""
         points = np.asarray(approx, dtype=np.float64).reshape(-1, 2)
         length = len(points)
         return [
@@ -607,11 +600,11 @@ class OpenCvPostProcess:
     def _is_house_pentagon(cls, approx, apex) -> bool:
         """这个五边形是不是"正方形 + 架在上边的等边三角形"。
 
-        判据只用一条几何事实：**顶角恒为 60°**（等边三角形内角）。为什么需要它——
-        平行边法只验证"存在一对平行边"，而掩码偏严时圈到的可能**只是编号底板**
-        （近方形），`approxPolyDP` 照样能凑出 5 个顶点、也照样有一对平行边，
-        于是算出一个**任意角度**的"转正"，OCR 还可能读出一个自信的错编号：
-        实测帧 1840 的 `s_min=100` 就是这样把 56 转成了 95（同一帧其余三级都读出
+        判据只用一条几何事实：顶角恒为 60°（等边三角形内角）。为什么需要它——
+        平行边法只验证"存在一对平行边"，而掩码偏严时圈到的可能只是编号底板
+        （近方形），approxPolyDP 照样能凑出 5 个顶点、也照样有一对平行边，
+        于是算出一个任意角度的"转正"，OCR 还可能读出一个自信的错编号：
+        实测帧 1840 的 s_min=100 就是这样把 56 转成了 95（同一帧其余三级都读出
         正确的 56）。顶角是房子特有的、且与旋转无关的量，正好拿来当门限。
         """
         points = np.asarray(approx, dtype=np.float64).reshape(-1, 2)
@@ -628,7 +621,7 @@ class OpenCvPostProcess:
         ``float64`` 轮廓直接抛 "Invalid image type (must be single-channel)"
         （``approxPolyDP`` 的输出类型取决于输入，不能保证是 int32），而这里
         只需要一个"用于判断旋转方向"的参考点，凸多边形顶点均值足够且没有
-        类型坑。
+        类型易错点。
         """
         points = np.asarray(approx, dtype=np.float64).reshape(-1, 2)
         if points.size == 0:
@@ -658,9 +651,7 @@ class OpenCvPostProcess:
         kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
         opening = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
         erosion = cv2.erode(opening, kernel, iterations=1)
-        contours, _ = cv2.findContours(
-            erosion, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-        )
+        contours, _ = cv2.findContours(erosion, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return np.empty((0, 1, 2), np.int32), False
         contour = max(contours, key=cv2.contourArea)
@@ -703,9 +694,7 @@ class OpenCvPostProcess:
         new_h = int(height * cos + width * sin)
         matrix[0, 2] += (new_w / 2) - center[0]
         matrix[1, 2] += (new_h / 2) - center[1]
-        return cv2.warpAffine(
-            image, matrix, (new_w, new_h), borderValue=(0, 0, 0)
-        )
+        return cv2.warpAffine(image, matrix, (new_w, new_h), borderValue=(0, 0, 0))
 
     # ------------------------------------------------------------------
     # OCR 候选
@@ -771,7 +760,7 @@ class OpenCvPostProcess:
         两位结果置信度加权 ×1.15、单位 ×0.6：单数字框被读成 ``"7"`` 时我们会
         补成 ``07``，但那种"猜出来"的结果不该压过真正的两位读数。
 
-        **形态成立的候选优先**，其次才比置信度：几何不成立的"转正"再自信也不能
+        形态成立的候选优先，其次才比置信度：几何不成立的"转正"再自信也不能
         压过真正的房子——实测帧 1840 里错转正读出的 ``95`` 加权分（1.15）确实
         高于正确转正读出的 ``56``，只看置信度就会选错。
         """
@@ -808,7 +797,7 @@ class OpenCvPostProcess:
         """识别一张裁剪图，返回 :class:`CropResult`。
 
         流程：去噪 → 等比放大到短边 300px → 掩码回退找五边形 → 几何转正 →
-        转正图整图 OCR。``side_px`` 会还原成**原始**像素边长供坐标解算使用。
+        转正图整图 OCR。``side_px`` 会还原成原始像素边长供坐标解算使用。
         """
         if image is None or image.size == 0:
             return CropResult(None, -1.0, None, "", 0.0, stage="empty")
@@ -822,7 +811,7 @@ class OpenCvPostProcess:
                     picture, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
                 )
             self.scale = scale
-            approx, ok = self._detect_pentagon(picture)
+            _, ok = self._detect_pentagon(picture)
             if not ok:
                 return CropResult(None, -1.0, None, "", 0.0, stage="no_pentagon")
             result = self._geometry_ocr(picture)
@@ -838,7 +827,7 @@ class OpenCvPostProcess:
                     house_ok=result.house_ok,
                 )
             return result
-        except Exception:  # noqa: BLE001 - 单个目标失败不影响整体
+        except Exception:
             LOGGER.exception("裁剪图识别异常")
             return CropResult(None, -1.0, None, "", 0.0, stage="error")
 
@@ -871,10 +860,7 @@ class OpenCvPostProcess:
                 row_deg = 90.0 + float(np.degrees(np.arctan2(vy, vx)))
                 stage = "min_angle"
                 # 兜底路径量到的也是顶角，只是门限宽（40~130°）；严格成立仍要求 ≈60°
-                house_ok = (
-                    abs(min_deg - self.HOUSE_APEX_ANGLE_DEG)
-                    <= self.HOUSE_APEX_ANGLE_TOL_DEG
-                )
+                house_ok = abs(min_deg - self.HOUSE_APEX_ANGLE_DEG) <= self.HOUSE_APEX_ANGLE_TOL_DEG
             rectified = self._rotate_img(image, row_deg)
             candidates = self._ocr_candidates(rectified)
             best = self._best_candidate(
@@ -886,7 +872,7 @@ class OpenCvPostProcess:
                 stage=stage,
                 house_ok=house_ok,
             )
-            # ⚠ 只有**形态成立**的结果才提前返回。形态不成立时继续往下试更宽松的
+            # ⚠ 只有形态成立的结果才提前返回。形态不成立时继续往下试更宽松的
             # 饱和度：真正的房子常常在那些级别才露出来（帧 1840 就是这样——严格
             # 级别给出假的"95"并一度抢先返回，真房子在 s_min=60 给出正确的 56）。
             if best.number is not None and best.house_ok:

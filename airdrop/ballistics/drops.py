@@ -34,9 +34,10 @@ import csv
 import json
 import logging
 import math
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -49,8 +50,8 @@ LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "DROPS_NAME",
-    "IMPACTS_JSONL_NAME",
     "IMPACTS_CSV_NAME",
+    "IMPACTS_JSONL_NAME",
     "DropRecord",
     "DropSample",
     "ImpactMeasurement",
@@ -161,9 +162,7 @@ class DropRecord:
         source: str = "manual",
     ) -> "DropRecord":
         """回填实测落点（返回新对象；本类是 frozen 的）。"""
-        return replace(
-            self, impact_ned=_vec3(impact_ned), impact_source=str(source)
-        )
+        return replace(self, impact_ned=_vec3(impact_ned), impact_source=str(source))
 
     def as_dict(self) -> dict[str, Any]:
         """落盘/进事件日志用的扁平字典（数值**不四舍五入**——这是原始数据）。"""
@@ -197,13 +196,9 @@ class DropRecord:
         if self.target_ned is not None:
             data["target_ned"] = [float(v) for v in self.target_ned]
         if self.release_position_ned is not None:
-            data["release_position_ned"] = [
-                float(v) for v in self.release_position_ned
-            ]
+            data["release_position_ned"] = [float(v) for v in self.release_position_ned]
         if self.predicted_impact_ned is not None:
-            data["predicted_impact_ned"] = [
-                float(v) for v in self.predicted_impact_ned
-            ]
+            data["predicted_impact_ned"] = [float(v) for v in self.predicted_impact_ned]
         if self.predicted_flight_time_s is not None:
             data["predicted_flight_time_s"] = float(self.predicted_flight_time_s)
         if self.predicted_error_m is not None:
@@ -225,17 +220,11 @@ class DropRecord:
         base = BallisticsConfig()
         ballistics = BallisticsConfig(
             mass_kg=float(raw_ballistics.get("mass_kg", base.mass_kg)),
-            drag_coefficient=float(
-                raw_ballistics.get("drag_coefficient", base.drag_coefficient)
-            ),
-            cross_area_m2=float(
-                raw_ballistics.get("cross_area_m2", base.cross_area_m2)
-            ),
+            drag_coefficient=float(raw_ballistics.get("drag_coefficient", base.drag_coefficient)),
+            cross_area_m2=float(raw_ballistics.get("cross_area_m2", base.cross_area_m2)),
             gravity=float(raw_ballistics.get("gravity", base.gravity)),
             rk_dt=float(raw_ballistics.get("rk_dt", base.rk_dt)),
-            air_density_isa=bool(
-                raw_ballistics.get("air_density_isa", base.air_density_isa)
-            ),
+            air_density_isa=bool(raw_ballistics.get("air_density_isa", base.air_density_isa)),
             wind_source=str(raw_ballistics.get("wind_source", base.wind_source)),
         )
         return cls(
@@ -250,8 +239,12 @@ class DropRecord:
             quaternion_wxyz=(
                 None
                 if quaternion is None
-                else (float(quaternion[0]), float(quaternion[1]),
-                      float(quaternion[2]), float(quaternion[3]))
+                else (
+                    float(quaternion[0]),
+                    float(quaternion[1]),
+                    float(quaternion[2]),
+                    float(quaternion[3]),
+                )
             ),
             wind_ned=_vec3(data.get("wind_ned")),
             origin=(
@@ -274,9 +267,7 @@ class DropRecord:
                 else float(data["predicted_flight_time_s"])
             ),
             predicted_error_m=(
-                None
-                if data.get("predicted_error_m") is None
-                else float(data["predicted_error_m"])
+                None if data.get("predicted_error_m") is None else float(data["predicted_error_m"])
             ),
             ballistics=ballistics,
             impact_ned=_vec3(data.get("impact_ned")),
@@ -284,7 +275,7 @@ class DropRecord:
         )
 
     @classmethod
-    def from_snapshot(
+    def from_snapshot(  # noqa: PLR0913 - 一次性把投放瞬间要记的量全收进来，拆开会更难对账
         cls,
         snapshot: TelemetrySnapshot,
         *,
@@ -319,10 +310,10 @@ class DropRecord:
             snapshot.quaternion_z,
         ):
             quaternion = (
-                float(snapshot.quaternion_w),      # type: ignore[arg-type]
-                float(snapshot.quaternion_x),      # type: ignore[arg-type]
-                float(snapshot.quaternion_y),      # type: ignore[arg-type]
-                float(snapshot.quaternion_z),      # type: ignore[arg-type]
+                float(snapshot.quaternion_w),  # type: ignore[arg-type]
+                float(snapshot.quaternion_x),  # type: ignore[arg-type]
+                float(snapshot.quaternion_y),  # type: ignore[arg-type]
+                float(snapshot.quaternion_z),  # type: ignore[arg-type]
             )
         return cls(
             index=int(index),
@@ -352,9 +343,7 @@ class DropRecord:
             predicted_flight_time_s=(
                 None if predicted_flight_time_s is None else float(predicted_flight_time_s)
             ),
-            predicted_error_m=(
-                None if predicted_error_m is None else float(predicted_error_m)
-            ),
+            predicted_error_m=(None if predicted_error_m is None else float(predicted_error_m)),
             ballistics=ballistics or BallisticsConfig(),
         )
 
@@ -401,7 +390,11 @@ def release_conditions(
     delay = float(record.delay_s if delay_s is None else delay_s)
     position = record.position_ned
     velocity = record.velocity_ned
-    p0 = tuple(position[i] + velocity[i] * delay for i in range(3))
+    p0: tuple[float, float, float] = (
+        position[0] + velocity[0] * delay,
+        position[1] + velocity[1] * delay,
+        position[2] + velocity[2] * delay,
+    )
     if offset_body_m is None or not any(float(v) for v in offset_body_m):
         return p0, velocity
     rotation = attitude_matrix(record)
@@ -411,10 +404,12 @@ def release_conditions(
             "（要么去掉 offset_body_m，要么补上姿态）"
         )
     offset_ned = rotation @ np.asarray(offset_body_m, dtype=np.float64).reshape(3)
-    return (
-        tuple(p0[i] + float(offset_ned[i]) for i in range(3)),
-        velocity,
+    shifted: tuple[float, float, float] = (
+        p0[0] + float(offset_ned[0]),
+        p0[1] + float(offset_ned[1]),
+        p0[2] + float(offset_ned[2]),
     )
+    return (shifted, velocity)
 
 
 def resolve_wind(record: DropRecord, *, scale: float = 1.0) -> tuple[float, float, float]:
@@ -425,8 +420,13 @@ def resolve_wind(record: DropRecord, *, scale: float = 1.0) -> tuple[float, floa
     """
     if record.wind_ned is None:
         return ZERO_WIND
+    wind = record.wind_ned
     factor = float(scale)
-    return tuple(float(value) * factor for value in record.wind_ned)  # type: ignore[return-value]
+    return (
+        float(wind[0]) * factor,
+        float(wind[1]) * factor,
+        float(wind[2]) * factor,
+    )
 
 
 def predict_record_impact(
@@ -443,9 +443,7 @@ def predict_record_impact(
     参数含义与 :func:`release_conditions` / :func:`resolve_wind` 一一对应；反演
     （:mod:`airdrop.ballistics.fit`）与报表都走这一个入口，免得两处各写一遍初始条件。
     """
-    position, velocity = release_conditions(
-        record, delay_s=delay_s, offset_body_m=offset_body_m
-    )
+    position, velocity = release_conditions(record, delay_s=delay_s, offset_body_m=offset_body_m)
     return model.predict_impact(
         position,
         velocity,
@@ -498,8 +496,12 @@ class ImpactMeasurement:
         filled = any(
             value is not None
             for value in (
-                self.lat_deg, self.lon_deg, self.alt_m,
-                self.north_m, self.east_m, self.down_m,
+                self.lat_deg,
+                self.lon_deg,
+                self.alt_m,
+                self.north_m,
+                self.east_m,
+                self.down_m,
             )
         )
         if filled:
@@ -510,27 +512,26 @@ class ImpactMeasurement:
 
     def to_ned(self, record: DropRecord) -> tuple[float, float, float]:
         """换算成 NED（用**该条记录**的原点；缺原点又给的是经纬度就报错）。"""
-        if self.has_lonlat:
+        lon_deg, lat_deg = self.lon_deg, self.lat_deg
+        if lon_deg is not None and lat_deg is not None:
             if record.origin is None:
                 raise ValueError(
                     f"index={self.index} 的落点给的是经纬度，但投放记录里没有 NED 原点，"
                     "无法换算——补上 origin，或直接给 north_m/east_m"
                 )
-            lon = float(self.lon_deg)
-            lat = float(self.lat_deg)
+            lon, lat = float(lon_deg), float(lat_deg)
             if self.alt_m is None:
                 # 只量了平面位置：高度按**原点地面高度**算。误差是二阶的——偏离原点
                 # 法线的高度误差要在几百米外才凑得出厘米级水平偏差（250m 处 500m
                 # 高度误差 ≈ 2cm），所以不值得为它要求必须量高度。
-                north, east, _ = wgs84_to_ned(
-                    lon, lat, float(record.origin.alt_m), record.origin
-                )
+                north, east, _ = wgs84_to_ned(lon, lat, float(record.origin.alt_m), record.origin)
                 return (north, east, float(record.ground_z))
             north, east, down = wgs84_to_ned(lon, lat, float(self.alt_m), record.origin)
             return (north, east, down)
-        if self.has_ned:
+        north_m, east_m = self.north_m, self.east_m
+        if north_m is not None and east_m is not None:
             down = float(record.ground_z if self.down_m is None else self.down_m)
-            return (float(self.north_m), float(self.east_m), down)
+            return (float(north_m), float(east_m), down)
         raise ValueError(f"index={self.index} 没有实测落点")
 
 
@@ -594,7 +595,7 @@ def load_drops(path: str | Path) -> tuple[DropRecord, ...]:
 def _iter_impact_rows(path: Path) -> Iterator[Mapping[str, Any]]:
     """按后缀选 JSONL / CSV 解析，统一产出字典（CSV 的空串按 None 处理）。"""
     if path.suffix.lower() == ".csv":
-        with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        with open(path, encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle):
                 yield {
                     key: (None if value is None or str(value).strip() == "" else value)
@@ -652,9 +653,7 @@ def load_impacts(path: str | Path) -> tuple[ImpactMeasurement, ...]:
                 note=str(row.get("note") or ""),
             )
         except ValueError as exc:
-            raise ValueError(
-                f"{target} 第 {number} 行的落点字段不是数字：{exc}"
-            ) from exc
+            raise ValueError(f"{target} 第 {number} 行的落点字段不是数字：{exc}") from exc
         measurements.append(measurement)
     return tuple(measurements)
 

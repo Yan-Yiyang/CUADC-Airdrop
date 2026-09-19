@@ -1,17 +1,17 @@
-"""`docs/handbook.md` §3 的示例逐条真跑：**文档里的示例必须真能运行**。
+"""docs/handbook.md §3 的示例逐条真跑：文档里的示例必须真能运行。
 
 为什么单独一个文件
 ------------------
 手册 §3 每个模块都给了一段"最小可运行示例"（离线、不碰硬件）。文档里的代码最容易腐烂：
-改了 API、改了默认值，示例照旧印在纸上，读者照着抄就报错。这个文件把那些示例**逐条搬成
-用例**——它们同时也是跨模块的接线冒烟：遥测 → 对齐 → 缓冲 → 解算 → 统计 → 弹道 → 任务 →
-记录回放，各跑一遍（细节由各自的 `test_*.py` 覆盖，这里只保证"按文档抄能跑通"）。
+改了 API、改了默认值，示例照旧印在纸上，读者照着抄就报错。这个文件把那些示例逐条搬成
+用例——它们同时也是跨模块的装配冒烟测试测试测试：遥测 → 对齐 → 缓冲 → 解算 → 统计 → 弹道 → 任务 →
+记录回放，各跑一遍（细节由各自的 test_*.py 覆盖，这里只保证"按文档抄能跑通"）。
 
 约定
 ----
 * 用例名与被验证的小节一一对应，改了手册那一段就改这里的同名函数；
-* 需要临时目录的用例用本文件的 `workdir` fixture（**不用 `tmp_path`**：受限沙箱里它会挂在
-  fixture 上，见 `AGENTS.md` 的"验证方式"）；
+* 需要临时目录的用例用本文件的 workdir fixture（不用 tmp_path：受限沙箱里它会挂在
+  fixture 上，见 AGENTS.md 的"验证方式"）；
 * 全部离线：不需要飞控、图传、GPU。
 """
 
@@ -21,6 +21,7 @@ import json
 import shutil
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,7 +44,6 @@ from airdrop import (
     LLARef,
     MissionConfig,
     MissionRunner,
-    MissionState,
     NedOrigin,
     OverflyConfig,
     PixelBox,
@@ -70,8 +70,8 @@ CAMERA = default_camera_model(320, 180)
 
 
 @pytest.fixture
-def workdir() -> Path:
-    """工作区内的临时目录；用例结束整棵删掉（不用 `tmp_path`：见模块 docstring）。"""
+def workdir() -> Iterator[Path]:
+    """工作区内的临时目录；用例结束整棵删掉（不用 tmp_path：见模块 docstring）。"""
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     path = WORK_ROOT / uuid.uuid4().hex[:8]
     path.mkdir()
@@ -83,7 +83,7 @@ def workdir() -> Path:
 
 # ----------------------------------------------------------------------
 def ex_telemetry() -> None:
-    """遥测：喂 MAVSDK 风格的更新，按时间查询（内插）。"""
+    """遥测：传入 MAVSDK 风格的更新，按时间查询（内插）。"""
     broker = TelemetryBroker(history_maxlen=1200, history_interval=0.0)
     position = SimpleNamespace(north_m=100.0, east_m=200.0, down_m=-50.0)
     velocity = SimpleNamespace(north_m_s=15.0, east_m_s=0.0, down_m_s=0.0)
@@ -108,9 +108,9 @@ def ex_align_and_buffer() -> None:
 
     image = np.zeros((180, 320, 3), dtype=np.uint8)
     # 帧的"收到时间" = 拍摄时刻 + 链路延时，于是 capture = timestamp - lag 正好落在遥测上
-    writer(VideoFrame(
-        index=1, image=image, timestamp=broker.get_snapshot().timestamp + 0.15, lag=0.15
-    ))
+    writer(
+        VideoFrame(index=1, image=image, timestamp=broker.get_snapshot().timestamp + 0.15, lag=0.15)
+    )
     record = buffer.latest()
     assert record is not None, "帧没有进缓冲（遥测没覆盖拍摄时刻？）"
     print("  入缓冲 #%d，拍摄时刻遥测 north=%s" % (record.index, record.snapshot.north_m))
@@ -131,11 +131,16 @@ def ex_georef() -> None:
     # 边长法独立估深度：depth ≈ f·S/(side_px·cos_tilt)；取与 50m 自洽的像素边长
     side_px = float(CAMERA.camera_matrix[0, 0]) * 1.0 / result.depth_m
     check = cross_check_by_side(
-        side_px=side_px, side_m=1.0, depth_by_intersection_m=result.depth_m,
-        camera=CAMERA, quaternion=(1.0, 0.0, 0.0, 0.0),
+        side_px=side_px,
+        side_m=1.0,
+        depth_by_intersection_m=result.depth_m,
+        camera=CAMERA,
+        quaternion=(1.0, 0.0, 0.0, 0.0),
     )
-    print("  边长法交叉验证 ok=%s 相对误差 %.4f（side_px=%.2f）"
-          % (check.ok, check.relative_error, side_px))
+    print(
+        "  边长法交叉验证 ok=%s 相对误差 %.4f（side_px=%.2f）"
+        % (check.ok, check.relative_error, side_px)
+    )
 
 
 # ----------------------------------------------------------------------
@@ -151,12 +156,15 @@ def ex_targeting() -> None:
     ]
     result = analyze(points, TargetingConfig(eps_m=0.75, min_samples=2))
     print("  选中编号 %s @ NED (%.2f, %.2f)" % (result.code, result.north_m, result.east_m))
-    print("  候选类 %d 个，噪声 %d，剔除 %d" % (len(result.clusters), len(result.noise), len(result.rejected)))
+    print(
+        "  候选类 %d 个，噪声 %d，剔除 %d"
+        % (len(result.clusters), len(result.noise), len(result.rejected))
+    )
 
 
 # ----------------------------------------------------------------------
 def ex_ballistics() -> None:
-    """弹道 + 投放判据：预测落点、越过目标保底投放。"""
+    """弹道 + 投放判据：预测落点、越过目标后强制投放。"""
     model = BallisticsModel(Config().ballistics)
     impact = model.predict_impact((0.0, 0.0, -20.0), (18.0, 0.0, 0.0), ground_z=0.0)
     print("  落点 %s，飞行时间 %.2fs" % (impact.ned, impact.flight_time_s))
@@ -168,13 +176,15 @@ def ex_ballistics() -> None:
     snapshot.north_m, snapshot.east_m, snapshot.down_m = 0.0, -35.0, -20.0
     snapshot.vx_m_s, snapshot.vy_m_s, snapshot.vz_m_s = 0.0, 18.0, 0.0
     decision = judge.update(snapshot, (0.0, 0.0, 0.0), now=snapshot.timestamp)
-    print("  判据: should_release=%s reason=%s 误差 %.2f m"
-          % (decision.should_release, decision.reason, decision.horizontal_error_m or -1.0))
+    print(
+        "  判据: should_release=%s reason=%s 误差 %.2f m"
+        % (decision.should_release, decision.reason, decision.horizontal_error_m or -1.0)
+    )
 
 
 # ----------------------------------------------------------------------
 def _mission_config() -> Config:
-    """手册 §3.8.4 里那段 `config = Config(...)`（两处要一起改：示例由本文件真跑）。"""
+    """手册 §3.8.4 里那段 config = Config(...)（两处要一起改：示例由本文件真跑）。"""
     return Config(
         routes=RoutesConfig(
             recon_route=(
@@ -188,7 +198,7 @@ def _mission_config() -> Config:
         ground=GroundConfig(ground_point_alt=500.0),
         # 离线示例：侦查航线由示例自己上传（auto）；正式任务用默认的 operator（操作手在 QGC 启动）
         mission=MissionConfig(recon_upload="auto"),
-        # 自检四项全关（示例里没有相机/模型）：**关掉 ≠ 通过**，只是离线跑通
+        # 自检四项全关（示例里没有相机/模型）：关掉 ≠ 通过，只是离线跑通
         preflight=PreflightConfig(
             load_detector=False,
             load_ocr=False,
@@ -205,8 +215,10 @@ def ex_mission_plan() -> None:
     print("  侦查任务项 %d 个，首项命令 %s" % (len(items), command_name(items[0].command)))
     origin = LLARef(lon_deg=8.0, lat_deg=47.0, alt_m=500.0)
     plan = build_drop_mission(config, origin=origin, target_ned=(300.0, 0.0, 0.0))
-    print("  投放任务：来源 %s，任务项 %d 个，目标 NED %s"
-          % (plan.source, len(plan.items), plan.target_ned))
+    print(
+        "  投放任务：来源 %s，任务项 %d 个，目标 NED %s"
+        % (plan.source, len(plan.items), plan.target_ned)
+    )
     print("  飞掠 entry/exit: %.6f / %.6f" % (plan.entry.lat, plan.exit.lat))
 
 
@@ -264,17 +276,21 @@ def ex_mission_runner() -> None:
         SimpleNamespace(north_m=0.0, east_m=-200.0, down_m=-40.0),
         SimpleNamespace(north_m_s=0.0, east_m_s=18.0, down_m_s=0.0),
     )
-    broker.update_in_air(True)         # 假飞控报告"已离地"（WAIT_AIRBORNE 那道门读它）
+    broker.update_in_air(True)  # 假飞控报告"已离地"（WAIT_AIRBORNE 那道门读它）
     runner = MissionRunner(config, controller, broker, clock=clock, sleep=lambda _s: None)
     for _ in range(4):
         runner.update()
         clock.now += 0.05
     controller.finished = True
     runner.update()
-    print("  状态 %s，上传 %d 次，历史 %d 条"
-          % (runner.state, runner.stats.uploads, len(runner.history)))
-    print("  最后一次转移: %s → %s (%s)"
-          % (runner.history[-1].from_state, runner.history[-1].to_state, runner.history[-1].reason))
+    print(
+        "  状态 %s，上传 %d 次，历史 %d 条"
+        % (runner.state, runner.stats.uploads, len(runner.history))
+    )
+    print(
+        "  最后一次转移: %s → %s (%s)"
+        % (runner.history[-1].from_state, runner.history[-1].to_state, runner.history[-1].reason)
+    )
 
 
 # ----------------------------------------------------------------------
@@ -282,7 +298,7 @@ def ex_drops_fit() -> None:
     """投放记录 + 反演：合成两条样本，反演出 Cd。"""
     from dataclasses import replace
 
-    truth = replace(Config().ballistics, drag_coefficient=0.8)   # 真值 Cd=0.8
+    truth = replace(Config().ballistics, drag_coefficient=0.8)  # 真值 Cd=0.8
     true_model = BallisticsModel(truth)
     records = [
         DropRecord(
@@ -292,7 +308,7 @@ def ex_drops_fit() -> None:
             velocity_ned=(speed, 0.0, -1.0),
             ground_z=0.0,
             delay_s=0.05,
-            ballistics=Config().ballistics,          # 记录里存的是当时的占位参数
+            ballistics=Config().ballistics,  # 记录里存的是当时的占位参数
         )
         for i, (height, speed) in enumerate([(25.0, 12.0), (45.0, 20.0)], start=1)
     ]
@@ -308,9 +324,14 @@ def ex_drops_fit() -> None:
 
     result = fit_ballistics(samples, FitConfig())
     print("  ok=%s reliable=%s（拟合参数 %s）" % (result.ok, result.reliable, list(result.fitted)))
-    print("  Cd=%.4f（真值 0.8），κ=Cd·A/m=%.5f，RMS=%.1e m"
-          % (result.parameters.get("drag_coefficient", float("nan")),
-             result.drag_k_per_m or float("nan"), result.rms_error_m or float("nan")))
+    print(
+        "  Cd=%.4f（真值 0.8），κ=Cd·A/m=%.5f，RMS=%.1e m"
+        % (
+            result.parameters.get("drag_coefficient", float("nan")),
+            result.drag_k_per_m or float("nan"),
+            result.rms_error_m or float("nan"),
+        )
+    )
 
 
 # ----------------------------------------------------------------------
@@ -318,16 +339,21 @@ def ex_cropproc() -> None:
     """裁剪图后处理（几何部分，不需要 OCR 权重）：五边形定位。"""
     image = np.zeros((320, 320, 3), dtype=np.uint8)
     side = 100
-    left, top = 110, 180                      # 正方形左上角
-    apex_y = int(top - side * (3 ** 0.5) / 2)  # 等边三角形顶角
+    left, top = 110, 180  # 正方形左上角
+    apex_y = int(top - side * (3**0.5) / 2)  # 等边三角形顶角
     pentagon = np.array(
-        [[left, top + side], [left + side, top + side],
-         [left + side, top], [left + side // 2, apex_y], [left, top]],
+        [
+            [left, top + side],
+            [left + side, top + side],
+            [left + side, top],
+            [left + side // 2, apex_y],
+            [left, top],
+        ],
         dtype=np.int32,
     )
-    cv2.fillPoly(image, [pentagon], (255, 0, 0))   # BGR：纯蓝
+    cv2.fillPoly(image, [pentagon], (255, 0, 0))  # BGR：纯蓝
     post = OpenCvPostProcess(color="blue")
-    post.image = image                        # edge_detection 用 self.image 作为输入
+    post.image = image  # edge_detection 用 self.image 作为输入
     approx, ok = post.edge_detection()
     print("  五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_min))
 
@@ -342,21 +368,45 @@ def ex_perception_worker() -> None:
     from airdrop import AlignedSample
 
     for index in (1, 2, 3):
-        frame = VideoFrame(index=index, image=np.zeros((180, 320, 3), dtype=np.uint8),
-                           timestamp=time.time(), lag=0.15)
-        buffer.put(AlignedSample(frame=frame, snapshot=snapshot, timestamp=frame.timestamp,
-                                 lag=0.15, mode="interpolate"))
+        frame = VideoFrame(
+            index=index,
+            image=np.zeros((180, 320, 3), dtype=np.uint8),
+            timestamp=time.time(),
+            lag=0.15,
+        )
+        buffer.put(
+            AlignedSample(
+                frame=frame,
+                snapshot=snapshot,
+                timestamp=frame.timestamp,
+                lag=0.15,
+                mode="interpolate",
+            )
+        )
 
     class _FakeDetector:
         def load(self):
             return self
 
-        def detect(self, image, *, frame_index=0, capture_timestamp=0.0,
-                   telemetry=None, mode="", undistort=None):
+        def detect(
+            self,
+            image,
+            *,
+            frame_index=0,
+            capture_timestamp=0.0,
+            telemetry=None,
+            mode="",
+            undistort=None,
+        ):
             detection = Detection(
-                frame_index=frame_index, capture_timestamp=capture_timestamp,
-                pixel=(160.0, 90.0), box=PixelBox(150.0, 80.0, 170.0, 100.0),
-                confidence=0.9, telemetry=telemetry, code=7, mode=mode,
+                frame_index=frame_index,
+                capture_timestamp=capture_timestamp,
+                pixel=(160.0, 90.0),
+                box=PixelBox(150.0, 80.0, 170.0, 100.0),
+                confidence=0.9,
+                telemetry=telemetry,
+                code=7,
+                mode=mode,
             )
             return DetectionBatch(image=image, detections=(detection,), undistorted=False)
 
@@ -372,8 +422,9 @@ def ex_perception_worker() -> None:
             time.sleep(0.05)
     finally:
         worker.stop()
-    print("  结果 %d 条，编号 %s，统计 %s"
-          % (len(results), [d.code for d in results], worker.stats))
+    print(
+        "  结果 %d 条，编号 %s，统计 %s" % (len(results), [d.code for d in results], worker.stats)
+    )
 
 
 # ----------------------------------------------------------------------
@@ -406,13 +457,16 @@ def ex_recorder_replay(work: Path) -> None:
     jpeg = cv2.imencode(".jpg", np.zeros((180, 320, 3), dtype=np.uint8))[1].tobytes()
     (frames_dir / "000001.jpg").write_bytes(jpeg)
     index_line = {
-        "index": 1, "filename": "000001.jpg", "capture_timestamp": base,
-        "received_timestamp": base + 0.15, "lag": 0.15, "extrapolated": False,
-        "offset": 0.0, "bytes": len(jpeg),
+        "index": 1,
+        "filename": "000001.jpg",
+        "capture_timestamp": base,
+        "received_timestamp": base + 0.15,
+        "lag": 0.15,
+        "extrapolated": False,
+        "offset": 0.0,
+        "bytes": len(jpeg),
     }
-    (flight_dir / "frames_index.jsonl").write_text(
-        json.dumps(index_line) + "\n", encoding="utf-8"
-    )
+    (flight_dir / "frames_index.jsonl").write_text(json.dumps(index_line) + "\n", encoding="utf-8")
 
     log = FlightLog.open(flight_dir)
     assert sum(1 for _ in log.iter_telemetry()) == 3
@@ -442,7 +496,7 @@ def ex_recorder_replay(work: Path) -> None:
 # 手册 §3 的 11 个示例，一条一个用例
 # ----------------------------------------------------------------------
 def test_handbook_telemetry_snippet() -> None:
-    """§3.1 遥测：喂 MAVSDK 风格的更新，按时间查询。"""
+    """§3.1 遥测：传入 MAVSDK 风格的更新，按时间查询。"""
     ex_telemetry()
 
 

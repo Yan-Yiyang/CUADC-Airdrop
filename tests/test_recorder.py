@@ -1,9 +1,10 @@
 """``FlightRecorder`` 的单元测试。
 
-所有用例都跑在 ``pytest`` 的 ``tmp_path`` 下，**离线**——不需要飞控、不需要
-ffmpeg、不需要硬件。手动往 ``AlignmentBuffer`` 喂帧、往 ``TelemetryBroker``
-灌数据，验证五件套 + 投放记录落盘 + 帧零重编码 + 线程安全 + 幂等行为。
+所有用例都跑在 ``pytest`` 的 ``tmp_path`` 下，离线——不需要飞控、不需要
+ffmpeg、不需要硬件。手动往 ``AlignmentBuffer`` 传入帧、往 ``TelemetryBroker``
+灌数据，验证五个记录文件 + 投放记录写入磁盘 + 帧零重编码 + 线程安全 + 幂等行为。
 """
+
 from __future__ import annotations
 
 import json
@@ -13,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -98,7 +99,7 @@ def _wait_until(predicate, timeout: float = 4.0, interval: float = 0.05) -> bool
 # 核心场景
 # ----------------------------------------------------------------------
 def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: TelemetryBroker) -> None:
-    """完整生命周期：start → 喂帧/遥测/事件/检测 → stop → 五件套齐全。"""
+    """完整生命周期：start → 传入帧/遥测/事件/检测 → stop → 五个记录文件齐全。"""
     buffer = AlignmentBuffer(capacity=32, storage="jpeg")
     config = Config().validated()
     recorder = FlightRecorder(config, base_dir=tmp_path)
@@ -119,7 +120,7 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
         assert flight_dir is not None
         assert flight_dir.exists()
         assert (flight_dir / "frames").is_dir()
-        assert (flight_dir / "config_snapshot.json").exists()  # 立刻落盘
+        assert (flight_dir / "config_snapshot.json").exists()  # 立刻写入磁盘
 
         # 5 帧
         for i in range(1, 6):
@@ -153,7 +154,7 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
             )
         )
 
-        # 等 recorder 把帧全部落盘
+        # 等 recorder 把帧全部写入磁盘
         assert _wait_until(
             lambda: recorder._frames_written == 5,
             timeout=4.0,
@@ -177,7 +178,7 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
         flight_dir / "config_snapshot.json",
     }
     missing = {p for p in expected_files if not p.exists()}
-    assert not missing, f"五件套 + 投放记录缺失: {missing}"
+    assert not missing, f"五个记录文件 + 投放记录缺失: {missing}"
 
     # 帧文件齐
     frame_files = sorted((flight_dir / "frames").glob("*.jpg"))
@@ -189,7 +190,13 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
         assert data[:2] == b"\xff\xd8", f"{f} 不是 JPEG"
 
     # frames_index.jsonl 行数 == 5，字段齐全
-    index_lines = (flight_dir / "frames_index.jsonl").read_text("utf-8").strip().split("\n")
+    # cast 只为让类型检查器知道这是 str（Path.read_text 的桩返回 str，但组合
+    # 表达式里 pyright 推成了 Never）；运行时就是普通的 str。
+    index_lines = (
+        cast(str, (flight_dir / "frames_index.jsonl").read_text(encoding="utf-8"))
+        .strip()
+        .split("\n")
+    )
     assert len(index_lines) == 5
     for line in index_lines:
         rec = json.loads(line)
@@ -202,17 +209,21 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
         assert rec["bytes"] > 0
 
     # events.jsonl 含 recorder_started/state/recorder_stopped
-    ev_lines = (flight_dir / "events.jsonl").read_text("utf-8").strip().split("\n")
-    kinds = [json.loads(l)["kind"] for l in ev_lines]
+    ev_lines = (
+        cast(str, (flight_dir / "events.jsonl").read_text(encoding="utf-8")).strip().split("\n")
+    )
+    kinds = [json.loads(item)["kind"] for item in ev_lines]
     assert kinds[0] == "recorder_started"
     assert "state" in kinds
     assert kinds[-1] == "recorder_stopped"
-    state_record = next(json.loads(l) for l in ev_lines if json.loads(l)["kind"] == "state")
+    state_record = next(
+        json.loads(item) for item in ev_lines if json.loads(item)["kind"] == "state"
+    )
     assert state_record["from_state"] == "RECON"
     assert state_record["to_state"] == "HOLD"
 
     # detections.jsonl 含 1 条 dict + 1 条 dataclass
-    det_lines = (flight_dir / "detections.jsonl").read_text("utf-8").strip().split("\n")
+    det_lines = (flight_dir / "detections.jsonl").read_text(encoding="utf-8").strip().split("\n")
     assert len(det_lines) == 2
     first = json.loads(det_lines[0])
     second = json.loads(det_lines[1])
@@ -221,30 +232,28 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
     assert "as_dict" not in second  # dataclass 已展开为字段
 
     # drops.jsonl：投放瞬间的状态（位置/速度/姿态/风）与判据的预测都要在
-    drop_lines = (flight_dir / "drops.jsonl").read_text("utf-8").strip().split("\n")
+    drop_lines = (flight_dir / "drops.jsonl").read_text(encoding="utf-8").strip().split("\n")
     assert len(drop_lines) == 1
     drop = json.loads(drop_lines[0])
     assert drop["index"] == 1
     assert drop["position_ned"] == pytest.approx([120.0, -35.0, -20.0])
     assert drop["velocity_ned"] == pytest.approx([0.0, 18.0, 0.0])
-    assert drop["attitude_deg"] == pytest.approx(
-        {"roll": 4.0, "pitch": -3.0, "yaw": 90.0}
-    )
+    assert drop["attitude_deg"] == pytest.approx({"roll": 4.0, "pitch": -3.0, "yaw": 90.0})
     assert drop["wind_ned"] == pytest.approx([2.0, -1.0, 0.0])
     assert drop["delay_s"] == pytest.approx(0.08)
     assert drop["predicted_error_m"] == pytest.approx(0.45)
 
     # flight.log 含 recorder 启动信息（root logger 被挂上 FileHandler）
-    log_text = (flight_dir / "flight.log").read_text("utf-8")
+    log_text = (flight_dir / "flight.log").read_text(encoding="utf-8")
     assert "FlightRecorder 已启动" in log_text
 
     # config_snapshot.json 含 video/record/perception 全套
-    cfg = json.loads((flight_dir / "config_snapshot.json").read_text("utf-8"))
+    cfg = json.loads((flight_dir / "config_snapshot.json").read_text(encoding="utf-8"))
     assert "video" in cfg and "record" in cfg and "perception" in cfg
     assert cfg["record"]["telemetry_hz"] == pytest.approx(10.0)
 
     # telemetry 节流：30Hz 灌入约 150ms，期望 1~10 行（10Hz 兜底；远小于 30）
-    tlm_lines = (flight_dir / "telemetry.jsonl").read_text("utf-8").strip().split("\n")
+    tlm_lines = (flight_dir / "telemetry.jsonl").read_text(encoding="utf-8").strip().split("\n")
     assert 1 <= len(tlm_lines) <= 15, f"telemetry 节流异常：{len(tlm_lines)} 行"
 
     # stats 仍可读
@@ -261,7 +270,7 @@ def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: Telemetry
 # 零重编码（核心承诺）
 # ----------------------------------------------------------------------
 def test_jpeg_storage_writes_zero_reencode(tmp_path: Path, broker: TelemetryBroker) -> None:
-    """jpeg 模式下，落盘的 jpeg 字节 == 缓冲里的 jpeg 字节（hash 完全相等）。"""
+    """jpeg 模式下，写入磁盘的 jpeg 字节 == 缓冲里的 jpeg 字节（hash 完全相等）。"""
     buffer = AlignmentBuffer(capacity=4, storage="jpeg", jpeg_quality=80)
     config = Config().validated()
     recorder = FlightRecorder(config, base_dir=tmp_path)
@@ -277,7 +286,7 @@ def test_jpeg_storage_writes_zero_reencode(tmp_path: Path, broker: TelemetryBrok
     on_disk = (flight_dir / "frames" / "000001.jpg").read_bytes()
     in_buffer = buffer.read_jpeg_bytes(1)
     assert in_buffer is not None
-    assert on_disk == in_buffer, "jpeg 落盘字节 != 缓冲字节（发生重编码）"
+    assert on_disk == in_buffer, "jpeg 写入磁盘字节 != 缓冲字节（发生重编码）"
 
     stats = recorder.stats()
     assert stats is not None
@@ -288,7 +297,7 @@ def test_jpeg_storage_writes_zero_reencode(tmp_path: Path, broker: TelemetryBrok
 # raw 缓冲：自动重新编码
 # ----------------------------------------------------------------------
 def test_raw_storage_reencodes_with_cv2(tmp_path: Path, broker: TelemetryBroker) -> None:
-    """raw 缓冲下 ``read_jpeg_bytes`` 返回 None → recorder 自行 cv2.imencode 落盘。"""
+    """raw 缓冲下 ``read_jpeg_bytes`` 返回 None → recorder 自行 cv2.imencode 写入磁盘。"""
     buffer = AlignmentBuffer(capacity=4, storage="raw")
     config = Config().validated()
     recorder = FlightRecorder(config, base_dir=tmp_path)
@@ -350,9 +359,7 @@ def test_cannot_restart_after_stop(tmp_path: Path, broker: TelemetryBroker) -> N
 # ----------------------------------------------------------------------
 # 同名时间戳目录不冲突
 # ----------------------------------------------------------------------
-def test_repeated_timestamp_increments_suffix(
-    tmp_path: Path, broker: TelemetryBroker
-) -> None:
+def test_repeated_timestamp_increments_suffix(tmp_path: Path, broker: TelemetryBroker) -> None:
     """两次 start 用同样的"时间戳"时，第二次要落到 ``-1`` 子目录。"""
     import time as _time
 
@@ -405,7 +412,7 @@ def test_event_log_thread_safe(tmp_path: Path) -> None:
         t.join()
     log.close()
 
-    lines = (tmp_path / "events.jsonl").read_text("utf-8").strip().split("\n")
+    lines = (tmp_path / "events.jsonl").read_text(encoding="utf-8").strip().split("\n")
     assert len(lines) == 250
     parsed = [json.loads(l) for l in lines]
     kinds = {p["kind"] for p in parsed}
@@ -434,7 +441,7 @@ def test_detection_writer_accepts_dict_mapping_and_dataclass(tmp_path: Path) -> 
     writer.append(object())  # 不可序列化
     writer.close()
 
-    lines = (tmp_path / "d.jsonl").read_text("utf-8").strip().split("\n")
+    lines = (tmp_path / "d.jsonl").read_text(encoding="utf-8").strip().split("\n")
     assert len(lines) == 3  # object() 被拒绝
     parsed = [json.loads(l) for l in lines]
     assert [p["code"] for p in parsed] == [1, 2, 3]
@@ -485,6 +492,6 @@ def test_telemetry_throttle_reduces_high_rate_input(tmp_path: Path) -> None:
 
     flight_dir = recorder.flight_dir
     assert flight_dir is not None
-    lines = (flight_dir / "telemetry.jsonl").read_text("utf-8").strip().split("\n")
+    lines = (flight_dir / "telemetry.jsonl").read_text(encoding="utf-8").strip().split("\n")
     # 10Hz × 1.3s ≈ 13 行；留 5~25 的余量；绝对不能 == 200
     assert 3 <= len(lines) <= 25, f"节流异常: {len(lines)} 行"

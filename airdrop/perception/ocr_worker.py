@@ -7,6 +7,7 @@ import multiprocessing as mp
 import queue
 import time
 from dataclasses import dataclass, field
+from multiprocessing.context import SpawnProcess
 from typing import Any
 
 import numpy as np
@@ -126,7 +127,7 @@ def ocr_worker_main(
                 elapsed_ms=(time.perf_counter() - started) * 1000.0,
                 rectified=crop_result.rectified,
             )
-        except Exception as exc:  # noqa: BLE001 - 单帧失败不能拖垮 worker
+        except Exception as exc:
             log.exception("OCR 处理异常 帧#%d", request.frame_index)
             result = OcrResult(
                 request_id=request.request_id,
@@ -161,7 +162,9 @@ class OcrWorkerPool:
         self._context = mp.get_context("spawn")  # Windows 默认；显式声明意图
         self._request_q: Any = self._context.Queue(maxsize=queue_size)
         self._result_q: Any = self._context.Queue(maxsize=result_queue_size)
-        self._processes: list[mp.Process] = []
+        # spawn 上下文的 Process 是 SpawnProcess（`mp.Process` 只是基类名），
+        # 按实际类型标注才不会被类型检查判成"装不进去"
+        self._processes: list[SpawnProcess] = []
         self._next_id = 0
         self._submitted = 0
         self._dropped = 0
@@ -216,7 +219,7 @@ class OcrWorkerPool:
                 try:  # 队列满：挤掉一个再放
                     self._request_q.get_nowait()
                     self._request_q.put_nowait(None)
-                except (queue.Empty, queue.Full):  # pragma: no cover
+                except queue.Empty, queue.Full:  # pragma: no cover
                     pass
         for process in self._processes:
             process.join(timeout)

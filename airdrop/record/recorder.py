@@ -44,15 +44,17 @@
 下磁盘写入约 4.5 MB/s。换更高画质（``storage="raw"``）开销 18 倍，1.5
 分钟就是 13 GiB。先按 jpeg 跑，回看时发现像素级问题再临时切 raw。
 """
+
 from __future__ import annotations
 
 import json
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import cv2
 import numpy as np
@@ -109,7 +111,8 @@ class _JsonlWriter:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = threading.RLock()
-        self._file = open(path, "a", encoding="utf-8")
+        # SIM115：这个句柄要活到 close()，是有意为之的长生命周期（不是漏了 with）
+        self._file = open(path, "a", encoding="utf-8")  # noqa: SIM115
         self._closed = False
         self._count = 0
 
@@ -126,7 +129,7 @@ class _JsonlWriter:
         """写入一条；返回是否成功。失败只记日志、不抛出。"""
         try:
             line = json.dumps(record, ensure_ascii=False, default=_json_default)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             LOGGER.exception("无法序列化 JSONL 记录: %s", dict(record))
             return False
         try:
@@ -229,8 +232,12 @@ class DropWriter(_JsonlWriter):
 
 def _payload_of(record: Any) -> dict[str, Any] | None:
     """把任意"记录对象"摊成字典：``as_dict()`` > Mapping > ``__dict__`` > None。"""
-    if hasattr(record, "as_dict") and callable(record.as_dict):
-        return dict(record.as_dict())
+    as_dict = getattr(record, "as_dict", None)
+    if callable(as_dict):
+        payload = as_dict()
+        # 只认映射：as_dict() 返回别的东西就当没这个方法，继续往下退（不抛异常）
+        if isinstance(payload, Mapping):
+            return dict(payload)
     if isinstance(record, Mapping):
         return dict(record)
     if hasattr(record, "__dict__"):
@@ -256,16 +263,16 @@ class RecorderStats:
     """Recorder 运行统计（线程安全地取）。"""
 
     __slots__ = (
-        "flight_dir",
-        "frames_written",
-        "telemetry_written",
-        "events",
         "detections",
         "drops",
+        "events",
+        "flight_dir",
+        "frames_written",
         "raw_reencoded",
+        "telemetry_written",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0917 - 统计项本身就是这个数量，位置参数与字段一一对应
         self,
         flight_dir: Path,
         frames_written: int,
@@ -487,7 +494,7 @@ class FlightRecorder:
                     detections=self._detections.count if self._detections else 0,
                     drops=self._drops.count if self._drops else 0,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 LOGGER.exception("recorder_stopped 事件写入失败")
 
         self._uninstall_log_handler()
@@ -500,9 +507,7 @@ class FlightRecorder:
         # 优先取实时计数（运行中）；stop 后 _events/_detections 会被置 None，
         # 此时用缓存字段（_events_written / _detections_written）。
         events = self._events.count if self._events else self._events_written
-        detections = (
-            self._detections.count if self._detections else self._detections_written
-        )
+        detections = self._detections.count if self._detections else self._detections_written
         drops = self._drops.count if self._drops else self._drops_written
         return RecorderStats(
             flight_dir=self._flight_dir,
@@ -532,7 +537,7 @@ class FlightRecorder:
             cursor = frame.index
             try:
                 self._write_one_frame(frame, frames_dir, index_file)
-            except Exception:  # noqa: BLE001 - 单帧失败不能打断整条飞行
+            except Exception:
                 LOGGER.exception("录制帧 #%d 失败", frame.index)
 
     def _write_one_frame(
@@ -589,8 +594,7 @@ class FlightRecorder:
                     # 一条遥测都没收到时的初始空快照不能入库：回放时它会成为
                     # 历史区间最左端的一个"全 None"端点，让最先几帧内插到
                     # None。正式飞行里它出现在第一帧遥测之前，会被这里挡掉。
-                    s.is_valid()
-                    and s.timestamp >= last + interval
+                    s.is_valid() and s.timestamp >= last + interval
                 ),
                 timeout=1.0,
             )
@@ -598,7 +602,9 @@ class FlightRecorder:
                 continue
             last_write_ts = snapshot.timestamp
             try:
-                out.write(json.dumps(snapshot.as_dict(), ensure_ascii=False, default=_json_default) + "\n")
+                out.write(
+                    json.dumps(snapshot.as_dict(), ensure_ascii=False, default=_json_default) + "\n"
+                )
                 out.flush()
             except OSError:
                 LOGGER.exception("telemetry 写入失败")
@@ -638,10 +644,11 @@ class FlightRecorder:
         self._events = EventLog(self._flight_dir / EVENTS_NAME)
         self._detections = DetectionWriter(self._flight_dir / DETECTIONS_NAME)
         self._drops = DropWriter(self._flight_dir / DROPS_NAME)
-        self._telemetry_file = open(
+        # SIM115：两个句柄都活到 _close_files()，长生命周期是有意为之
+        self._telemetry_file = open(  # noqa: SIM115
             self._flight_dir / TELEMETRY_NAME, "a", encoding="utf-8"
         )
-        self._frames_index_file = open(
+        self._frames_index_file = open(  # noqa: SIM115
             self._flight_dir / FRAMES_INDEX_NAME, "a", encoding="utf-8"
         )
 
@@ -673,9 +680,7 @@ class FlightRecorder:
     # ------------------------------------------------------------------
     def _install_log_handler(self) -> None:
         assert self._flight_dir is not None
-        handler = logging.FileHandler(
-            self._flight_dir / FLIGHT_LOG_NAME, encoding="utf-8"
-        )
+        handler = logging.FileHandler(self._flight_dir / FLIGHT_LOG_NAME, encoding="utf-8")
         handler.setLevel(logging.INFO)
         handler.setFormatter(
             logging.Formatter(
@@ -699,7 +704,7 @@ class FlightRecorder:
             return
         try:
             logging.getLogger().removeHandler(handler)
-        except Exception:  # noqa: BLE001
+        except Exception:
             LOGGER.exception("移除 log handler 失败")
         try:
             handler.flush()

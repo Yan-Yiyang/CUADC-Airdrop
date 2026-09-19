@@ -1,23 +1,23 @@
-"""核验 `docs/handbook.md` 与代码是否一致（文档不许漂）。
+"""核验 docs/handbook.md 与代码是否一致（文档不许漂）。
 
-用法（**命令行解析在 `airdrop/run.py`**）::
+用法（命令行解析在 airdrop/run.py）::
 
     ./.venv/Scripts/python.exe -m airdrop.run check-docs
     ./.venv/Scripts/python.exe -m tools.check_docs          # 等价写法
 
 检查七件事
 ----------
-1. **参数齐全**：`airdrop.config` 里每个 dataclass 的每个字段都出现在手册里；
-2. **公开 API 齐全**：`airdrop.__all__` 里的类/函数名都出现在手册里；
-3. **引用可解析**：手册里每个 `` `airdrop.x.y` `` 引用都能真正 import + getattr 到
+1. 参数齐全：airdrop.config 里每个 dataclass 的每个字段都出现在手册里；
+2. 公开 API 齐全：airdrop.__all__ 里的类/函数名都出现在手册里；
+3. 引用可解析：手册里每个 `` airdrop.x.y `` 引用都能真正 import + getattr 到
    （这条专抓"文档里写了不存在的 API"这类幻觉）；
-4. **产物文件名齐全**：飞行目录七件套、标定产物、反演输入输出等文件名都在手册里；
-5. **入口与测试覆盖**：`airdrop.run` 的**每个子命令**与 `tests/*.py` 都被手册覆盖；
-6. **章节结构**：目录 / 模块 / 参数 / 输出 / 流程 / 审查 六个主题都有；
-7. **反查编造**：形似 config 字段（`*_m` / `*_s` / `*_hz` …）但 config 里没有的名字。
+4. 产物文件名齐全：飞行目录七个文件、标定产物、反演输入输出等文件名都在手册里；
+5. 入口与测试覆盖：airdrop.run 的每个子命令与 tests/*.py 都被手册覆盖；
+6. 章节结构：目录 / 模块 / 参数 / 输出 / 流程 / 审查 六个主题都有；
+7. 反查编造：形似 config 字段（*_m / *_s / *_hz …）但 config 里没有的名字。
 
-⚠ 检查 3 在**子进程**里做：要核验 `airdrop.video.buffer` 这类引用就得真 import 它们
-（会加载 cv2 / mavsdk），而本工具本身是被 `airdrop.run check-docs` 调起来的——
+⚠ 检查 3 在子进程里做：要核验 airdrop.video.buffer 这类引用就得真 import 它们
+（会加载 cv2 / mavsdk），而本工具本身是被 airdrop.run check-docs 调起来的——
 "帮助/工具入口不加载重库"这条约束因此要求把重活挪出本进程。语义与直接 import 完全一致。
 
 退出码：0 = 全过；1 = 有缺口（缺口逐条打印，方便直接补文档）。
@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib
 import inspect
@@ -57,7 +58,7 @@ REQUIRED_FILES: tuple[str, ...] = (
 )
 
 #: 必须在手册里出现的入口与测试文件
-#: （**子命令**由 `airdrop.run.SUBCOMMANDS` 动态给出，见 main 的第 5 项检查）
+#: （子命令由 airdrop.run.SUBCOMMANDS 动态给出，见 main 的第 5 项检查）
 REQUIRED_ENTRIES: tuple[str, ...] = (
     "tests/test_config.py",
     "tests/test_telemetry.py",
@@ -123,7 +124,7 @@ print(json.dumps(bad))
 def _resolve_all(references: list[str]) -> tuple[list[str], str]:
     """批量核验引用；返回 ``(不可解析的引用, 错误说明)``。
 
-    在**子进程**里 import：核验 ``airdrop.video.buffer`` 这类引用必然加载 cv2 / mavsdk，
+    在子进程里 import：核验 ``airdrop.video.buffer`` 这类引用必然加载 cv2 / mavsdk，
     而本工具会被 ``airdrop.run check-docs`` 调起来——那条路径要求"CLI 进程不加载重库"。
     子进程继承工作目录（``python -c`` 会把 cwd 放进 ``sys.path``），语义与直接 import 一致。
     """
@@ -135,6 +136,7 @@ def _resolve_all(references: list[str]) -> tuple[list[str], str]:
         encoding="utf-8",
         errors="replace",
         timeout=600,
+        check=False,  # 探针的失败信息由 stdout 回传，这里不看退出码
     )
     if probe.returncode != 0:
         return [], f"引用核验子进程退出码 {probe.returncode}：{probe.stderr.strip()[:200]}"
@@ -160,13 +162,14 @@ def main(**overrides) -> int:
     """跑一遍全部检查；关键字与 :func:`build_config` 一致。返回进程退出码。"""
     settings = build_config(**overrides)
     doc_path = Path(settings.doc_path)
-    # 控制台编码（编码不支持Unicode时）装不下的字符**不要炸**：本文件早先在这里
+    # 控制台编码（编码不支持Unicode时）装不下的字符不要抛出异常：本文件早先在这里
     # 因为打印 "✅"/"❌" 抛过 UnicodeEncodeError，把退出码变成了 1 —— 检查
     # 明明全过，却看起来像失败。结论行改成 ASCII，同时给 stdout 加 replace 兜底。
-    try:
-        sys.stdout.reconfigure(errors="replace")
-    except (AttributeError, ValueError):  # pragma: no cover - 非标准 stdout
-        pass
+    with contextlib.suppress(AttributeError, ValueError):
+        # 非标准 stdout（已被重定向/包装）时放弃，不影响检查结果。
+        # `reconfigure` 只在 TextIOWrapper 上有，类型桩里的 `sys.stdout` 是 TextIO，
+        # 所以这里显式忽略"没有该属性"。
+        sys.stdout.reconfigure(errors="replace")  # pyright: ignore[reportAttributeAccessIssue]
     if not doc_path.exists():
         print(f"找不到手册：{doc_path}", file=sys.stderr)
         return 1
@@ -189,7 +192,10 @@ def main(**overrides) -> int:
             field_count += 1
             if f"`{field.name}`" not in text and f" {field.name} " not in text:
                 missing.append(f"{class_name}.{field.name}")
-    report(f"config 字段齐全（{len(tables)} 个 dataclass / {field_count} 个字段）", sorted(set(missing)))
+    report(
+        f"config 字段齐全（{len(tables)} 个 dataclass / {field_count} 个字段）",
+        sorted(set(missing)),
+    )
 
     # 2) 顶层公开 API
     top = importlib.import_module("airdrop")
@@ -200,18 +206,18 @@ def main(**overrides) -> int:
     ]
     report(f"顶层公开 API 齐全（{len(top.__all__)} 个名字）", sorted(missing))
 
-    # 3) `airdrop.*` 引用可解析（在子进程里真 import，避免本进程拉起 cv2/mavsdk）
+    # 3) airdrop.* 引用可解析（在子进程里真 import，避免本进程拉起 cv2/mavsdk）
     refs = sorted(set(re.findall(r"`(airdrop\.[A-Za-z_][\w.]*)", text)))
     bad, probe_error = _resolve_all(refs)
     if probe_error:
         print(f"[FAIL] 引用核验没能跑起来：{probe_error}")
         failures.append("引用核验子进程")
-    report(f"文档里的 `airdrop.*` 引用可解析（共 {len(refs)} 个）", bad)
+    report(f"文档里的 airdrop.* 引用可解析（共 {len(refs)} 个）", bad)
 
     # 4) 产物文件名
     report("产物/输入文件名齐全", [name for name in REQUIRED_FILES if name not in text])
 
-    # 5) 入口与测试文件：**子命令**取自 airdrop.run 的注册表（加子命令就必须写进手册）
+    # 5) 入口与测试文件：子命令取自 airdrop.run 的注册表（加子命令就必须写进手册）
     entry_missing = [name for name in REQUIRED_ENTRIES if name not in text]
     report("测试文件被文档覆盖", entry_missing)
     from airdrop.run import SUBCOMMANDS  # 惰性导入：只有本检查需要它

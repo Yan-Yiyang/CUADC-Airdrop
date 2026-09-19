@@ -1,25 +1,25 @@
 """标定采集示例：录一个标准飞行目录给 ``tools/calibrate.py`` 用。
 
-用法（**集中式入口在 `airdrop/run.py`**）::
+用法（集中式入口在 airdrop/run.py）::
 
     ./.venv/Scripts/python.exe -m airdrop.run calibration-capture
     ./.venv/Scripts/python.exe -m airdrop.run calibration-capture --rtsp-url rtsp://... --telemetry-lag 0.18
 
-本文件是**纯库模块**：顶部常量是默认值，`build_config(**覆盖)` / `main(**kwargs)` 按需传值；
-命令行由 `airdrop/run.py` 解析，重依赖都在函数体内导入（`--help` 不加载它们）。
+本文件是纯库模块：顶部常量是默认值，build_config(**覆盖) / main(**kwargs) 按需传值；
+命令行由 airdrop/run.py 解析，重依赖都在函数体内导入（--help 不加载它们）。
 
 采集方法（"板子不动、飞机在动"）
 --------------------------------
-1. 棋盘格**固定**放在地面/桌面，板面平整，方格边长用尺量准（``BOARD_SQUARE_M``
+1. 棋盘格固定放在地面/桌面，板面平整，方格边长用尺量准（``BOARD_SQUARE_M``
    只是提醒——真正填进 ``tools/calibrate.py`` 的是你量出来的那个值）；
 2. 飞机通电（飞控输出姿态）、相机正常拉流；
-3. **手持飞机在棋盘格上方缓慢平移 + 旋转**，让棋盘格全程可见，并且要有充分的
-   **旋转激励**（至少绕两个不平行的轴转）——时间差互相关与手眼标定都靠它；
+3. 手持飞机在棋盘格上方缓慢平移 + 旋转，让棋盘格全程可见，并且要有充分的
+   旋转激励（至少绕两个不平行的轴转）——时间差互相关与手眼标定都靠它；
 4. 录完按 Ctrl-C 结束，目录会打印出来，把它作为标定工具的输入
    （``python -m airdrop.run calibrate --flight <目录>``）。
 
 建议：标定时把姿态流速率调高（``config.telemetry.attitude_rate_hz``，本示例用 50Hz），
-姿态内插误差直接进外参。录出来的就是标准飞行目录（五件套），标定脚本读它即可。
+姿态内插误差直接进外参。录出来的就是标准飞行目录（五个记录文件），标定脚本读它即可。
 """
 
 from __future__ import annotations
@@ -33,14 +33,14 @@ from airdrop import Config
 # ----------------------------------------------------------------------
 # 配置（改这里）
 # ----------------------------------------------------------------------
-SYSTEM_ADDRESS: str | None = None   # None = 用 TelemetryConfig 的默认地址
-RTSP_URL = None                 # None = 用 VideoConfig 默认的 HM30 地址
-TELEMETRY_LAG_S = 0.15          # 本次采集**不要**用旧标定值去改它：时间差正是要标的东西
-ATTITUDE_RATE_HZ = 50.0         # 标定建议 ≥50Hz（姿态内差直接进外参）
+SYSTEM_ADDRESS: str | None = None  # None = 用 TelemetryConfig 的默认地址
+RTSP_URL = None  # None = 用 VideoConfig 默认的 HM30 地址
+TELEMETRY_LAG_S = 0.15  # 本次采集不要用旧标定值去改它：时间差正是要标的东西
+ATTITUDE_RATE_HZ = 50.0  # 标定建议 ≥50Hz（姿态内差直接进外参）
 POSITION_RATE_HZ = 20.0
-BUFFER_SECONDS = 300.0          # 缓冲够长，免得采到一半被驱逐
-BOARD_SQUARE_M = 0.025          # 只作提醒：真正用到的值填在 tools/calibrate.py 里
-MAX_SECONDS = 180.0             # 采集上限（秒），到点自动停
+BUFFER_SECONDS = 300.0  # 缓冲够长，免得采到一半被驱逐
+BOARD_SQUARE_M = 0.025  # 只作提醒：真正用到的值填在 tools/calibrate.py 里
+MAX_SECONDS = 180.0  # 采集上限（秒），到点自动停
 
 LOGGER = logging.getLogger("calibration_capture")
 
@@ -63,11 +63,7 @@ def build_config(
     )
     if system_address is not None:
         telemetry = replace(telemetry, system_address=system_address)
-    video = (
-        base.video
-        if rtsp_url is None
-        else replace(base.video, url=rtsp_url)
-    )
+    video = base.video if rtsp_url is None else replace(base.video, url=rtsp_url)
     return Config(
         telemetry=telemetry,
         video=replace(video, telemetry_lag=telemetry_lag_s),

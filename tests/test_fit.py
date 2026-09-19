@@ -19,6 +19,7 @@ import json
 import math
 import shutil
 import uuid
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 
@@ -62,7 +63,7 @@ WIND = (2.0, -1.5, 0.0)
 
 
 @pytest.fixture
-def workdir() -> Path:
+def workdir() -> Iterator[Path]:
     """工作区内的临时目录；用例结束整棵删掉（不用 ``tmp_path``：见 AGENTS）。"""
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     path = WORK_ROOT / uuid.uuid4().hex[:8]
@@ -124,7 +125,7 @@ def _measure(
     delay_s: float = TRUE_DELAY,
     wind_scale: float = 1.0,
     offsets: dict[int, tuple[float, float]] | None = None,
-) -> list[DropSample]:
+) -> tuple[DropSample, ...]:
     """用**真值**参数正演出"实测落点"（合成实验的全部依据）。
 
     ⚠ 默认让"真值延迟"与记录里的 ``delay_s`` **一致**（= 一次 ``DropConfig.delay_s``
@@ -134,11 +135,9 @@ def _measure(
     ``wind_scale`` 用来造"真风是记录值若干倍"的场景。
     """
     model = BallisticsModel(ballistics or BallisticsConfig(drag_coefficient=TRUE_CD))
-    samples = []
+    samples: list[DropSample] = []
     for record in records:
-        impact = predict_record_impact(
-            record, model, delay_s=delay_s, wind_scale=wind_scale
-        )
+        impact = predict_record_impact(record, model, delay_s=delay_s, wind_scale=wind_scale)
         assert impact.ok, impact.reason
         north, east, down = impact.ned
         if offsets and record.index in offsets:
@@ -151,7 +150,7 @@ def _measure(
                 impact_source="synthetic",
             )
         )
-    return samples
+    return tuple(samples)
 
 
 def _spread_campaign() -> list[DropRecord]:
@@ -171,8 +170,7 @@ def _flat_campaign() -> list[DropRecord]:
     Cd 与延迟就又能部分分开了（实战里有风反而是好事）。
     """
     return [
-        _record(index, height_m=30.0, speed_m_s=15.0, heading_deg=heading,
-                wind=(0.0, 0.0, 0.0))
+        _record(index, height_m=30.0, speed_m_s=15.0, heading_deg=heading, wind=(0.0, 0.0, 0.0))
         for index, heading in enumerate((0.0, 90.0, 180.0, 270.0), 1)
     ]
 
@@ -182,13 +180,17 @@ def _flat_campaign() -> list[DropRecord]:
 # ----------------------------------------------------------------------
 def test_drop_record_round_trips_through_jsonl(workdir: Path) -> None:
     record = _record(1, delay_s=0.05)
-    record = replace(record, predicted_impact_ned=(1.0, 2.0, 0.0),
-                     predicted_flight_time_s=2.5, predicted_error_m=0.4)
+    record = replace(
+        record,
+        predicted_impact_ned=(1.0, 2.0, 0.0),
+        predicted_flight_time_s=2.5,
+        predicted_error_m=0.4,
+    )
     path = workdir / DROPS_NAME
     append_drop(path, record)
     append_drop(path, _record(2, wind=None, quaternion=None))
 
-    loaded = load_drops(workdir)            # 给目录也能找
+    loaded = load_drops(workdir)  # 给目录也能找
     assert [item.index for item in loaded] == [1, 2]
 
     first = loaded[0]
@@ -204,7 +206,7 @@ def test_drop_record_round_trips_through_jsonl(workdir: Path) -> None:
 
     second = loaded[1]
     assert second.wind_ned is None and second.quaternion_wxyz is None
-    assert second.euler_deg == (3.0, -2.0, 0.0)   # 欧拉角还在
+    assert second.euler_deg == (3.0, -2.0, 0.0)  # 欧拉角还在
     assert second.height_agl_m == pytest.approx(40.0)
 
 
@@ -222,9 +224,9 @@ def test_release_conditions_apply_delay_and_body_offset() -> None:
     record = _record(1, height_m=40.0, speed_m_s=20.0, heading_deg=0.0, delay_s=0.0)
     # 1) 一阶前推：位置 += 速度 × 延迟（与 ReleaseJudge 同款）
     position, velocity = release_conditions(record, delay_s=0.5)
-    assert position == pytest.approx((record.position_ned[0] + 10.0,
-                                      record.position_ned[1],
-                                      record.position_ned[2] - 0.5))
+    assert position == pytest.approx(
+        (record.position_ned[0] + 10.0, record.position_ned[1], record.position_ned[2] - 0.5)
+    )
     assert velocity == record.velocity_ned
 
     # 2) 默认沿用记录里的 delay_s
@@ -240,8 +242,9 @@ def test_release_conditions_apply_delay_and_body_offset() -> None:
         (record.position_ned[0], record.position_ned[1] - 1.0, record.position_ned[2])
     )
     # 没有姿态就不许假装水平
-    without_attitude = replace(rolled, quaternion_wxyz=None, roll_deg=None,
-                              pitch_deg=None, yaw_deg=None)
+    without_attitude = replace(
+        rolled, quaternion_wxyz=None, roll_deg=None, pitch_deg=None, yaw_deg=None
+    )
     with pytest.raises(ValueError, match="没有姿态"):
         release_conditions(without_attitude, offset_body_m=(0.0, 0.0, 1.0))
 
@@ -258,8 +261,7 @@ def test_predict_record_impact_matches_a_direct_model_call() -> None:
     model = BallisticsModel(BallisticsConfig(drag_coefficient=TRUE_CD))
     wrapped = predict_record_impact(record, model, delay_s=TRUE_DELAY)
     position, velocity = release_conditions(record, delay_s=TRUE_DELAY)
-    direct = model.predict_impact(position, velocity, ground_z=record.ground_z,
-                                  wind=WIND)
+    direct = model.predict_impact(position, velocity, ground_z=record.ground_z, wind=WIND)
     assert wrapped.ok and direct.ok
     assert wrapped.ned == pytest.approx(direct.ned)
     assert wrapped.flight_time_s == pytest.approx(direct.flight_time_s)
@@ -305,7 +307,7 @@ def test_mass_is_a_measured_input_not_a_fitted_parameter() -> None:
     assert not hasattr(FitConfig(), "fit_mass_kg")
     assert not hasattr(FitConfig(), "mass_bounds")
     with pytest.raises(TypeError):
-        FitConfig(**{"fit_mass_kg": True})       # type: ignore[call-arg]
+        FitConfig(**{"fit_mass_kg": True})  # type: ignore[call-arg]
 
 
 def test_identified_quantity_is_kappa_given_the_measured_mass() -> None:
@@ -358,14 +360,21 @@ def test_fit_recovers_release_delay_when_speeds_spread() -> None:
     assert result.parameters["release_delay_s"] == pytest.approx(TRUE_DELAY, rel=1e-2)
     assert result.release_delay_s == pytest.approx(TRUE_DELAY, rel=1e-2)
     correlation = result.correlation["drag_coefficient"]["release_delay_s"]
-    assert 0.0 < correlation < 0.99        # 确实相关，但分得开
+    assert 0.0 < correlation < 0.99  # 确实相关，但分得开
     assert result.condition_number < 1e3
 
 
 def test_fit_recovers_a_wind_scale_with_measured_wind() -> None:
-    records = [_record(index, height_m=25.0 + 10.0 * index, speed_m_s=12.0 + 3.0 * index,
-                       heading_deg=heading, delay_s=0.0)
-               for index, heading in enumerate((0.0, 90.0, 200.0), 1)]
+    records = [
+        _record(
+            index,
+            height_m=25.0 + 10.0 * index,
+            speed_m_s=12.0 + 3.0 * index,
+            heading_deg=heading,
+            delay_s=0.0,
+        )
+        for index, heading in enumerate((0.0, 90.0, 200.0), 1)
+    ]
     # 真风是记录值的两倍：按 2 倍正演出"实测落点"，反演应当把它找回来
     truth = _measure(records, delay_s=0.0, wind_scale=2.0)
 
@@ -377,7 +386,7 @@ def test_fit_recovers_a_wind_scale_with_measured_wind() -> None:
 
 def test_fit_keeps_a_constant_offset_in_the_bias_not_in_the_parameters() -> None:
     """整体偏 2m：这不该被"调参调掉"，而要作为常数偏差报出来。"""
-    samples = _measure(_spread_campaign(), offsets={i: (2.0, 0.0) for i in (1, 2, 3, 4)})
+    samples = _measure(_spread_campaign(), offsets=dict.fromkeys((1, 2, 3, 4), (2.0, 0.0)))
     result = fit_ballistics(samples, FitConfig())
 
     assert result.ok
@@ -410,9 +419,7 @@ def test_fit_refuses_parameters_that_cannot_be_separated() -> None:
     assert "不可辨识" in result.reason
     assert result.condition_number > 1e6
     # 诊断照给：相关性 ≈ 1，协方差退化
-    assert result.correlation["drag_coefficient"]["release_delay_s"] == pytest.approx(
-        1.0, abs=1e-3
-    )
+    assert result.correlation["drag_coefficient"]["release_delay_s"] == pytest.approx(1.0, abs=1e-3)
 
     forced = fit_ballistics(
         samples, FitConfig(fit_release_delay_s=True, allow_ill_conditioned=True)
@@ -439,8 +446,8 @@ def test_fit_refuses_a_wind_scale_with_zero_wind() -> None:
 
 
 def test_fit_refuses_underdetermined_problems() -> None:
-    samples = _measure(_spread_campaign())[:1]      # 2 个残差
-    config = FitConfig(fit_release_delay_s=True, fit_wind_scale=True)   # 3 个参数
+    samples = _measure(_spread_campaign())[:1]  # 2 个残差
+    config = FitConfig(fit_release_delay_s=True, fit_wind_scale=True)  # 3 个参数
     result = fit_ballistics(samples, config)
     assert not result.ok and "欠定" in result.reason
 
@@ -473,9 +480,7 @@ def test_fit_rejects_empty_inputs() -> None:
 
 def test_fit_rejects_a_starting_point_outside_the_bounds() -> None:
     samples = _measure(_spread_campaign())
-    result = fit_ballistics(
-        samples, FitConfig(base=BallisticsConfig(drag_coefficient=5.0))
-    )
+    result = fit_ballistics(samples, FitConfig(base=BallisticsConfig(drag_coefficient=5.0)))
     assert not result.ok and "初值越界" in result.reason
 
 
@@ -500,11 +505,13 @@ def test_match_impacts_accepts_wgs84_and_reports_unknown_indices() -> None:
         rows.append({"index": sample.index, "lat_deg": lat, "lon_deg": lon})
     matched = match_impacts(
         records,
-        tuple(ImpactMeasurement(index=row["index"], lat_deg=row["lat_deg"],
-                                lon_deg=row["lon_deg"]) for row in rows),
+        tuple(
+            ImpactMeasurement(index=row["index"], lat_deg=row["lat_deg"], lon_deg=row["lon_deg"])
+            for row in rows
+        ),
     )
     assert len(matched) == len(records)
-    for got, want in zip(matched, samples):
+    for got, want in zip(matched, samples, strict=True):
         assert got.impact_ned[0] == pytest.approx(want.impact_ned[0], abs=1e-3)
         assert got.impact_ned[1] == pytest.approx(want.impact_ned[1], abs=1e-3)
         assert got.impact_ned[2] == pytest.approx(want.impact_ned[2])
@@ -536,8 +543,7 @@ def test_match_impacts_skips_undecided_rows_and_needs_an_origin() -> None:
             (ImpactMeasurement(index=1, lat_deg=47.0, lon_deg=8.0),),
         )
     # NED 形式不需要原点
-    matched = match_impacts(no_origin, (ImpactMeasurement(index=1, north_m=3.0,
-                                                          east_m=4.0),))
+    matched = match_impacts(no_origin, (ImpactMeasurement(index=1, north_m=3.0, east_m=4.0),))
     assert matched[0].impact_ned == (3.0, 4.0, 0.0)
 
 
@@ -547,14 +553,20 @@ def test_impact_files_support_jsonl_and_csv(workdir: Path) -> None:
 
     jsonl = workdir / IMPACTS_JSONL_NAME
     lines = [
-        {"index": record.index, "north_m": sample.impact_ned[0],
-         "east_m": sample.impact_ned[1], "down_m": sample.impact_ned[2]}
-        for record, sample in zip(records, samples)
+        {
+            "index": record.index,
+            "north_m": sample.impact_ned[0],
+            "east_m": sample.impact_ned[1],
+            "down_m": sample.impact_ned[2],
+        }
+        for record, sample in zip(records, samples, strict=True)
     ]
     # 第一条留空（还没量）+ 一条注释用不到的字段
     jsonl.write_text(
-        json.dumps({"index": 1, "lat_deg": None, "lon_deg": None, "note": "待测"}) + "\n"
-        + "\n".join(json.dumps(row, ensure_ascii=False) for row in lines[1:]) + "\n",
+        json.dumps({"index": 1, "lat_deg": None, "lon_deg": None, "note": "待测"})
+        + "\n"
+        + "\n".join(json.dumps(row, ensure_ascii=False) for row in lines[1:])
+        + "\n",
         encoding="utf-8",
     )
     matched = match_impacts(records, load_impacts(jsonl))
@@ -586,7 +598,7 @@ def test_impact_template_round_trips_into_the_loader(workdir: Path) -> None:
     assert not any(item.measured for item in measurements)
     assert match_impacts(records, measurements) == ()
 
-    payload = json.loads(path.read_text("utf-8").splitlines()[0])
+    payload = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
     assert payload["lat_deg"] is None and payload["north_m"] is None
     with pytest.raises(FileNotFoundError):
         load_impacts(workdir / "nope.jsonl")
@@ -599,16 +611,17 @@ def test_drop_writer_appends_records(workdir: Path) -> None:
     writer = DropWriter(workdir / DROPS_NAME)
     try:
         assert writer.append(_record(1))
-        assert writer.append({"index": 2, "position_ned": [0.0, 0.0, -10.0],
-                              "velocity_ned": [5.0, 0.0, 0.0]})
-        assert not writer.append(object())      # 不支持的类型：记 ERROR、返回 False
+        assert writer.append(
+            {"index": 2, "position_ned": [0.0, 0.0, -10.0], "velocity_ned": [5.0, 0.0, 0.0]}
+        )
+        assert not writer.append(object())  # 不支持的类型：记 ERROR、返回 False
         assert writer.count == 2
     finally:
         writer.close()
     records = load_drops(workdir / DROPS_NAME)
     assert [record.index for record in records] == [1, 2]
 
-    writer.append(_record(3))                   # 关闭后：不抛，直接拒绝
+    writer.append(_record(3))  # 关闭后：不抛，直接拒绝
     assert writer.count == 2
 
 
@@ -617,7 +630,7 @@ def test_recorder_opens_the_drop_log_in_the_flight_dir(workdir: Path) -> None:
     recorder = FlightRecorder(Config(), base_dir=workdir)
     with pytest.raises(RuntimeError, match="尚未启动"):
         _ = recorder.drops
-    recorder._flight_dir = workdir              # 白盒：直接给目录，跳过 start()
+    recorder._flight_dir = workdir  # 白盒：直接给目录，跳过 start()
     recorder._open_files()
     try:
         assert recorder.drops.append(_record(1))
@@ -674,8 +687,11 @@ def _flight_dir(workdir: Path, *, with_impacts: bool, rows: int = 4) -> Path:
         lines = []
         for sample in samples:
             lon, lat, _ = ned_to_wgs84(sample.impact_ned, ORIGIN)
-            lines.append(json.dumps({"index": sample.index, "lat_deg": lat,
-                                     "lon_deg": lon}, ensure_ascii=False))
+            lines.append(
+                json.dumps(
+                    {"index": sample.index, "lat_deg": lat, "lon_deg": lon}, ensure_ascii=False
+                )
+            )
         (flight / IMPACTS_JSONL_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return flight
 
@@ -696,20 +712,16 @@ def test_fit_tool_runs_the_whole_field_workflow(workdir: Path, capsys) -> None:
     assert "结论：ok=True reliable=True" in printed
     assert "BallisticsConfig(" in printed
 
-    report = json.loads(output.read_text("utf-8"))
+    report = json.loads(output.read_text(encoding="utf-8"))
     assert report["fit"]["reliable"] is True
-    assert report["fit"]["parameters"]["drag_coefficient"] == pytest.approx(
-        TRUE_CD, rel=1e-3
-    )
+    assert report["fit"]["parameters"]["drag_coefficient"] == pytest.approx(TRUE_CD, rel=1e-3)
     assert report["flights"][0]["measured"] == 4
     assert len(report["samples"]) == 4
     assert report["samples"][0]["impact_source"] == "gps"
     assert "position_ned" in report["samples"][0]["record"]
 
 
-def test_fit_tool_writes_a_template_when_nothing_is_measured(
-    workdir: Path, capsys
-) -> None:
+def test_fit_tool_writes_a_template_when_nothing_is_measured(workdir: Path, capsys) -> None:
     from tools import fit_ballistics as tool
 
     flight = _flight_dir(workdir, with_impacts=False)
@@ -722,9 +734,7 @@ def test_fit_tool_writes_a_template_when_nothing_is_measured(
     assert not (workdir / "report.json").exists()
 
 
-def test_fit_tool_can_point_at_a_drops_file_and_an_impacts_file(
-    workdir: Path, capsys
-) -> None:
+def test_fit_tool_can_point_at_a_drops_file_and_an_impacts_file(workdir: Path, capsys) -> None:
     from tools import fit_ballistics as tool
 
     flight = _flight_dir(workdir, with_impacts=True)
@@ -752,8 +762,10 @@ def test_fit_tool_reports_an_unreliable_fit(workdir: Path, capsys) -> None:
         append_drop(flight / DROPS_NAME, record)
     (flight / IMPACTS_JSONL_NAME).write_text(
         "\n".join(
-            json.dumps({"index": s.index, "north_m": s.impact_ned[0],
-                        "east_m": s.impact_ned[1]}, ensure_ascii=False)
+            json.dumps(
+                {"index": s.index, "north_m": s.impact_ned[0], "east_m": s.impact_ned[1]},
+                ensure_ascii=False,
+            )
             for s in samples
         )
         + "\n",
@@ -768,7 +780,7 @@ def test_fit_tool_reports_an_unreliable_fit(workdir: Path, capsys) -> None:
     assert code == 2
     assert "不可辨识" in printed
     assert "reliable=False" in printed
-    assert json.loads((workdir / "report.json").read_text("utf-8"))["fit"]["ok"] is False
+    assert json.loads((workdir / "report.json").read_text(encoding="utf-8"))["fit"]["ok"] is False
 
 
 def test_describe_shows_the_judged_and_the_fitted_error_side_by_side() -> None:
@@ -784,11 +796,11 @@ def test_describe_shows_the_judged_and_the_fitted_error_side_by_side() -> None:
             predicted_error_m=1.5,
             predicted_impact_ned=sample.impact_ned,
         )
-        for record, sample in zip(records, judged)
+        for record, sample in zip(records, judged, strict=True)
     ]
     samples = _measure(records, delay_s=TRUE_DELAY)
     result = fit_ballistics(samples, FitConfig())
     text = describe(result, samples)
     assert "判据误差m" in text and "反演后误差m" in text
-    assert "1.500" in text                       # 判据当时那一列
+    assert "1.500" in text  # 判据当时那一列
     assert "常数偏差" in text

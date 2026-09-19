@@ -1,25 +1,25 @@
 """航线规划：侦查航线、飞掠段（entry/exit）与降落段的拼接（计划 4.7 / Q13 / Q14）。
 
-四件事，全是**纯函数**（不碰 MAVSDK、不碰网络，离线可测）：
+四件事，全是纯函数（不碰 MAVSDK、不碰网络，离线可测）：
 
 1. :func:`build_recon_mission`：侦查航线 → 任务项（首项带起飞项）；
 2. :func:`overfly_positions` / :func:`overfly_waypoints`：以目标为中心、沿配置航向
-   前后各半段长生成 `[entry, exit]`——飞机从 entry 进、**飞过目标**、从 exit 出，
+   前后各半段长生成 [entry, exit]——飞机从 entry 进、飞过目标、从 exit 出，
    方向与判据里的"越过目标"（``dot(位置−目标, 航向) > 0``）严格一致，符号不能反；
-3. :func:`build_drop_mission`：飞掠段 + 降落段**拼成一条任务上传**（Q13），
+3. :func:`build_drop_mission`：飞掠段 + 降落段拼成一条任务上传（Q13），
    没有目标时用备用点（Q11：备用点走同一套弹道判据）；
-4. :func:`airdrop.mission.plan_file.load_plan`：降落段可以直接用**操作手在 QGC 里
-   画好、另存为 ``.plan`` 的航线**（``RoutesConfig.land_plan``）——飞掠段插在它前面。
-   这样"必须让飞控认可的降落剖面"由画航线的人负责；本包只按 PX4 的判据**预检**
+4. :func:`airdrop.mission.plan_file.load_plan`：降落段可以直接用操作手在 QGC 里
+   画好、另存为 ``.plan`` 的航线（``RoutesConfig.land_plan``）——飞掠段插在它前面。
+   这样"必须让飞控认可的降落剖面"由画航线的人负责；本包只按 PX4 的判据预检
    （:func:`airdrop.mission.plan_file.check_fixed_wing_landing`），不合格就带着原因拒绝。
 
 坐标口径
 --------
-- 目标/飞掠段用 **NED（米）**，与 :mod:`airdrop.georef` 的输出、投放判据的输入一致；
-- 航点用 **WGS84**，由 :func:`airdrop.georef.ned_to_wgs84` 换算，原点就是
+- 目标/飞掠段用 NED（米），与 :mod:`airdrop.georef` 的输出、投放判据的输入一致；
+- 航点用 WGS84，由 :func:`airdrop.georef.ned_to_wgs84` 换算，原点就是
   ``GPS_GLOBAL_ORIGIN``（INIT 阶段取到的那一个）；
-- ``Waypoint.alt_m`` 与 :attr:`airdrop.mission.items.MissionItem.alt_m` 都是**相对
-  起飞点的高度**（``MAV_FRAME_GLOBAL_RELATIVE_ALT``），不是海拔——所以飞掠高度直接取
+- ``Waypoint.alt_m`` 与 :attr:`airdrop.mission.items.MissionItem.alt_m` 都是相对
+  起飞点的高度（``MAV_FRAME_GLOBAL_RELATIVE_ALT``），不是海拔——所以飞掠高度直接取
   ``OverflyConfig.altitude_m``，不做任何高程换算。备用点换算成 NED 时按
   "原点海拔 + 相对高度"给海拔（见 :func:`waypoint_to_ned`），但那只是把切平面
   对准，返回的 down 一律按地面处理。
@@ -29,13 +29,14 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 from ..ballistics.release import heading_unit_vector
 from ..config import Config, Waypoint
 from ..georef import LLARef, ned_to_wgs84, wgs84_to_ned
-from .items import MAV_CMD_NAV_LAND, MAV_CMD_NAV_TAKEOFF, MissionItem
+from .items import MAV_CMD_NAV_TAKEOFF, MissionItem
 from .plan_file import PlanError, check_fixed_wing_landing, load_plan
 
 if TYPE_CHECKING:  # 仅类型标注：运行时导入 telemetry 会让装配顺序变脆
@@ -61,7 +62,7 @@ GROUND_DOWN_M = 0.0
 class PlanningError(ValueError):
     """航线无法生成（缺目标、缺备用点、缺原点、几何参数非法……）。
 
-    一律**显式失败**：宁可任务起不来，也不要上传一条"看着能飞"的错航线。
+    一律显式失败：宁可任务起不来，也不要上传一条"看着能飞"的错航线。
     """
 
 
@@ -116,7 +117,7 @@ def _waypoint_dict(waypoint: Waypoint) -> dict[str, float]:
 def llaref_of(origin: NedOrigin) -> LLARef:
     """控制器给的 :class:`NedOrigin` → georef 的 :class:`LLARef`。
 
-    ⚠ 两者字段顺序**相反**（``NedOrigin`` 是 lat 在前、``LLARef`` 是 lon 在前），
+    ⚠ 两者字段顺序相反（``NedOrigin`` 是 lat 在前、``LLARef`` 是 lon 在前），
     这里按字段名逐个搬，绝不按位置传。
     """
     return LLARef(
@@ -130,7 +131,7 @@ def waypoint_to_ned(waypoint: Waypoint, origin: LLARef) -> tuple[float, float, f
     """航点 → 地面上一点的 NED（米）。
 
     ``down`` 恒为 :data:`GROUND_DOWN_M`（目标是地面点，投放判据也只用水平距离）。
-    水平位置用 ``原点海拔 + 航点相对高度`` 做换算——**不能拿 0 当海拔**：
+    水平位置用 ``原点海拔 + 航点相对高度`` 做换算——不能拿 0 当海拔：
     NED 是原点处的切平面，海拔填错会把水平分量也带偏（实测 500m 高度差 ⇒ 2cm）。
     """
     north, east, _down = wgs84_to_ned(
@@ -142,7 +143,9 @@ def waypoint_to_ned(waypoint: Waypoint, origin: LLARef) -> tuple[float, float, f
     return (north, east, GROUND_DOWN_M)
 
 
-def _check_target(target_ned: Sequence[float], *, what: str = "目标坐标") -> tuple[float, float, float]:
+def _check_target(
+    target_ned: Sequence[float], *, what: str = "目标坐标"
+) -> tuple[float, float, float]:
     if len(target_ned) != 3:
         raise PlanningError(f"{what}必须是 3 维 NED 矢量，收到 {len(target_ned)} 维")
     north, east, down = (float(target_ned[0]), float(target_ned[1]), float(target_ned[2]))
@@ -215,13 +218,13 @@ def _load_plan_items(path: str, *, what: str) -> tuple[MissionItem, ...]:
 def build_recon_mission(config: Config) -> tuple[MissionItem, ...]:
     """侦查航线 → 任务项。
 
-    两个来源**二选一**（``Config.validated()`` 保证不会同时配置）：
+    两个来源二选一（``Config.validated()`` 保证不会同时配置）：
 
-    * ``RoutesConfig.recon_plan``：操作手在 QGC 里画的 ``.plan``，**原样使用**；
+    * ``RoutesConfig.recon_plan``：操作手在 QGC 里画的 ``.plan``，原样使用；
     * ``RoutesConfig.recon_route``：配置航点，``MissionConfig.takeoff_first``
       时首项做成起飞项（固定翼的起飞由首航点的起飞项承担）。
 
-    刻意**不自动补** plan 里缺的起飞项：补出来的项是"看着能飞"的隐患，宁可告警让
+    刻意不自动补 plan 里缺的起飞项：补出来的项是"看着能飞"的隐患，宁可告警让
     操作手自己决定（先手飞起飞再启动任务）。
     """
     plan_path = str(config.routes.recon_plan or "")
@@ -267,9 +270,9 @@ def build_drop_mission(
 ) -> DropMissionPlan:
     """飞掠段 + 降落段合并成一条任务（Q13）：``[entry, exit] + 降落段``。
 
-    降落段两个来源**二选一**（``Config.validated()`` 保证）：
+    降落段两个来源二选一（``Config.validated()`` 保证）：
 
-    * ``RoutesConfig.land_plan``：操作手的 QGC ``.plan``（**飞掠段插在它前面**）；
+    * ``RoutesConfig.land_plan``：操作手的 QGC ``.plan``（飞掠段插在它前面）；
     * ``RoutesConfig.landing_route``：配置航点生成，``MissionConfig.land_last``
       时末项做成降落项。
 
@@ -277,8 +280,8 @@ def build_drop_mission(
     两者都没有、或没有 NED 原点、或降落段为空 —— 全部抛 :class:`PlanningError`。
 
     ⚠ 降落段会先过一遍 :func:`~airdrop.mission.plan_file.check_fixed_wing_landing`
-    的本地预检：PX4 固定翼对降落剖面有硬性几何要求，不满足就**整条任务被拒**，
-    而飞控只会"没有可用任务，盘旋"（2026-09 演练里因此白等 15 分钟）。宁可在规划
+    的本地预检：PX4 固定翼对降落剖面有硬性几何要求，不满足就整条任务被拒，
+    而飞控只会"没有可用任务，盘旋"（2026-09 演练里因此空等 15 分钟）。宁可在规划
     阶段带着原因失败。
     """
     if origin is None:
@@ -300,7 +303,7 @@ def build_drop_mission(
         tail = tuple(MissionItem.from_waypoint(waypoint) for waypoint in landing)
         if config.mission.land_last:
             last = landing[-1]
-            tail = tail[:-1] + (MissionItem.land(float(last.lat), float(last.lon)),)
+            tail = (*tail[:-1], MissionItem.land(float(last.lat), float(last.lon)))
         tail_source = "route"
 
     if target_ned is not None:
@@ -311,8 +314,7 @@ def build_drop_mission(
         source = "backup"
     else:
         raise PlanningError(
-            "既没有目标坐标、也没有备用点（RoutesConfig.backup_point）："
-            "无法生成飞掠航线"
+            "既没有目标坐标、也没有备用点（RoutesConfig.backup_point）：无法生成飞掠航线"
         )
 
     entry, exit_ = overfly_waypoints(
@@ -333,8 +335,7 @@ def build_drop_mission(
     )
     if problems:
         raise PlanningError(
-            f"降落段不合格（{tail_source}）——PX4 固定翼会拒整条任务："
-            + "；".join(problems)
+            f"降落段不合格（{tail_source}）——PX4 固定翼会拒整条任务：" + "；".join(problems)
         )
     items = (*head, *tail)
 

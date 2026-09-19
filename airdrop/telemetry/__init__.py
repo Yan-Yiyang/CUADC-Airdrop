@@ -6,16 +6,14 @@
   查 NED 原点）——状态机面向 :class:`MissionController` 协议编程，离线测试用假控制器；
 - :mod:`airdrop.telemetry.models`：遥测快照与指令数据模型。
 
-⚠ **惰性导出**（见 :mod:`airdrop._lazy`）：`import airdrop.telemetry` 只执行本文件。
+⚠ 惰性导出（见 :mod:`airdrop._lazy`）：import airdrop.telemetry 只执行本文件。
 ``mavsdk_thread`` / ``controller`` 会拉 mavsdk，所以排在最后——取快照数据模型不该顺带
 加载飞控栈（CLI 的 ``--help`` 依赖这一点）。
 """
 
 from .._lazy import lazy_dir, lazy_exports
 
-__getattr__ = lazy_exports(
-    __name__, ("models", "broker", "controller", "mavsdk_thread")
-)
+__getattr__ = lazy_exports(__name__, ("models", "broker", "controller", "mavsdk_thread"))
 __dir__ = lazy_dir(__name__)
 
 __all__ = [

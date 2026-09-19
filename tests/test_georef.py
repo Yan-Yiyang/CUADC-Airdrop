@@ -78,7 +78,7 @@ def test_ned_to_wgs84_matches_geod_distance_and_azimuth(north: float, east: floa
 def test_wgs84_round_trip(ned: tuple[float, float, float]) -> None:
     """往返互逆，误差 <1e-6（计划 P6 的数值口径）。"""
     back = wgs84_to_ned(*ned_to_wgs84(ned, HOME), HOME)
-    for got, want in zip(back, ned):
+    for got, want in zip(back, ned, strict=True):
         assert got == pytest.approx(want, abs=1e-6), f"{ned} -> {back}"
 
 
@@ -108,7 +108,7 @@ def test_camera_rejects_non_rotation_extrinsics() -> None:
     with pytest.raises(ValueError, match="R_bc"):
         CameraModel(
             camera_matrix=np.eye(3) * 800 + np.array([[0, 0, 0], [0, 0, 0], [0, 0, -799]]),
-            r_bc=np.full((3, 3), 0.5),      # 既不正交 det 也不为 1
+            r_bc=np.full((3, 3), 0.5),  # 既不正交 det 也不为 1
         )
 
 
@@ -131,8 +131,12 @@ def test_camera_scaled_rejects_bad_scale() -> None:
 
 
 def test_rotation_helpers_are_orthonormal() -> None:
-    for matrix in (rotation_x(30.0), rotation_y(-42.0), rotation_z(97.0),
-                   euler_to_matrix(10.0, -20.0, 35.0)):
+    for matrix in (
+        rotation_x(30.0),
+        rotation_y(-42.0),
+        rotation_z(97.0),
+        euler_to_matrix(10.0, -20.0, 35.0),
+    ):
         assert np.allclose(matrix @ matrix.T, np.eye(3), atol=1e-12)
         assert np.linalg.det(matrix) == pytest.approx(1.0)
 
@@ -241,9 +245,7 @@ def test_image_down_maps_to_nose_direction() -> None:
         (-90.0, 1.0, 0.0),
     ],
 )
-def test_image_right_follows_yaw(
-    yaw: float, expect_north: float, expect_east: float
-) -> None:
+def test_image_right_follows_yaw(yaw: float, expect_north: float, expect_east: float) -> None:
     """机头朝东时，图像右应当指向正南——与 旧版 的实测表一致。"""
     camera = _camera()
     result = pixel_to_ned(
@@ -302,7 +304,7 @@ def test_lever_arm_shifts_camera_origin() -> None:
     matrix = np.array([[800.0, 0, 640.0], [0, 800.0, 360.0], [0, 0, 1.0]])
     camera = CameraModel(
         camera_matrix=matrix,
-        t_bc=np.array([1.0, 0.0, 0.0]),   # 相机在机体前方 1m
+        t_bc=np.array([1.0, 0.0, 0.0]),  # 相机在机体前方 1m
         image_size=(1280, 720),
     )
     result = pixel_to_ned(
@@ -339,7 +341,7 @@ def test_ground_above_camera_is_rejected() -> None:
     result = pixel_to_ned(
         (640.0, 360.0),
         camera=camera,
-        ground_z=-100.0,          # 比飞机（-50）还高
+        ground_z=-100.0,  # 比飞机（-50）还高
         position_ned=(0.0, 0.0, -50.0),
         euler_deg=(0.0, 0.0, 0.0),
         undistort=False,
@@ -353,11 +355,17 @@ def test_quaternion_and_euler_agree_in_pixel_to_ned() -> None:
     euler = (5.0, -3.0, 70.0)
     half_yaw = math.radians(70.0) / 2.0
     from_euler = pixel_to_ned(
-        (700.0, 400.0), camera=camera, ground_z=0.0,
-        position_ned=(10.0, -5.0, -60.0), euler_deg=euler, undistort=False,
+        (700.0, 400.0),
+        camera=camera,
+        ground_z=0.0,
+        position_ned=(10.0, -5.0, -60.0),
+        euler_deg=euler,
+        undistort=False,
     )
     from_quat = pixel_to_ned(
-        (700.0, 400.0), camera=camera, ground_z=0.0,
+        (700.0, 400.0),
+        camera=camera,
+        ground_z=0.0,
         position_ned=(10.0, -5.0, -60.0),
         quaternion=(math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw)),
         undistort=False,
@@ -365,8 +373,12 @@ def test_quaternion_and_euler_agree_in_pixel_to_ned() -> None:
     assert from_euler.ok and from_quat.ok
     # 纯偏航的四元数与欧拉角一致，但这里欧拉角含 roll/pitch，故只比对纯偏航场景
     pure = pixel_to_ned(
-        (700.0, 400.0), camera=camera, ground_z=0.0,
-        position_ned=(10.0, -5.0, -60.0), euler_deg=(0.0, 0.0, 70.0), undistort=False,
+        (700.0, 400.0),
+        camera=camera,
+        ground_z=0.0,
+        position_ned=(10.0, -5.0, -60.0),
+        euler_deg=(0.0, 0.0, 70.0),
+        undistort=False,
     )
     assert pure.ned is not None and from_quat.ned is not None
     assert pure.ned[0] == pytest.approx(from_quat.ned[0], abs=1e-9)
@@ -377,7 +389,9 @@ def test_pixel_to_ned_requires_attitude() -> None:
     camera = _camera()
     with pytest.raises(ValueError, match="四元数或欧拉角"):
         pixel_to_ned(
-            (640.0, 360.0), camera=camera, ground_z=0.0,
+            (640.0, 360.0),
+            camera=camera,
+            ground_z=0.0,
             position_ned=(0.0, 0.0, -50.0),
         )
 
@@ -388,18 +402,22 @@ def test_pixel_to_ned_requires_attitude() -> None:
 def test_ray_is_normalized_and_points_down() -> None:
     camera = _camera()
     ray = pixel_to_ray_ned(
-        (camera.cx, camera.cy), camera=camera, euler_deg=(0.0, 0.0, 0.0),
+        (camera.cx, camera.cy),
+        camera=camera,
+        euler_deg=(0.0, 0.0, 0.0),
         undistort=False,
     )
     assert float(np.linalg.norm(ray)) == pytest.approx(1.0)
-    assert ray[2] == pytest.approx(1.0)   # 正下方（NED z 向下为正）
+    assert ray[2] == pytest.approx(1.0)  # 正下方（NED z 向下为正）
 
 
 def test_ray_center_matches_camera_axis_rotation() -> None:
     """中心像素的视线应当等于 R_nb @ R_bc @ [0,0,1]。"""
     camera = _camera()
     ray = pixel_to_ray_ned(
-        (camera.cx, camera.cy), camera=camera, euler_deg=(0.0, 0.0, 33.0),
+        (camera.cx, camera.cy),
+        camera=camera,
+        euler_deg=(0.0, 0.0, 33.0),
         undistort=False,
     )
     expected = euler_to_matrix(0.0, 0.0, 33.0) @ (camera.r_bc @ np.array([0.0, 0.0, 1.0]))
@@ -474,28 +492,27 @@ def test_principal_point_is_fixed_by_undistort() -> None:
 def test_depth_by_side_matches_legacy_formula() -> None:
     """f·S/(side_px·cos_tilt)，零姿态下 cos_tilt=1。"""
     camera = _camera(f=800.0)
-    depth = estimate_depth_by_side(
-        16.0, camera=camera, side_m=1.0, euler_deg=(0.0, 0.0, 0.0)
-    )
+    depth = estimate_depth_by_side(16.0, camera=camera, side_m=1.0, euler_deg=(0.0, 0.0, 0.0))
     assert depth == pytest.approx(800.0 * 1.0 / 16.0, rel=1e-12)
 
 
 def test_depth_by_side_rejects_bad_input() -> None:
     camera = _camera()
-    assert estimate_depth_by_side(0.0, camera=camera, side_m=1.0,
-                                  euler_deg=(0.0, 0.0, 0.0)) is None
-    assert estimate_depth_by_side(-2.0, camera=camera, side_m=1.0,
-                                  euler_deg=(0.0, 0.0, 0.0)) is None
-    assert estimate_depth_by_side(16.0, camera=camera, side_m=0.0,
-                                  euler_deg=(0.0, 0.0, 0.0)) is None
+    assert estimate_depth_by_side(0.0, camera=camera, side_m=1.0, euler_deg=(0.0, 0.0, 0.0)) is None
+    assert (
+        estimate_depth_by_side(-2.0, camera=camera, side_m=1.0, euler_deg=(0.0, 0.0, 0.0)) is None
+    )
+    assert (
+        estimate_depth_by_side(16.0, camera=camera, side_m=0.0, euler_deg=(0.0, 0.0, 0.0)) is None
+    )
 
 
 def test_depth_by_side_diverges_when_axis_near_horizontal() -> None:
     """光轴接近水平时 cos_tilt→0，必须判失败（旧代码就是靠这个阈值兜的）。"""
     camera = _camera()
-    assert estimate_depth_by_side(
-        16.0, camera=camera, side_m=1.0, euler_deg=(90.0, 0.0, 0.0)
-    ) is None
+    assert (
+        estimate_depth_by_side(16.0, camera=camera, side_m=1.0, euler_deg=(90.0, 0.0, 0.0)) is None
+    )
 
 
 def test_cross_check_agrees_on_synthetic_flat_ground() -> None:
@@ -511,14 +528,19 @@ def test_cross_check_agrees_on_synthetic_flat_ground() -> None:
     side_px = camera.focal_px * 1.0 / height
     result = pixel_to_ned(
         (camera.cx, camera.cy),
-        camera=camera, ground_z=0.0, position_ned=position,
-        euler_deg=(0.0, 0.0, 0.0), undistort=False,
+        camera=camera,
+        ground_z=0.0,
+        position_ned=position,
+        euler_deg=(0.0, 0.0, 0.0),
+        undistort=False,
     )
     assert result.ok
     check = cross_check_by_side(
-        side_px=side_px, side_m=1.0,
+        side_px=side_px,
+        side_m=1.0,
         depth_by_intersection_m=result.depth_m,
-        camera=camera, euler_deg=(0.0, 0.0, 0.0),
+        camera=camera,
+        euler_deg=(0.0, 0.0, 0.0),
     )
     assert check.ok, check.reason
     assert check.relative_error < 1e-6
@@ -528,9 +550,11 @@ def test_cross_check_flags_inconsistent_side() -> None:
     """像素边长与深度不匹配（例如检测框框错了）时必须判不通过。"""
     camera = _camera(f=800.0)
     check = cross_check_by_side(
-        side_px=100.0, side_m=1.0,
+        side_px=100.0,
+        side_m=1.0,
         depth_by_intersection_m=50.0,
-        camera=camera, euler_deg=(0.0, 0.0, 0.0),
+        camera=camera,
+        euler_deg=(0.0, 0.0, 0.0),
         tolerance=0.25,
     )
     assert not check.ok
@@ -540,8 +564,11 @@ def test_cross_check_flags_inconsistent_side() -> None:
 def test_cross_check_handles_missing_side_estimate() -> None:
     camera = _camera()
     check = cross_check_by_side(
-        side_px=0.0, side_m=1.0, depth_by_intersection_m=50.0,
-        camera=camera, euler_deg=(0.0, 0.0, 0.0),
+        side_px=0.0,
+        side_m=1.0,
+        depth_by_intersection_m=50.0,
+        camera=camera,
+        euler_deg=(0.0, 0.0, 0.0),
     )
     assert not check.ok
     assert math.isnan(check.relative_error)
@@ -578,8 +605,7 @@ def test_load_camera_model_reads_all_fields(tmp_path: Path) -> None:
 
 
 def test_load_camera_model_defaults_extrinsics_when_absent(tmp_path: Path) -> None:
-    path = _write_calib(tmp_path / "camera_calib.json", R_bc=None, t_bc=None,
-                        telemetry_lag=None)
+    path = _write_calib(tmp_path / "camera_calib.json", R_bc=None, t_bc=None, telemetry_lag=None)
     model = load_camera_model(path)
     assert np.allclose(model.r_bc, DEFAULT_R_BC)
     assert np.allclose(model.t_bc, np.zeros(3))
@@ -618,8 +644,11 @@ def test_default_camera_model_is_usable() -> None:
     model = default_camera_model(1280, 720)
     result = pixel_to_ned(
         (model.cx + 10.0, model.cy),
-        camera=model, ground_z=0.0, position_ned=(0.0, 0.0, -30.0),
-        euler_deg=(0.0, 0.0, 0.0), undistort=False,
+        camera=model,
+        ground_z=0.0,
+        position_ned=(0.0, 0.0, -30.0),
+        euler_deg=(0.0, 0.0, 0.0),
+        undistort=False,
     )
     assert result.ok and result.ned is not None
 
@@ -673,8 +702,7 @@ def test_ground_config_needs_altitude_only() -> None:
     """经纬度目前只用于记录/核对，换算 ground_z 只需要海拔。"""
     from airdrop.config import GroundConfig
 
-    config = GroundConfig(ground_point_lat=31.2, ground_point_lon=121.4,
-                          ground_point_alt=70.0)
+    config = GroundConfig(ground_point_lat=31.2, ground_point_lon=121.4, ground_point_alt=70.0)
     assert config.ground_z(100.0) == pytest.approx(30.0)
 
 

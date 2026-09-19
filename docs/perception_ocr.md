@@ -1,8 +1,8 @@
 # 感知/OCR：转正形态判据、Cls 与 onnxruntime（实测）
 
-这份讲什么：检测 → 裁剪 → 五边形转正 → OCR 的流水线细节与实测结论，含顶角形态门限的来龙
+本文档说明：检测 → 裁剪 → 五边形转正 → OCR 的流水线细节与实测结论，含顶角形态门限的来龙
 去脉、RapidOCR 的 `Cls` 与权重命名、onnxruntime-gpu 的 CUDA 前提与速度表、几何转正 180°
-缺陷复盘。动 `perception/cropproc.py`、换 OCR 权重/引擎、或复测真实素材准确率时读它。
+缺陷复盘。修改 `perception/cropproc.py`、换 OCR 权重/引擎、或复测真实素材准确率时请先阅读本文档。
 **内容逐字搬自 `AGENTS.md`（"架构要点"两条 + "工程缺口"尾部），与 AGENTS.md 同等权威。**
 
 ---
@@ -19,7 +19,7 @@
   60°（顶角）/ 90°(bl) / 90°(br) / 150°(tl) / 150°(tr)，合计 540°，
   最小内角就是顶角，兜底路径的 40~130° 门限对标准形态是**通过**的。
   合成用例 `test_pentagon_interior_angles` 把 60/90/90/150/150 钉死。
-  **两个踩过的坑（都会让顶角量错）**：
+  **两个遇到过的问题（都会让顶角量错）**：
   1. 顶点顺序写成 `apex, tl, tr, br, bl` 是**自交**多边形，顶角的"邻居"变成两个
      不同侧的角，量出 15°，据此误判成"门限对标准形态失效"；
   2. ``_find_min_angle`` 原来用 ``_angle(pts[i], pts[i+1], pts[i+2])`` 并把
@@ -27,7 +27,7 @@
      现已改成用 ``pts[i]`` 的**真实前后邻居**。
 - **OcrEngine**（`cropproc.py`）：RapidOCR 薄封装，**det/rec 走 TORCH 引擎 + 显式本地 `.pth` 路径**。
   `default_models.yaml` 里没有 `torch:` 段，TORCH 只能靠 `model_path` 指定本地权重。
-  **方向分类（Cls）现在接了**，默认 `cls_engine="onnx"`（实测最快，见本文件末节"实测结论"里的速度表），
+  **方向分类（Cls）现已接入**，默认 `cls_engine="onnx"`（实测最快，见本文件末节"实测结论"里的速度表），
   另有 `"torch"` 与 `"off"`；`cls_autorotate` 决定它是否参与识别（默认开，
   即 PP-OCR 流水线会按判定把倒置文本行转正再识别）。对外只多一个
   `classify_orientation(image) -> OcrOrientation`（给几何转正做交叉验证用）。

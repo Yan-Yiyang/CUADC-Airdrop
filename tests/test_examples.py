@@ -1,15 +1,15 @@
 """示例目录的"不生锈"检查：每个示例都能导入、都有 ``main()``、导入期不加载重依赖。
 
 示例是给人照抄的，最容易随接口演进而悄悄失效（改了构造参数、搬了模块，示例却没人跑）。
-这里只做**离线可做的**那部分校验：
+这里只做离线可做的那部分校验：
 
 * 模块能导入（说明 import 的 API 都还在，且没有在导入期连飞控/开图传）；
-* **导入不加载重依赖**（torch / cv2 / mavsdk / ultralytics / rapidocr）：重活都在
-  函数体内，命令行只需要读常量——`airdrop.run` 的 `--help` 靠这条保持廉价；
+* 导入不加载重依赖（torch / cv2 / mavsdk / ultralytics / rapidocr）：重活都在
+  函数体内，命令行只需要读常量——airdrop.run 的 --help 靠这条保持廉价；
 * 有 ``main()``（``examples`` 的约定：``main(**kwargs)`` + 顶部常量 = 默认值）；
 * 模块级常量区块存在，且 ``build_config(**覆盖)`` 真的覆盖得动。
 
-**不**执行 ``main()``：那几个示例要飞控、图传或真实素材，跑起来就不是单测了。
+不执行 ``main()``：那几个示例要飞控、图传或真实素材，跑起来就不是单测了。
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = REPO_ROOT / "examples"
 
-#: 示例模块导入后**不许**出现在 sys.modules 里的重依赖
+#: 示例模块导入后不许出现在 sys.modules 里的重依赖
 HEAVY_MODULES = ("torch", "cv2", "mavsdk", "ultralytics", "rapidocr", "onnxruntime")
 
 
@@ -56,7 +56,7 @@ def test_example_imports_and_exposes_main(name: str) -> None:
 
 @pytest.mark.parametrize("name", _example_modules())
 def test_importing_an_example_does_not_load_heavy_libraries(name: str) -> None:
-    """项目约定：示例是**纯库模块**——重依赖只在函数体内导入。
+    """项目约定：示例是纯库模块——重依赖只在函数体内导入。
 
     命令行只读常量（默认值）与调 ``build_config``，所以导入期必须廉价；
     这条同时保证 ``python -m airdrop.run <子命令> --help`` 不加载重库。
@@ -75,6 +75,7 @@ def test_importing_an_example_does_not_load_heavy_libraries(name: str) -> None:
         encoding="utf-8",
         errors="replace",
         timeout=300,
+        check=False,  # 退出码由下面那条断言负责
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("NONE"), (
@@ -84,7 +85,7 @@ def test_importing_an_example_does_not_load_heavy_libraries(name: str) -> None:
 
 @pytest.mark.parametrize("name", _example_modules())
 def test_example_documents_its_configuration(name: str) -> None:
-    """项目约定：示例的默认值写在文件顶部常量里，命令行解析只在 `airdrop/run.py`。"""
+    """项目约定：示例的默认值写在文件顶部常量里，命令行解析只在 airdrop/run.py。"""
     source = (EXAMPLES_DIR / f"{name}.py").read_text(encoding="utf-8")
 
     assert "argparse" not in source, f"examples/{name}.py 不该自己解析命令行（归 airdrop/run.py）"
@@ -114,7 +115,7 @@ def test_full_mission_builds_a_valid_config() -> None:
 
 
 def test_full_mission_build_config_honours_overrides() -> None:
-    """`build_config(**覆盖)` 必须真的覆盖得动（命令行就是走这条路）。"""
+    """build_config(**覆盖) 必须真的覆盖得动（命令行就是走这条路）。"""
     from examples import full_mission
 
     config = full_mission.build_config(
@@ -154,12 +155,11 @@ def test_sitl_scenario_builds_config_and_synthetic_target() -> None:
     from types import SimpleNamespace
 
     from airdrop import TelemetryBroker
-
     from examples import sitl_mission
 
     config = sitl_mission.build_config()
     assert config.telemetry.system_address == sitl_mission.SYSTEM_ADDRESS
-    assert (config.routes.landing_route or config.routes.land_plan), "降落段必须有一个来源"
+    assert config.routes.landing_route or config.routes.land_plan, "降落段必须有一个来源"
     assert config.overfly.heading_deg == sitl_mission.OVERFLY_HEADING_DEG
     # 演练档：侦查航线由本包上传；起飞前自检四项全关（SITL 没有相机/模型/图传）
     assert config.mission.recon_upload == "auto"
@@ -171,11 +171,11 @@ def test_sitl_scenario_builds_config_and_synthetic_target() -> None:
             config.preflight.check_video,
         )
     )
-    # 地面演练的逃生开关：不等起飞（正式任务必须 True，见 airdrop/config.py）
+    # 地面演练的临时放行开关：不等起飞（正式任务必须 True，见 airdrop/config.py）
     assert config.mission.require_airborne is False
-    assert (
-        sitl_mission.build_config(require_airborne=True).mission.require_airborne is True
-    ), "override 要真的覆盖得动"
+    assert sitl_mission.build_config(require_airborne=True).mission.require_airborne is True, (
+        "override 要真的覆盖得动"
+    )
 
     broker = TelemetryBroker()
     broker.update_local_position_velocity(

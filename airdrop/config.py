@@ -90,7 +90,7 @@ class PerceptionConfig:
     model_path: str = "models/best2.pt"
     device: str = "0"
     conf_threshold: float = 0.25
-    imgsz: int = 1280               # best2.pt 训练分辨率 640；实测 640/1280 检出数一致
+    imgsz: int = 1280  # best2.pt 训练分辨率 640；实测 640/1280 检出数一致
 
     # OCR 引擎（TORCH，本地权重；P5 复测：medium ~97ms/帧 @RTX3060Laptop）
     models_dir: str = "models/ppocr"
@@ -100,15 +100,15 @@ class PerceptionConfig:
     ocr_use_cuda: bool = True
 
     # OCR 目标形态（旧版 实战规格：五边形=正方形+等边三角形，边长 1m）
-    target_color: str = "blue"          # blue / red
+    target_color: str = "blue"  # blue / red
     target_side_length_m: float = 1.0
     min_side_px: float = 10.0
     max_side_px: float = 400.0
     ocr_conf_threshold: float = 0.6
     ocr_workers: int = 2
     ocr_queue_size: int = 500
-    ocr_dedupe_s: float = 0.8           # 同一目标送检最小时间间隔（0 = 不去重）
-    ocr_dedupe_px: float = 30.0         # 同一目标送检最小中心位移（px）
+    ocr_dedupe_s: float = 0.8  # 同一目标送检最小时间间隔（0 = 不去重）
+    ocr_dedupe_px: float = 30.0  # 同一目标送检最小中心位移（px）
 
     # 排故素材
     save_crops: bool = False
@@ -207,11 +207,11 @@ class TargetingConfig:
     **起飞前按任务选定**，代码不做隐式回退。结果坐标 = 类内成员坐标均值。
     """
 
-    eps_m: float = 0.75                 # 聚类半径，预期目标间距下 0.5~1.0
-    min_samples: int = 2                # 噪声点（label=-1）剔除
+    eps_m: float = 0.75  # 聚类半径，预期目标间距下 0.5~1.0
+    min_samples: int = 2  # 噪声点（label=-1）剔除
     selection_rule: str = "median"
     weight_by_confidence: bool = False  # 开时按置信度加权（聚类与均值同时加权）
-    require_label: bool = True          # 只考虑有有效编码的类
+    require_label: bool = True  # 只考虑有有效编码的类
 
 
 # ---------------------------------------------------------------- 弹道与投放
@@ -224,13 +224,13 @@ class BallisticsConfig:
     **靠投放试验反演 Cd**（`tools/fit_ballistics.py`，见 :mod:`airdrop.ballistics.fit`）。
     """
 
-    mass_kg: float = 0.365              # **实测称重**（占位值仅用于跑通链路）
-    drag_coefficient: float = 0.6       # 投放试验反演（占位值）
-    cross_area_m2: float = 0.004        # 几何量（卡尺/投影面积）
+    mass_kg: float = 0.365  # **实测称重**（占位值仅用于跑通链路）
+    drag_coefficient: float = 0.6  # 投放试验反演（占位值）
+    cross_area_m2: float = 0.004  # 几何量（卡尺/投影面积）
     gravity: float = 9.80665
     rk_dt: float = 0.005
-    air_density_isa: bool = True        # 空气密度按 ISA 标准大气随高度变化
-    wind_source: str = "telemetry"      # telemetry（PX4 风估计）/ zero
+    air_density_isa: bool = True  # 空气密度按 ISA 标准大气随高度变化
+    wind_source: str = "telemetry"  # telemetry（PX4 风估计）/ zero
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +238,7 @@ class DropConfig:
     """投放判据：预测落点距目标 ≤ radius 即投；飞过点后保底投放。"""
 
     radius_m: float = 2.0
-    delay_s: float = 0.0                # 指令→离机延迟（状态前推补偿）
+    delay_s: float = 0.0  # 指令→离机延迟（状态前推补偿）
     force_after_pass: bool = True
     evaluation_hz: float = 20.0
 
@@ -327,12 +327,12 @@ class MissionConfig:
     """
 
     tick_hz: float = 20.0
-    init_max_s: float = 30.0            # 等遥测 + NED 原点
-    recon_max_s: float = 600.0          # 侦查航线（约 1 分钟）的兜底上限
-    hold_process_max_s: float = 10.0    # HOLD_PROCESS 等结果的上限（计划 4.7）
+    init_max_s: float = 30.0  # 等遥测 + NED 原点
+    recon_max_s: float = 600.0  # 侦查航线（约 1 分钟）的兜底上限
+    hold_process_max_s: float = 10.0  # HOLD_PROCESS 等结果的上限（计划 4.7）
     #: 至少等这么久再接受"没有结果"的判断——否则缓冲里还没被消费的帧会被当成"没看到目标"
     hold_process_min_s: float = 2.0
-    land_max_s: float = 900.0           # 飞掠段 + 降落航线的兜底上限
+    land_max_s: float = 900.0  # 飞掠段 + 降落航线的兜底上限
     #: 上传并启动后，等多久确认"飞控真的进了任务模式"（见 MissionRunner 的启动确认）。
     #: 飞控可能拒绝模式切换却仍然回 ACK：不确认的话飞机一直盘旋，要等到状态超时才失败。
     mission_start_timeout_s: float = 20.0
@@ -385,9 +385,9 @@ class RecordConfig:
     """飞行记录（文本日志/遥测/检测/事件/投放/视频帧）与回放。"""
 
     dir: str = "flights"
-    video: bool = True                  # 落盘缓冲内的 jpeg（零重编码）
+    video: bool = True  # 落盘缓冲内的 jpeg（零重编码）
     telemetry_hz: float = 10.0
-    event_eval_hz: float = 5.0          # 释放评估摘要频率
+    event_eval_hz: float = 5.0  # 释放评估摘要频率
 
 
 # ---------------------------------------------------------------- 顶层装配
@@ -396,9 +396,7 @@ class Config:
     """整个系统的配置装配点。"""
 
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
-    video: VideoConfig = field(
-        default_factory=lambda: VideoConfig(url=HM30_DEFAULT_RTSP)
-    )
+    video: VideoConfig = field(default_factory=lambda: VideoConfig(url=HM30_DEFAULT_RTSP))
     align: AlignConfig = field(default_factory=AlignConfig)
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
@@ -413,12 +411,11 @@ class Config:
     preflight: PreflightConfig = field(default_factory=PreflightConfig)
     record: RecordConfig = field(default_factory=RecordConfig)
 
-    def validated(self) -> "Config":
+    def validated(self) -> Config:  # noqa: PLR0912 - 逐片段的取值域检查，串行铺开最直观
         """取值域检查：不合法就抛错，别等飞到一半才发现。"""
         if self.perception.mode not in PERCEPTION_MODES:
             raise ValueError(
-                f"perception.mode 只支持 {sorted(PERCEPTION_MODES)}: "
-                f"{self.perception.mode!r}"
+                f"perception.mode 只支持 {sorted(PERCEPTION_MODES)}: {self.perception.mode!r}"
             )
         if self.perception.target_color not in TARGET_COLORS:
             raise ValueError(
@@ -487,9 +484,7 @@ class Config:
         if self.gripper.instance < 0:
             raise ValueError(f"gripper.instance 不能为负: {self.gripper.instance}")
         if self.gripper.release_settle_s < 0:
-            raise ValueError(
-                f"gripper.release_settle_s 不能为负: {self.gripper.release_settle_s}"
-            )
+            raise ValueError(f"gripper.release_settle_s 不能为负: {self.gripper.release_settle_s}")
         if self.routes.recon_route and self.routes.recon_plan:
             raise ValueError(
                 "侦查段只能二选一：routes.recon_route（配置航点）与 "
@@ -510,9 +505,7 @@ class Config:
                 f"{self.mission.recon_upload!r}"
             )
         if self.mission.airborne_alt_m < 0:
-            raise ValueError(
-                f"mission.airborne_alt_m 不能为负：{self.mission.airborne_alt_m}"
-            )
+            raise ValueError(f"mission.airborne_alt_m 不能为负：{self.mission.airborne_alt_m}")
         if self.preflight.video_probe_s <= 0 or self.preflight.max_s <= 0:
             raise ValueError(
                 "preflight.video_probe_s / max_s 必须为正："
