@@ -287,7 +287,10 @@ class Hm30VideoSource:
         if thread is not None and thread.is_alive():
             thread.join(timeout)
             if thread.is_alive():
-                LOGGER.warning("拉流线程未在 %.1fs 内退出", timeout)
+                # 线程没停就别清引用：清了 running 会变 False、start() 会再起
+                # 一个线程，两个拉流线程抢同一个源。保留引用，稍后可再调 stop()。
+                LOGGER.warning("拉流线程未在 %.1fs 内退出，保留引用（可再调 stop()）", timeout)
+                return
         self._thread = None
         self._set_state("stopped")
 

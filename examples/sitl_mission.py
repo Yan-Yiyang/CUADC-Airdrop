@@ -36,8 +36,9 @@ BACKUP_POINT = Waypoint(lat=47.398000, lon=8.546000, alt_m=0.0)
 #: * ``LAND_PLAN`` 非空：用操作手在 QGC 里画好、另存为 ``.plan`` 的航线
 #:   （``routes/land.plan``；里面的"固定翼降落航线"复杂项会在本地展开成 MAVLink 项）。
 #:   飞掠段插在它前面，合成一条任务上传。
-#: * ``LAND_PLAN`` 为空：用下面的 ``LANDING_ROUTE`` 生成——进场 40m 高、离落点约 390m
-#:   ⇒ 下滑角 0.10 ✓（2026-09 之前的 40m/183m = 0.219 会被飞控判"下滑角过陡"）。
+#: * ``LAND_PLAN`` 为空：用下面的 ``LANDING_ROUTE`` 生成——进场 40m 高、离落点约 394m
+#:   ⇒ 下滑斜率 tan≈0.102（约 5.8°）✓（2026-09 之前的 40m/183m = tan 0.219 ≈ 12.4°
+#:   会被飞控判"下滑角过陡"）。
 LAND_PLAN = "routes/land.plan"
 LANDING_ROUTE = (
     Waypoint(lat=47.396500, lon=8.545000, alt_m=40.0),

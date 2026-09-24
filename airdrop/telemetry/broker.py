@@ -147,17 +147,17 @@ class TelemetryBroker:
 
         返回
         ----
-        对应时刻的快照；历史为空时返回 None。
+        对应时刻的快照；历史为空时返回 None。非法 ``mode`` 抛 ``ValueError``
+        （与历史是否为空无关）。
         """
+        if mode not in SUPPORTED_QUERY_MODES:  # 先校验模式：错误语义不该随历史有无而变
+            raise ValueError(f"不支持的查询模式: {mode}，可选 {sorted(SUPPORTED_QUERY_MODES)}")
         with self._lock:
             if not self._history:
                 return None
 
             if mode == "nearest":
                 return copy.copy(self._nearest_snapshot_locked(timestamp))
-
-            if mode != "interpolate":
-                raise ValueError(f"不支持的查询模式: {mode}，可选 {sorted(SUPPORTED_QUERY_MODES)}")
 
             return copy.copy(self._evaluate_snapshot_locked(timestamp))
 

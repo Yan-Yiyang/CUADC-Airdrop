@@ -6,12 +6,16 @@
 
 * 重力只有 ``+z`` 分量（往下掉）；
 * 阻力相对空气算（``v − w``，``w`` 是风的速度矢量）——这是风会平移落点的唯一原因；
-* ``ρ`` 默认按 ISA 随高度变化。
+* **密度基准是真实海拔（GPS/原点海拔），不是"地面=海平面"**：``isa_air_density()``
+  收的是海拔高度，调用方用 ``ground_altitude_m + 离地高度`` 得到它。
+  ``air_density_isa=True`` 时逐级按海拔算 ρ；``False``（默认）在**初始（投放）海拔**
+  上算一次、全弹道共用（比海平面常密度更接近真实，见下）。
 
 两处刻意的取舍（都写在代码里免得被当 bug）
 ------------------------------------------
-1. ISA 用"离地高度"当海拔：站点海拔没接入本模块，而 20m 量级下密度只差 ~0.2%，
-   对落点的影响可以忽略。要精确就得把地面点海拔传进来（``ground_z`` 已经是相对量）。
+1. 默认（``air_density_isa=False``）用**投放海拔处的常密度**：一次 ISA 求值折进
+   阻力系数。任务高度约 20m 时与逐级变化的差别只有 ~0.2%，而逐级求值要贵 26~30%；
+   高海拔站点或大落差投放可打开 ``air_density_isa``。
 2. 落点用线性插值定在穿越瞬间：定步长 5ms 直接取"第一个 z ≥ ground_z 的步"会带来
    最多一步的水平误差（10 m/s 平飞时 5cm）；穿越点插值后与解析解对得上。
 """
@@ -63,13 +67,15 @@ def as_float_triple(
     return (float(first), float(second), float(third))
 
 
-def isa_air_density(height_m: float) -> float:
-    """ISA 标准大气下 ``height_m`` 处的空气密度（kg/m³）。
+def isa_air_density(altitude_m: float) -> float:
+    """ISA 标准大气下 ``altitude_m``（**海拔**，米）处的空气密度（kg/m³）。
 
-    ``height_m`` 是离地高度（见模块 docstring 的取舍 1），负值按 0 处理。
+    ⚠ 参数是**海拔高度**（AMSL），不是离地高度：地面在 1500m 高原时，地面处的
+    密度是 ``isa_air_density(1500)`` ≈ 1.056，而不是 1.225。调用方拿
+    ``ground_altitude_m + 离地高度`` 得到海拔。负值（低于海平面）按 0 处理。
     """
-    height = max(float(height_m), 0.0)
-    return SEA_LEVEL_DENSITY * (1.0 - _ISA_COEFF * height) ** _ISA_EXP
+    altitude = max(float(altitude_m), 0.0)
+    return SEA_LEVEL_DENSITY * (1.0 - _ISA_COEFF * altitude) ** _ISA_EXP
 
 
 def wind_from_snapshot(
@@ -127,22 +133,37 @@ class BallisticsModel:
             raise ValueError(f"质量必须为正: {config.mass_kg}")
         if config.rk_dt <= 0:
             raise ValueError(f"积分步长必须为正: {config.rk_dt}")
-        #: 阻力系数 k = ½·Cd·A/m（1/m），ρ 单独随高度算
+        #: 阻力系数 k = ½·Cd·A/m（1/m）
         self._k = 0.5 * config.drag_coefficient * config.cross_area_m2 / config.mass_kg
 
     @property
     def config(self) -> BallisticsConfig:
         return self._config
 
-    def drag_factor(self, velocity_rel: Sequence[float], height_m: float) -> float:
-        """阻力加速度系数 ``½·ρ·Cd·A/m·|v_rel|``（1/s）；再乘 ``v_rel`` 就是加速度。"""
-        density = isa_air_density(height_m) if self._config.air_density_isa else SEA_LEVEL_DENSITY
+    def drag_factor(
+        self,
+        velocity_rel: Sequence[float],
+        height_m: float,
+        *,
+        ground_altitude_m: float = 0.0,
+    ) -> float:
+        """``height_m``（离地）处的阻力加速度系数 ``½·ρ·Cd·A/m·|v_rel|``（1/s）。
+
+        这是**点查询**：密度取该处的 ISA 值（海拔 = ``ground_altitude_m + height_m``），
+        与 ``air_density_isa`` 开关无关——开关只决定正演里密度是否随高度逐级变化。
+        """
+        density = isa_air_density(ground_altitude_m + height_m)
         speed = math.sqrt(sum(float(v) ** 2 for v in velocity_rel))
         return self._k * density * speed
 
-    def terminal_velocity(self, height_m: float = 0.0) -> float:
-        """终端速度 ``v_t = √(2mg / (ρ·Cd·A))``（m/s）。"""
-        density = isa_air_density(height_m) if self._config.air_density_isa else SEA_LEVEL_DENSITY
+    def terminal_velocity(self, height_m: float = 0.0, *, ground_altitude_m: float = 0.0) -> float:
+        """``height_m``（离地）处的终端速度 ``v_t = √(2mg / (ρ·Cd·A))``（m/s）。
+
+        同样是点查询、ISA 密度（海拔 = ``ground_altitude_m + height_m``）。
+        关闭 ``air_density_isa`` 的常密度正演取的是**投放高度**处的值，
+        所以在投放高度上查询它，就是那条常密度弹道的终端速度。
+        """
+        density = isa_air_density(ground_altitude_m + height_m)
         area_term = self._config.drag_coefficient * self._config.cross_area_m2
         if area_term <= 0:
             return float("inf")  # 无阻力：不存在终端速度
@@ -155,16 +176,34 @@ class BallisticsModel:
         self,
         velocity: Sequence[float],
         wind: Sequence[float],
-        height_m: float,
+        altitude_m: float,
     ) -> tuple[float, float, float]:
-        """当前加速度：重力 + 阻力。"""
-        rel = [float(velocity[i]) - float(wind[i]) for i in range(3)]
-        factor = self.drag_factor(rel, height_m)
-        gravity = self._config.gravity
+        """当前加速度：重力 + 阻力（密度取 ``altitude_m`` 处的 ISA 值）。
+
+        这是"密度随高度逐级变化"那条路径用的；常密度路径直接用
+        :meth:`_acceleration_with_scale`，不经过这里。
+        """
+        return self._acceleration_with_scale(
+            velocity, wind, self._k * isa_air_density(altitude_m), self._config.gravity
+        )
+
+    @staticmethod
+    def _acceleration_with_scale(
+        velocity: Sequence[float],
+        wind: Sequence[float],
+        drag_scale: float,
+        gravity: float,
+    ) -> tuple[float, float, float]:
+        """用固定密度系数计算加速度，供 RK4 热路径复用。"""
+        rel_x = float(velocity[0]) - float(wind[0])
+        rel_y = float(velocity[1]) - float(wind[1])
+        rel_z = float(velocity[2]) - float(wind[2])
+        speed = math.sqrt(rel_x * rel_x + rel_y * rel_y + rel_z * rel_z)
+        factor = drag_scale * speed
         return (
-            -factor * rel[0],
-            -factor * rel[1],
-            gravity - factor * rel[2],
+            -factor * rel_x,
+            -factor * rel_y,
+            gravity - factor * rel_z,
         )
 
     def predict_impact(
@@ -173,6 +212,7 @@ class BallisticsModel:
         velocity_ned: Sequence[float],
         *,
         ground_z: float = 0.0,
+        ground_altitude_m: float = 0.0,
         wind: Sequence[float] = (0.0, 0.0, 0.0),
     ) -> Impact:
         """从 ``position_ned``/``velocity_ned`` 起积分，返回落点与飞行时间。
@@ -180,6 +220,11 @@ class BallisticsModel:
         终止条件 ``z ≥ ground_z``；穿越点线性插值。落不到地（时长超过
         :data:`MAX_FLIGHT_TIME_S`）或起点已在地面以下都返回 ``ok=False`` 并说明原因
         ——不返回一个编出来的落点。
+
+        ``ground_altitude_m`` 是**地面平面的海拔**（AMSL，来自 GPS 原点/地面点）：
+        它是密度的基准——``air_density_isa=True`` 时按 ``ground_altitude_m + 离地
+        高度`` 逐级求值；``False`` 时在**初始（投放）海拔** ``ground_altitude_m +
+        初始离地高度`` 上求一次常密度，全弹道共用。
         """
         if len(position_ned) != 3 or len(velocity_ned) != 3:
             raise ValueError("position_ned / velocity_ned 必须是 3 维 NED 矢量")
@@ -190,17 +235,38 @@ class BallisticsModel:
             return Impact(False, None, 0.0, 0.0, reason="below_ground")
 
         dt = self._config.rk_dt
+        baseline = float(ground_altitude_m)
+        if self._config.air_density_isa:
+            drag_scale = None  # 逐级按海拔密度算
+        else:
+            # 常密度：按初始（投放）海拔算一次；比"海平面常密度"更接近真实
+            initial_height = max(ground_z - p[2], 0.0)
+            drag_scale = self._k * isa_air_density(baseline + initial_height)
         elapsed = 0.0
         while elapsed < MAX_FLIGHT_TIME_S:
             height = max(ground_z - p[2], 0.0)
             # RK4：k1..k4 分别是位置与速度的斜率
-            a1 = self._acceleration(v, w, height)
+            if drag_scale is None:
+                a1 = self._acceleration(v, w, baseline + height)
+            else:
+                a1 = self._acceleration_with_scale(v, w, drag_scale, self._config.gravity)
             v2 = [v[i] + 0.5 * dt * a1[i] for i in range(3)]
-            a2 = self._acceleration(v2, w, max(ground_z - (p[2] + 0.5 * dt * v[2]), 0.0))
+            height2 = max(ground_z - (p[2] + 0.5 * dt * v[2]), 0.0)
+            if drag_scale is None:
+                a2 = self._acceleration(v2, w, baseline + height2)
+            else:
+                a2 = self._acceleration_with_scale(v2, w, drag_scale, self._config.gravity)
             v3 = [v[i] + 0.5 * dt * a2[i] for i in range(3)]
-            a3 = self._acceleration(v3, w, max(ground_z - (p[2] + 0.5 * dt * v[2]), 0.0))
+            if drag_scale is None:
+                a3 = self._acceleration(v3, w, baseline + height2)
+            else:
+                a3 = self._acceleration_with_scale(v3, w, drag_scale, self._config.gravity)
             v4 = [v[i] + dt * a3[i] for i in range(3)]
-            a4 = self._acceleration(v4, w, max(ground_z - (p[2] + dt * v[2]), 0.0))
+            height4 = max(ground_z - (p[2] + dt * v[2]), 0.0)
+            if drag_scale is None:
+                a4 = self._acceleration(v4, w, baseline + height4)
+            else:
+                a4 = self._acceleration_with_scale(v4, w, drag_scale, self._config.gravity)
 
             p_next = [
                 p[i] + dt / 6.0 * (v[i] + 2.0 * v2[i] + 2.0 * v3[i] + v4[i]) for i in range(3)

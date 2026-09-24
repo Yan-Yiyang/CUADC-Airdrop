@@ -1,4 +1,20 @@
-'AirDrop 3.0 全局配置——全部参数的唯一集中处。\n\n约定\n----\n- 全部为 frozen dataclass（可用 ``dataclasses.replace`` 派生变体）；\n- **不使用命令行参数**：要改参数就改这里，或在构造 :class:`Config` 时显式传；\n- 每个字段注明单位与来源（实测值 / 标定产出 / 占位待微调）；\n- :class:`Config` 是装配点，各模块从它取自己的配置片段，模块内部不散落魔法数字；\n- ``Config.validated()`` 做取值域检查（异常在启动前暴露，而不是飞到一半才发现）。'
+"""AirDrop 3.0 全局配置——全部参数的唯一集中处。
+
+约定
+----
+- 全部为 frozen dataclass（可用 ``dataclasses.replace`` 派生变体）；
+- **不使用命令行参数**：要改参数就改这里，或在构造 :class:`Config` 时显式传；
+- 每个字段注明单位与来源（实测值 / 标定产出 / 占位待微调）；
+- :class:`Config` 是装配点，各模块从它取自己的配置片段，模块内部不散落魔法数字；
+- ``Config.validated()`` 做取值域检查（异常在启动前暴露，而不是飞到一半才发现）。
+
+字段来源与现状
+--------------
+- ``video.telemetry_lag``：ffmpeg 后端实测 ≈0.15s；**标定流程步骤二会给出实测值并覆盖**；
+- ``ballistics``：350ml 矿泉水瓶的占位参数，**需投放试验微调**；
+- ``overfly.leg_length_m``：保证平飞的段长，**需实验验证**；
+- ``perception.mode`` / ``targeting.selection_rule``：**起飞前按任务选定**。
+"""
 
 from __future__ import annotations
 
@@ -43,7 +59,8 @@ class TelemetryConfig:
     速率字段是**请求给飞控的上发频率**。它们直接决定帧-遥测内插的上限精度：
     固定翼 15~20 m/s 平飞时，位置流 1Hz 的内插误差是米级，10Hz 降到分米级；
     姿态流变化更快，20m 高度下 1° 姿态误差 ≈0.35m 地面误差，所以要求 ≥30Hz。
-    实际速率在 P2 阶段经 ``set_rate_*`` 下发（当前实现尚未设置）。
+    速率由 :class:`~airdrop.telemetry.MavsdkThread` 在连接就绪后经 ``set_rate_*``
+    统一下发（见其 ``_apply_telemetry_rates``）；单条速率失败只记日志，不中断连接。
     """
 
     system_address: str = "udpin://0.0.0.0:14540"
@@ -106,9 +123,11 @@ class PerceptionConfig:
     max_side_px: float = 400.0
     ocr_conf_threshold: float = 0.6
     ocr_workers: int = 2
+    #: OCR 积压告警阈值（请求/结果队列都无界、不丢弃；见 airdrop.perception.ocr_worker）
     ocr_queue_size: int = 500
-    ocr_dedupe_s: float = 0.8  # 同一目标送检最小时间间隔（0 = 不去重）
-    ocr_dedupe_px: float = 30.0  # 同一目标送检最小中心位移（px）
+    # 保留旧字段以兼容配置文件；当前 OCR 逐帧送检，这两个字段不再参与运行时判定。
+    ocr_dedupe_s: float = 0.0
+    ocr_dedupe_px: float = 0.0
 
     # 排故素材
     save_crops: bool = False
@@ -222,6 +241,10 @@ class BallisticsConfig:
     ⚠ **质量是称出来的**（台秤/天平实测，别当待估参数）；``drag_coefficient`` 与
     ``cross_area_m2`` 只以 ``Cd·A`` 的乘积影响弹道，单靠落点数据分不开——固定面积、
     **靠投放试验反演 Cd**（`tools/fit_ballistics.py`，见 :mod:`airdrop.ballistics.fit`）。
+
+    空气密度以**真实海拔**为基准（飞行取 GPS 原点/地面点海拔，反演取投放记录里的
+    原点，见 ``BallisticsModel.predict_impact`` 的 ``ground_altitude_m``）：
+    ``air_density_isa=False``（默认）在投放海拔算一次常密度；``True`` 则逐级随海拔变化。
     """
 
     mass_kg: float = 0.365  # **实测称重**（占位值仅用于跑通链路）
@@ -229,7 +252,9 @@ class BallisticsConfig:
     cross_area_m2: float = 0.004  # 几何量（卡尺/投影面积）
     gravity: float = 9.80665
     rk_dt: float = 0.005
-    air_density_isa: bool = True  # 空气密度按 ISA 标准大气随高度变化
+    # False（默认）= 在投放（初始）海拔上算一次常密度、全弹道共用；
+    # True = 逐级按"地面海拔 + 离地高度"求 ISA 密度（贵 26~30%，高海拔/大落差时更准）
+    air_density_isa: bool = False
     wind_source: str = "telemetry"  # telemetry（PX4 风估计）/ zero
 
 

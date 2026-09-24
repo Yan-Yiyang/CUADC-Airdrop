@@ -92,6 +92,8 @@ class ReleaseJudge:
     ballistics: BallisticsModel
     overfly_heading_deg: float
     ground_z: float = 0.0
+    #: 地面平面的海拔（AMSL，GPS 原点/地面点）——密度的基准；0 = 未接（地面当海平面）
+    ground_altitude_m: float = 0.0
     #: 显式风矢量（NED，m/s）；None 表示**每个节拍按 ``BallisticsConfig.wind_source``
     #: 从快照取**（取不到则零风降级并记一次日志）。
     wind_ned: tuple[float, float, float] | None = None
@@ -126,10 +128,15 @@ class ReleaseJudge:
         target_ned: Sequence[float],
         *,
         ground_z: float | None = None,
+        ground_altitude_m: float | None = None,
         wind_ned: Sequence[float] | None = None,
         now: float | None = None,
     ) -> ReleaseDecision:
-        """评估一次；``target_ned`` 是目标（或备用点）的 NED 坐标。"""
+        """评估一次；``target_ned`` 是目标（或备用点）的 NED 坐标。
+
+        ``ground_altitude_m`` 是地面海拔（密度基准，见
+        :meth:`BallisticsModel.predict_impact`）；不给就用构造时的值。
+        """
         stamp = time.time() if now is None else float(now)
         self._evaluations += 1
 
@@ -157,6 +164,9 @@ class ReleaseJudge:
             release_position,
             velocity,
             ground_z=self.ground_z if ground_z is None else ground_z,
+            ground_altitude_m=(
+                self.ground_altitude_m if ground_altitude_m is None else ground_altitude_m
+            ),
             wind=wind,
         )
 

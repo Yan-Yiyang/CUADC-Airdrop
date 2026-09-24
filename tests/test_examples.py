@@ -137,6 +137,22 @@ def test_full_mission_build_config_honours_overrides() -> None:
     assert not config.preflight.check_video, "不接图传时视频自检无从做起"
 
 
+def test_full_mission_default_route_passes_landing_precheck() -> None:
+    """默认配置必须真的拼得出任务：降落几何过 PX4 预检（这是最容易踩的坑）。"""
+    from airdrop import build_drop_mission
+    from airdrop.georef import LLARef
+    from examples import full_mission
+
+    config = full_mission.build_config()
+    origin = LLARef(lon_deg=8.5456, lat_deg=47.3977, alt_m=500.0)
+    plan = build_drop_mission(config, origin=origin, target_ned=(100.0, 200.0, 0.0))
+
+    commands = [item.command for item in plan.items]
+    assert commands[:2] == [16, 16], "飞掠段是 [entry, exit] 两个 NAV_WAYPOINT"
+    assert 21 in commands, "降落段末尾必须有 NAV_LAND"
+    assert plan.source == "target" and plan.landing_count >= 2
+
+
 def test_calibration_capture_builds_a_valid_config() -> None:
     from examples import calibration_capture
 

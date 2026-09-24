@@ -245,7 +245,8 @@ class MissionItem:
         """由配置里的航点构造（``waypoint`` 只要带 ``lat``/``lon``/``alt_m``）。
 
         ``land=True`` 时做成降落项；接受半径沿用 ``waypoint.acceptance_radius_m``
-        （未配置则用默认值）。
+        （未配置则用默认值）。⚠ 降落项按降落语义构造（相对高度 0、到地面），
+        **不沿用**航点的 ``alt_m`` 与接受半径——``NAV_LAND`` 本身就落在地面。
         """
         radius = float(getattr(waypoint, "acceptance_radius_m", 0.0) or 0.0)
         if land:

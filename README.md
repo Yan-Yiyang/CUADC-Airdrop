@@ -26,6 +26,12 @@
 | `tools.calibrate` | 三步标定：内参 → 画面/遥测时间差 → 手眼外参 | `test_calibrate.py` |
 | `tools.fit_ballistics` | 投放试验反演弹道参数（最小二乘 + 可辨识性诊断） | `test_fit.py` |
 
+> **第一次上手先看 [`docs/handbook.md`](docs/handbook.md)**（项目手册：目录总览、各模块调用方法与
+> 最小示例、参数总表、输入输出字段、使用流程、代码审查速查、排障表）。
+> 设计决策与"遇到过的问题/实测结论"在 **[`AGENTS.md`](AGENTS.md)**（本仓库的工作手册），
+> 长专题（标定/OpenCV、图传/ffmpeg、感知/OCR、投放反演）在 **[`docs/`](docs/)** 下的专题笔记，
+> 两者**同等权威**。README 只说明使用方法。
+
 ## 目录结构
 
 ```text
@@ -213,7 +219,7 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
 ## 测试与代码规范
 
 ```bash
-./.venv/Scripts/python.exe -m pytest                 # 全部（附覆盖率，当前 ≈81%）
+./.venv/Scripts/python.exe -m pytest                 # 全部（附覆盖率，当前 ≈85%）
 ./.venv/Scripts/python.exe -m pytest -m "not stream" # 跳过要起 ffmpeg 的用例
 ./.venv/Scripts/python.exe -m pytest -m realdata     # GPU + 旧版 实战素材（分钟级）
 ./.venv/Scripts/python.exe -m pytest -k mission -v   # 只跑某个主题

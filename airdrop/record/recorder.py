@@ -30,7 +30,9 @@
 
 * **frame writer**：``buffer.wait_new`` 跟随最新帧 → 取 jpeg 字节 → 写盘。
   唯一会解码的场合是 ``storage="raw"`` 缓冲（此时 ``read_jpeg_bytes`` 返回
-  None，writer 用 ``cv2.imencode`` 重新编码）；
+  None，writer 用 ``cv2.imencode`` 重新编码）。写盘落后到超过缓冲容量时会
+  **跳号**：跳掉的帧计入 :attr:`RecorderStats.frames_skipped` 并发 WARNING
+  ——绝不静默地少录；
 * **telemetry writer**：``broker.wait_next_snapshot`` 等到下一条快照 →
   按 ``telemetry_hz`` 节流（默认 10Hz）→ 写盘。30Hz 原始流不必每条都留。
 
@@ -89,6 +91,8 @@ CONFIG_SNAPSHOT_NAME = "config_snapshot.json"
 
 # frame writer 在 raw 缓冲下重新编码时使用的 JPEG 画质
 _REENCODE_JPEG_QUALITY = 90
+_INDEX_FLUSH_EVERY = 16
+_TELEMETRY_FLUSH_EVERY = 16
 
 # 飞行目录名的时间戳格式（与排序友好，便于 ls 浏览）
 _FLIGHT_DIR_FMT = "%Y%m%d-%H%M%S"
@@ -267,6 +271,7 @@ class RecorderStats:
         "drops",
         "events",
         "flight_dir",
+        "frames_skipped",
         "frames_written",
         "raw_reencoded",
         "telemetry_written",
@@ -281,6 +286,7 @@ class RecorderStats:
         detections: int,
         drops: int,
         raw_reencoded: int,
+        frames_skipped: int = 0,
     ) -> None:
         self.flight_dir = flight_dir
         self.frames_written = frames_written
@@ -289,6 +295,8 @@ class RecorderStats:
         self.detections = detections
         self.drops = drops
         self.raw_reencoded = raw_reencoded
+        #: 因缓冲驱逐/写盘落后而**没写进磁盘**的帧数（>0 说明录制不完整，日志里有 WARNING）
+        self.frames_skipped = frames_skipped
 
 
 # ----------------------------------------------------------------------
@@ -352,6 +360,7 @@ class FlightRecorder:
 
         # 运行统计
         self._frames_written = 0
+        self._frames_skipped = 0
         self._telemetry_written = 0
         self._raw_reencoded = 0
         self._events_written = 0
@@ -475,11 +484,16 @@ class FlightRecorder:
         if self._flight_dir is None and not self._stop_event.is_set():
             return  # 从未启动过
         self._stop_event.set()
+        alive = False
         for thread in (self._frame_thread, self._telemetry_thread):
             if thread is not None and thread.is_alive():
                 thread.join(timeout)
                 if thread.is_alive():
+                    alive = True
                     LOGGER.warning("recorder 线程未在 %.1fs 内退出: %s", timeout, thread.name)
+        if alive:
+            LOGGER.warning("后台写入线程仍在运行，保留文件句柄，稍后可再次调用 stop() 收尾")
+            return
         self._frame_thread = None
         self._telemetry_thread = None
 
@@ -517,13 +531,19 @@ class FlightRecorder:
             detections=detections,
             drops=drops,
             raw_reencoded=self._raw_reencoded,
+            frames_skipped=self._frames_skipped,
         )
 
     # ------------------------------------------------------------------
     # 后台线程
     # ------------------------------------------------------------------
     def _frame_writer_loop(self) -> None:
-        """跟随缓冲逐帧落盘（零重编码优先；raw 缓冲下重新编码）。"""
+        """跟随缓冲逐帧落盘（零重编码优先；raw 缓冲下重新编码）。
+
+        ``wait_new`` 只能返回"当前保留的最早一条"：一旦写盘落后到超过缓冲
+        容量（默认 5400 帧 ≈3 分钟），被驱逐的帧就补不回来了。所以这里显式
+        检查序号跳变——跳号只记账 + 告警，不假装"录全了"。
+        """
         assert self._buffer is not None and self._frames_dir is not None
         buffer = self._buffer
         frames_dir = self._frames_dir
@@ -534,6 +554,17 @@ class FlightRecorder:
             frame = buffer.wait_new(after_index=cursor, timeout=1.0)
             if frame is None:
                 continue
+            if frame.index > cursor + 1:
+                skipped = frame.index - cursor - 1
+                self._frames_skipped += skipped
+                LOGGER.warning(
+                    "录制跳号：序号 %d→%d 之间的 %d 帧未落盘"
+                    "（写盘落后于缓冲容量，或录制在帧产生之后才启动）；"
+                    "飞行目录里这几帧缺失，统计见 frames_skipped",
+                    cursor + 1,
+                    frame.index,
+                    skipped,
+                )
             cursor = frame.index
             try:
                 self._write_one_frame(frame, frames_dir, index_file)
@@ -578,8 +609,9 @@ class FlightRecorder:
             ensure_ascii=False,
         )
         index_file.write(index_line + "\n")
-        index_file.flush()
         self._frames_written += 1
+        if self._frames_written % _INDEX_FLUSH_EVERY == 0:
+            index_file.flush()
 
     def _telemetry_writer_loop(self) -> None:
         """按 ``telemetry_hz`` 节流写盘。"""
@@ -605,11 +637,12 @@ class FlightRecorder:
                 out.write(
                     json.dumps(snapshot.as_dict(), ensure_ascii=False, default=_json_default) + "\n"
                 )
-                out.flush()
+                self._telemetry_written += 1
+                if self._telemetry_written % _TELEMETRY_FLUSH_EVERY == 0:
+                    out.flush()
             except OSError:
                 LOGGER.exception("telemetry 写入失败")
                 continue
-            self._telemetry_written += 1
 
     # ------------------------------------------------------------------
     # 目录 / 文件
@@ -711,4 +744,5 @@ class FlightRecorder:
             handler.close()
         except OSError:
             LOGGER.exception("log handler 关闭失败")
+        logging.getLogger().setLevel(self._original_root_level)
         self._log_handler = None

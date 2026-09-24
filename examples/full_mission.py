@@ -63,9 +63,14 @@ RECON_ROUTE = (
     Waypoint(lat=47.398742, lon=8.546594, alt_m=60.0),
 )
 BACKUP_POINT = Waypoint(lat=47.398000, lon=8.546000, alt_m=0.0)
+#: 降落段。固定翼有硬性几何要求（PX4 会照这套判据拒整条任务）：
+#: 降落项紧前一项必须严格高于落点，且 **下滑斜率（tan，垂直差/水平距离）**
+#: ≤ tan(FW_LND_ANG+0.1°)（默认 8° ⇒ 上限约 0.142）。
+#: 下面的 40m/约 394m ⇒ tan≈0.102（约 5.8°）能过；**换空域时按这条算一遍**
+#: （`build_drop_mission` 会在规划阶段预检，不合格直接报错，不会等到飞控拒）。
 LANDING_ROUTE = (
-    Waypoint(lat=47.396000, lon=8.545000, alt_m=40.0),
-    Waypoint(lat=47.395000, lon=8.544000, alt_m=0.0),
+    Waypoint(lat=47.396500, lon=8.545000, alt_m=40.0),
+    Waypoint(lat=47.393600, lon=8.542000, alt_m=0.0),
 )
 #: 非空 = 用操作手在 QGC 画好的降落航线（与 LANDING_ROUTE 二选一，见 RoutesConfig）
 LAND_PLAN = ""
@@ -215,7 +220,7 @@ def main(
     # 4) 图传 → 对齐 → 环形缓冲（一帧不落的那条路：sink 逐帧）
     #    --no-video（use_video=False）时不接图传/感知：状态机照常跑，
     #    HOLD_PROCESS 取不到结果就走备用点；记录器仍需要一个空缓冲（frames/ 为空）。
-    buffer = AlignmentBuffer(capacity_for(config.video.fps or 30.0, 180.0), storage="jpeg")
+    buffer = AlignmentBuffer(capacity_for(30.0, 180.0), storage="jpeg")
     camera = source = writer = worker = tracker = targets = None
     if use_video:
         camera = config.camera.load_model()
@@ -253,13 +258,15 @@ def main(
     # 最后进 RECON：MissionConfig.recon_upload="operator"（默认）表示**由操作手在
     # QGC 上传并启动侦查航线**，本包不上传、只等它开始再监视进度；自动测试才用 "auto"。
     def _load_camera() -> str:
-        """载入相机标定，返回一句可读的细节。
+        """报告相机标定（复用装配时已载入的那份），返回一句可读的细节。
 
         细节是给 ``preflight`` 事件用的：不要把 ``CameraModel`` 直接返回——它是
         带 numpy 数组的 dataclass，``str()`` 出来是一大坨多行 repr，会把事件日志搞脏。
         ``source`` 为 None 说明用的是默认模型（标定文件缺失/损坏）。
         """
-        model = config.camera.load_model()
+        # 视频链路装配时已经载入过一份（见上面的 camera）：复用同一个实例，
+        # 不重复读文件，也避免"预检检查的模型与解算用的不是同一个"的错觉。
+        model = camera if camera is not None else config.camera.load_model()
         origin = model.source or "默认模型（标定缺失/损坏，坐标不可信）"
         return f"{config.camera.calib_file} → {origin}，标定尺寸 {model.image_size}"
 

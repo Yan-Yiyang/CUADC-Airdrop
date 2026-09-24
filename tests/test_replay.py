@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import time
 import uuid
@@ -364,17 +365,42 @@ def test_pacer_finish_flushes_pending_before_extending() -> None:
     assert span[1] >= 105.0
 
 
-def test_pacer_finish_warns_on_suspicious_gap() -> None:
-    """末尾遥测缺得太多（日志被截断/链路掉了）要喊出来，不能默默延伸。"""
+def test_pacer_finish_warns_on_suspicious_gap(caplog) -> None:
+    """末尾遥测缺得太多（日志被截断/链路掉了）要喊出来，不能默默延伸。
+
+    告警量按**最后一条真实快照**算：逐帧调用 ``finish`` 时如果按上一次的
+    延伸点算，一整段缺失会被摊成每帧几十毫秒，warning 永远不触发。
+    """
     broker = TelemetryBroker(history_maxlen=100, history_interval=0.0)
     pacer = TelemetryPacer(
         broker, [_snapshot(100.0), _snapshot(100.5)], ahead_s=0.0, tail_warn_s=1.0
     )
-    added = pacer.finish(101.0)
+    with caplog.at_level(logging.WARNING, logger="airdrop.record.replay"):
+        added = pacer.finish(102.0)  # 最后一条真实遥测在 100.5 → 缺 1.5s > tail_warn_s
     assert added >= 1
     assert pacer.tail_extended == added
     span = broker.history_span()
-    assert span is not None and span[1] >= 101.0
+    assert span is not None and span[1] >= 102.0
+    assert [record for record in caplog.records if "末尾" in record.message], caplog.text
+
+
+def test_pacer_finish_warns_once_for_incrementally_extended_tail(caplog) -> None:
+    """逐帧补尾部（_play_files 的真实调用方式）：缺 10s 也只告警一次。"""
+    broker = TelemetryBroker(history_maxlen=500, history_interval=0.0)
+    pacer = TelemetryPacer(
+        broker, [_snapshot(100.0), _snapshot(100.5)], ahead_s=0.0, tail_warn_s=5.0
+    )
+    with caplog.at_level(logging.WARNING, logger="airdrop.record.replay"):
+        for step in range(1, 41):  # 0.25s 一帧，补到 110.5（缺 10s）
+            target = 100.5 + step * 0.25
+            if target > pacer.cover_to():
+                pacer.finish(target)
+            pacer.publish_until(target)
+    warnings = [record for record in caplog.records if "末尾" in record.message]
+    assert len(warnings) == 1, caplog.text
+    assert pacer.tail_extended > 1, "逐帧延伸会积累多条，不是 0/1 那点量"
+    span = broker.history_span()
+    assert span is not None and span[1] >= 110.5
 
 
 def test_pacer_finish_without_snapshots_is_noop() -> None:

@@ -44,5 +44,4 @@ __all__ = [
     "PixelBox",
     "correct_ocr_number",
     "ocr_worker_main",
-    "put_drop_oldest",
 ]

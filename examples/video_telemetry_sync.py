@@ -188,8 +188,12 @@ def main(
 
     broker = TelemetryBroker()
     mavsdk = MavsdkThread(broker=broker, system_address=config.telemetry.system_address)
-    mavsdk.start()
-    mavsdk.connect(config.telemetry.system_address)
+    try:
+        mavsdk.start()
+        mavsdk.connect(config.telemetry.system_address)
+    except BaseException:
+        mavsdk.stop()
+        raise
 
     LOGGER.info("等待遥测就绪...")
     if broker.wait_next_snapshot(timeout=15.0, predicate=lambda s: s.is_valid()) is None:

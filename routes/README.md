@@ -21,8 +21,9 @@ QGC 里画好航线 → **Save / 另存为** → 选择本目录：
 2. 降落段最后一项是 `NAV_LAND`（`command=21`）；
 3. **`NAV_LAND` 的紧前一项必须严格高于落点**，且
    `(前项高 − 落点高) / 水平距离 ≤ tan(FW_LND_ANG + 0.1°)`
-   （`FW_LND_ANG` 默认 8° ⇒ 约 0.142；改过飞控参数就把 `RoutesConfig.fw_land_angle_deg` 同步）。
-   例：**20 m 高 / 距落点 300 m** ⇒ 0.067 ✓；**40 m 高 / 距落点 183 m** ⇒ 0.219 ✗ 被判"下滑角过陡"；
+   （`FW_LND_ANG` 默认 8° ⇒ 上限约 0.142；改过飞控参数就把 `RoutesConfig.fw_land_angle_deg` 同步）。
+   ⚠ 下面例子里的数字是**斜率 tanθ，不是角度**：**20 m 高 / 距落点 300 m** ⇒ tan≈0.067（约 3.8°）✓；
+   **40 m 高 / 距落点 183 m** ⇒ tan≈0.219（约 12.4°）✗ 被判"下滑角过陡"；
 4. 进场点只能是普通航点或 QGC"固定翼降落航线"复杂项里的绕圈下降到高度
    （`fwLandingPattern`：`DO_LAND_START + NAV_LOITER_TO_ALT + NAV_LAND`，本包会照 QGC 的逻辑展开）；
 5. 其它 QGC 复杂项（VTOL 降落、测绘/结构航线）**不支持**，请改存成普通航点。

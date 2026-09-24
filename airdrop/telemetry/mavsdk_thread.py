@@ -193,11 +193,17 @@ class MavsdkThread:
         if self._loop is not None and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
 
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                # 线程没停就别清引用（清了 start() 会再起一个，且 _loop 正被它用着）。
+                # 保留 _loop/_thread，稍后可再调 stop()；其余收尾照常做。
+                LOGGER.warning("MAVSDK 线程未在 %.1fs 内退出，保留引用（可再调 stop()）", timeout)
+            else:
+                self._thread = None
+                self._loop = None
 
-        self._loop = None
         drone, self._drone = self._drone, None
         self._release_drone(drone)  # 幂等；正常路径上会话 finally 已释放过
         self._ready.clear()

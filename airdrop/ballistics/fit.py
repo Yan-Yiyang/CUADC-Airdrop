@@ -6,7 +6,7 @@
 位置/速度/风 → RK4 积分 → 落点。**反演（inverse）**是拿它的输出与实测落点的差做
 最小二乘，把参数往回拧::
 
-    参数 θ = (Cd, m, A, δt, 风比例)
+    参数 θ = (Cd, A, δt, 风比例)——**质量不在其中**（它是称出来的输入，见下）
     r_i(θ) = [预测落点(θ) − 实测落点]_x,y      # 每次投放贡献 2 个残差（北、东）
     θ* = argmin Σ |r_i(θ)|²
 
@@ -107,7 +107,9 @@ class FitConfig:
 
     ``base`` 是**没有被拟合的参数**取值来源，也是拟合的初值来源。它必须带上
     **实测**的质量与（若固定面积）几何面积——见模块 docstring 第 1 条：
-    **质量是称出来的输入量，不是待估参数**。
+    **质量是称出来的输入量，不是待估参数**。``base.air_density_isa`` 决定反演
+    正演用的密度模型；密度基准（地面海拔）逐条取自投放记录的原点
+    （:attr:`DropRecord.ground_altitude_m`），记录缺原点时退回 0 并在报告里告警。
     """
 
     base: BallisticsConfig = field(default_factory=BallisticsConfig)
@@ -638,6 +640,12 @@ def fit_ballistics(  # noqa: PLR0911, PLR0912, PLR0915 - 一次反演要把"取�
     sigma: dict[str, float] = {}
     correlation: dict[str, dict[str, float]] = {}
     warnings: list[str] = []
+    missing_origin = [sample.name for sample in data if sample.record.origin is None]
+    if missing_origin:
+        warnings.append(
+            f"这些投放记录没有 NED 原点：{missing_origin}——密度基准退回海平面，"
+            "高原站点会高估密度；补上记录里的 origin 再重跑"
+        )
     if dof >= 1:
         residual_sum = float(np.sum(np.square(residuals(solution.x))))
         variance = residual_sum / dof

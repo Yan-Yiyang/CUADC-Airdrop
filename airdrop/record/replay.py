@@ -251,10 +251,10 @@ class TelemetryPacer:
     只推进到帧时刻本身的话，帧时刻正好是历史区间的右边界，数值上虽能内插
     （比率 1.0），但一旦遥测有细微抖动就会退化成外推。
 
-    素材播完后由 :class:`ReplayVideoSource` 调一次 :meth:`finish`：把最后一条
-    快照延伸到最后帧的拍摄时刻。**必须补这一步**——录制器按固定频率写遥测，
-    日志的最后一条通常比末帧早几十毫秒，不补的话末帧会去等对齐器的 1.0s 上限、
-    然后被记成"链路停顿"丢弃（回放里那是假警报）。
+    由 :class:`ReplayVideoSource` 在每帧投递前按需调用 :meth:`finish`：只把遥测
+    覆盖补到当前帧的拍摄时刻。**必须补这一步**——录制器按固定频率写遥测，日志的
+    最后一条通常比末帧早几十毫秒，不补的话末帧会去等对齐器的 1.0s 上限、然后被
+    记成"链路停顿"丢弃（回放里那是假警报）。
     """
 
     def __init__(
@@ -275,6 +275,8 @@ class TelemetryPacer:
         self._cursor = 0
         self._finished = 0
         self._warned_no_coverage = False
+        self._warned_tail = False
+        self._coverage_timestamp = float("-inf")
 
     @classmethod
     def from_log(
@@ -313,14 +315,19 @@ class TelemetryPacer:
 
     @property
     def tail_extended(self) -> int:
-        """为补足素材末尾而额外延伸的快照条数（正常素材为 0 或 1）。"""
+        """为补足素材覆盖而额外延伸的快照条数。
+
+        ⚠ 逐帧调用 :meth:`finish` 时它会按帧数增长（30 fps 下补 30 秒就是
+        ~30 条，每帧一条），不是"正常素材 0 或 1"；要判断"尾部缺了多少"
+        看 ``cover_to()`` 与最后一条真实快照的差，或看有没有那条 WARNING。
+        """
         return self._finished
 
     def cover_to(self) -> float:
         """当前已推进到的时间；没有快照时返回 ``-inf``。"""
         if self._cursor == 0:
             return float("-inf")
-        return self._timestamps[self._cursor - 1]
+        return max(self._timestamps[self._cursor - 1], self._coverage_timestamp)
 
     # ------------------------------------------------------------------
     # 推进
@@ -340,7 +347,7 @@ class TelemetryPacer:
         return count
 
     def finish(self, capture_timestamp: float) -> int:
-        """素材播完后调一次：把遥测覆盖补到 ``capture_timestamp``（通常是末帧）。
+        """把遥测覆盖补到 ``capture_timestamp``（回放源在每帧投递前按需调用）。
 
         必要的原因：素材往往**遥测先于视频结束**——录制器按固定频率写遥测，
         而视频流停在最后一帧，日志的最后一条通常比末帧早几十毫秒。不补的话，
@@ -348,37 +355,42 @@ class TelemetryPacer:
         记成"链路停顿"丢弃——那是**假警报**，而且白白浪费 1 秒。
 
         补法是"把最后一条快照沿时间轴向前延伸"：状态取最后一个已知值，
-        时间戳按原时间轴单调前进。延伸超过 ``tail_warn_s`` 秒说明素材末尾
-        遥测缺失得可疑（可能是链路掉了或日志被截断），如实记 warning。
+        时间戳按原时间轴单调前进。**尾部缺失量按最后一条真实快照算**
+        （不是按上一次的延伸点）——逐帧调用时后者每步只差几十毫秒，一整段
+        缺失会被摊平，``tail_warn_s`` 的告警就永远不会触发。超过
+        ``tail_warn_s`` 秒只告警**一次**（同一次回放里素材尾部就这一处问题）。
 
         到这一刻为止**尚未覆盖的历史区间**（日志中途就断掉的场合）也一并用最后
         一条快照填上：否则那一段里的帧会一帧一帧各等满 1.0s 再被丢弃——回放里
-        空耗时间，还会把"素材日志不完整"伪装成"链路停顿"。
-        调用方（:class:`ReplayVideoSource`）只在**素材已播完**时调它，所以
-        中途掉遥测的那一刻仍会如实触发对齐等待与告警。
+        空耗时间，还会把"素材日志不完整"伪装成"链路停顿"。⚠ 中段断档走不到这里
+        （``_timestamps[-1]`` 还在后面，本方法直接返回），那些帧仍会如实触发
+        对齐等待与告警。
 
         返回本次**延伸**出来的条数（0 表示不需要补）；先把待灌的真实快照灌完
         的那部分不计入其中（那不算"延伸"）。
         """
         if not self._snapshots:
             return 0
-        # 先把还没灌的真实快照按原顺序灌完，再谈延伸。否则延伸出来的点会排在
-        # 队列**前面**，之后那些更早的真实点再灌进去就把 broker 的历史写乱了
-        # （历史必须按时间递增）。
-        self.publish_until(self._timestamps[-1])
-        anchor = self._timestamps[-1]
+        # 只推进当前帧所需的真实遥测；不能把帧之后的整段日志提前灌入 broker。
+        self.publish_until(capture_timestamp)
+        if self._timestamps[-1] >= capture_timestamp:
+            return 0
+        anchor = self.cover_to()
+        if self._cursor == 0:
+            return 0
         if capture_timestamp + 1e-6 <= anchor:
             return 0
-        gap = capture_timestamp - anchor
-        if gap > self._tail_warn_s:
+        missing = capture_timestamp - self._timestamps[-1]
+        if missing > self._tail_warn_s and not self._warned_tail:
+            self._warned_tail = True
             LOGGER.warning(
                 "遥测日志在 %.3f 就结束了，而素材帧一直到 %.3f（差 %.2fs）——"
                 "末尾这段没有真实遥测，已按最后一条快照延伸，结果仅供参考",
-                anchor,
+                self._timestamps[-1],
                 capture_timestamp,
-                gap,
+                missing,
             )
-        last = self._snapshots[-1]
+        last = self._snapshots[self._cursor - 1]
         # 逐步推进（每步不超过 ahead_s），保证区间连续、内插不会落到空档
         step = max(self._ahead_s, 0.05)
         point = anchor
@@ -387,10 +399,8 @@ class TelemetryPacer:
             point = min(point + step, capture_timestamp)
             extended = replace(last, timestamp=point + 1e-6)
             self._broker.publish(extended)
-            self._timestamps.append(extended.timestamp)
-            self._snapshots.append(extended)
-            self._cursor += 1
             added += 1
+        self._coverage_timestamp = capture_timestamp
         self._finished += added
         LOGGER.debug(
             "补齐素材末端：遥测从 %.3f 延伸到 %.3f（%d 条）",
@@ -629,7 +639,9 @@ class ReplayVideoSource:
         if thread is not None and thread.is_alive():
             thread.join(timeout)
             if thread.is_alive():
-                LOGGER.warning("回放线程未在 %.1fs 内退出", timeout)
+                # 线程没停就别清引用（否则 running 会撒谎、start() 会起第二个）
+                LOGGER.warning("回放线程未在 %.1fs 内退出，保留引用（可再调 stop()）", timeout)
+                return
         self._thread = None
         self._set_state("stopped")
 
@@ -758,11 +770,6 @@ class ReplayVideoSource:
         base_capture = records[0].capture_timestamp
         base_wall = time.monotonic()
         last_wall = base_wall
-        # 先把遥测覆盖补到**末帧**的拍摄时刻再做别的：素材末尾"遥测先结束、视频
-        # 后结束"是常态，而这里补完之后，每一帧都能内插命中、对齐器一次都不用等
-        # （补的只是结尾那段没有任何真实遥测的空白，见 TelemetryPacer.finish）。
-        if self._telemetry is not None:
-            self._telemetry_published += self._telemetry.finish(records[-1].capture_timestamp)
         for record in records:
             if self._stop_event.is_set():
                 return
@@ -777,6 +784,8 @@ class ReplayVideoSource:
                     return
                 last_wall = time.monotonic()
             if self._telemetry is not None:
+                if record.capture_timestamp > self._telemetry.cover_to():
+                    self._telemetry_published += self._telemetry.finish(record.capture_timestamp)
                 self._telemetry_published += self._telemetry.publish_until(record.capture_timestamp)
             image = self._read_image(record)
             if image is None:
@@ -809,7 +818,7 @@ class ReplayVideoSource:
             record = self._buffer.wait_new(after_index=cursor, timeout=0.5)
             if record is None:
                 if self._produced >= len(expected):
-                    return
+                    break
                 continue
             cursor = record.index
             if record.index not in expected:

@@ -204,6 +204,12 @@ include = ["airdrop", "tests", "tools", "examples"]
 exclude = [
     "**/node_modules",
     "**/__pycache__",
+    "**/.venv",
+    "**/venv",
+    "**/.tox",
+    "**/.mypy_cache",
+    "**/.pytest_cache",
+    "**/.ruff_cache",
     "**/.*",
     "PX4-Autopilot-1.17.0",
     "qgroundcontrol-master",

@@ -1,8 +1,9 @@
 """投放试验反演：读投放记录 + 实测落点 → 优化弹道参数（P12）。
 
-用法（**改本文件顶部的常量，不带命令行参数**——项目约定）::
+用法（命令行由集中入口解析；本文件顶部的常量就是默认值）::
 
-    python -m tools.fit_ballistics
+    ./.venv/Scripts/python.exe -m airdrop.run fit-ballistics --help
+    ./.venv/Scripts/python.exe -m airdrop.run fit-ballistics --impacts <落点文件> --mass-kg 0.365
 
 流程
 ----

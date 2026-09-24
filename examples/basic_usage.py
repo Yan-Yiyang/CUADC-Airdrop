@@ -81,43 +81,43 @@ def main(*, system_address: str = ADDRESS, demo_commands: bool = DEMO_COMMANDS) 
     broker.subscribe(on_snapshot)
 
     mavsdk = MavsdkThread(broker=broker, system_address=system_address)
-    mavsdk.start()
-    mavsdk.connect(system_address)
-
-    LOGGER.info("等待第一条遥测快照...")
-    first = broker.wait_next_snapshot(timeout=15.0, predicate=lambda s: s.is_valid())
-    if first is None:
-        LOGGER.error("15 秒内未收到任何遥测数据")
-        mavsdk.stop()
-        return 1
-
-    LOGGER.info("第一条快照：%s", first.as_dict())
-
-    # 按时间戳查询：其他模块给出一个时间戳时，可获取那一刻的状态。
-    historical = broker.get_snapshot_at(first.timestamp)
-    LOGGER.info("按时间戳查询结果：%s", historical.as_dict())
-
     stop_event = threading.Event()
-    reader = threading.Thread(target=reader_loop, args=(broker, stop_event), daemon=True)
-    reader.start()
-
-    if demo_commands:
-        for command in (Command("arm"), Command("takeoff"), Command("land")):
-            result = mavsdk.send_command(command)
-            LOGGER.info(
-                "指令 %s -> success=%s error=%s",
-                command.name,
-                result.success,
-                result.error,
-            )
-            if not result.success:
-                break
-            time.sleep(2.0)
-
-    # 3.0 起不再有跨进程桥（external_bridge 已删除）：消费者直接读同一个 broker；
-    # 唯一需要的多进程组件是感知侧的 OCR 工作进程（见 REWRITE_PLAN.md 4.3）。
-
+    reader: threading.Thread | None = None
     try:
+        mavsdk.start()
+        mavsdk.connect(system_address)
+
+        LOGGER.info("等待第一条遥测快照...")
+        first = broker.wait_next_snapshot(timeout=15.0, predicate=lambda s: s.is_valid())
+        if first is None:
+            LOGGER.error("15 秒内未收到任何遥测数据")
+            return 1
+
+        LOGGER.info("第一条快照：%s", first.as_dict())
+
+        # 按时间戳查询：其他模块给出一个时间戳时，可获取那一刻的状态。
+        historical = broker.get_snapshot_at(first.timestamp)
+        LOGGER.info("按时间戳查询结果：%s", historical.as_dict())
+
+        reader = threading.Thread(target=reader_loop, args=(broker, stop_event), daemon=True)
+        reader.start()
+
+        if demo_commands:
+            for command in (Command("arm"), Command("takeoff"), Command("land")):
+                result = mavsdk.send_command(command)
+                LOGGER.info(
+                    "指令 %s -> success=%s error=%s",
+                    command.name,
+                    result.success,
+                    result.error,
+                )
+                if not result.success:
+                    break
+                time.sleep(2.0)
+
+        # 3.0 起不再有跨进程桥（external_bridge 已删除）：消费者直接读同一个 broker；
+        # 唯一需要的多进程组件是感知侧的 OCR 工作进程（进程隔离是当前的保守默认，
+        # 见 airdrop/perception/ocr_worker.py 的模块说明）。
         LOGGER.info("运行中... 按 Ctrl+C 停止")
         while True:
             time.sleep(1.0)
@@ -125,7 +125,8 @@ def main(*, system_address: str = ADDRESS, demo_commands: bool = DEMO_COMMANDS) 
         pass
     finally:
         stop_event.set()
-        reader.join(timeout=2.0)
+        if reader is not None:
+            reader.join(timeout=2.0)
         mavsdk.stop()
     return 0
 

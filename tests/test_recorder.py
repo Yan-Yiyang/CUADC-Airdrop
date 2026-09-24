@@ -319,6 +319,36 @@ def test_raw_storage_reencodes_with_cv2(tmp_path: Path, broker: TelemetryBroker)
 
 
 # ----------------------------------------------------------------------
+# 跳号可见性：落后到帧被驱逐时必须记账 + 告警
+# ----------------------------------------------------------------------
+def test_recorder_counts_evicted_frames(
+    tmp_path: Path, broker: TelemetryBroker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """写盘跟不上、帧已被缓冲驱逐：不能假装录全了，要计数并 WARNING。"""
+    buffer = AlignmentBuffer(capacity=2, storage="jpeg")
+    for index in range(1, 6):  # 容量 2：帧 1~3 会被驱逐
+        buffer.put(_make_sample(index))
+
+    recorder = FlightRecorder(Config().validated(), base_dir=tmp_path)
+    with caplog.at_level(logging.WARNING, logger="airdrop.record.recorder"):
+        recorder.start(broker=broker, buffer=buffer)
+        try:
+            assert _wait_until(lambda: recorder._frames_written == 2, timeout=3.0)
+        finally:
+            recorder.stop()
+
+    assert [record for record in caplog.records if "跳号" in record.message], caplog.text
+    stats = recorder.stats()
+    assert stats is not None
+    assert stats.frames_written == 2
+    assert stats.frames_skipped == 3, "序号 1~3 被驱逐，必须如实计数"
+    flight_dir = recorder.flight_dir
+    assert flight_dir is not None
+    assert (flight_dir / "frames" / "000004.jpg").is_file()
+    assert not (flight_dir / "frames" / "000001.jpg").exists()
+
+
+# ----------------------------------------------------------------------
 # start 幂等 / stop 幂等
 # ----------------------------------------------------------------------
 def test_start_is_idempotent_when_running(tmp_path: Path, broker: TelemetryBroker) -> None:
@@ -450,19 +480,26 @@ def test_detection_writer_accepts_dict_mapping_and_dataclass(tmp_path: Path) -> 
 def test_recorder_logger_handler_removed_after_stop(
     tmp_path: Path, broker: TelemetryBroker
 ) -> None:
-    """stop 后 root logger 上不再有该 recorder 注入的 handler。"""
+    """stop 后移除 handler，并恢复 root logger 原始级别。"""
     buffer = AlignmentBuffer(capacity=2)
     recorder = FlightRecorder(Config().validated(), base_dir=tmp_path)
+    root = logging.getLogger()
+    original_level = root.level
+    root.setLevel(logging.ERROR)
 
-    before = list(logging.getLogger().handlers)
-    recorder.start(broker=broker, buffer=buffer)
-    during = list(logging.getLogger().handlers)
-    added = [h for h in during if h not in before]
-    assert len(added) == 1  # 多挂了 1 个 FileHandler
+    try:
+        before = list(root.handlers)
+        recorder.start(broker=broker, buffer=buffer)
+        during = list(root.handlers)
+        added = [h for h in during if h not in before]
+        assert len(added) == 1  # 多挂了 1 个 FileHandler
 
-    recorder.stop()
-    after = list(logging.getLogger().handlers)
-    assert added[0] not in after, "stop 后未摘除 root logger handler"
+        recorder.stop()
+        after = list(root.handlers)
+        assert added[0] not in after, "stop 后未摘除 root logger handler"
+        assert root.level == logging.ERROR
+    finally:
+        root.setLevel(original_level)
 
 
 # ----------------------------------------------------------------------

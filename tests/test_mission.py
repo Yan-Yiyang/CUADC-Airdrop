@@ -178,6 +178,7 @@ class FakeJudge:
         self.updates = 0
         self.resets = 0
         self.ground_z: float | None = None
+        self.ground_altitude_m: float | None = None
         self.now: float | None = None
 
     def update(
@@ -186,12 +187,14 @@ class FakeJudge:
         target_ned: Sequence[float],
         *,
         ground_z: float | None = None,
+        ground_altitude_m: float | None = None,
         wind_ned: Sequence[float] | None = None,
         now: float | None = None,
     ) -> ReleaseDecision:
         self.updates += 1
         self.targets.append((float(target_ned[0]), float(target_ned[1]), float(target_ned[2])))
         self.ground_z = ground_z
+        self.ground_altitude_m = ground_altitude_m
         self.now = now
         if self._decisions:
             return self._decisions.pop(0)
@@ -255,8 +258,8 @@ def _config(
     recon_route = tuple(
         Waypoint(lat=47.0 + index * 1e-3, lon=8.0, alt_m=60.0) for index in range(recon)
     )
-    # 降落段按固定翼的几何要求造：进场点 40m 高、离落点约 330m（下滑角 0.12 <
-    # tan(8.1°)），否则 build_drop_mission 的本地预检会（正确地）把它拒掉。
+    # 降落段按固定翼的几何要求造：进场点 40m 高、离落点约 330m（下滑斜率 tan≈0.12，
+    # 约 6.8°，小于上限 tan(8.1°)），否则 build_drop_mission 的本地预检会（正确地）把它拒掉。
     landing_route: tuple[Waypoint, ...] = ()
     if landing >= 2:
         landing_route = (
@@ -1193,11 +1196,17 @@ def test_runner_completes_full_mission() -> None:
 def test_runner_uploads_recon_then_merged_drop_mission() -> None:
     clock = FakeClock()
     controller = FakeController()
-    runner = _runner(clock, controller, judge=FakeJudge([ReleaseDecision(True, "predict")]))
+    judge = FakeJudge([ReleaseDecision(True, "predict")])
+    runner = _runner(clock, controller, judge=judge)
 
     _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.OVERFLY)
+    _drive(runner, clock, ticks=1)  # OVERFLY 的判据评估发生在进入状态后的下一拍
+
+    # 判据每一拍都拿到 ground_z 与密度基准（地面海拔）：默认地面点未配置时用原点海拔 500m
+    assert judge.ground_z == pytest.approx(0.0)
+    assert judge.ground_altitude_m == pytest.approx(ORIGIN.alt_m)
 
     assert len(controller.uploads) == 2
     recon, drop = controller.uploads

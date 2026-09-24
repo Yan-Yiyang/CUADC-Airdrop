@@ -109,7 +109,7 @@ def main(
     thread = MavsdkThread.from_config(config.telemetry, broker=broker)
     source = Hm30VideoSource(config.video)
     aligner = FrameTelemetryAligner(broker, max_wait=config.align.max_wait, mode=config.align.mode)
-    buffer = AlignmentBuffer(capacity_for(config.video.fps or 30.0, buffer_seconds), storage="jpeg")
+    buffer = AlignmentBuffer(capacity_for(30.0, buffer_seconds), storage="jpeg")
     writer = AlignmentWriter(buffer, aligner)
     recorder = FlightRecorder(config)
 

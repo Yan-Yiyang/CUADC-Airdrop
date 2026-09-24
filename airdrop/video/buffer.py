@@ -237,8 +237,8 @@ class AlignmentBuffer:
     def storage(self) -> str:
         return self._storage
 
-    def put(self, sample: AlignedSample) -> BufferedFrame:
-        """把一条对齐结果存入缓冲，返回入库记录。
+    def put(self, sample: AlignedSample, *, materialize: bool = True) -> BufferedFrame | None:
+        """把一条对齐结果存入缓冲，可选返回解码后的入库记录。
 
         传入 :meth:`airdrop.alignment.FrameTelemetryAligner.align` 的返回值即可；
         若 ``sample`` 为 None（对齐失败/无遥测）会抛 ``ValueError``，调用方应先
@@ -268,6 +268,8 @@ class AlignmentBuffer:
             self._log_estimate_locked(nbytes)
             self._condition.notify_all()
 
+        if not materialize:
+            return None
         frame = self._materialize(stored)
         if frame is None:  # 刚编码的数据不该解不出来
             raise RuntimeError("入库记录无法还原为画面")
@@ -404,6 +406,7 @@ class AlignmentBuffer:
         仅靠 ``wait_new``。
         """
         deadline = None if timeout is None else time.monotonic() + timeout
+        stored: StoredFrame | None = None
         with self._condition:
             while True:
                 records = self._records
@@ -413,13 +416,14 @@ class AlignmentBuffer:
                     idx = bisect.bisect_left(records, target, key=_index)
                     if idx < len(records):
                         stored = records[idx]
-                        return self._materialize(stored)
+                        break
                 remaining = None
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return None
                 self._condition.wait(remaining)
+            return self._materialize(stored)
 
     # ------------------------------------------------------------------
     # 内部实现
@@ -575,7 +579,7 @@ class AlignmentWriter:
             with self._lock:
                 self._skipped += 1
             return
-        self._buffer.put(sample)
+        self._buffer.put(sample, materialize=False)
         with self._lock:
             self._written += 1
 

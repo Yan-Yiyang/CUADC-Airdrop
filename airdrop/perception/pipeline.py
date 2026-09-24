@@ -1,4 +1,32 @@
-'感知主循环：逐帧 YOLO → （OCR 送检 | cls12 直出）→ :class:`Detection`。\n\n    AlignmentBuffer ──wait_new(一帧不落)──> PerceptionWorker\n                                              ├─ YOLO 检测（全帧）\n                                              ├─ ocr 模式：裁剪 → 按目标去重 → mp.Queue → OCR 进程×N\n                                              └─ cls12 模式：类别直出编号\n                                            OCR 结果回填 ──> Detection ──> 结果队列（消费者取走）\n\n两条铁律\n--------\n1. **输入必须来自缓冲**（``wait_new`` / ``iter_between``），不能用 ``read()``\n   循环——那条路允许丢帧，而"目标可能只出现一瞬"。本类只接受\n   :class:`~airdrop.video.buffer.AlignmentBuffer`。\n2. **OCR 绝不阻塞逐帧检测**。OCR 单帧约 100ms（GPU）而 YOLO 约 29ms，内联\n   OCR 会让有效帧率掉到 1/4。所以裁剪图送进**独立进程**池，检测继续跑；\n   编号晚几帧回来无所谓（同一目标在整个侦查段会被看到几十次）。\n\n去重（``ocr_dedupe_s`` / ``ocr_dedupe_px``）\n--------------------------------------------\n同一目标在连续几十帧里都被检出，每帧都送 OCR 是纯浪费（也是队列被打满的主因）。\n规则：**同一目标**（中心位移 < ``ocr_dedupe_px``）在 ``ocr_dedupe_s`` 秒内只送\n一次。去重在**送检时**按"画面拍摄时刻"判断，所以多目标同帧互不误伤。\n'
+"""感知主循环：逐帧 YOLO → （OCR 送检 | cls12 直出）→ :class:`Detection`。
+
+数据流
+------
+::
+
+    AlignmentBuffer ──wait_new(一帧不落)──> PerceptionWorker
+                                              ├─ YOLO 检测（全帧）
+                                              ├─ ocr 模式：裁剪 → 按目标去重 → mp.Queue → OCR 进程×N
+                                              └─ cls12 模式：类别直出编号
+                                            OCR 结果回填 ──> Detection ──> 结果队列（消费者取走）
+
+两条铁律
+--------
+1. **输入必须来自缓冲**（``wait_new`` / ``iter_between``），不能用 ``read()``
+   循环——那条路允许丢帧，而"目标可能只出现一瞬"。本类只接受
+   :class:`~airdrop.video.buffer.AlignmentBuffer`。
+2. **OCR 绝不阻塞逐帧检测**。OCR 单帧约 100ms（GPU）而 YOLO 约 29ms，内联
+   OCR 会让有效帧率掉到 1/4。所以裁剪图送进**独立进程**池，检测继续跑；
+   编号晚几帧回来无所谓（同一目标在整个侦查段会被看到几十次）。
+
+OCR 逐帧送检
+------------
+默认不启用跨帧去重；显式打开时才按时间/像素窗口合并相邻重复请求。目标可能只在
+少数帧中清晰可见，运动模糊会让相邻帧的可识别性不同；**每个 YOLO 检测结果都会
+进入无界队列，绝不因为"队列满"而丢掉送检请求或结果**。OCR 落后时队列会积压
+（只告警、不丢弃），内存账由 ``ocr_queue_size`` 阈值上的 WARNING 与
+:attr:`PerceptionStats` 的 ``submitted - results`` 如实反映。
+"""
 
 from __future__ import annotations
 
@@ -16,9 +44,13 @@ from ..video.buffer import AlignmentBuffer, BufferedFrame
 from .cropproc import OcrEngineConfig
 from .detector import Detector, DetectorConfig
 from .models import Detection
-from .ocr_worker import OcrResult, OcrWorkerPool, put_drop_oldest
+from .ocr_worker import OcrResult, OcrWorkerPool
 
 LOGGER = logging.getLogger(__name__)
+
+#: 检测结果队列积压告警阈值（队列本身无界）：消费者（target_result 回调）没在抽干
+#: 时只告警一次，提醒确认它还在跑。
+_RESULT_BACKLOG_WARN = 2000
 
 __all__ = ["PerceptionConfigLike", "PerceptionStats", "PerceptionWorker"]
 
@@ -39,9 +71,11 @@ class PerceptionConfigLike:
     target_color: str = "blue"
     ocr_conf_threshold: float = 0.6
     ocr_workers: int = 2
+    #: OCR **积压告警阈值**（不是队列容量：请求/结果队列都无界、不丢弃，见 ocr_worker）
     ocr_queue_size: int = 500
-    ocr_dedupe_s: float = 0.8
-    ocr_dedupe_px: float = 30.0
+    # 仅在显式开启时生效；默认关闭，避免误伤运动模糊下唯一清晰帧。
+    ocr_dedupe_s: float = 0.0
+    ocr_dedupe_px: float = 0.0
     min_side_px: float = 10.0
     max_side_px: float = 400.0
     engine: OcrEngineConfig = field(default_factory=OcrEngineConfig)
@@ -66,7 +100,8 @@ class PerceptionStats:
     deduped: int = 0  # 被去重挡下的送检数
     results: int = 0  # 收到的 OCR 结果数
     invalid_side: int = 0  # 像素边长超出有效区间而被丢弃的
-    ocr_dropped: int = 0  # OCR 队列满而丢掉的请求数
+    #: OCR 请求丢弃数——**不丢弃策略下恒为 0**，保留作监控（一旦非 0 说明有新的丢弃路径）
+    ocr_dropped: int = 0
     lag_frames: int = 0  # 处理落后最新帧多少帧
     last_error: str | None = None
 
@@ -107,13 +142,17 @@ class PerceptionWorker:
         self._pool = pool
         self._owns_pool = pool is None and config.mode == "ocr"
 
-        self._results: queue.Queue[Detection] = queue.Queue(maxsize=2000)
+        # 结果队列**无界**：检测结果同样不丢（消费者慢时只积压，不丢目标）。
+        # 积压超过 _RESULT_BACKLOG_WARN 时告警一次（见 _emit）。
+        self._results: queue.Queue[Detection] = queue.Queue()
+        self._results_warned = False
         self._stats = PerceptionStats()
         self._stats_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._cursor = self._start_index
-        # 去重表：[(拍摄时刻, u, v)]，按时间自然有序，过期从头部丢掉
+        # 去重缓存：[(capture_timestamp, u, v)]；**只在启用去重时记录**，
+        # 否则它会被每帧的检测结果喂大（见 _process_frame 的说明）。
         self._recent: list[tuple[float, float, float]] = []
         #: 送检中的 OCR 请求：request_id → 该帧的基础 Detection（结果回来时回填编号）
         self._pending: dict[int, Detection] = {}
@@ -201,11 +240,15 @@ class PerceptionWorker:
         """停工作线程与 OCR 进程池（幂等）。"""
         self._stop_event.set()
         thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout)
+        if thread is not None:
             if thread.is_alive():
-                LOGGER.warning("感知线程未在 %.1fs 内退出", timeout)
-        self._thread = None
+                thread.join(timeout)
+            if thread.is_alive():
+                # 线程没停就别清引用（否则 running 会撒谎、start() 会起第二个）；
+                # 池照常停：线程在下一拍看到 stop_event 就会退出。
+                LOGGER.warning("感知线程未在 %.1fs 内退出，保留引用（可再调 stop()）", timeout)
+            else:
+                self._thread = None
         if self._owns_pool and self._pool is not None:
             self._pool.stop()
         self._collect_remaining(timeout=0.5)
@@ -301,17 +344,25 @@ class PerceptionWorker:
                 with self._stats_lock:
                     self._stats.deduped += 1
                 continue
-            self._remember(detection)
+            # 只有去重开着时才记位置缓存：关闭去重时 _expire 不会被调用（它的
+            # 唯一调用点在 _should_skip 里），记下来的条目会随每帧检测无界增长。
+            if self._dedupe_enabled():
+                self._remember(detection)
             self._submit(detection, crop)
 
     # ------------------------------------------------------------------
     # 去重
     # ------------------------------------------------------------------
-    def _should_skip(self, detection: Detection) -> bool:
-        """该目标在去重窗口内是否已经送检过。"""
+    def _dedupe_enabled(self) -> bool:
+        """是否启用跨帧去重（两个阈值都为 0 = 关闭）。"""
         config = self._config
-        if config.ocr_dedupe_s <= 0 and config.ocr_dedupe_px <= 0:
+        return config.ocr_dedupe_s > 0 or config.ocr_dedupe_px > 0
+
+    def _should_skip(self, detection: Detection) -> bool:
+        """在启用去重时，跳过相邻时间/位置近似重复的 OCR 请求。"""
+        if not self._dedupe_enabled():
             return False
+        config = self._config
         u, v = detection.pixel
         now = detection.capture_timestamp
         self._expire(now)
@@ -323,10 +374,12 @@ class PerceptionWorker:
         return False
 
     def _remember(self, detection: Detection) -> None:
+        """记住一条已提交送检的目标位置，用于后续最近窗口去重。"""
         u, v = detection.pixel
         self._recent.append((detection.capture_timestamp, u, v))
 
     def _expire(self, now: float) -> None:
+        """淘汰超出时间窗口的历史位置，避免缓存无限增长。"""
         window = self._config.ocr_dedupe_s
         if window <= 0:
             self._recent.clear()
@@ -360,6 +413,10 @@ class PerceptionWorker:
         pool = self._pool
         if pool is None:
             return
+        # 池侧丢弃计数同步进统计（不丢弃策略下恒为 0；留着是为了万一将来
+        # 又出现丢弃路径，监控里能立刻看见）
+        with self._stats_lock:
+            self._stats.ocr_dropped = int(pool.stats.get("dropped", 0))
         while True:
             result = pool.poll(timeout=timeout) if timeout else pool.poll()
             if result is None:
@@ -434,8 +491,20 @@ class PerceptionWorker:
         with self._stats_lock:
             if detection.code is not None:
                 self._stats.with_code += 1
-        if put_drop_oldest(self._results, detection):
-            LOGGER.debug("结果队列满，丢弃最旧的一条检测")
+        # 结果队列无界：不丢弃任何检测结果。积压只告警（跨阈值一次），
+        # 提醒确认消费者（target_result/pump）还在抽。
+        self._results.put_nowait(detection)
+        size = self._results.qsize()
+        if not self._results_warned and size >= _RESULT_BACKLOG_WARN:
+            self._results_warned = True
+            LOGGER.warning(
+                "检测结果积压 %d 条（阈值 %d）：**不丢弃**，但消费者可能没在抽干"
+                "（检查 MissionRunner 的 target_result 回调是否在跑）",
+                size,
+                _RESULT_BACKLOG_WARN,
+            )
+        elif self._results_warned and size < _RESULT_BACKLOG_WARN // 2:
+            self._results_warned = False
         callback = self._on_detection
         if callback is not None:
             try:

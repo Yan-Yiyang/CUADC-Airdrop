@@ -147,6 +147,19 @@ class DropRecord:
         return float(self.ground_z - self.position_ned[2])
 
     @property
+    def ground_altitude_m(self) -> float | None:
+        """地面平面的海拔（AMSL）= 原点海拔 − ``ground_z``；缺原点时返回 None。
+
+        密度基准用它（见 :meth:`BallisticsModel.predict_impact` 的
+        ``ground_altitude_m``）：地面点与原点同高时 ground_z=0，取的就是原点海拔；
+        配了地面点则正好是地面点海拔。**不要**用 0 顶替缺失的原点——那等于把地面
+        当海平面，高原上会明显高估空气密度。
+        """
+        if self.origin is None:
+            return None
+        return float(self.origin.alt_m) - float(self.ground_z)
+
+    @property
     def heading_deg(self) -> float | None:
         """航迹方位（自北顺时针，度）；水平速度太小就返回 None。"""
         north, east = self.velocity_ned[0], self.velocity_ned[1]
@@ -437,17 +450,24 @@ def predict_record_impact(
     offset_body_m: Sequence[float] | None = None,
     wind_scale: float = 1.0,
     ground_z: float | None = None,
+    ground_altitude_m: float | None = None,
 ):
     """用 ``model`` 正演这一条记录的落点（返回 :class:`~airdrop.ballistics.model.Impact`）。
 
     参数含义与 :func:`release_conditions` / :func:`resolve_wind` 一一对应；反演
     （:mod:`airdrop.ballistics.fit`）与报表都走这一个入口，免得两处各写一遍初始条件。
+
+    ``ground_altitude_m`` 缺省取 :attr:`DropRecord.ground_altitude_m`（原点海拔 −
+    ``ground_z``，即记录里的 GPS 高度基准）；记录没有原点时退回 0（等于原地面的
+    旧行为）——此时高原站点会有密度偏差，反演报告里应把该条记录的原点补齐。
     """
+    baseline = record.ground_altitude_m if ground_altitude_m is None else float(ground_altitude_m)
     position, velocity = release_conditions(record, delay_s=delay_s, offset_body_m=offset_body_m)
     return model.predict_impact(
         position,
         velocity,
         ground_z=float(record.ground_z if ground_z is None else ground_z),
+        ground_altitude_m=0.0 if baseline is None else float(baseline),
         wind=resolve_wind(record, scale=wind_scale),
     )
 

@@ -261,10 +261,54 @@ def test_predict_record_impact_matches_a_direct_model_call() -> None:
     model = BallisticsModel(BallisticsConfig(drag_coefficient=TRUE_CD))
     wrapped = predict_record_impact(record, model, delay_s=TRUE_DELAY)
     position, velocity = release_conditions(record, delay_s=TRUE_DELAY)
-    direct = model.predict_impact(position, velocity, ground_z=record.ground_z, wind=WIND)
+    baseline = record.ground_altitude_m
+    assert baseline is not None
+    direct = model.predict_impact(
+        position,
+        velocity,
+        ground_z=record.ground_z,
+        ground_altitude_m=baseline,
+        wind=WIND,
+    )
     assert wrapped.ok and direct.ok
     assert wrapped.ned == pytest.approx(direct.ned)
     assert wrapped.flight_time_s == pytest.approx(direct.flight_time_s)
+
+
+def test_ground_altitude_baseline_comes_from_the_record_origin() -> None:
+    """密度基准来自记录里的 GPS 原点：origin 海拔 − ground_z；缺原点退回 None/0。"""
+    record = replace(
+        _record(1, ground_z=-20.0), origin=LLARef(lon_deg=8.0, lat_deg=47.0, alt_m=1500.0)
+    )
+    assert record.ground_altitude_m == pytest.approx(1520.0)
+    assert replace(record, origin=None).ground_altitude_m is None
+
+    model = BallisticsModel(BallisticsConfig(drag_coefficient=TRUE_CD, air_density_isa=True))
+    with_origin = predict_record_impact(record, model, delay_s=TRUE_DELAY)
+    without_origin = predict_record_impact(replace(record, origin=None), model, delay_s=TRUE_DELAY)
+    assert with_origin.ok and without_origin.ok
+    assert with_origin.flight_time_s < without_origin.flight_time_s, (
+        "1500m 高原空气稀薄 → 下落更快（时间更短）；缺原点会退回海平面基准"
+    )
+
+
+def test_fit_uses_the_record_ground_altitude_for_isa_density() -> None:
+    """反演的正演也要吃记录里的海拔基准：高原数据 + ISA 开，仍能把真值 Cd 收回。"""
+    plateau = LLARef(lon_deg=8.0, lat_deg=47.0, alt_m=1500.0)
+    base = BallisticsConfig(drag_coefficient=TRUE_CD, air_density_isa=True)
+    records = [replace(record, origin=plateau) for record in _spread_campaign()]
+    samples = _measure(records, ballistics=base)
+    result = fit_ballistics(samples, FitConfig(base=BallisticsConfig(air_density_isa=True)))
+
+    assert result.ok and result.reliable, result.reason
+    assert result.parameters["drag_coefficient"] == pytest.approx(TRUE_CD, rel=1e-6)
+
+
+def test_fit_warns_when_records_have_no_origin() -> None:
+    """缺原点的记录会让密度基准退回海平面：不能静默，报告里要告警。"""
+    records = [replace(record, origin=None) for record in _spread_campaign()]
+    result = fit_ballistics(_measure(records), FitConfig())
+    assert any("没有 NED 原点" in warning for warning in result.warnings)
 
 
 # ----------------------------------------------------------------------
@@ -419,7 +463,9 @@ def test_fit_refuses_parameters_that_cannot_be_separated() -> None:
     assert "不可辨识" in result.reason
     assert result.condition_number > 1e6
     # 诊断照给：相关性 ≈ 1，协方差退化
-    assert result.correlation["drag_coefficient"]["release_delay_s"] == pytest.approx(1.0, abs=1e-3)
+    assert abs(result.correlation["drag_coefficient"]["release_delay_s"]) == pytest.approx(
+        1.0, abs=1e-3
+    )
 
     forced = fit_ballistics(
         samples, FitConfig(fit_release_delay_s=True, allow_ill_conditioned=True)

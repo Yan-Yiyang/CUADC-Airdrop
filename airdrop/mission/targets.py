@@ -268,8 +268,9 @@ class PerceptionTargetSource:
         """感知/解算还有活没干完吗。
 
         判据：缓冲里还有帧没处理（``lag_frames``）或送出去的 OCR 还没回来
-        （``submitted > results``）。刻意不包含"结果还在队列里没抽干"——
-        那由 :meth:`pump` 负责，而 :meth:`result` 每次都会先抽一遍。
+        （``submitted > results``——请求/结果都不丢弃，这个差值就是真正的未完成数）。
+        刻意不包含"结果还在队列里没抽干"——那由 :meth:`pump` 负责，
+        而 :meth:`result` 每次都会先抽一遍。
         """
         stats = self.worker.stats
         return self.worker.lag_frames > 0 or stats.submitted > stats.results

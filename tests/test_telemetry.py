@@ -195,6 +195,11 @@ def test_query_mode_validation(broker: TelemetryBroker) -> None:
     broker.update_global_position(make_position(47.0, 8.0, 500.0, 10.0))
     with pytest.raises(ValueError, match="不支持的查询模式"):
         broker.get_snapshot_at(time.time(), mode="bilinear")
+    # 历史为空时也一样抛：错误语义不该随"有没有收到遥测"而变
+    empty = TelemetryBroker()
+    with pytest.raises(ValueError, match="不支持的查询模式"):
+        empty.get_snapshot_at(time.time(), mode="bilinear")
+    assert empty.get_snapshot_at(time.time(), mode="nearest") is None
 
 
 def test_history_throttle() -> None:

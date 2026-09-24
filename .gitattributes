@@ -1,0 +1,8 @@
+# 行尾统一为 LF（索引与工作区都按 LF 检出/比较），与操作系统和工具的
+# core.autocrlf 设置解耦。
+#
+# 为什么：部分工具（如 OpenCode 的 Git 层）会硬编码 `-c core.autocrlf=false`，
+# CRLF 工作区会被当成"整文件删除 + 插入"显示（anomalyco/opencode#27276）；
+# `eol=lf` 让所有工具的比较口径一致，也让逐字节比较的 diff 不再失真。
+# 二进制文件由 Git 自动识别（text=auto），不会被动。
+* text=auto eol=lf

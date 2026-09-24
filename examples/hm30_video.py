@@ -65,7 +65,7 @@ def build_config(
     ).validated()
 
 
-def run(
+def run(  # noqa: PLR0912 - 预览、存盘、断流和时限是互斥运行路径
     source: Hm30VideoSource,
     *,
     preview: bool = PREVIEW,
@@ -79,14 +79,20 @@ def run(
 
     writer = None
     started = time.monotonic()
+    deadline = started + duration if duration > 0 else None
     last_report = started
     last_index = 0
 
     try:
         while True:
-            frame = source.read(timeout=1.0)
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            timeout = 1.0 if deadline is None else min(1.0, max(deadline - time.monotonic(), 0.0))
+            frame = source.read(timeout=timeout)
             if frame is None:
                 LOGGER.warning("读取超时，状态=%s", source.stats.state)
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 continue
 
             if save_path and writer is None:
@@ -100,6 +106,11 @@ def run(
                     max(source.stats.fps, 10.0),
                     (frame.width, frame.height),
                 )
+                if not writer.isOpened():
+                    writer.release()
+                    writer = None
+                    LOGGER.error("无法打开视频输出: %s", save_path)
+                    return
                 LOGGER.info("开始存盘: %s (%dx%d)", save_path, frame.width, frame.height)
             if writer is not None:
                 writer.write(frame.image)
@@ -131,7 +142,7 @@ def run(
                 last_index = stats.frames
                 last_report = now
 
-            if duration and now - started >= duration:
+            if deadline is not None and now >= deadline:
                 break
     except KeyboardInterrupt:
         LOGGER.info("用户中断")

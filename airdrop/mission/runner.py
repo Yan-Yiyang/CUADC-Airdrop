@@ -19,9 +19,11 @@
   （示例里是主线程 + Ctrl-C）；:meth:`update` 可以单拍驱动，测试才可能确定性地跑。
 * 面向协议编程：控制器只要求满足 :class:`~airdrop.telemetry.MissionController`
   （离线测试用假控制器），投放判据只要求 :class:`ReleaseJudgeLike`。
-* 完成判定用 MAVSDK 的 ``is_mission_finished()`` 而不是自己解析进度流，但它是
-  请求/响应，新任务刚上传时可能仍回上一次的 ``True`` → 由 :class:`MissionMonitor`
-  要求"先见到 False 再见到 True"，避免刚起飞就以为任务飞完了。
+* 完成判定读**飞控侧任务进度**（``mission_raw`` 的 ``mission_current == mission_total``，
+  经 :meth:`~airdrop.telemetry.DroneController.mission_finished`），不是自己解析
+  MAVLink 进度流；这是一条"飞控状态读数"，新任务刚上传、还没启动时可能仍是上一次
+  任务的 ``True`` → 由 :class:`MissionMonitor` 要求"先见到 False 再见到 True"，
+  避免刚起飞就以为任务飞完了。
 * 失败必须显式：命令失败、规划失败、链路陈旧、超时 —— 一律进 ``ABORT`` 并写
   事件日志；不会"假装成功继续跑"。
 * 只有两个时钟来源：注入的 ``clock``（时间）与 ``sleep``（节拍），测试里换成
@@ -83,6 +85,7 @@ class ReleaseJudgeLike(Protocol):
         target_ned: Sequence[float],
         *,
         ground_z: float | None = None,
+        ground_altitude_m: float | None = None,
         wind_ned: Sequence[float] | None = None,
         now: float | None = None,
     ) -> ReleaseDecision: ...
@@ -100,12 +103,13 @@ _INSTANT_STATES = frozenset({MissionState.PREFLIGHT, MissionState.WAIT_AIRBORNE}
 
 @dataclass
 class MissionMonitor:
-    """跟踪一次上传任务的完成情况，对 ``is_mission_finished()`` 的陈旧值免疫。
+    """跟踪一次上传任务的完成情况，对"已飞完"的陈旧读数免疫。
 
-    背景：``is_mission_finished()`` 是请求/响应，飞控（或 mavsdk_server）在新任务刚
-    上传、还没跑起来的那一拍，可能仍回上一次任务留下的 ``True``。判据：先看到
-    ``False``（任务确实在跑），之后的 ``True`` 才算数。每上传一次任务换一个新实例
-    （正常任务都是分钟级，绝不会整段时间都观测不到 ``False``）。
+    背景：完成判定读的是飞控侧任务进度（``mission_raw`` 的 ``mission_current ==
+    mission_total``，见 :meth:`~airdrop.telemetry.DroneController.mission_finished`），
+    它是**飞控状态读数**——新任务刚上传、还没跑起来的那一拍，可能仍是上一次任务留下的
+    ``True``。判据：先看到 ``False``（任务确实在跑），之后的 ``True`` 才算数。
+    每上传一次任务换一个新实例（正常任务都是分钟级，绝不会整段时间都观测不到 ``False``）。
     """
 
     armed: bool = False
@@ -113,7 +117,7 @@ class MissionMonitor:
     true_seen: int = 0
 
     def update(self, finished: bool) -> bool:
-        """传入一拍 ``is_mission_finished()`` 的读数，返回"这次任务是否已完成"。"""
+        """传入一拍任务完成读数，返回"这次任务是否已完成"。"""
         if not finished:
             self.armed = True
             self.false_seen += 1
@@ -532,6 +536,7 @@ class MissionRunner:
                     snapshot,
                     self._plan.target_ned,
                     ground_z=self._ground_z(),
+                    ground_altitude_m=self._ground_altitude(),
                     now=now,
                 )
             except Exception as exc:  # noqa: BLE001 - 判据异常按任务失败处理，不让主循环带崩
@@ -858,6 +863,20 @@ class MissionRunner:
                 )
             return 0.0
         return float(ground)
+
+    def _ground_altitude(self) -> float:
+        """地面平面的**海拔**（AMSL）——弹道密度的基准（见 ``predict_impact``）。
+
+        有地面点参数时就是地面点海拔（``origin.alt − ground_z``）；没配地面点时退到
+        NED 原点海拔（原点高度面，通常离目标不远，误差可接受）；连原点都还没有（不该
+        出现在 OVERFLY）时返回 0，即旧的"地面当海平面"行为。
+        """
+        if self._ned_origin is None:
+            return 0.0
+        ground = self._config.ground.ground_z(self._ned_origin.alt_m)
+        if ground is None:
+            return float(self._ned_origin.alt_m)
+        return float(self._ned_origin.alt_m) - float(ground)
 
     @staticmethod
     def _has_position(snapshot: TelemetrySnapshot) -> bool:

@@ -98,8 +98,9 @@ def _analytic_vertical_drop(drop_height_m: float, terminal: float) -> tuple[floa
 def test_drag_fall_matches_analytic_vertical_solution() -> None:
     """有阻力时竖直下落也必须与解析解一致（这是对阻力项与 RK4 的强校验）。"""
     model = _model()
-    terminal = model.terminal_velocity(0.0)
     for height in (20.0, 60.0, 150.0):
+        # 关闭 ISA 的常密度取"投放海拔"处的 ISA 值 → 解析解要用同一高度处的 v_t
+        terminal = model.terminal_velocity(height)
         impact = model.predict_impact((0.0, 0.0, -height), (0.0, 0.0, 0.0))
         assert impact.ok
         expect_t, expect_v = _analytic_vertical_drop(height, terminal)
@@ -107,11 +108,55 @@ def test_drag_fall_matches_analytic_vertical_solution() -> None:
         assert impact.speed_m_s == pytest.approx(expect_v, rel=5e-3)
 
 
-def test_terminal_velocity_asymptote() -> None:
-    """终端速度：落下速度永远不超过 v_t，且高度翻倍后只是逼近它。"""
+def test_off_mode_density_is_isa_at_release_altitude() -> None:
+    """关闭 ISA 也不假设海平面：常密度取"地面海拔 + 投放离地高度"的 ISA 值。
+
+    1500m 高原 + 100m 投放 ⇒ ρ = isa_air_density(1600)；空气稀薄、阻力更小，
+    所以比"地面=海平面"落得更快（时间更短、落点速度更大）。
+    """
     model = _model()
-    terminal = model.terminal_velocity(0.0)
-    assert terminal == pytest.approx(
+    height, baseline = 100.0, 1500.0
+    impact = model.predict_impact((0.0, 0.0, -height), (0.0, 0.0, 0.0), ground_altitude_m=baseline)
+    assert impact.ok
+    terminal = model.terminal_velocity(height, ground_altitude_m=baseline)
+    expect_t, expect_v = _analytic_vertical_drop(height, terminal)
+    assert impact.flight_time_s == pytest.approx(expect_t, rel=5e-3)
+    assert impact.speed_m_s == pytest.approx(expect_v, rel=5e-3)
+
+    sea_level = model.predict_impact((0.0, 0.0, -height), (0.0, 0.0, 0.0))
+    assert impact.flight_time_s < sea_level.flight_time_s, "高原空气稀薄 → 落得更快"
+    assert impact.speed_m_s > sea_level.speed_m_s
+
+
+def test_isa_mode_uses_altitude_baseline() -> None:
+    """开启 ISA：逐级按真实海拔算密度，高海拔站点飞得更远、落得更快。"""
+    model = _model(air_density_isa=True)
+    position, velocity = (0.0, 0.0, -300.0), (20.0, 0.0, 0.0)
+    sea_level = model.predict_impact(position, velocity)
+    plateau = model.predict_impact(position, velocity, ground_altitude_m=2500.0)
+    assert sea_level.ok and plateau.ok
+    assert plateau.ned[0] > sea_level.ned[0] + 1.0, "稀薄空气 → 射程明显更远"
+    assert plateau.flight_time_s < sea_level.flight_time_s
+
+
+def test_drag_factor_and_terminal_velocity_use_ground_altitude() -> None:
+    """两个点查询都按"地面海拔 + 离地高度"取 ISA 密度（与开关无关）。"""
+    model = _model(drag_coefficient=0.0)  # 无阻力时先只验 terminal 的无穷
+    assert model.terminal_velocity(0.0, ground_altitude_m=3000.0) == float("inf")
+
+    model = _model()
+    assert model.terminal_velocity(50.0, ground_altitude_m=1500.0) == pytest.approx(
+        model.terminal_velocity(1550.0), rel=1e-12
+    )
+    assert model.drag_factor((10.0, 0.0, 0.0), 50.0, ground_altitude_m=1500.0) == pytest.approx(
+        model.drag_factor((10.0, 0.0, 0.0), 1550.0), rel=1e-12
+    )
+
+
+def test_terminal_velocity_asymptote() -> None:
+    """终端速度：落下速度永远不超过**它自己那条弹道的** v_t，且高度翻倍后只是逼近它。"""
+    model = _model()
+    assert model.terminal_velocity(0.0) == pytest.approx(
         math.sqrt(
             2
             * model.config.mass_kg
@@ -123,10 +168,13 @@ def test_terminal_velocity_asymptote() -> None:
 
     near = model.predict_impact((0.0, 0.0, -50.0), (0.0, 0.0, 0.0))
     far = model.predict_impact((0.0, 0.0, -500.0), (0.0, 0.0, 0.0))
-    assert near.speed_m_s < terminal and far.speed_m_s < terminal
+    # 常密度取"投放海拔"处的 ISA 值 → 参照各自投放高度上的 v_t
+    near_terminal = model.terminal_velocity(50.0)
+    far_terminal = model.terminal_velocity(500.0)
+    assert near.speed_m_s < near_terminal and far.speed_m_s < far_terminal
     assert far.speed_m_s > near.speed_m_s, "落得更高应当更快（但不超过 v_t）"
-    gap_near = terminal - near.speed_m_s
-    gap_far = terminal - far.speed_m_s
+    gap_near = near_terminal - near.speed_m_s
+    gap_far = far_terminal - far.speed_m_s
     assert gap_far < gap_near * 0.5, "从 500m 落下应当明显更接近终端速度"
 
 
@@ -239,6 +287,30 @@ def test_no_release_while_far_and_not_passed() -> None:
     assert decision.reason == "waiting"
     assert not decision.passed_target
     assert decision.horizontal_error_m is not None and decision.horizontal_error_m > 2.0
+
+
+def test_judge_passes_ground_altitude_into_the_prediction() -> None:
+    """``ground_altitude_m`` 必须真的进到预测：高原空气稀薄 → 落点更远。"""
+    model = _model(air_density_isa=True)
+    snapshot = _snapshot(position=(0.0, 0.0, -300.0), velocity=(20.0, 0.0, 0.0))
+    target = (9999.0, 9999.0, 0.0)  # 够不着，只取预测落点
+
+    sea_level = ReleaseJudge(
+        DropConfig(), model, overfly_heading_deg=0.0, ground_altitude_m=0.0
+    ).update(snapshot, target, now=100.0)
+    plateau = ReleaseJudge(
+        DropConfig(), model, overfly_heading_deg=0.0, ground_altitude_m=2500.0
+    ).update(snapshot, target, now=100.0)
+
+    assert sea_level.predicted is not None and sea_level.predicted.ok
+    assert plateau.predicted is not None and plateau.predicted.ok
+    assert plateau.predicted.ned[0] > sea_level.predicted.ned[0] + 1.0
+    # per-call 覆盖也要生效
+    override = ReleaseJudge(
+        DropConfig(), model, overfly_heading_deg=0.0, ground_altitude_m=0.0
+    ).update(snapshot, target, ground_altitude_m=2500.0, now=100.0)
+    assert override.predicted is not None
+    assert override.predicted.ned[0] == pytest.approx(plateau.predicted.ned[0])
 
 
 def test_fallback_after_passing_target() -> None:

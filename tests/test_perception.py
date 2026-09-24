@@ -8,8 +8,11 @@ pipeline 的 detector / pool 都是构造注入的，这里正是为了可测性
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -832,8 +835,33 @@ def test_pipeline_cls12_mode_emits_without_ocr() -> None:
     assert pool.submitted == [], "cls12 不该走 OCR"
 
 
-def test_pipeline_dedupes_same_target() -> None:
-    """同一目标在去重窗口内只送一次 OCR。"""
+def test_pipeline_sends_every_frame_to_ocr_by_default() -> None:
+    """默认配置不启用去重，确保每个可见帧都送 OCR。"""
+    buffer = _buffer_with(5)
+    pool = _FakePool(numbers=[42] * 5)
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr"),
+        buffer=buffer,
+        detector=_FakeDetector(),
+        pool=pool,
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 10.0
+        results: list[Detection] = []
+        while len(results) < 1 and time.monotonic() < deadline:
+            results.extend(worker.drain_results())
+            time.sleep(0.02)
+    finally:
+        worker.stop()
+    # 默认关闭去重，5 帧里同一位置的目标仍逐帧送检
+    assert len(pool.submitted) == 5
+    stats = worker.stats
+    assert stats.deduped == 0
+
+
+def test_pipeline_dedupe_when_enabled() -> None:
+    """显式打开去重时，相近重复目标在窗口内只保留首个 OCR 请求。"""
     buffer = _buffer_with(5)
     pool = _FakePool(numbers=[42] * 5)
     worker = PerceptionWorker(
@@ -851,8 +879,7 @@ def test_pipeline_dedupes_same_target() -> None:
             time.sleep(0.02)
     finally:
         worker.stop()
-    # 5 帧里同一位置的目标只送 1 次
-    assert len(pool.submitted) == 1, f"去重失效：送了 {len(pool.submitted)} 次"
+    assert len(pool.submitted) == 1
     stats = worker.stats
     assert stats.deduped == 4
 
@@ -875,6 +902,53 @@ def test_pipeline_dedupe_allows_distinct_targets() -> None:
     finally:
         worker.stop()
     assert len(pool.submitted) == 2, "两个不同位置的目标应当分别送检"
+
+
+def test_pipeline_recent_cache_stays_empty_when_dedupe_disabled() -> None:
+    """去重关闭时 **不** 能往位置缓存里记东西。
+
+    ``_expire`` 的唯一调用点在 ``_should_skip`` 里，而去重关闭时 ``_should_skip``
+    直接返回——记进去的条目没有任何淘汰路径，会随每帧检测无界增长。
+    """
+    buffer = _buffer_with(5)
+    pool = _FakePool(numbers=[42] * 5)
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr", ocr_dedupe_s=0.0, ocr_dedupe_px=0.0),
+        buffer=buffer,
+        detector=_FakeDetector(),
+        pool=pool,
+    )
+    for index in range(1, 6):
+        frame = buffer.at(index)
+        assert frame is not None
+        worker._process_frame(frame)
+    assert worker._recent == []
+    assert len(pool.submitted) == 5, "关闭去重时每帧都要送检"
+
+
+def test_pipeline_result_queue_never_drops() -> None:
+    """检测结果队列无界：消费者暂时不抽也不会丢（超过旧的 2000 上限）。"""
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=AlignmentBuffer(capacity=8),
+        detector=_FakeDetector(),
+        pool=None,
+    )
+    detection = Detection(
+        frame_index=1,
+        capture_timestamp=1000.0,
+        pixel=(10.0, 10.0),
+        box=PixelBox(0.0, 0.0, 20.0, 20.0),
+        confidence=0.9,
+        telemetry=TelemetrySnapshot(),
+    )
+    total = 2101
+    for frame_index in range(1, total + 1):
+        worker._emit(replace(detection, frame_index=frame_index), code=1, set_code=True)
+    drained = worker.drain_results()
+    assert len(drained) == total
+    assert drained[0].frame_index == 1
+    assert drained[-1].frame_index == total
 
 
 def test_pipeline_drops_invalid_side_length() -> None:
@@ -1053,3 +1127,81 @@ def test_detection_as_dict_includes_telemetry() -> None:
     assert payload["telemetry"]["yaw_deg"] == 90.0
     # 遥测只留关键字段，别把整条快照塞进去
     assert "attitude_timestamp_us" not in payload["telemetry"]
+
+
+# ----------------------------------------------------------------------
+# OcrWorkerPool：不丢弃 + 积压告警
+# ----------------------------------------------------------------------
+def _close_pool_queues(pool) -> None:
+    """关掉测试里手工打开的进程池队列，别让 feeder 线程挂到进程退出。"""
+    for bounded in (pool._request_q, pool._result_q):
+        with contextlib.suppress(Exception):
+            bounded.close()
+            bounded.join_thread()
+
+
+def test_ocr_pool_submit_never_drops() -> None:
+    """queue_size 只是告警阈值：请求队列无界，submit 永远回任务号。"""
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    pool = OcrWorkerPool(workers=1, queue_size=2)
+    # 不拉起真的 OCR 进程（那会加载 torch/权重）：只验证队列策略
+    pool._started = True
+    try:
+        ids = [
+            pool.submit(
+                np.zeros((2, 2, 3), np.uint8), frame_index=index, capture_timestamp=float(index)
+            )
+            for index in range(5)
+        ]
+        assert ids == [1, 2, 3, 4, 5]
+        assert pool.stats["submitted"] == 5
+        assert pool.stats["dropped"] == 0, "不丢弃策略下 dropped 必须恒为 0"
+    finally:
+        _close_pool_queues(pool)
+
+
+def test_ocr_pool_warns_when_backlog_exceeds_threshold(caplog) -> None:
+    """积压超过 queue_size 时告警（只跨阈值一次）；回落后再次涨上来会重新告警。"""
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    logger_name = "airdrop.perception.ocr_worker"
+    pool = OcrWorkerPool(workers=1, queue_size=4)
+    pool._started = True
+    try:
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            for index in range(5):  # 第 4 个请求时越过阈值
+                pool.submit(
+                    np.zeros((2, 2, 3), np.uint8),
+                    frame_index=index,
+                    capture_timestamp=float(index),
+                )
+        warnings = [record for record in caplog.records if "积压" in record.message]
+        assert len(warnings) == 1, caplog.text
+
+        # 造 4 条结果取走：未完成数回到 1（< 阈值一半），告警状态复位。
+        # ⚠ mp.Queue 的 put_nowait 只是写进父进程的 feeder 缓冲，紧接着的 get_nowait
+        # 可能读不到——这里用带超时的 get，别让用例依赖调度时序。
+        for request_id in range(1, 5):
+            pool._result_q.put_nowait(
+                OcrResult(
+                    request_id=request_id,
+                    frame_index=request_id,
+                    capture_timestamp=float(request_id),
+                    number=None,
+                )
+            )
+        for _ in range(4):
+            assert pool.poll(timeout=1.0) is not None
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            for index in range(5, 9):  # 再次积压到阈值
+                pool.submit(
+                    np.zeros((2, 2, 3), np.uint8),
+                    frame_index=index,
+                    capture_timestamp=float(index),
+                )
+        assert [record for record in caplog.records if "积压" in record.message], caplog.text
+    finally:
+        _close_pool_queues(pool)

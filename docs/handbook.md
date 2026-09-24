@@ -20,6 +20,16 @@
 
 ### 0.2 与其它文档的分工（冲突时以谁为准）
 
+| 文档 | 讲什么 | 权威性 |
+| --- | --- | --- |
+| `README.md` | 怎么用：安装、四条入口、配置速览、安全提示 | 使用口径 |
+| **本文档** `docs/handbook.md` | 全景手册：目录、数据流、逐模块调用方法、参数总表、输入输出、流程、审查清单、排障 | 使用 + 审查口径 |
+| `AGENTS.md` | 给 AI 智能体的工作手册：环境约定、架构要点、关键易错点索引、验证方式 | 约定口径 |
+| `docs/calibration_opencv.md` | 三步标定与 OpenCV 5.0 问题与易错点全记录（实测表、方程、判据） | **实测口径** |
+| `docs/video_hm30_ffmpeg.md` | 图传链路为什么只有 ffmpeg 一个后端 + 逐项实测 | **实测口径** |
+| `docs/perception_ocr.md` | 检测/OCR 细节：转正形态门限、Cls 权重命名、onnxruntime 前提 | **实测口径** |
+| `docs/ballistics_fit.md` | P12 投放记录与反演：可辨识性判据、σ、留一验证 | **实测口径** |
+
 **冲突时的优先级**：代码与 `docs/` 下的实测记录 > 本文档 > `AGENTS.md`/`README.md` 的概述性描述。
 本文档刻意**不复制**专题笔记里的长篇实测结论，只给一行指针——要动那条链路前先读笔记。
 
@@ -576,7 +586,7 @@ load_broker_from_log(flight_dir, *, broker=None, history_maxlen=0, ahead_s=0.5)
     -> tuple[TelemetryBroker, TelemetryPacer]
 TelemetryPacer(broker, snapshots, *, ahead_s=0.5, tail_warn_s=5.0)
     · publish_until(timestamp) -> int      # 发布 ≤ timestamp + ahead_s 的快照
-    · finish(capture_timestamp) -> int     # 素材播完后把覆盖补到末帧
+    · finish(capture_timestamp) -> int     # 按需把覆盖补到某帧：投递每帧前调用（尾部缺失时延伸）
     · cover_to() -> float                  # 当前已推进到的时间
 ```
 
@@ -604,7 +614,7 @@ FlightLog.iter_telemetry() -> Iterator[TelemetrySnapshot]
 | `airdrop.perception.detector` | `Detector`（YOLO 封装，`ultralytics` 惰性导入）、`DetectionBatch`、`DetectorConfig` |
 | `airdrop.perception.cropproc` | `OpenCvPostProcess`（裁剪图 → 五边形定位 → 转正 → OCR）、`OcrEngine`（RapidOCR 薄封装）、`OcrEngineConfig`、`CropResult`、`OcrText`、`OcrOrientation` |
 | `airdrop.perception.number` | `correct_ocr_number`：OCR 原始串 → 00–99 整数（`OCR_CHAR_MAP` 字符映射） |
-| `airdrop.perception.ocr_worker` | `OcrWorkerPool`（OCR 独立进程池）、`OcrRequest`、`OcrResult`、`ocr_worker_main`、`put_drop_oldest` |
+| `airdrop.perception.ocr_worker` | `OcrWorkerPool`（OCR 独立进程池）、`OcrRequest`、`OcrResult`、`ocr_worker_main` |
 | `airdrop.perception.pipeline` | `PerceptionWorker`（逐帧主循环）、`PerceptionStats`、`PerceptionConfigLike` |
 
 #### 3.4.1 两个数据模型
@@ -750,12 +760,12 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 #### 3.4.5 `OcrWorkerPool` —— OCR 独立进程池
 
 ```python
-OcrWorkerPool(workers=2, *, queue_size=500, result_queue_size=500, config: dict | None = None)
+OcrWorkerPool(workers=2, *, queue_size=500, config: dict | None = None)
 # start() / stop(timeout=5.0) / submit(crop, *, frame_index, capture_timestamp, payload=None)
 # poll(timeout=0.0) / drain()
 ```
 
-- `submit` 返回任务号，队列满时返回 `None`（并丢最旧的未处理请求，见 `put_drop_oldest`）；`PerceptionWorker` 把这类丢弃计进 `PerceptionStats.ocr_dropped`。
+- `submit` 返回任务号；请求/结果队列都**无界、不丢弃**（目标可能只清晰一瞬，漏一个请求就可能漏目标）。`queue_size` 不再是容量，而是**积压告警阈值**：未完成数（`submitted - results`）达到它时打一条 WARNING（跨阈值一次；回落到一半以下后再次涨上来会重新告警），提示降帧率或加 OCR worker。`PerceptionStats.ocr_dropped` 同步池侧的 `dropped` 计数——不丢弃策略下它恒为 0，保留作监控。
 - OCR 放独立进程的理由：RapidOCR 单帧几十到几百毫秒，放主循环里会直接拖垮逐帧检测。进程参数经 `config`（字典）传给 `ocr_worker_main`。
 - Windows 是 spawn 语义：**入口脚本必须放在 `if __name__ == "__main__":` 之下**，否则子进程会重复导入主模块。受限沙箱里命名管道不可用，进程池会起不来（见 §8）。
 
@@ -782,10 +792,10 @@ PerceptionWorker(config: PerceptionConfigLike, *, buffer: AlignmentBuffer,
 其余行为约定：
 
 - **边长过滤**：`side_px` 不在 `min_side_px` 与 `max_side_px` 之间的检测被丢弃并计入 `invalid_side`（默认 10~400 px）。
-- **去重**：同一目标的重复送检按"拍摄时刻差 `ocr_dedupe_s` 且中心位移小于 `ocr_dedupe_px`"判定，命中计 `deduped`，不重复占用 OCR。
+- **OCR 逐帧送检**：默认不启用跨帧去重，避免运动模糊导致唯一清晰帧被跳过；显式打开 `ocr_dedupe_s` / `ocr_dedupe_px` 时，才按时间和像素窗口合并相邻重复请求。**OCR 请求、OCR 结果、检测结果三条队列都无界、不丢弃**：积压只告警（OCR 侧按 `ocr_queue_size`，检测结果侧按 2000 条阈值），不会因为"队列满"丢掉任何请求或结果；积压长期不降时调 `perception.ocr_workers` 或降检测帧率。
 - **编号覆盖规则**：只有 `cls12` 的类别直出才写编号；OCR 结果回填时不会清掉已存在的编号（否则跨帧投票会被打乱）。
 - 单帧异常不终止循环：记日志并写进 `PerceptionStats.last_error`。
-- `PerceptionStats` 字段：`frames`（处理的帧数）、`detections`、`with_code`、`submitted`（送 OCR 次数）、`deduped`、`results`、`invalid_side`、`ocr_dropped`、`lag_frames`、`last_error`。
+- `PerceptionStats` 字段：`frames`（处理的帧数）、`detections`、`with_code`、`submitted`（送 OCR 次数）、`deduped`、`results`、`invalid_side`、`ocr_dropped`（队列丢弃数——不丢弃策略下恒为 0，保留作监控）、`lag_frames`、`last_error`。
 
 ```python
 """感知主循环（cls12 模式 + 注入假检测器）：缓冲 → 检测 → Detection。"""
@@ -1020,17 +1030,17 @@ print(
 
 ```python
 BallisticsModel(config: BallisticsConfig)        # 参数见 §4.2
-drag_factor(velocity_rel, height_m) -> float
-terminal_velocity(height_m=0.0) -> float
+drag_factor(velocity_rel, height_m, *, ground_altitude_m=0.0) -> float
+terminal_velocity(height_m=0.0, *, ground_altitude_m=0.0) -> float
 predict_impact(position_ned, velocity_ned, *, ground_z=0.0,
-               wind=(0.0, 0.0, 0.0)) -> Impact
+               ground_altitude_m=0.0, wind=(0.0, 0.0, 0.0)) -> Impact
 ```
 
 `Impact` 字段：`ok`、`ned`（落点）、`flight_time_s`、`speed_m_s`、`reason`。失败**不编落点**：起点已在地面以下 → `reason='below_ground'`；积分超过 `MAX_FLIGHT_TIME_S`（120 s）仍未落地 → `reason='timeout'`；两种都是 `ok=False`、`ned=None`。
 
 模型要点：
 
-- 阻力按空气相对速度算，风作为空气速度参与；空气密度由 `isa_air_density(height_m)` 给出（`SEA_LEVEL_DENSITY=1.225`），**用离地高度当海拔**（站点海拔未接入，20 m 量级误差 ~0.2%，可忽略）。
+- 阻力按空气相对速度算，风作为空气速度参与；**密度基准是真实海拔**：`ground_altitude_m` 是地面平面的海拔（飞行时由 `MissionRunner` 传 GPS 原点/地面点海拔，反演时取投放记录的 `origin.alt_m − ground_z`）。关闭 `air_density_isa`（默认）时在**投放（初始）海拔**上算一次 ISA 密度、全弹道共用；打开后按 `ground_altitude_m + 离地高度` **逐级**求值（贵 26~30%，高海拔/大落差时更准）。不再有"地面=海平面"的假设；记录缺原点时退回 0，反演报告会告警。
 - 定步长 RK4（`rk_dt` 默认 0.005 s）；**落点用线性插值定在穿越地面的瞬间**，不是"第一个 z ≥ 地面的步"。
 - `wind_from_snapshot(snapshot, config)`：`wind_source='telemetry'` 时从快照取风；**取不到返回 `None`**，刻意与"风确实是 0"区分开；调用方按零风降级并只记一次日志。
 
@@ -1038,8 +1048,9 @@ predict_impact(position_ned, velocity_ned, *, ground_z=0.0,
 
 ```python
 ReleaseJudge(config: DropConfig, ballistics: BallisticsModel, overfly_heading_deg: float,
-             ground_z=0.0, wind_ned=None, on_event=None, summary_hz=5.0)
-update(snapshot, target_ned, *, ground_z=None, wind_ned=None, now=None) -> ReleaseDecision
+             ground_z=0.0, ground_altitude_m=0.0, wind_ned=None, on_event=None, summary_hz=5.0)
+update(snapshot, target_ned, *, ground_z=None, ground_altitude_m=None,
+       wind_ned=None, now=None) -> ReleaseDecision
 reset()
 ```
 
@@ -1066,7 +1077,7 @@ reset()
 | `write_impact_template(path, records)` | 生成待填的实测落点模板 |
 | `release_conditions(record, *, delay_s=None, offset_body_m=None)` | 求出释放瞬间的（位置, 速度） |
 | `resolve_wind(record, *, scale=1.0)` | 取出该次投放的风（可缩放） |
-| `predict_record_impact(record, model, *, delay_s=None, offset_body_m=None, wind_scale=1.0, ground_z=None)` | 用给定模型重算落点，返回 `Impact` |
+| `predict_record_impact(record, model, *, delay_s=None, offset_body_m=None, wind_scale=1.0, ground_z=None, ground_altitude_m=None)` | 用给定模型重算落点，返回 `Impact`（密度基准缺省取记录原点海拔） |
 | `attitude_matrix(record)` | 由四元数或欧拉角还原姿态矩阵（都没有则 `None`） |
 
 `DropRecord` 字段分四组：
@@ -1076,7 +1087,7 @@ reset()
 - 当时的预测：`release_position_ned`、`predicted_impact_ned`、`predicted_flight_time_s`、`predicted_error_m`；
 - 参数与实测：`ballistics`（当时用的参数快照）、`impact_ned`、`impact_source`。
 
-属性/方法：`from_snapshot(...)`（从遥测快照建记录）、`from_dict`/`as_dict`、`height_agl_m`、`horizontal_speed_m_s`、`heading_deg`、`euler_deg`。文件名常量：`DROPS_NAME='drops.jsonl'`、`IMPACTS_JSONL_NAME='impacts.jsonl'`、`IMPACTS_CSV_NAME='impacts.csv'`。
+属性/方法：`from_snapshot(...)`（从遥测快照建记录）、`from_dict`/`as_dict`、`height_agl_m`、`ground_altitude_m`（地面海拔 = `origin.alt_m − ground_z`，密度的基准）、`horizontal_speed_m_s`、`heading_deg`、`euler_deg`。文件名常量：`DROPS_NAME='drops.jsonl'`、`IMPACTS_JSONL_NAME='impacts.jsonl'`、`IMPACTS_CSV_NAME='impacts.csv'`。
 
 #### 3.7.4 `fit` —— 弹道参数反演
 
@@ -1091,10 +1102,11 @@ FIT_PARAMETERS = ('drag_coefficient', 'cross_area_m2', 'release_delay_s', 'wind_
 
 `FitResult` 关键字段：`ok`、`reliable`、`reason`、`fitted`（实际拟合的参数名）、`parameters`、`ballistics`（拟合后的参数对象）、`release_delay_s`、`wind_scale`、`drag_k_per_m`（κ = Cd·A/m）、`drag_area_m2`、`drag_area_sigma_m2`、`n_samples`、`n_equations`、`dof`、`rms_error_m`、`max_error_m`、`bias_north_m`、`bias_east_m`、`per_drop`（`DropResidual` 列表）、`sigma`、`correlation`、`condition_number`、`at_bound`、`leave_one_out_rms_m`、`leave_one_out_max_m`、`leave_one_out_errors_m`、`warnings`、`nfev`。
 
-三条必须记住的结论（完整推导在 [`docs/ballistics_fit.md`](ballistics_fit.md)）：
+四条必须记住的结论（完整推导在 [`docs/ballistics_fit.md`](ballistics_fit.md)）：
 
 - **质量是称出来的，不进反演**：数据能识别的只有 κ = Cd·A/m 一个数，所以质量填错多少，Cd 与 Cd·A 就跟着错多少，κ 不变。
 - **同高同速下 Cd 与释放延迟不可辨识**（条件数实测 1.06e10，会被直接拒绝）：要分开就得把速度或高度拉开；有风反而容易分离。
+- **密度基准取记录的原点海拔**（`origin.alt_m − ground_z`，见 §3.7.1；缺原点退回 0 并在 `FitResult.warnings` 告警）：同一站点自洽；改过密度基准（或换站点/海拔）后重跑旧数据，Cd 会按密度差等比变化。
 - 有常数偏差时先看 `bias_north_m`/`bias_east_m`，别急着加参数。
 
 运行入口：`python -m airdrop.run fit-ballistics`（见 §6.2；`tools/fit_ballistics.py` 里的常量就是默认值）。
@@ -1263,8 +1275,9 @@ FW_DEFAULT_LAND_ANGLE_DEG = 8.0       # PX4 FW_LND_ANG 出厂默认
   `frame=MAV_FRAME_MISSION`、参数全 0。只支持 `fwLandingPattern`——VTOL 降落、测绘/结构航线
   **显式报错**，不猜着展开。
 - **降落预检照 PX4 的判据**（`MissionFeasibility/FeasibilityChecker.cpp`）：紧前一项必须**严格高于**
-  落点；下滑角 `(前项高 − 落点高) / 水平距离 ≤ tan(FW_LND_ANG + 0.1°)`；进场项只能是
-  `NAV_WAYPOINT` 或 `NAV_LOITER_TO_ALT`；`LOITER_TO_ALT` 进场时落点必须在盘旋圈**外**。
+  落点；下滑**斜率**（tan，垂直差/水平距离）≤ `tan(FW_LND_ANG + 0.1°)`（默认 8° ⇒ 上限约 0.142，
+  即约 8.1°）；进场项只能是 `NAV_WAYPOINT` 或 `NAV_LOITER_TO_ALT`（后者按
+  `sqrt(圆心距² − 半径²)` 修正水平距离，与 PX4 一致）；`LOITER_TO_ALT` 进场时落点必须在盘旋圈**外**。
   `preceding` 用来说明"`items` 之前还有一项"（飞掠段插在降落段前面时就是飞掠段的 exit）。
 - 不合格的航线在**规划阶段**就带着原因失败（`PlanningError`），而不是上传后被飞控整条拒掉、
   飞机原地盘旋——2026-09 的 SITL 演练里为此空等了 15 分钟。
@@ -1701,9 +1714,9 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `max_side_px` | float | `400.0` | 最大像素边长（校验要求大于最小值） |
 | `ocr_conf_threshold` | float | `0.6` | OCR 置信度门限 |
 | `ocr_workers` | int | `2` | OCR 进程数（≥ 1） |
-| `ocr_queue_size` | int | `500` | OCR 请求队列长度（≥ 1） |
-| `ocr_dedupe_s` | float | `0.8` | 去重时间窗（秒） |
-| `ocr_dedupe_px` | float | `30.0` | 去重位移门限（像素） |
+| `ocr_queue_size` | int | `500` | OCR 积压**告警阈值**（≥ 1；队列无界、不丢弃） |
+| `ocr_dedupe_s` | float | `0.0` | 旧配置兼容字段，当前不启用去重 |
+| `ocr_dedupe_px` | float | `0.0` | 旧配置兼容字段，当前不启用去重 |
 | `save_crops` | bool | `False` | 裁剪图写入磁盘开关（⚠ 当前无消费者，见 4.17） |
 | `crop_dir` | str | `'log/target'` | 裁剪图目录（⚠ 同上） |
 | `max_crops` | int | `5000` | 裁剪图上限（⚠ 同上） |
@@ -1750,7 +1763,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `cross_area_m2` | float | `0.004` | 迎风面积（几何量） |
 | `gravity` | float | `9.80665` | 重力加速度 |
 | `rk_dt` | float | `0.005` | RK4 定步长（秒） |
-| `air_density_isa` | bool | `True` | 用 ISA 密度随高度变化 |
+| `air_density_isa` | bool | `False` | `False`=按**投放海拔**算一次常密度（真实海拔基准）；`True`=按"地面海拔+离地高度"逐级 ISA |
 | `wind_source` | str | `'telemetry'` | `telemetry` / `zero`（`WIND_SOURCES`） |
 
 ### 4.9 `DropConfig` —— 投放判据
@@ -2142,10 +2155,10 @@ config = Config(
 ).validated()  # ⚠ 直接构造不会校验，必须调 validated()
 ```
 
-### 6.4 测试怎么跑
+### 6.5 测试怎么跑
 
 ```bash
-./.venv/Scripts/python.exe -m pytest                     # 全部（附覆盖率，当前 ≈81%）
+./.venv/Scripts/python.exe -m pytest                     # 全部（附覆盖率，当前 ≈85%）
 ./.venv/Scripts/python.exe -m pytest -m "not stream"     # 跳过要起 ffmpeg 的用例（占 UDP 51234）
 ./.venv/Scripts/python.exe -m pytest -m realdata         # GPU + 旧版 实战素材（分钟级）
 ./.venv/Scripts/python.exe -m pytest -k mission -v       # 只跑某个主题
@@ -2174,7 +2187,7 @@ config = Config(
 | `tests/test_cli.py` | 集中式入口：子命令注册表（parser + handler）、`--help`/`check-docs` **不加载重库**（干净子进程实测）、参数不合法退出码 2、选项覆盖真的进了 `build_config()` | 否 |
 | `tests/test_handbook.py` | **本手册 §3 的 11 段示例逐条真跑**（文档里的代码必须能运行） | 否 |
 
-### 6.5 一次真实任务的推荐顺序
+### 6.6 一次真实任务的推荐顺序
 
 1. **标定**：`examples/calibration_capture.py` 录素材 → `tools/calibrate.py` 出 `camera_calib.json`
    → 把 `telemetry_lag` 回填 `VideoConfig`（一步同时解决相机外参与时间差）。
@@ -2234,6 +2247,8 @@ config = Config(
 | 39 | 正式流程 `INIT → PREFLIGHT → WAIT_AIRBORNE → RECON`：先自检（载入模型 + 视频自检），再等"在空中"，最后才进侦查；等待起飞的检查有**临时放行开关** `MissionConfig.require_airborne`（默认 `True`），置 `False`（**只给地面演练/离线测试**）时该检查立即放行，且**必须留痕**——记 `airborne_skipped` 事件（带 `reason`）+ WARNING 日志，绝不静默通过 | `mission/runner.py` 的 `_tick_preflight`/`_tick_airborne`、`config.py` 的 `MissionConfig.require_airborne`、`airdrop/preflight.py` | 在停机坪上就进侦查：PX4 会在地面"追"第一个航点，或因任务不可行直接盘旋；演练则相反——飞不飞都空等到 `airborne_timeout_s`（1800s）才失败 |
 | 40 | 侦查航线**默认由操作手在 QGC 上传并启动**（`MissionConfig.recon_upload='operator'`）；`'auto'` 只用于自动测试 | `config.py` 的 `RECON_UPLOAD_MODES`、`runner._begin_recon` | 自动上传会覆盖操作手刚画好的航线 |
 | 41 | 自检**关掉 ≠ 通过**：关掉的项记 `preflight` 事件（`ok=null`）；**开着却没注入回调 = 装配错误**，直接判失败 | `airdrop/preflight.py` 的 `PreflightCheck.skipped` / `PreflightError` | 把"漏了装配"当成"检查通过"，正式任务带着没自检的系统起飞 |
+| 42 | OCR 请求 / OCR 结果 / 检测结果三条队列都**无界、不丢弃**；积压只告警（`ocr_queue_size` 与结果队列 2000 条阈值），绝不因为"队列满"丢数据 | `perception/ocr_worker.py` 的 `submit`/`_warn_if_backlogged`、`perception/pipeline.py` 的 `_emit`/`_collect_remaining` | 丢掉一个送检请求或一条结果 ⇒ 可能漏掉只清晰一瞬的目标编号（编号是坐标解算的输入） |
+| 43 | 弹道密度以**真实海拔**为基准：`ground_altitude_m` 来自 GPS 原点/地面点（反演取记录 `origin.alt_m − ground_z`）；关闭 ISA 也在投放海拔算一次常密度 | `ballistics/model.py` 的 `predict_impact`、`mission/runner.py` 的 `_ground_altitude`、`ballistics/drops.py` 的 `predict_record_impact` | 把地面当海平面：1500 m 站点高估密度 ~16% ⇒ 高估阻力、预测落点偏近；反演参数迁移到别的海拔也会错 |
 
 ### 7.2 失败语义一览（"到底怎么算失败"）
 
@@ -2289,7 +2304,7 @@ config = Config(
 - [ ] 有没有在业务代码里硬编码数值（应进 `config.py`）？
 - [ ] 新增参数有没有进 `Config.validated()` 的取值域检查？
 - [ ] 失败路径是否**显式**（抛错 / `ok=False` / `None` 三选一，并在 docstring 写明）？
-- [ ] 是否碰了 §7.1 里 38 条不变量中的任何一条？改了哪条就要同步 `AGENTS.md` 与对应专题笔记。
+- [ ] 是否碰了 §7.1 里 43 条不变量中的任何一条？改了哪条就要同步 `AGENTS.md` 与对应专题笔记。
 - [ ] 碰了任务项 / 航线来源 / 启动与完成判定（§7 第 31~35 条）时，除了离线用例，**跑一次 SITL 演练**（`examples/sitl_mission.py`）——这四条都是"离线测不出来、真飞控才暴露"的。
 - [ ] 回归用例加了吗（`tests/` 是回归落点）？跑过 `pytest -m "not stream"` 吗？
 - [ ] 三份文档是否同步：`README.md`（怎么用）、`AGENTS.md`（约定与易错点）、本手册（目录/参数/产物）？
