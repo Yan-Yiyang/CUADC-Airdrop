@@ -12,7 +12,8 @@
 * **默认（离线）**：位姿与"检测结果"是合成的（脚本化假检测器给固定像素与编号），
   georef / targeting / planner / runner **全是真的**——验收计划里那句
   "回放全链路产出结果坐标"。
-* **``-m realdata``（GPU）**：帧来自 旧版 实战视频、YOLO 与 OCR 都是真的，
+* **``-m realdata``（GPU）**：帧来自真实实战视频（用环境变量
+  ``AIRDROP_REALDATA_VIDEO`` 指定）、YOLO 与 OCR 都是真的，
   只有位姿是合成的（那段素材没有遥测）。见文件末尾的说明。
 
 为什么坐标断言能写死
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import time
 import uuid
@@ -582,7 +584,20 @@ def test_target_source_busy_follows_perception_backlog() -> None:
 # ----------------------------------------------------------------------
 # 真实素材全链路（-m realdata）
 # ----------------------------------------------------------------------
-VIDEO = Path(r"input/flight.mp4")
+#: 真实素材视频的环境变量名
+REALDATA_VIDEO_ENV = "AIRDROP_REALDATA_VIDEO"
+
+
+def _realdata_video() -> Path | None:
+    """从环境变量读视频路径；没设或文件不存在时返回 None（用例跳过）。"""
+    raw = os.environ.get(REALDATA_VIDEO_ENV, "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.is_file() else None
+
+
+VIDEO = _realdata_video()
 WEIGHTS = Path("models/best2.pt")
 MODELS_DIR = Path("models/ppocr")
 #: 目标段里连续几帧（画面里都在目标附近）
@@ -660,12 +675,10 @@ def test_real_video_replay_produces_target_coordinates(workdir: Path) -> None:
     所以这条用例验的是**链路连通与量纲**（真像素能一路走到地面坐标、编号能读对），
     **不是**坐标精度——精度要靠带遥测的真实素材或标定飞行。
     """
-    import os
-
     pytest.importorskip("ultralytics")
     pytest.importorskip("rapidocr")
-    if not VIDEO.is_file() or not WEIGHTS.is_file():
-        pytest.skip("缺少 旧版 素材或 YOLO 权重")
+    if VIDEO is None or not WEIGHTS.is_file():
+        pytest.skip(f"未用 {REALDATA_VIDEO_ENV} 指定素材视频，或缺少 YOLO 权重")
     if os.environ.get("AIRDROP_SKIP_GPU"):
         pytest.skip("设了 AIRDROP_SKIP_GPU")
 

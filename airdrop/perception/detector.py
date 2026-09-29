@@ -22,7 +22,7 @@ __all__ = ["DetectionBatch", "Detector", "DetectorConfig"]
 class DetectorConfig:
     """YOLO 检测参数。"""
 
-    # 实测可用的权重是 best2.pt（best.pt/best1.pt 对现目标形态零检出，见 config.py）
+    # YOLO 检测权重（单类 target）
     model_path: str = "models/best2.pt"
     device: str = "0"  # 显式指定：见模块 docstring
     conf_threshold: float = 0.25

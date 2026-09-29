@@ -243,8 +243,7 @@ def _draw_buildings(draw: ImageDraw.ImageDraw, rng: Random, size: int) -> None:
 def _draw_markings(draw: ImageDraw.ImageDraw, rng: Random, size: int) -> None:
     """路面标线：几排短白线（停车位/车道那种），**不写任何数字或文字**。
 
-    ⚠ 贴图里不许出现可读的数字/文字：那会和真靶标（数字板）混淆，
-    这条是用户要求（2026-09）——早先版本会随机画几个数字当干扰，已去掉。
+    ⚠ 贴图里不许出现可读的数字/文字：那会和真靶标（数字板）混淆。
     """
     for _ in range(rng.randint(1, 2)):
         base_x = rng.uniform(0.0, size * 0.7)

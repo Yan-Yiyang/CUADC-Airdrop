@@ -100,10 +100,23 @@ class AlignConfig:
 # ---------------------------------------------------------------- 视频处理
 @dataclass(frozen=True, slots=True)
 class PerceptionConfig:
-    '视频处理（YOLO + RapidOCR）。**起飞前按任务选模式**。\n\n    - ``mode="ocr"``：YOLO 检出目标框 → 裁剪 → RapidOCR 读印刷数字（编码 00–99）；\n    - ``mode="cls12"``：YOLO 12 类直出编号（1–12），无 OCR 环节。'
+    """视频处理（YOLO + RapidOCR）。**起飞前按任务选模式**。
+
+    - ``mode="ocr"``：YOLO 检出目标框 → 裁剪 → RapidOCR 读印刷数字（编码 00–99）；
+    - ``mode="cls12"``：YOLO 12 类直出编号（1–12），无 OCR 环节。
+
+    三条要求：
+
+    1. **``mode="cls12"`` 需要 12 类检测权重**（仓库目前只提供单类 ``target``
+       权重；12 类权重就位前该模式编号恒为 1）。
+    2. **检测权重用 ``best2.pt``**（单类 ``target``；仓库不带权重，
+       用 :mod:`tools.fetch_models` 复制）。
+    3. **``device`` 必须显式给定**：不依赖 ultralytics 的自动检测
+       （当前实测会选中 ``cuda:0``，显式指定零成本地固定设备）。
+    """
 
     mode: str = "ocr"
-    # YOLO 检测权重（单类 target）。实测可用的是 best2.pt，见上。
+    # YOLO 检测权重（单类 target）
     model_path: str = "models/best2.pt"
     device: str = "0"
     conf_threshold: float = 0.25
@@ -116,7 +129,7 @@ class PerceptionConfig:
     rec_keys: str = "ppocrv6_dict.txt"
     ocr_use_cuda: bool = True
 
-    # OCR 目标形态（旧版 实战规格：五边形=正方形+等边三角形，边长 1m）
+    # OCR 目标形态（实战规格：五边形=正方形+等边三角形，边长 1m）
     target_color: str = "blue"  # blue / red
     target_side_length_m: float = 1.0
     min_side_px: float = 10.0
@@ -222,7 +235,8 @@ class GroundConfig:
 class TargetingConfig:
     """聚类与结果筛选（scikit-learn DBSCAN）。
 
-    ``selection_rule``：跨聚类标签取中位数（``"median"``）或最大值（``"max"``）对应的类，
+    ``selection_rule``：跨聚类标签取中位数（``"median"``，在**去重后**的编号上取，下中位）
+    或最大值（``"max"``）对应的类，
     **起飞前按任务选定**，代码不做隐式回退。结果坐标 = 类内成员坐标均值。
     """
 

@@ -1,6 +1,7 @@
 [project]
 name = "airdrop"
 version = "3.0.0"
+authors = [{ name = "太原理工大学航模协会" }, { name = "燕羿洋" }]
 requires-python = ">=3.14"
 dependencies = [
     "imageio-ffmpeg",
@@ -179,12 +180,10 @@ known-first-party = ["airdrop", "tools", "examples"]
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
-# 全库已按本配置格式化过一遍（2026-09，67/85 个文件），此后 `format --check`
-# 应保持 "85 files already formatted"。格式化**只许动排版**：验收判据是
-# "格式化前后 AST（剥掉位置信息）完全一致"——本次实测 77/77 个文件等价，
-# 唯一的内容变化是一个以引号开头的 docstring 按 PEP 257 补了首空格。
+# 全库已按本配置格式化；`format --check` 应保持全绿。格式化**只许动排版**：
+# 验收判据是"格式化前后 AST（剥掉位置信息）完全一致"，不要只依赖测试通过。
 #
-# 两条实测结论（都别再"顺手"改）：
+# 两条结论（都别再"顺手"改）：
 # 1. `number` 一栏不需要配：Python 3.14 的 `except A, B:`（PEP 758）就是合法的
 #    元组写法，格式化会把 `except (A, B):` 收成它，不是语法错误。
 # 2. **E501 保持关闭**。`ruff format` 在时会自动压掉 E501，而格式化器对
@@ -195,8 +194,7 @@ line-ending = "auto"
 # ======================================================================
 # pyright —— 类型检查
 # ======================================================================
-# 实测：basic 与 standard 在本仓库的报错完全一致（都是 126 errors，差异只有
-# reportPossiblyUnboundVariable 等少数规则，且都落在第三方源码里），
+# basic 与 standard 在本仓库的报错一致（差异规则都落在第三方源码里），
 # 因此取兼容性更好、误报更少的 basic。
 # 跑法：./.venv/Scripts/pyright.exe（读本节配置；PKG 列表来自 include）
 [tool.pyright]
@@ -236,17 +234,19 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
-    # realdata 用例要 GPU + 旧版 实战素材（分钟级、依赖外部文件），
-    # 默认跳过；要跑就显式 `-m realdata`
+    # realdata 用例要 GPU + 真实素材（分钟级、依赖外部文件；视频用
+    # 环境变量 AIRDROP_REALDATA_VIDEO 指定），默认跳过；要跑就显式 `-m realdata`。
+    # sitl 用例要 WSL+PX4 SITL+图传在跑（分钟级），同样默认跳过：`-m sitl`
     "-m",
-    "not realdata",
+    "not realdata and not sitl",
     "--cov=airdrop",
     "--cov-report=term-missing:skip-covered",
 ]
 markers = [
     "stream: 需要 ffmpeg 与本机 UDP 端口（会起子进程，秒级）",
     "network: 走网络错误路径，需要等超时或连接被拒",
-    "realdata: 需要 GPU + 真实素材/权重（旧版 实战视频、PP-OCR 权重），分钟级",
+    "realdata: 需要 GPU + 真实素材/权重（视频路径用 AIRDROP_REALDATA_VIDEO 指定、PP-OCR 权重），分钟级",
+    "sitl: 需要 WSL 里已经起好的 PX4 SITL + Gazebo 图传（本测试只驱动，不负责启动；分钟级）",
 ]
 # 全局超时兜底：拉流用例一旦卡住（管道读不回、子进程不退）要能失败而不是挂死。
 # Windows 上没有 SIGALRM，必须用 thread 方式。

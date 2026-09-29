@@ -233,7 +233,16 @@ def main(
         # 5) 感知 → 坐标解算 → 目标统计（回放与实飞共用这一条）
         worker = PerceptionWorker(config.perception.to_pipeline_config(), buffer=buffer)
         tracker = TargetTracker(config, camera=camera, on_event=on_event)
-        targets = PerceptionTargetSource(worker=worker, tracker=tracker)
+        targets = PerceptionTargetSource(
+            worker=worker,
+            tracker=tracker,
+            # 检出写进飞行记录（detections.jsonl）——不接的话这个文件永远是空的
+            on_detection=(
+                (lambda detection: recorder.detections.append(detection))  # noqa: PLW0108 - 延迟取 recorder
+                if recorder is not None
+                else None
+            ),
+        )
 
     # 6) 投放判据：弹道 + 一次性锁存（每拍预测落点，越过目标后强制投放）
     judge = ReleaseJudge(

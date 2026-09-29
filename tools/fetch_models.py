@@ -8,38 +8,52 @@
 
 用法（命令行解析在 airdrop/run.py）::
 
-    ./.venv/Scripts/python.exe -m airdrop.run fetch-models
-    ./.venv/Scripts/python.exe -m airdrop.run fetch-models --source-dir D:\\weights
+    ./.venv/Scripts/python.exe -m airdrop.run fetch-models --source-dir <YOLO 权重目录>
+    ./.venv/Scripts/python.exe -m airdrop.run fetch-models \
+        --source-dir <YOLO 权重目录> --source-ocr-dir <OCR 权重目录>
+
+来源目录也可以先放进环境变量（命令行选项优先）::
+
+    AIRDROP_SOURCE_DIR=<YOLO 权重目录>
+    AIRDROP_SOURCE_OCR_DIR=<OCR 权重目录>
+
+不单独指定 OCR 来源时按 YOLO 来源目录处理（两组权重常常放在一起）。
 
 本文件是纯库模块：顶部常量是默认值，:func:`build_config` / :func:`main` 按需覆盖。
 
-来源
-----
-* YOLO：``SOURCE_DIR/best2.pt`` → ``models/best2.pt``
-  （实测可用的是 best2.pt；best.pt / best1.pt 对现目标形态零检出）
-* PP-OCRv6：``SOURCE_DIR`` 里的 ``*.pth`` 与 ``*dict.txt`` → ``models/ppocr/``
-* 方向分类（Cls）：同一目录下的 ``ch_ptocr_mobile_v2.0_cls_mobile.pth``（TORCH 版）
-  与 ``ch_ppocr_mobile_v2.0_cls_mobile.onnx``（ONNX 版）→ ``models/ppocr/``；
-  文件名不能规范化，理由见下面 ``OCR_FILES`` 的注释。
+需要哪些模型文件
+----------------
+* YOLO 检测：``best2.pt`` → ``models/best2.pt``（单类 ``target``）
+* PP-OCRv6（TORCH）：``*.pth`` 与 ``*dict.txt`` → ``models/ppocr/``
+* 方向分类（Cls）：``ch_ppocr_mobile_v2.0_cls_mobile.onnx`` 与
+  ``ch_ptocr_mobile_v2.0_cls_mobile.pth`` → ``models/ppocr/``（文件名保持原样）
 
- ``SOURCE_DIR`` 默认指向 旧版 的安装位置（那里已下载好 TORCH 权重）。
-换机器时改成你自己的素材路径即可。本脚本只做复制，不联网——要重新下载
-TORCH 版 PP-OCR 权重，用 ``rapidocr`` 自己的下载器或 modelscope 取，
-下完放到 ``SOURCE_DIR`` 再跑本脚本。
+权重来源需自备（仓库不带权重）。本脚本只做复制，不联网。
 """
 
 from __future__ import annotations
 
+import os
 import shutil
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+
 # ----------------------------------------------------------------------
-# 配置（改这里）
+# 配置（改这里；也可由命令行选项 / 环境变量覆盖）
 # ----------------------------------------------------------------------
-SOURCE_DIR = Path(r"input/flight.dat")
-# rapidocr 的 TORCH 权重通常在它的 site-packages/rapidocr/models 下
-SOURCE_OCR_DIR = Path(r"input/flight.dat")
+def _env_path(name: str) -> Path | None:
+    """从环境变量取一个可选目录；没设或为空时返回 None。"""
+    raw = os.environ.get(name, "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
+#: YOLO 权重来源目录（环境变量 ``AIRDROP_SOURCE_DIR``；命令行 ``--source-dir`` 优先）
+SOURCE_DIR = _env_path("AIRDROP_SOURCE_DIR")
+#: OCR 权重来源目录（环境变量 ``AIRDROP_SOURCE_OCR_DIR``）；
+#: rapidocr 的 TORCH 权重通常在它的 site-packages/rapidocr/models 下
+SOURCE_OCR_DIR = _env_path("AIRDROP_SOURCE_OCR_DIR")
 TARGET_DIR = Path("models")
 TARGET_OCR_DIR = TARGET_DIR / "ppocr"
 
@@ -53,13 +67,8 @@ OCR_FILES = (
     "PP-OCRv6_rec_tiny.pth",
     "ppocrv6_dict.txt",
     "ppocrv6_tiny_dict.txt",
-    # 方向分类（Cls）。两个名字都不能改：
-    # * ``.onnx`` 用 RapidOCR 的正规模型名；
-    # * ``.pth`` 必须叫 ``ch_ptocr_...``——RapidOCR 的 ``arch_config.yaml`` 里那条 cls
-    #   架构被拼错了（``ptocr`` 而非 ``ppocr``），而 TORCH 引擎是按文件名 stem 查架构
-    #   （``networks/main.py`` 的 ``_load_arch_config``），名字对不上直接
-    #   ``ValueError: architecture ... is not in arch_config.yaml``。
-    #   实测：同一个权重改名成 ``ch_ppocr_...pth`` 就加载不了，叫 ``ch_ptocr_...pth`` 才行。
+    # 方向分类（Cls）两个权重都要（ONNX 是默认引擎，TORCH 备选）；
+    # 文件名保持 RapidOCR 原命名，不要改动（TORCH 引擎按文件名 stem 查架构）。
     "ch_ptocr_mobile_v2.0_cls_mobile.pth",
     "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
 )
@@ -85,10 +94,14 @@ def copy_missing(source: Path, target: Path, names: tuple[str, ...]) -> int:
 
 @dataclass(frozen=True, slots=True)
 class FetchConfig:
-    """复制权重用到的路径（默认值 = 本文件顶部的常量）。"""
+    """复制权重用到的路径（默认值 = 本文件顶部的常量）。
 
-    source_dir: Path = SOURCE_DIR
-    source_ocr_dir: Path = SOURCE_OCR_DIR
+    ``source_dir`` 为 None 表示"还没指定来源"，:func:`main` 会打印用法并以
+    非零退出；``source_ocr_dir`` 不指定时按 ``source_dir`` 处理。
+    """
+
+    source_dir: Path | None = SOURCE_DIR
+    source_ocr_dir: Path | None = SOURCE_OCR_DIR
     target_dir: Path = TARGET_DIR
     yolo_files: tuple[str, ...] = YOLO_FILES
     ocr_files: tuple[str, ...] = OCR_FILES
@@ -102,15 +115,23 @@ def build_config(**overrides) -> FetchConfig:
 def main(**overrides) -> int:
     """复制缺失的权重；关键字与 :func:`build_config` 一致。返回进程退出码。"""
     settings = build_config(**overrides)
-    print(f"YOLO 权重源: {settings.source_dir}")
-    print(f"OCR  权重源: {settings.source_ocr_dir}")
+    source_dir = settings.source_dir
+    if source_dir is None:
+        print(
+            "未指定权重来源：用 --source-dir <目录> 指定，或先设环境变量 AIRDROP_SOURCE_DIR。",
+            file=sys.stderr,
+        )
+        return 1
+    source_ocr_dir = settings.source_ocr_dir or source_dir
+    if settings.source_ocr_dir is None:
+        print(f"（未单独指定 OCR 来源，按 {source_ocr_dir} 处理）")
+    print(f"YOLO 权重源: {source_dir}")
+    print(f"OCR  权重源: {source_ocr_dir}")
     print(f"目标目录   : {settings.target_dir.resolve()}")
     print()
-    total = copy_missing(
-        Path(settings.source_dir), Path(settings.target_dir), tuple(settings.yolo_files)
-    )
+    total = copy_missing(Path(source_dir), Path(settings.target_dir), tuple(settings.yolo_files))
     total += copy_missing(
-        Path(settings.source_ocr_dir),
+        Path(source_ocr_dir),
         Path(settings.target_dir) / "ppocr",
         tuple(settings.ocr_files),
     )

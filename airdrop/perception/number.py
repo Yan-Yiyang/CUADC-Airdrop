@@ -4,7 +4,7 @@
 大部分错误，而且不依赖任何模型：印刷数字被认成形状相近的字母（``O``/``l``/
 ``S``/``B``/``g``）是最常见的失败模式，直接映射回数字即可。
 
-移植自 旧版 ``drone/target.py`` 的 ``correct_ocr_number``（久经实测），
+移植自旧版实现 ``drone/target.py`` 的 ``correct_ocr_number``（久经实测），
 逻辑与阈值一字不改——这条规则是调出来的，没有理由重调。
 """
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 __all__ = ["OCR_CHAR_MAP", "correct_ocr_number"]
 
-# 易混淆字符映射（OCR 纠错）——与 旧版 完全一致，不要随手加条目：
+# 易混淆字符映射（OCR 纠错）——与旧版实现完全一致，不要随手加条目：
 # 每多一条映射就多一类"把真数字改错"的风险，这张表是实测调出来的。
 OCR_CHAR_MAP = {
     "o": "0",

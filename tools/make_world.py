@@ -91,7 +91,7 @@ CONTROL_ZONE_EAST_M = 0.0
 CONTROL_ZONE_NORTH_M = -34.0
 
 #: 贴地标线的标高（米）：层与层之间留 20mm。⚠ **绝不让两层共面重叠**——
-#: 曾经操纵区与起降区标记都是 z=0.02 且有一块重叠，渲染出来就是贴图打架（z-fighting）。
+#: 共面又重叠会渲染成贴图打架（z-fighting）。
 RUNWAY_Z_M = 0.01
 LANDING_ZONE_Z_M = 0.03
 CONTROL_ZONE_Z_M = 0.05
@@ -1218,7 +1218,7 @@ def referenced_assets(world_text: str) -> list[str]:
     """从世界 SDF 里抽出引用的资产路径（``<uri>`` / ``<albedo_map>``，去重、保持顺序）。
 
     ⚠ 这些 URI 是**元素文本**（``<uri>materials/...</uri>``），不是属性值——
-    早先按引号切分的写法一条都抓不到，等于没有自检（回归用例见 tests/test_world.py）。
+    解析必须按元素文本取，否则一条都抓不到、自检形同虚设（回归用例见 tests/test_world.py）。
     """
     root = ET.fromstring(world_text)
     found: list[str] = []

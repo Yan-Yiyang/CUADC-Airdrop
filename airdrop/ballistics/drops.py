@@ -458,8 +458,8 @@ def predict_record_impact(
     （:mod:`airdrop.ballistics.fit`）与报表都走这一个入口，免得两处各写一遍初始条件。
 
     ``ground_altitude_m`` 缺省取 :attr:`DropRecord.ground_altitude_m`（原点海拔 −
-    ``ground_z``，即记录里的 GPS 高度基准）；记录没有原点时退回 0（等于原地面的
-    旧行为）——此时高原站点会有密度偏差，反演报告里应把该条记录的原点补齐。
+    ``ground_z``，即记录里的 GPS 高度基准）；记录没有原点时按 0 处理（视作地面海拔为
+    0）——此时高原站点会有密度偏差，反演报告里应把该条记录的原点补齐。
     """
     baseline = record.ground_altitude_m if ground_altitude_m is None else float(ground_altitude_m)
     position, velocity = release_conditions(record, delay_s=delay_s, offset_body_m=offset_body_m)

@@ -431,7 +431,7 @@ class MissionRunner:
     def _tick_airborne(self, now: float) -> None:
         """``WAIT_AIRBORNE``：什么都不下发，等飞机真的在空中再进侦查。
 
-        在停机坪上就进侦查（旧行为）等于让飞机在地面执行任务：PX4 会在起飞前就
+        在停机坪上就进侦查等于让飞机在地面执行任务：PX4 会在起飞前就
         开始"追"第一个航点，或者干脆因为任务不可行而盘旋。
 
         ``MissionConfig.require_airborne=False`` 是地面演练/测试的临时放行开关：
@@ -743,12 +743,11 @@ class MissionRunner:
         """确认"任务真的在跑"：飞控进了任务模式。
 
         为什么必须有这一步：``mission.start_mission()`` 回成功不等于进了任务模式
-        ——飞控可能拒绝模式切换却仍然回 ACK，飞机继续盘旋。2026-09 SITL 演练里因此
-        空等了 15 分钟才被状态超时抓出来。这里给它一个短的确认窗口
+        ——飞控可能拒绝模式切换却仍然回 ACK，飞机继续盘旋。这里给它一个短的确认窗口
         （``MissionConfig.mission_start_timeout_s``），超时按显式失败处理。
 
-        模式流不可用时（``flight_mode`` 为 ``None``）退化为不做确认并只记一次日志：
-        宁可退回旧行为，也不要因为取不到模式就把任务判失败。
+        模式流不可用时（``flight_mode`` 为 ``None``）退化为跳过确认并只记一次日志：
+        宁可跳过确认，也不要因为取不到模式就把任务判失败。
         """
         if self._start_confirmed:
             return True

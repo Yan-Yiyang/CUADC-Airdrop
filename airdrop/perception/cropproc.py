@@ -1,10 +1,10 @@
 """裁剪图后处理：五边形定位 → 几何转正 → 整图 OCR 读编号。
 
-移植自 旧版 ``drone/cvproc.py``（久经实测的目标形态与参数）。目标形态：
+移植自旧版实现 ``drone/cvproc.py``（久经实测的目标形态与参数）。目标形态：
 五边形 = 正方形 + 等边三角形（边长 1m），编号印在正方形中心的白底方块上
 （0.6m，黑字）。
 
-流水线（顺序不可随意改动，每一步都在 旧版 有实测理由）
+流水线（顺序不可随意改动，每一步都在旧版实现里有实测理由）
 --------------------------------------------------------
 1. JPEG 往返去噪：DVR 图传的细颗粒噪点会干扰轮廓提取，编解码一次即可抹平；
 2. 等比放大到短边 300px（上限 10 倍）：小目标识别率显著提升。``side_px``
@@ -17,14 +17,14 @@
    顶角是唯一不与任一平行边共享端点的顶点），失败回退最小内角法（40~130° 门限，
    斜视角会把 60° 投影到这个区间）；
 6. 转正图整图 OCR。注意用彩图——PP-OCRv6 的 det 对灰度图检不出文本框
-   （旧版 实测易错点，P5 未复测，保守沿用）；
+   （旧版实测易错点，P5 未复测，保守沿用）；
 7. 候选合并：单数字框按行聚类拼成两位数；两位结果置信度加权（×1.15）、
    单位 ×0.6，防止把 ``"7"`` 误报成 ``07``；
 8. 编号交给 :func:`~airdrop.perception.number.correct_ocr_number` 纠错。
 
-与 旧版 的差异（都是被 rapidocr 3.9.2 的 API 逼的，不是主动改的）
+与旧版实现的差异（都是被 rapidocr 3.9.2 的 API 逼的，不是主动改的）
 ------------------------------------------------------------------
-* 旧版 的 ``_rapid_readtext`` 往 ``__call__`` 上传 ``allowlist`` / ``low_text``
+* 旧版实现的 ``_rapid_readtext`` 往 ``__call__`` 上传 ``allowlist`` / ``low_text``
   / ``text_threshold`` / ``batch_size`` 等参数；3.9.2 的 ``__call__`` 只接受
   图像，这些参数已不存在。替代方案：
   - 置信度过滤交给 ``Global.text_score``（构造时设定，等价于低阈值放行 +
@@ -32,15 +32,9 @@
   - ``allowlist`` 没有对应配置项，改由 :func:`correct_ocr_number` 过滤非数字
     （它本来就在做这件事，且更严格）；
   - ``rec_batch_num`` 走 ``Rec.rec_batch_num`` 配置。
-* 方向分类（Cls）原先关闭，理由是错的。旧记录写的是"``arch_config.yaml`` 里没有
-  Cls 的 torch 架构条目（只有 det/rec）"，实测不成立：TORCH 的 arch_config 里
-  有 cls 条目（``model_type: cls`` / MobileNetV3 / ClsHead），只是键名被 RapidOCR
-  自己拼错了——写的是 ``ch_ptocr_mobile_v2.0_cls_mobile``（``pt``）而正规模型名是
-  ``ch_ppocr_...``（``pp``）。TORCH 引擎按文件名 stem 查架构
-  （``networks/main.py`` 的 ``_load_arch_config``），所以只要把权重命名成那个拼错的名字
-  就能加载（实测：改名成 ``ch_ppocr_...pth`` 立刻 ``ValueError: architecture ... is not
-  in arch_config.yaml``，叫 ``ch_ptocr_...pth`` 正常工作、极性也正确）。
-  现在按 :class:`OcrEngineConfig` 的 ``cls_engine`` 选引擎（默认 ONNX，见该类注释）。
+* 方向分类（Cls）的权重文件名保持 RapidOCR 原样（TORCH 版是
+  ``ch_ptocr_mobile_v2.0_cls_mobile.pth``，引擎按文件名 stem 查架构）；
+  用哪个引擎由 :class:`OcrEngineConfig` 的 ``cls_engine`` 决定（默认 ONNX）。
 """
 
 from __future__ import annotations
@@ -78,11 +72,11 @@ class OcrEngineConfig:
     rec_model: str = "PP-OCRv6_rec_medium.pth"
     rec_keys: str = "ppocrv6_dict.txt"
     #: 方向分类（Cls）用哪个引擎：``"onnx"`` / ``"torch"`` / ``"off"``。
-    #: 默认 ONNX：本机实测（同权重、6 张一批）ONNX-CUDA 0.96ms/张、ONNX-CPU 1.28、
+    #: 默认 ONNX：实测（同权重、6 张一批）ONNX-CUDA 0.96ms/张、ONNX-CPU 1.28、
     #: TORCH-CUDA 2.28、TORCH-CPU 4.14，而三者判定逐位相同（同分数 0.9801/0.9799）。
     cls_engine: str = "onnx"
     cls_onnx_model: str = "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
-    #: ⚠ 这里的 ``ptocr`` 是 RapidOCR 自己的拼写错误，不能改名（理由见模块 docstring）
+    #: 文件名保持 RapidOCR 原拼写（``ptocr``），不要规范化
     cls_torch_model: str = "ch_ptocr_mobile_v2.0_cls_mobile.pth"
     #: Cls 是否用 CUDA。⚠ ONNX 的 CUDA EP 依赖 torch 先被 import
     #: （torch/lib 里的 cuDNN/cuBLAS 才在进程搜索路径上），否则 onnxruntime 会静默
@@ -181,7 +175,7 @@ class OcrEngine:
         if self._engine is not None:
             return self._engine
         if self._failed:
-            raise RuntimeError("OCR 引擎此前初始化失败，请检查模型文件与 CUDA")
+            raise RuntimeError("OCR 引擎初始化失败，请检查模型文件与 CUDA")
         config = self._config
         missing = [
             str(path)
@@ -409,7 +403,7 @@ class CropResult:
 class OpenCvPostProcess:
     """目标裁剪图后处理：颜色掩码 → 凸包五边形 → 转正 → 整图 OCR。
 
-    参数命名与 旧版 对齐（``color`` / ``ocr_conf_threshold``），便于对照实测值；
+    参数命名与旧版实现对位（``color`` / ``ocr_conf_threshold``），便于对照实测值；
     逻辑按新的 RapidOCR 接口重写，几何部分逐行保留。
     """
 
@@ -539,7 +533,7 @@ class OpenCvPostProcess:
 
         两条平行边的平均方向转到竖直；旋转后若顶点落在边下方（说明整体倒了
         180°）再翻一次。``getRotationMatrix2D(θ)`` 的实际变换是
-        ``α_after = α - θ``（旧版 实验确认），所以"转竖直"用 ``row = ea - 90``。
+        ``α_after = α - θ``（旧版实验确认），所以"转竖直"用 ``row = ea - 90``。
         """
         pts = approx.reshape(-1, 2).astype(np.float64)
         n = len(pts)

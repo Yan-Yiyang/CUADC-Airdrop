@@ -79,6 +79,7 @@ def test_subcommand_list_covers_the_old_entries() -> None:
     assert set(run.SUBCOMMANDS) == {
         "full-mission",
         "sitl",
+        "sitl-recon",
         "replay",
         "basic",
         "hm30-video",

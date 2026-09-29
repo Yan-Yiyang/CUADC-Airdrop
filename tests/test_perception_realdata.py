@@ -1,6 +1,7 @@
 """P5 真实素材端到端验证（转成用例）：视频帧 → YOLO → 裁剪 → OCR。
 
-素材：旧版 实战视频 flight.mp4 的目标段。
+素材是外部文件，用环境变量 ``AIRDROP_REALDATA_VIDEO`` 指定（不设或文件不存在
+时用例跳过）；仓库不携带视频。默认帧段取自一段实战视频的目标段。
 """
 
 from __future__ import annotations
@@ -11,7 +12,20 @@ from pathlib import Path
 import cv2
 import pytest
 
-VIDEO = Path(r"input/flight.mp4")
+#: 真实素材视频的环境变量名
+REALDATA_VIDEO_ENV = "AIRDROP_REALDATA_VIDEO"
+
+
+def _realdata_video() -> Path | None:
+    """从环境变量读视频路径；没设或文件不存在时返回 None（用例跳过）。"""
+    raw = os.environ.get(REALDATA_VIDEO_ENV, "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.is_file() else None
+
+
+VIDEO = _realdata_video()
 WEIGHTS = Path("models/best2.pt")
 MODELS_DIR = Path("models/ppocr")
 
@@ -24,13 +38,13 @@ def _read_frame(capture: cv2.VideoCapture, index: int):
     return frame if ok else None
 
 
-@pytest.mark.skipif(not VIDEO.is_file(), reason="缺少 旧版 实战视频素材")
+@pytest.mark.skipif(VIDEO is None, reason=f"未用 {REALDATA_VIDEO_ENV} 指定真实素材视频")
 @pytest.mark.skipif(not WEIGHTS.is_file(), reason="缺少 YOLO 权重 models/best2.pt")
 @pytest.mark.skipif(
     not (MODELS_DIR / "PP-OCRv6_det_medium.pth").is_file(), reason="缺少 PP-OCR 权重"
 )
 def test_real_video_reads_target_codes() -> None:
-    """实战视频的目标段：检出的真目标必须读出正确编号（56/95）。
+    """实战视频的目标段：检出的真目标必须读出正确编号（56/56/56）。
 
     刻意不要 ``tmp_path`` 参数：受限沙箱里该 fixture 建目录会
     ``PermissionError: [WinError 5]``（``--basetemp`` 也绕不开，pytest 收尾时
@@ -66,9 +80,8 @@ def test_real_video_reads_target_codes() -> None:
         capture.release()
 
     # 每帧最高置信度的那个框应当读出编号；三帧都是 56。
-    # ⚠ 1840 原本记的是 95——那是错的：该帧物理目标就是 56，"56" 绕图心转 180°
-    # 恰好读成 "95"，而饱和度过严那一级的假房子（掩码只圈到编号底板）抢先返回了
-    # 那个翻转结果。转正补上"顶角≈60°"的形态门限后恢复正常。别把 95 改回去。
+    # ⚠ 1840 必须读出 56，不能读成 95："56" 绕图心转 180° 恰好形似 "95"，两者 OCR
+    # 分数也几乎相同，只能靠"顶角≈60°"的形态门限保证转正方向正确。别把 95 改回来。
     expected = {924: 56, 1535: 56, 1840: 56}
     for index, want in expected.items():
         codes = [c for c in results[index] if c is not None]
@@ -130,7 +143,7 @@ def _number_strip(engine, rectified):
     return rectified[y0:y1, x0:x1]
 
 
-@pytest.mark.skipif(not VIDEO.is_file(), reason="缺少 旧版 实战视频素材")
+@pytest.mark.skipif(VIDEO is None, reason=f"未用 {REALDATA_VIDEO_ENV} 指定真实素材视频")
 @pytest.mark.skipif(not WEIGHTS.is_file(), reason="缺少 YOLO 权重 models/best2.pt")
 @pytest.mark.skipif(
     not (MODELS_DIR / "ch_ppocr_mobile_v2.0_cls_mobile.onnx").is_file(),

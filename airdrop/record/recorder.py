@@ -431,7 +431,7 @@ class FlightRecorder:
                 LOGGER.debug("FlightRecorder 已在运行，跳过 start: %s", self._flight_dir)
                 return self
             if self._flight_dir is not None:
-                # 曾经启动过、被 stop 过了；不要复用旧目录
+                # 已 stop 过的实例不复用旧目录
                 raise RuntimeError(
                     f"FlightRecorder 已停止于 {self._flight_dir}，"
                     "请新建一个 FlightRecorder 实例再录新一次"

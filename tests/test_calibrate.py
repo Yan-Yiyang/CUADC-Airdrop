@@ -178,7 +178,7 @@ def test_detect_corners_finds_rendered_board() -> None:
 
 
 def test_rendered_board_projects_inside_frame() -> None:
-    """板子四角必须投影在画幅内——被裁掉一半的板子检不出角点（踩过一次）。"""
+    """板子四角必须投影在画幅内——被裁掉一半的板子检不出角点。"""
     frames, poses = _render_views(8)
     board = board_object_points(PATTERN, SQUARE)
     for rvec, tvec in poses:
@@ -565,7 +565,7 @@ def test_lever_arm_report_keeps_measured_value_without_estimate() -> None:
 
 
 def test_extrinsics_requires_one_body_pose_per_board_pose() -> None:
-    """遥测 10 Hz、画面 30 Hz，"第 i 条遥测配第 i 帧"是错的——数量对不上必须报错。"""
+    """遥测 10 Hz、画面 30 Hz，不能"第 i 条遥测配第 i 帧"——数量对不上必须报错。"""
     x_true = true_x_matrix()
     frames, poses = _board_views(6)
     bodies = [body_pose_from_board(p, x_true) for p in poses]

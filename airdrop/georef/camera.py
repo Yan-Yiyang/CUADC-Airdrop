@@ -2,11 +2,11 @@
 
 为什么外参不能硬编码
 --------------------
-旧版 把安装角写成常量 ``_CAM_YAW_OFFSET_DEG = 90``（见其 ``coordinates.py``）。
+旧版实现把安装角写成常量 ``_CAM_YAW_OFFSET_DEG = 90``（见其 ``coordinates.py``）。
 那个 90° 是**当时那台相机在那个支架上**的安装偏航；换相机/换支架就全错，而且
 错误会以"目标偏 90°"这种极难归因的方式表现出来。P6 改成从标定文件读 ``R_bc``，
 并把 90° 只作为**没有标定文件时的默认值**（它正好等价于 legacy 的固定安装角，
-所以未标定时行为与 旧版 一致）。
+所以未标定时行为与旧版实现一致）。
 
 约定（务必一致，错了会让目标镜像/旋转）
 ----------------------------------------
@@ -63,16 +63,16 @@ def rotation_z(angle_deg: float) -> np.ndarray:
 def euler_to_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
     """机体 3-2-1（Z-Y-X）姿态 → 机体→NED 旋转矩阵 ``R_nb``。
 
-    与 旧版 ``coordinates.euler_to_rotation_matrix`` 完全一致：``Rz @ Ry @ Rx``。
+    与旧版实现 ``coordinates.euler_to_rotation_matrix`` 完全一致：``Rz @ Ry @ Rx``。
     """
     return rotation_z(yaw_deg) @ rotation_y(pitch_deg) @ rotation_x(roll_deg)
 
 
 #: 没有标定文件时的默认"相机→机体"外参 = 绕机体 Z（向下）转 +90°。
 #:
-#: 这不是随手取的：旧版 的 ``pixel_to_ned`` 用 ``yaw + 90°`` 构造旋转矩阵，
+#: 这不是随手取的：旧版实现的 ``pixel_to_ned`` 用 ``yaw + 90°`` 构造旋转矩阵，
 #: 数学上等价于在**机体→NED** 之前先做一次绕机体 z 的 +90°（相机系→机体系）。
-#: 本机实测确认了这一点：该模型下"图像右移 → 机体右、图像下移 → 机头方向"。
+#: 实测确认了这一点：该模型下"图像右移 → 机体右、图像下移 → 机头方向"。
 DEFAULT_R_BC = rotation_z(90.0)
 
 

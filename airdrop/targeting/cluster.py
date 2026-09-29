@@ -13,7 +13,7 @@
   ``min_samples`` 仍然表示"至少看到几次"，相对置信度只调制核心点判据。
 * 类标签 = 类内 ``code`` 众数（平票取较小值；全 None → 该类无标签）；
   结果坐标 = 类内均值（加权开关打开时为加权均值）。
-* 跨类筛选只在中带编号的类里做：median 取标签的下中位数（偶数个取下中位），
+* 跨类筛选只在中带编号的类里做：median 取**去重后编号**的下中位数（偶数个取下中位），
   max 取标签最大。None 取不了中位数，所以无编号的类无论如何都不参与筛选；
   配置里的 ``require_label`` 控制的是"无编号的类要不要留在结果列表里"。
 * 同一标签有多个类时（两个目标印着同一个编号）取成员最多者，再比平均置信度，
@@ -158,7 +158,8 @@ def select_cluster(
     """按 ``selection_rule`` 选出唯一的候选类；选不出返回 None。
 
     * 只有带编号的类参与（中位数/最大值都要数字）；
-    * ``median``：标签排序后取下中位数（偶数个取靠下的那个）；
+    * ``median``：**去重后的编号**排序取中位数（下中位）——同一编号可能有多个类
+      （同一目标看到多次甚至被野点分裂），按"类"取中位会让重复编号改变结果；
     * ``max``：标签最大；
     * 同一标签有多个类时：成员多者优先，再比平均置信度，再比坐标（保证可复现）；
     * 未知规则显式报错，不做隐式回退（计划 Q8）。
@@ -168,7 +169,10 @@ def select_cluster(
         return None
 
     if config.selection_rule == "median":
-        labels = sorted(cluster.code for cluster in candidates if cluster.code is not None)
+        # ⚠ 中位数取在**去重后的编号**上：一台目标会被看到几十次，大倾角/野点还可能让
+        # 它的观测分裂成多个同编号的类（实测 r2 世界：12 号出现 3 个类，按照"类"取中位
+        # 把任务结果选成了 12；规则是"每区三个编号里取中位" ⇒ 94/12/56 → 56）。
+        labels = sorted({cluster.code for cluster in candidates if cluster.code is not None})
         target = labels[(len(labels) - 1) // 2]  # 偶数个 → 下中位
     elif config.selection_rule == "max":
         target = max(cluster.code for cluster in candidates if cluster.code is not None)

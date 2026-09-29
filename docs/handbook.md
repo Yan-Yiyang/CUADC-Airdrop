@@ -994,7 +994,7 @@ select_cluster(clusters, config) -> Cluster | None
 2. **先剔病态点**：坐标非有限（georef 病态给出 `inf`/`nan`）的点进 `rejected` 并计数，不参与聚类。
 3. **DBSCAN**（`eps_m` 默认 0.75、`min_samples` 默认 2）：两条实测语义必须记住——`eps` 边界是**闭区间**（恰好等于 `eps` 的两点相连）；`sample_weight` 是**绝对权重**，直接进核心点判据 `Σw ≥ min_samples`，所以按置信度加权时必须先归一到均值 1（代码里用 `MIN_WEIGHT=1e-6` 兜零）。
 4. **类标签取类内编号众数**；坐标取类内均值。
-5. **跨类选唯一结果**：`selection_rule='median'`（按标签取**下中位**）或 `'max'`（取最大标签）。只有**带编号**的类能参与（`None` 取不了中位数）；`require_label=False` 时无编号的类仍留在 `clusters` 里供核对，但不会被选中。
+5. **跨类选唯一结果**：`selection_rule='median'`（在**去重后的编号**上取**下中位**）或 `'max'`（取最大标签）。只有**带编号**的类能参与（`None` 取不了中位数）；`require_label=False` 时无编号的类仍留在 `clusters` 里供核对，但不会被选中。⚠ 中位数按**去重编号**取：同一编号可能分裂成多个类（同一目标看到多次、野点另成一类），按"类"取中位会让重复编号改变结果。
 6. **结果唯一性**：同一标签出现多个类时按"成员多 → 置信度高 → 坐标"定序，保证结果稳定。
 
 ```python
@@ -1055,13 +1055,13 @@ update(snapshot, target_ned, *, ground_z=None, ground_altitude_m=None,
 reset()
 ```
 
-`ReleaseDecision` 字段：`should_release`、`reason`、`timestamp`、`predicted`（预测落点）、`horizontal_error_m`、`passed_target`、`release_position`、`delay_s`。
+`ReleaseDecision` 字段：`should_release`、`reason`、`timestamp`、`predicted`（预测落点）、`horizontal_error_m`、`passed_target`、`approached`、`release_position`、`delay_s`。
 
 判定逻辑：
 
 1. 每拍用当前快照预测落点，**水平误差 ≤ `radius_m` 即投**（`reason='predict'`）；
-2. 已越过目标且 `force_after_pass=True` 时，越过目标后强制投放判据（`force_after_pass`）生效并执行强制投放（`reason` 里标明是强制投放）；
-3. **一次投放即锁存**：投过之后不再触发，`reset()` 才能重新武装；
+2. **本次飞掠里先从目标前方接近过**（`approached=True`）且已越过目标、`force_after_pass=True` 时，执行强制投放（`reason='fallback'`）。⚠ "越过"只看沿航向的投影符号，没有 `approached` 前提的话，进入飞掠时飞机投影已在目标后方（例如刚结束盘旋、还在飞往入场点）会在第一拍假触发（实测 r2 世界架次 <架次>：113 m 误差）；
+3. **一次投放即锁存**：投过之后不再触发，`reset()` 才能重新武装（`approached` 也一并清零，每次飞掠各自重新计）；
 4. `delay_s` 的状态前推是一阶近似（位置 += 速度 × 延迟），不做加速度二次项；
 5. 摘要按 `SUMMARY_HZ`（5 Hz）落事件日志，触发瞬间写完整预测（落点/飞行时间/水平误差/前推后位置）。`on_event` 签名 `(kind, data)`，接 recorder 的标准写法是 `lambda kind, data: recorder.events.emit(kind, **data)`；事件写盘失败**不影响判据**。
 
@@ -1775,7 +1775,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | --- | --- | --- | --- |
 | `radius_m` | float | `2.0` | 投放半径：预测落点水平误差 ≤ 它就投（需 > 0） |
 | `delay_s` | float | `0.0` | 从判据触发到弹离开的延迟（状态前推用） |
-| `force_after_pass` | bool | `True` | 越过目标后的强制投放 |
+| `force_after_pass` | bool | `True` | 越过目标后的强制投放（前提：本次飞掠里先从目标前方接近过，见 `ReleaseDecision.approached`） |
 | `evaluation_hz` | float | `20.0` | 评估节拍口径（实际节拍来自 `MissionConfig.tick_hz`，默认也是 20 Hz） |
 
 ### 4.10 `OverflyConfig` —— 飞掠段
@@ -2080,6 +2080,7 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | --- | --- | --- | --- | --- |
 | `python -m airdrop.run full-mission` | `examples/full_mission.py` | 飞控 + 图传 + `camera_calib.json` + 航线配置；`--dry-run` 可不装弹。**这是正式任务档**：`INIT→PREFLIGHT`（载入模型 + 视频自检）→`WAIT_AIRBORNE`→`RECON`（侦查航线由操作手在 QGC 上传并启动，`recon_upload="operator"`） | `flights/<ts>/` 一整套；终端打印任务与统计 | 0 成功 / 2 未到 DONE / 130 中断 / 1 异常 |
 | `python -m airdrop.run sitl` | `examples/sitl_mission.py` | PX4 SITL 在 `udpin://0.0.0.0:14540`；`--land-plan` 指向的 `routes/land.plan` 要在（不给则用内置 `LANDING_ROUTE`）。**这是自动测试档**：自检全关、`recon_upload="auto"`（本包上传侦查航线）、**不等起飞**（`require_airborne=False`，见 §4.13） | 终端"演练记录"：状态轨迹 / 上传与投放次数 / 判据评估次数 / 飞掠计划；`flights/<ts>/` 记录 | 0 成功 / 2 未到 DONE / 130 中断 / 1 异常 |
+| `python -m airdrop.run sitl-recon` | `tools/sitl_recon.py` | WSL 里起 SITL（`bash sim/run_sitl.sh r2`）+ Gazebo 自带的 RTP/H.264 图传（**不必用 HM30**）。**完全标准流程**：本脚本只扮演操作手（上传/启动「起飞任务」与「侦查航线」），其余交给 `MissionRunner` 状态机 + 真 `Preflight` + `PerceptionWorker`（OCR 进程池）+ `DryRunController`：监视侦查 → 空中出目标 → 飞掠投放 → 降落（**没有任何 offboard 设定点**）。测试期间临时把 `NAV_DLL_ACT` 置 0（跑完还原成 2）；`MIS_TKO_LAND_REQ` 已在仿真机型里永久置 0（理由见 `sim/airframes/4007_gz_rc_cessna_down_cam` 的注释——只飞侦查段，投弹航线要空中出结果才能生成） | 终端精度报告 + `.sitl-recon-tmp/report.json`（任务结果与分井误差、延时敏感性、反向诊断）+ `flights/<ts>/` 记录 | 0 成功 / 2 没遥测 / 3 没画面 / 4 没解锁 / 5 没进任务模式 / 6 没起飞 / 7 没飞完（仍出报告） / 1 异常 |
 | `python -m airdrop.run replay` | `examples/replay_flight.py` | 一份飞行目录（`--flight`，不给则取 `flights/` 最新） | 终端：帧统计、目标点、聚类结果、飞掠航线（**不上传**） | 0（没结果也是 0，只是走备用点分支） |
 | `python -m airdrop.run calibration-capture` | `examples/calibration_capture.py` | 图传（不给 `--rtsp-url` 用默认 HM30 地址）+ 飞控遥测 | 一个标定用飞行目录（姿态 50Hz、位置 20Hz、缓冲 300s） | 0；一帧没收到 = 1 |
 | `python -m airdrop.run calibrate` | `tools/calibrate.py` | 上面那份标定目录（`--flight`） | `camera_calib.json`；终端打印每步残差/相关系数 | 0；`--strict` 且外参/时间差没标出来 = 2 |
@@ -2111,6 +2112,10 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | `--flight DIR` | replay / calibrate | 飞行目录（回放素材 / 标定素材） |
 | `--speed` | replay | 回放速度（0 = 全速） |
 | `--strict` | replay / calibrate | 回放异常即失败 / 标定降级（外参或时间差没标出来）即返回 2 |
+| `--lag S` | sitl-recon | 图传链路延时估计（秒；报告里还会给 lag 扫描与反向诊断） |
+| `--recon-timeout S` | sitl-recon | RECON 段的上限（秒，状态机在这一段等侦查航线飞完） |
+| `--video-wait S` | sitl-recon | 等第一帧画面的上限（秒；SITL 刚启动时可以给大一点） |
+| `--work-dir DIR` | sitl-recon | 产物目录（模拟相机标定/SDP/检测明细/`report.json`） |
 | `--impacts FILE` | fit-ballistics | 实测落点文件 |
 | `--mass-kg` | fit-ballistics | `BallisticsConfig.mass_kg`（**实测值，不参与反演**） |
 | `--seed N` | make-world | 天井位置与朝向的随机种子（默认 0 = 入库布局） |
@@ -2217,6 +2222,7 @@ config = Config(
 | `tests/test_e2e.py` | 回放驱动全链路：帧 → 感知 → 坐标 → 统计 → 航线（另有 `realdata` 变体） | 否（变体需 GPU） |
 | `tests/test_fit.py` | 投放记录读写、反演真值回收、退化/不可辨识必拒、工具现场流程 | 否 |
 | `tests/test_examples.py` | 示例与工具不脱节（导入即校验 + **导入不加载重库** + 真跑装配函数） | 否 |
+| `tests/test_sitl_recon.py` | **SITL 侦查精度（可选，标 `sitl`，默认跳过）**：驱动 `tools/sitl_recon.py` 跑完整标准流程，断言状态机 `DONE`、三个编号全识别、任务选中 56、误差与留一验证都 < 2 m；SITL 没在跑就 skip | 否（要 WSL 里已起 PX4 SITL） |
 | `tests/test_cli.py` | 集中式入口：子命令注册表（parser + handler）、`--help`/`check-docs` **不加载重库**（干净子进程实测）、参数不合法退出码 2、选项覆盖真的进了 `build_config()` | 否 |
 | `tests/test_handbook.py` | **本手册 §3 的 11 段示例逐条真跑**（文档里的代码必须能运行） | 否 |
 | `tests/test_world.py` | CUADC 赛区世界：**生成结果 == 入库文件**、目标区在起飞线两端（±200, 0）、天井区内随机摆放且间距 > 20m、五边形环壁（厚 5mm、高 400mm）、**规则里只是示意的东西不许出现**（4m/6m 打击圈、天井箭头）、同区天井同色、贴地标线不共面重叠（防 z-fighting）、两轮靶标摆位（第二轮中位数落在第 3 座）、演练航线对准中位数天井、目标区底色（常见路面色 + 少量纹理）、周边航拍底图（不压跑道/目标区、互不重叠）、底图生成器（可复现/离线校验）、俯视预览图（尺寸/可复现/参数校验）、资产逐级存在、数字板必须是**白底黑字** | 否 |

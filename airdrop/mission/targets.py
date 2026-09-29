@@ -251,14 +251,26 @@ class PerceptionTargetSource:
 
     ``MissionRunner(target_result=source.result, target_busy=source.busy)`` 即可：
     实飞时 ``worker`` 吃的是图传缓冲，回放时吃的是回放缓冲，其余代码一模一样。
+
+    ``on_detection``：每条 :class:`~airdrop.perception.models.Detection` 在**进 tracker
+    之前**会被回调一次（异常只记日志、不影响解算）——生产链路用它把检出写进飞行记录的
+    ``detections.jsonl``（``FlightRecorder.detections.append``），否则那个文件永远是空的。
     """
 
     worker: PerceptionWorker
     tracker: TargetTracker
+    on_detection: Callable[[Detection], None] | None = None
 
     def pump(self) -> int:
         """抽干结果队列并解算（每拍调一次，或由 :meth:`result` 顺便调）。"""
-        return self.tracker.extend(self.worker.drain_results())
+        detections = self.worker.drain_results()
+        if self.on_detection is not None:
+            for detection in detections:
+                try:
+                    self.on_detection(detection)
+                except Exception:
+                    LOGGER.exception("检出记录回调失败（不影响解算）")
+        return self.tracker.extend(detections)
 
     def result(self) -> TargetingResult:
         self.pump()

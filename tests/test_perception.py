@@ -80,7 +80,7 @@ def test_correct_ocr_number_rejects_garbage(raw) -> None:
 
 
 def test_correct_ocr_number_maps_confusable_letters_in_words() -> None:
-    """纯字母串里若含易混字符，仍会被映射成数字——这是 旧版 的既定行为。
+    """纯字母串里若含易混字符，仍会被映射成数字——这是旧版实现的既定行为。
 
     ``'abc'`` 里的 ``b`` 按表映射成 6，所以结果是 6 而不是"拒绝"。这条**故意
     保留**：那张映射表是实测调出来的，改它就得重新验证所有历史识别结果。
@@ -132,11 +132,10 @@ def _pentagon_approx(angle_deg: float = 0.0) -> np.ndarray:
     正方形 (70,90)-(130,150)；三角形底边 = 正方形上边 (tl—tr，长 60)，
     顶角在上边中点正上方 ``90 − 60·√3/2``。三条边都是 60，**顶角内角就是 60°**。
 
-    ⚠ **顶点顺序必须是简单的多边形绕行**：``apex, tl, bl, br, tr``。
-    曾经写成 ``apex, tl, tr, br, bl``——那是**自交**图形，顶角的两个"邻居"变成了
-    两个下角（bl/bl 与 tl），量出的顶角是 15° 而不是 60°，还害我误判成
-    "等边三角形顶角是 15°、门限失效"。正确顺序下的内角是
-    60（顶角）/120（tl）/90（bl）/90（br）/120（tr），合计 540 = (5−2)·180。
+    ⚠ **顶点顺序必须是简单多边形的绕行**：``apex, tl, bl, br, tr``。
+    写成 ``apex, tl, tr, br, bl`` 会得到**自交**图形，顶角的两个"邻居"取错，
+    量出的角度不属于顶角。正确顺序下的内角是
+    60（顶角）/150（tl）/90（bl）/90（br）/150（tr），合计 540 = (5−2)·180。
     """
     side = 60.0
     half = side / 2.0
@@ -288,9 +287,9 @@ def test_find_apex_by_parallel_reports_the_pair() -> None:
 
 
 # 关于"转正后顶点朝哪边"：不在合成数据上断言。目标形态（三角形朝向相对正方形
-# 的方位、轮廓绕行方向）决定了转正后的朝向，而这是靠 旧版 的实战素材标定的；
-# 本机真实素材的端到端用例（tests/test_perception_realdata.py：读出 56/95）
-# 才是这条逻辑的真正验收——合成数据的朝向假设曾经把我带偏过。
+# 的方位、轮廓绕行方向）决定了转正后的朝向，而这是靠真实实战素材标定的；
+# 真实素材的端到端用例（tests/test_perception_realdata.py：读出 56/56/56）
+# 才是这条逻辑的真正验收——合成数据的朝向假设不足以验收这条逻辑。
 
 
 def test_find_min_angle_locates_triangle_tip() -> None:
@@ -808,6 +807,34 @@ def test_pipeline_ocr_mode_emits_detections_with_codes() -> None:
     assert stats.frames == 3 and stats.detections == 3
     assert stats.submitted == 3 and stats.results == 3
     assert stats.with_code == 3
+
+
+def test_pipeline_keeps_results_queued_until_drained() -> None:
+    """结果队列**无界、不丢弃**：没人抽就一直在队列里（``queued_results`` 如实反映）。
+
+    这条是"实飞里 HOLD 之后才产出的结果不能丢"的钉子：消费者（``pump``）随时来抽，
+    之前攒下的结果都还在；收尾补抽之后队列必须归零。
+    """
+    buffer = _buffer_with(3)
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr", ocr_dedupe_s=0.0, ocr_dedupe_px=0.0),
+        buffer=buffer,
+        detector=_FakeDetector(),
+        pool=_FakePool(numbers=[42, 56, 95]),
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 10.0
+        while worker.queued_results < 3 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert worker.queued_results == 3, "处理完就该在队列里等着被抽，不能丢"
+        assert worker.stats.results == 3
+    finally:
+        worker.stop()
+
+    drained = worker.drain_results()
+    assert [d.code for d in drained] == [42, 56, 95]
+    assert worker.queued_results == 0
 
 
 def test_pipeline_cls12_mode_emits_without_ocr() -> None:

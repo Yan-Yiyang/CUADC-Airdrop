@@ -12,10 +12,10 @@
 4. **靶标摆对**：第一轮每区 3 张图片靶、第二轮每区 3 个两位数（中位数落在第 3 座）；
    同一区的天井必须**同一种颜色**（A 蓝 / B 红，规则 3.3）；
 5. **资产齐全且不是坏的那种**：世界引用的网格 → 材质 → 贴图逐级存在；
-   数字板必须是**白底黑字**（曾经生成反了：黑底白字，肉眼一看就不对）。
+   数字板必须是**白底黑字**。
 
-另有一条防 z-fighting 的回归：贴地标线不许有"共面且重叠"的两层（曾经红色操纵区与
-起降区标记都是 z=0.02 且重叠，渲染出来贴图打架）。
+另有一条防 z-fighting 的回归：贴地标线不许有"共面且重叠"的两层
+（共面重叠会渲染成贴图打架）。
 """
 
 from __future__ import annotations
@@ -443,7 +443,7 @@ def _png_mean_and_spread(path: Path) -> tuple[tuple[float, float, float], float]
 
 @pytest.mark.parametrize("digit", range(10))
 def test_digit_sheets_are_black_on_white(digit: int) -> None:
-    """规则 3.3.2：白底、加粗黑体黑色——曾经生成成黑底白字，肉眼一眼能看出来。"""
+    """规则 3.3.2：白底、加粗黑体黑色。"""
     width, height, bright, dark = _png_size_and_luminance(
         WORLD_DIR / f"materials/textures/digit_{digit}.png"
     )
@@ -740,6 +740,72 @@ def test_sitl_recon_route_aims_at_the_median_well() -> None:
     assert math.hypot(backup_east - center_east, backup_north - center_north) < 0.5, (
         "备用点应当就是 A 区中心"
     )
+
+
+# ----------------------------------------------------------------------
+# SITL 侦查精度测试（tools/sitl_recon.py）：真值表、扫掠线、模拟相机
+# ----------------------------------------------------------------------
+def test_sitl_recon_truth_table_matches_the_world() -> None:
+    """真值表（编号 → 天井中心 ENU）必须与入库世界的 A 区布点逐座对得上。"""
+    from tools import sitl_recon
+
+    wells = {}
+    for well in make_world.wells_for_round(2):
+        if well.zone != "A" or well.content is None:
+            continue
+        payload = well.content[1]
+        assert isinstance(payload, tuple)  # 数字靶的内容是 (tens, ones)
+        wells[payload[0] * 10 + payload[1]] = well
+    assert set(sitl_recon.WELLS_A_ENU) <= set(wells)
+    for code, (east_m, north_m) in sitl_recon.WELLS_A_ENU.items():
+        well = wells[code]
+        assert abs(well.east_m - east_m) < 0.05, f"{code} 号天井东向坐标与世界不一致"
+        assert abs(well.north_m - north_m) < 0.05, f"{code} 号天井北向坐标与世界不一致"
+
+
+def test_sitl_recon_legs_cover_every_well_and_reverse_once() -> None:
+    """每条扫掠线都要真的压过天井（水平偏差 ≤ 2 m），且有一组同线反向（延时诊断）。"""
+    from tools import sitl_recon
+
+    for code, (east_m, north_m) in sitl_recon.WELLS_A_ENU.items():
+        covering = [
+            leg
+            for leg in sitl_recon.RECON_LEGS_ENU
+            if min(leg[0][0], leg[1][0]) - 1.0 <= east_m <= max(leg[0][0], leg[1][0]) + 1.0
+            and abs(leg[0][1] - north_m) <= 2.0
+        ]
+        assert covering, f"{code} 号天井没有扫掠线压过（改航线要照着真值表来）"
+    reversed_pair = [
+        (leg_a, leg_b)
+        for leg_a in sitl_recon.RECON_LEGS_ENU
+        for leg_b in sitl_recon.RECON_LEGS_ENU
+        if leg_a[0] == leg_b[1] and leg_a[1] == leg_b[0]
+    ]
+    assert reversed_pair, "扫掠线里缺一组同线反向（延时诊断要用）"
+
+
+def test_sitl_recon_route_and_camera_writers() -> None:
+    """航点、模拟相机标定、SDP 的纯函数产物要能被下游真读走。"""
+    from airdrop import load_camera_model
+    from tools import sitl_recon
+
+    route = sitl_recon.recon_route()
+    assert route[0].alt_m == pytest.approx(sitl_recon.TAKEOFF_ALT_M)  # 首项 = 起飞项
+    assert all(point.alt_m == pytest.approx(sitl_recon.RECON_ALT_M) for point in route[1:])
+
+    work = WORK_ROOT / "sitl-recon"
+    calib = sitl_recon.write_sim_calib(work / "camera_calib_sim.json")
+    model = load_camera_model(calib)
+    assert model.is_calibrated()  # 读得回来（不是缺省模型）
+    assert model.fx == pytest.approx(
+        (sitl_recon.CAMERA_WIDTH / 2.0) / math.tan(sitl_recon.CAMERA_HFOV_RAD / 2.0)
+    )
+    assert list(model.t_bc) == pytest.approx(list(sitl_recon.CAMERA_T_BC))
+
+    sdp = sitl_recon.write_stream_sdp(work / "stream.sdp")
+    text = sdp.read_text(encoding="ascii")
+    assert f"m=video {sitl_recon.STREAM_PORT} RTP/AVP 96" in text
+    assert "a=rtpmap:96 H264/90000" in text
 
 
 def test_wind_option_writes_the_wind_element() -> None:

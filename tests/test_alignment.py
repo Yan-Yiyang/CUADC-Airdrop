@@ -303,7 +303,7 @@ def test_align_no_wait_when_history_covers_capture_ts(broker: TelemetryBroker) -
 def test_align_max_wait_zero_keeps_old_extrapolation(
     broker: TelemetryBroker,
 ) -> None:
-    """max_wait=0（默认）= 旧行为：未覆盖时直接外推，不等待。"""
+    """max_wait=0（默认）= 未覆盖时直接外推，不等待。"""
     now = time.time()
     base = now - 5.0
     fill_history(broker, base, count=11, step=0.1)

@@ -278,6 +278,15 @@ class PerceptionWorker:
                 return out
             out.append(item)
 
+    @property
+    def queued_results(self) -> int:
+        """结果队列里还没被消费的条数（监控用）。
+
+        队列**无界、不丢弃**：消费者（``MissionRunner`` 的 ``target_result``/``pump``）
+        不抽，结果就一直留着等抽——所以收尾时这个数字应该回落到 0。
+        """
+        return self._results.qsize()
+
     def iter_results(self, timeout: float = 0.5) -> Any:
         """迭代结果，直到 :meth:`stop` 且队列排空。"""
         idle_deadline = time.monotonic() + timeout

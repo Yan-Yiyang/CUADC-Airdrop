@@ -225,6 +225,12 @@ Video Streaming”（UDP 5600 / RTP）与插件自带的 README
 Windows 侧跑演练用 `python -m airdrop.run sitl`（`examples/sitl_mission.py` 的航线
 已对准本赛区），先用 QGC 或遥控手动起飞。
 
+**自动侦查精度测试**：`python -m airdrop.run sitl-recon`（`tools/sitl_recon.py`）——
+自动上传「起飞 + 扫掠」任务并**先解锁、再 `MISSION_START`**，只用 Gazebo 自带的
+RTP/H.264 视频流（`127.0.0.1:5600`，不必用 HM30），跑完给"解算坐标 vs 天井中心"的误差
+报告。装机细节、参数约定（`MIS_TKO_LAND_REQ` / `NAV_DLL_ACT`）与三条实测教训见
+[`../sim/README.md`](../sim/README.md)。
+
 ## 6. 重建 / 换场景
 
 ```bash

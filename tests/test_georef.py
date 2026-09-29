@@ -5,7 +5,7 @@
 验收口径（计划 P6）：合成几何单测误差 <1e-6；NED↔WGS84 用 pyproj ``Geod``
 大地线真值校验（移植代码原本就带这套验证，这里补上回归）。
 
-关键的一条：**默认外参必须复现 旧版 的行为**（图像右=机体右、中心=正下方）。
+关键的一条：**默认外参必须复现旧版实现的行为**（图像右=机体右、中心=正下方）。
 这条如果不成立，说明坐标约定在移植时被改坏了——它比任何数值精度都重要。
 """
 
@@ -141,8 +141,8 @@ def test_rotation_helpers_are_orthonormal() -> None:
         assert np.linalg.det(matrix) == pytest.approx(1.0)
 
 
-def test_euler_to_matrix_matches_旧版_rz_ry_rx() -> None:
-    """姿态矩阵必须是 Rz·Ry·Rx（与 旧版 一致），顺序错了姿态就全错。"""
+def test_euler_to_matrix_matches_rz_ry_rx() -> None:
+    """姿态矩阵必须是 Rz·Ry·Rx（与旧版实现一致），顺序错了姿态就全错。"""
     roll, pitch, yaw = 12.0, -7.0, 143.0
     expected = rotation_z(yaw) @ rotation_y(pitch) @ rotation_x(roll)
     assert np.allclose(euler_to_matrix(roll, pitch, yaw), expected)
@@ -180,7 +180,7 @@ def test_quaternion_rejects_zero() -> None:
 
 
 # ----------------------------------------------------------------------
-# 像素 → NED：必须复现 旧版 的行为
+# 像素 → NED：必须复现旧版实现的行为
 # ----------------------------------------------------------------------
 def test_image_center_is_nadir() -> None:
     """图像中心在零姿态下就是飞机正下方。"""
@@ -202,7 +202,7 @@ def test_image_center_is_nadir() -> None:
 
 
 def test_image_right_maps_to_body_right() -> None:
-    """图像右移 → 机体右（yaw=0 时是正东）——与 旧版 实测一致。"""
+    """图像右移 → 机体右（yaw=0 时是正东）——与旧版实测一致。"""
     camera = _camera()
     position = (0.0, 0.0, -50.0)
     result = pixel_to_ned(
@@ -246,7 +246,7 @@ def test_image_down_maps_to_nose_direction() -> None:
     ],
 )
 def test_image_right_follows_yaw(yaw: float, expect_north: float, expect_east: float) -> None:
-    """机头朝东时，图像右应当指向正南——与 旧版 的实测表一致。"""
+    """机头朝东时，图像右应当指向正南——与旧版的实测表一致。"""
     camera = _camera()
     result = pixel_to_ned(
         (camera.cx + 16.0, camera.cy),

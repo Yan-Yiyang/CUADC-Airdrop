@@ -201,6 +201,53 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             ),
         ),
     ),
+    "sitl-recon": Subcommand(
+        name="sitl-recon",
+        module="tools.sitl_recon",
+        help="SITL 侦查精度自动测试：真飞机 + 真感知，量「解算坐标 vs 天井中心」误差",
+        options=(
+            Option(
+                ("--system-address",),
+                "system_address",
+                "MAVSDK 系统地址（SITL 默认 udpin://0.0.0.0:14540）",
+                source="SYSTEM_ADDRESS",
+            ),
+            Option(
+                ("--lag",),
+                "lag_s",
+                "图传链路延时估计（秒；报告里还会给 lag 扫描）",
+                kind="float",
+                source="TELEMETRY_LAG_S",
+            ),
+            Option(
+                ("--recon-timeout",),
+                "recon_timeout_s",
+                "RECON 段的上限（秒，状态机在这一段等侦查航线飞完）",
+                kind="float",
+                source="RECON_TIMEOUT_S",
+            ),
+            Option(
+                ("--video-wait",),
+                "video_wait_s",
+                "等第一帧画面的上限（秒）",
+                kind="float",
+                source="VIDEO_WAIT_S",
+            ),
+            Option(
+                ("--work-dir",),
+                "work_dir",
+                "产物目录（标定/SDP/检测明细/报告）",
+                source="WORK_DIR",
+            ),
+            Option(
+                ("--no-record",),
+                "record",
+                "不写飞行目录（默认记录五个文件）",
+                kind="flag-off",
+                source="RECORD",
+            ),
+        ),
+    ),
     "replay": Subcommand(
         name="replay",
         module="examples.replay_flight",

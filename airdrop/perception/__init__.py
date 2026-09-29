@@ -4,7 +4,7 @@
 --------
 * :mod:`~airdrop.perception.detector`：YOLO 封装（显式 device、预计算去畸变）；
 * :mod:`~airdrop.perception.cropproc`：裁剪图后处理（五边形 → 转正 → RapidOCR），
-  移植自 旧版 实战实现；
+  移植自旧版实战实现；
 * :mod:`~airdrop.perception.number`：编号纠错（收敛到 00–99）；
 * :mod:`~airdrop.perception.ocr_worker`：OCR 独立工作进程；
 * :mod:`~airdrop.perception.pipeline`：主循环（缓冲 → 检测 → 送检/直出 → Detection）。

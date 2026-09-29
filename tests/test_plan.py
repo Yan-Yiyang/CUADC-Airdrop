@@ -5,9 +5,8 @@
 ``NAV_LAND`` 的紧前一项必须严格高于落点、下滑角不超过 ``tan(FW_LND_ANG+0.1°)``、
 进场项只能是 ``NAV_WAYPOINT`` / ``NAV_LOITER_TO_ALT``、落点必须在盘旋圈外。
 
-2026-09 的 SITL 演练里，正是因为降落剖面不满足这套判据，飞控把整条任务判为
-不可行（``No valid mission available, loitering``），飞机原地盘旋 15 分钟才被
-状态机的超时抓出来——所以这套判据值得逐条钉住。
+降落剖面不满足这套判据时，飞控会把整条任务判为不可行
+（``No valid mission available, loitering``）——所以这套判据值得逐条钉住。
 """
 
 from __future__ import annotations

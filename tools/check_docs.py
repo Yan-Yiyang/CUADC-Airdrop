@@ -163,9 +163,9 @@ def main(**overrides) -> int:
     """跑一遍全部检查；关键字与 :func:`build_config` 一致。返回进程退出码。"""
     settings = build_config(**overrides)
     doc_path = Path(settings.doc_path)
-    # 控制台编码（编码不支持Unicode时）装不下的字符不要抛出异常：本文件早先在这里
-    # 因为打印 "✅"/"❌" 抛过 UnicodeEncodeError，把退出码变成了 1 —— 检查
-    # 明明全过，却看起来像失败。结论行改成 ASCII，同时给 stdout 加 replace 兜底。
+    # 控制台编码（Windows 上常是 GBK）装不下的字符不要抛出异常：打印非 ASCII 字符
+    # 抛 UnicodeEncodeError 会把退出码变成 1——检查明明全过，却看起来像失败。
+    # 结论行用 ASCII，同时给 stdout 加 replace 兜底。
     with contextlib.suppress(AttributeError, ValueError):
         # 非标准 stdout（已被重定向/包装）时放弃，不影响检查结果。
         # `reconfigure` 只在 TextIOWrapper 上有，类型桩里的 `sys.stdout` 是 TextIO，

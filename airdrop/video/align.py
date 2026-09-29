@@ -1,4 +1,67 @@
-'图传帧与遥测的时间对齐。\n\n这个延时不改变数据的含义，但如果不处理，做视觉引导时就会拿"现在的遥测"\n去解释"150ms 前的画面"。无人机以 10 m/s 平飞时，150ms 对应 1.5 米的位移——\n对精准空投来说这是不能忽略的系统性偏差，而且它会随着速度变化伪装成"算法\n不准"。\n\n因此每拿到一帧后，先把它收到的时间减掉这段固定延时，得到画面真正的\n拍摄时刻，再用这个时刻去 :class:`~airdrop.broker.TelemetryBroker` 取那一刻\n的遥测（默认在历史之间线性内插）::\n\n    aligner = FrameTelemetryAligner(broker)          # 默认扣 150ms\n    sample = aligner.align(source.read(timeout=1.0))\n    if sample is not None and not sample.extrapolated:\n        aim_at(sample.image, sample.snapshot.latitude_deg, sample.snapshot.yaw_deg)\n\n等价的手写形式（不需要本模块也能做）::\n\n    timestamp = frame.capture_timestamp             # = frame.timestamp - 0.15\n    snapshot = broker.get_snapshot_at(timestamp, mode="interpolate")\n\n延时放在哪里\n------------\n延时是链路属性而不是消费者的选择，因此它定义在\n:attr:`airdrop.video.VideoConfig.telemetry_lag` 上，由拉流源写进每一帧\n（:attr:`airdrop.video.VideoFrame.capture_timestamp`）。对齐器默认直接采用\n帧上携带的值，也可以用 ``lag=`` 显式覆盖（换后端做对照、或现场标定出新值\n后临时试探）。\n\n标定方式：见 ``docs/calibration_opencv.md`` 的步骤二（棋盘格 PnP / 光流求画面角速度，\n与飞控角速度互相关得到画面-遥测时间差），比秒表法可靠。本模块只处理"常数\n延时"，不做抖动自适应——真实链路还有毫秒级抖动的部分，那要靠相机自己的\nRTCP 时间戳解决，不是这里能修好的。\n\n关于等待（``max_wait``）\n------------------------\n正常情况下拍摄时刻（= 收到时间 − 150ms）已经落在历史范围内，直接内插即可。\n但遥测偶尔会比视频慢半拍：那一刻的拍摄时刻比历史最新时间还新，只能外推。\n外推几十毫秒虽不算致命，却是系统性的（每次慢半拍都外推同一小段）。\n\n所以给对齐器设 ``max_wait``（计划定稿 1.0s）：先等遥测追上拍摄时刻，\n追上了就内插；等满上限还没追上，说明遥测流本身出了问题——那时按\n``on_timeout="drop"`` 丢弃该帧（不拿外推凑数），并记 warning 日志与\n:attr:`FrameTelemetryAligner.stats`，让链路故障显式暴露出来。\n\n代价要说清楚：等待发生在调用 :meth:`align` 的线程里。挂成 sink 时就是\n阻塞采集线程——正常 10~30Hz 遥测下只有几十毫秒，但遥测真停顿时每帧\n都会等满上限（拉流会随之积压）。这是刻意的取舍：遥测停顿本身就是事故，\n宁可丢帧并报警，也不要"看起来还在工作"。\n\n关于外推\n--------\n查询时刻落在历史范围之外时，代理会做线性外推并返回结果。外推在短距离内\n近似可用，但拉长就失去意义（例如遥测断了 3 秒还在"外推"飞机的姿态）。\n:class:`AlignedSample` 因此如实标记 ``extrapolated`` 与超出边界的秒数\n``offset``；需要硬保证时给对齐器设 ``max_extrapolation``，超限的直接\n返回 None。\n'
+"""图传帧与遥测的时间对齐。
+
+为什么需要对齐
+--------------
+图传链路从"机载相机曝光"到"本进程从管道里切出一帧"之间有一段固定的处理
+延时：H.264 编码（相机侧）、无线链路传输、解码、以及 ffmpeg 输出管道的缓冲。
+实测这段约为 150ms（见 :mod:`airdrop.video` 开头的实测数据）。
+
+这个延时不改变数据的含义，但如果不处理，做视觉引导时就会拿"现在的遥测"
+去解释"150ms 前的画面"。无人机以 10 m/s 平飞时，150ms 对应 1.5 米的位移——
+对精准空投来说这是不能忽略的系统性偏差，而且它会随着速度变化伪装成"算法
+不准"。
+
+因此每拿到一帧后，先把它收到的时间减掉这段固定延时，得到画面真正的
+拍摄时刻，再用这个时刻去 :class:`~airdrop.broker.TelemetryBroker` 取那一刻
+的遥测（默认在历史之间线性内插）::
+
+    aligner = FrameTelemetryAligner(broker)          # 默认扣 150ms
+    sample = aligner.align(source.read(timeout=1.0))
+    if sample is not None and not sample.extrapolated:
+        aim_at(sample.image, sample.snapshot.latitude_deg, sample.snapshot.yaw_deg)
+
+等价的手写形式（不需要本模块也能做）::
+
+    timestamp = frame.capture_timestamp             # = frame.timestamp - 0.15
+    snapshot = broker.get_snapshot_at(timestamp, mode="interpolate")
+
+延时放在哪里
+------------
+延时是链路属性而不是消费者的选择，因此它定义在
+:attr:`airdrop.video.VideoConfig.telemetry_lag` 上，由拉流源写进每一帧
+（:attr:`airdrop.video.VideoFrame.capture_timestamp`）。对齐器默认直接采用
+帧上携带的值，也可以用 ``lag=`` 显式覆盖（换后端做对照、或现场标定出新值
+后临时试探）。
+
+标定方式：见 ``docs/calibration_opencv.md`` 的步骤二（棋盘格 PnP / 光流求画面角速度，
+与飞控角速度互相关得到画面-遥测时间差），比秒表法可靠。本模块只处理"常数
+延时"，不做抖动自适应——真实链路还有毫秒级抖动的部分，那要靠相机自己的
+RTCP 时间戳解决，不是这里能修好的。
+
+关于等待（``max_wait``）
+------------------------
+正常情况下拍摄时刻（= 收到时间 − 150ms）已经落在历史范围内，直接内插即可。
+但遥测偶尔会比视频慢半拍：那一刻的拍摄时刻比历史最新时间还新，只能外推。
+外推几十毫秒虽不算致命，却是系统性的（每次慢半拍都外推同一小段）。
+
+所以给对齐器设 ``max_wait``（计划定稿 1.0s）：先等遥测追上拍摄时刻，
+追上了就内插；等满上限还没追上，说明遥测流本身出了问题——那时按
+``on_timeout="drop"`` 丢弃该帧（不拿外推凑数），并记 warning 日志与
+:attr:`FrameTelemetryAligner.stats`，让链路故障显式暴露出来。
+
+代价要说清楚：等待发生在调用 :meth:`align` 的线程里。挂成 sink 时就是
+阻塞采集线程——正常 10~30Hz 遥测下只有几十毫秒，但遥测真停顿时每帧
+都会等满上限（拉流会随之积压）。这是刻意的取舍：遥测停顿本身就是事故，
+宁可丢帧并报警，也不要"看起来还在工作"。
+
+关于外推
+--------
+查询时刻落在历史范围之外时，代理会做线性外推并返回结果。外推在短距离内
+近似可用，但拉长就失去意义（例如遥测断了 3 秒还在"外推"飞机的姿态）。
+:class:`AlignedSample` 因此如实标记 ``extrapolated`` 与超出边界的秒数
+``offset``；需要硬保证时给对齐器设 ``max_extrapolation``，超限的直接
+返回 None。
+"""
 
 from __future__ import annotations
 
@@ -89,7 +152,7 @@ class FrameTelemetryAligner:
     max_wait:
         等待上限（秒）。拍摄时刻比历史最新时间还新时，先等一小会儿让遥测
         追上，从而能内插而不是外推；超过该上限仍没等到就按 ``on_timeout``
-        处理。默认 0.0 = 不等待（保持旧行为：直接外推）。
+        处理。默认 0.0 = 不等待（直接外推）。
     on_timeout:
         等待超时后的动作。目前支持 ``"drop"``：丢弃该帧（返回 None）。
         正常遥测（10~30Hz）下等待只有几十毫秒；真的等到超时说明遥测流本身
