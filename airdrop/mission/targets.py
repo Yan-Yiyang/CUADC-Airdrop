@@ -20,10 +20,13 @@ georef 又会让纯几何层依赖目标语义。所以放在这里，并且实�
    就等于纠正两遍。默认 ``undistort=None`` 表示自动判断：读 ``Detection.extra``
    里检测器留下的 ``undistorted`` 标记（:meth:`~airdrop.perception.Detector.detect`
    会写），检测器纠正过就不再纠正。
-2. 边长交叉验证只是诊断，默认不剔点。计划 4.4 要求用已知边长（1m）独立估深度、
-   与地面求交互校；差异超门限会记事件与计数，但默认不把点丢掉——误判一个真实
-   观测的代价比多一个野点大，而 targeting 的 DBSCAN 本来就靠"看到几十次"筛野点。
-   要严格按门限剔点，把 ``reject_on_side_mismatch=True`` 打开。
+2. 边长交叉验证**默认关掉**（``side_check_tolerance=0``）。它是"用已知边长（1m）独立
+   估深度、再与地面求交互校"的*诊断*，只在**回放优化**时选择性打开（例如定位标定/几何
+   问题：标定不对时它会大面积不通过）；正式流程里大倾角帧天然会超门限（实测架次
+   20260929-201431：35 个观测里 15 次），它既不影响解算也不该刷日志。打开后仍只记
+   事件与计数、**不剔点**——误判一个真实观测的代价比多一个野点大，而 targeting 的
+   DBSCAN 本来就靠"看到几十次"筛野点；要真的按门限剔点再加
+   ``reject_on_side_mismatch=True``。
 """
 
 from __future__ import annotations
@@ -43,8 +46,10 @@ LOGGER = logging.getLogger(__name__)
 
 __all__ = ["PerceptionTargetSource", "TargetTracker"]
 
-#: 目标边长法的允许相对误差（与 ``cross_check_by_side`` 的默认值一致）
-DEFAULT_SIDE_TOLERANCE = 0.25
+#: 边长交叉验证的默认门限（**0 = 关掉**，见模块 docstring 第 2 条）。
+#: 它是**回放优化**用的诊断：要打开就显式给门限（如 0.25），例如回放入口的
+#: ``--side-check 0.25``；正式流程保持关掉（大倾角帧必超门限，只会刷日志）。
+DEFAULT_SIDE_TOLERANCE = 0.0
 
 
 @dataclass(slots=True)

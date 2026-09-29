@@ -543,6 +543,48 @@ def test_tracker_skips_points_without_attitude_and_without_position() -> None:
     }
 
 
+def test_tracker_side_check_is_off_by_default() -> None:
+    """边长互校**默认关掉**（正式流程不刷日志）；回放优化时才显式给门限。
+
+    同一份"边长与求交深度明显不符"的观测：默认既不计 ``side_mismatch`` 也不发事件；
+    ``side_check_tolerance>0`` 时才作诊断（仍然只记不剔点）。
+    """
+    capture = 1000.0
+    snapshot = _pose_snapshot(capture)
+    box = PixelBox(140.0, 80.0, 180.0, 120.0)
+    detection = Detection(
+        frame_index=1,
+        capture_timestamp=capture,
+        pixel=box.center,
+        box=box,
+        confidence=0.9,
+        telemetry=snapshot,
+        code=56,
+        # 20 m 处的 1 m 目标在主点附近约 14 px（fx≈277），100 px 差一个数量级 → 必不通过
+        side_px=100.0,
+        extra={"undistorted": True},
+    )
+
+    events: list[str] = []
+    default = TargetTracker(
+        _config(), camera=CAMERA, on_event=lambda kind, _data: events.append(kind)
+    )
+    assert default.side_check_tolerance == 0.0, "默认关掉：连计数都不做"
+    assert default.add(detection) is not None
+    assert default.stats["side_mismatch"] == 0
+    assert "side_check" not in events
+
+    enabled = TargetTracker(
+        _config(),
+        camera=CAMERA,
+        side_check_tolerance=0.25,
+        on_event=lambda kind, _data: events.append(kind),
+    )
+    assert enabled.add(detection) is not None, "打开诊断也仍然不剔点"
+    assert enabled.stats["side_mismatch"] == 1
+    assert "side_check" in events
+
+
 def test_target_source_busy_follows_perception_backlog() -> None:
     """``busy()``：缓冲没处理完或 OCR 没回来就算"还在干活"。"""
 

@@ -1,4 +1,4 @@
-# AirDrop 3.0 项目手册（用户 / 代码审查者 / 维护者）
+# CUADC固定翼无人机侦查与打击控制项目：项目手册（用户 / 代码审查者 / 维护者）
 
 > 版本：`airdrop.__version__` = **3.0.0**；本文档面向 v3.0.0 的代码状态。
 > 本文所有**签名与默认值**来自机器自省（`python -m airdrop.run dump-api` 产出 `docs/api_reference.md`），
@@ -149,7 +149,7 @@
                         │ Detection(frame_index, capture_timestamp, pixel, code, telemetry)
         ┌───────────────▼───────────┐
         │ mission.TargetTracker      │  georef.pixel_to_ned（拍摄时刻遥测）
-        │  + 边长交叉验证（诊断）     │  + 去畸变只做一次（按 Detection.extra 判断）
+        │  + 边长互校（默认关）       │  + 去畸变只做一次（按 Detection.extra 判断）
         └───────────────┬───────────┘
                         │ TargetPoint(north_m, east_m, capture_timestamp, code, confidence)
         ┌───────────────▼───────────┐
@@ -2103,13 +2103,15 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | `--system-address` | full-mission / sitl / basic / video-sync / calibration-capture | `TelemetryConfig.system_address` |
 | `--rtsp-url` | full-mission / hm30-video / video-sync / calibration-capture | `VideoConfig.url` |
 | `--telemetry-lag` | full-mission / video-sync / calibration-capture | `VideoConfig.telemetry_lag` |
-| `--land-plan` | full-mission / sitl | `RoutesConfig.land_plan`（与配置航点**二选一**，同时给会报错） |
+| `--land-plan` | full-mission / sitl / replay | `RoutesConfig.land_plan`（与配置航点**二选一**，同时给会报错；replay 只规划不上传） |
 | `--recon-upload {operator,auto}` | full-mission / sitl | `MissionConfig.recon_upload` |
 | `--no-video` | full-mission | 本架次不接图传：跳过图传/感知，自检四项也相应关掉 |
 | `--no-preflight` | full-mission | 把 `config.preflight` 各项全关掉（**关掉 ≠ 通过**：每项仍记 `ok=null` 事件） |
 | `--require-airborne` / `--no-require-airborne` | full-mission / sitl | `MissionConfig.require_airborne`（地面演练才关） |
 | `--target-offset N,E,D` | sitl | 合成目标相对盘旋点的 NED 偏移 |
 | `--flight DIR` | replay / calibrate | 飞行目录（回放素材 / 标定素材） |
+| `--calib FILE` | replay | `CameraConfig.calib_file`（**要用录该素材时同一份**；SITL 架次是 `.sitl-recon-tmp/camera_calib_sim.json`） |
+| `--side-check TOL` | replay | 边长互校门限（**默认关**；回放优化时才给，如 0.25——诊断用，不剔点） |
 | `--speed` | replay | 回放速度（0 = 全速） |
 | `--strict` | replay / calibrate | 回放异常即失败 / 标定降级（外参或时间差没标出来）即返回 2 |
 | `--lag S` | sitl-recon | 图传链路延时估计（秒；报告里还会给 lag 扫描与反向诊断） |

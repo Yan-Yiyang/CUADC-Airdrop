@@ -297,6 +297,27 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 choices=("median", "max"),
                 source="SELECTION_RULE",
             ),
+            Option(
+                ("--calib",),
+                "calib_file",
+                "相机标定文件（要用录这段素材时同一份；SITL 架次是 .sitl-recon-tmp/camera_calib_sim.json）",
+                kind="str",
+                source="CALIB_FILE",
+            ),
+            Option(
+                ("--land-plan",),
+                "land_plan",
+                "降落航线 .plan（不给就只打印飞掠段，不规划降落）",
+                kind="str",
+                source="LAND_PLAN",
+            ),
+            Option(
+                ("--side-check",),
+                "side_check_tolerance",
+                "边长互校门限（默认关；回放优化时才给，如 0.25）",
+                kind="float",
+                source="SIDE_CHECK_TOLERANCE",
+            ),
         ),
     ),
     "basic": Subcommand(
@@ -760,7 +781,7 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="python -m airdrop.run",
-        description="AirDrop 集中式入口：子命令 + 选项，参数到配置走关键字覆盖",
+        description="CUADC固定翼无人机侦查与打击控制项目：集中式入口（子命令 + 选项，参数到配置走关键字覆盖）",
         epilog="子命令的 --help 给出该入口的全部选项与默认值来源。",
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<子命令>")

@@ -50,6 +50,9 @@
    - ffmpeg 断流判定靠 `-timeout <微秒>`（协议层 socket 超时，实测 2.7s 生效）；
      **`-rw_timeout` 对 UDP 输入无效**（12s 都不退出）。缺了 `-timeout`，管道读会
      永久阻塞，`stop()` 也退不掉。
+   - **本地文件类输入不能加 `-timeout`**：`Hm30VideoSource` 按 URL 里有没有 `://` 决定加不加
+     ——SITL 演练走的是本地 **SDP 文件**，加上去 ffmpeg 直接
+     `Option timeout not found` 打不开输入（见 `airdrop/video/source.py` 的建命令处注释）。
    - 子进程能被父进程直接杀掉（OpenCV 的 `read()` 是 C 层调用、外部无法中断），
      这是 `stop()` 永远不会被阻塞的管道读卡住的根本原因。
    - **不探测流地址、也不探测分辨率**：地址错就把 ffmpeg 的输出原样当错误抛出

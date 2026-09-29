@@ -32,6 +32,13 @@ if TYPE_CHECKING:  # 仅类型标注用，避免 telemetry → config 的运行�
 
 LOGGER = logging.getLogger(__name__)
 
+#: 释放 mavsdk_server 的等待上限（秒）。实测（2026-09）：没有飞控/SITL 时
+#: ``connect()`` 超时之后，这条释放路径会**永久阻塞**（gRPC poller 报
+#: ``Event loop is closed``，随后 ``System.__del__`` / ``_stop_mavsdk_server``
+#: 不再返回）。所以它放在守护线程里执行、只等这么久——宁可留一个后台线程收尾，
+#: 也不能拖死调用方（``stop()`` 被拖死会让"没起 SITL 就 skip"的探活永远回不来）。
+RELEASE_TIMEOUT_S = 5.0
+
 
 def _error_code(exc: BaseException) -> str | None:
     """从 MAVSDK 异常中提取错误码名称（如 ``COMMAND_DENIED``）。"""
@@ -388,23 +395,43 @@ class MavsdkThread:
             self._release_drone(drone)
 
     @staticmethod
-    def _release_drone(drone: System | None) -> None:
-        """显式终止 mavsdk_server 子进程，而不是被动等待 ``System.__del__``。
+    def _release_drone(drone: System | None, timeout: float = RELEASE_TIMEOUT_S) -> None:
+        """显式终止 mavsdk_server 子进程，且**绝不把调用方拖死**。
 
         MAVSDK-Python 没有公开的 ``close()``：``__del__`` 调用的就是这个
         内部方法，且可以重复调用（子进程未启动时是空操作）。显式调用后
         即使别处还残留引用（在途指令协程、调用方持有的旧 System），
         子进程也会立即退出。旧版本 mavsdk 没有该方法时静默跳过，退回
         引用计数/GC 回收路径。
+
+        ⚠ 这条路径**可能会永久阻塞**（2026-09 实测：没有飞控/SITL、``connect()``
+        超时之后，gRPC poller 线程报 ``Event loop is closed``，随后
+        ``System.__del__`` / ``_stop_mavsdk_server`` 里的调用不再返回）。它挂在
+        事件循环线程上会把整个会话收尾卡死，挂在 ``stop()`` 的调用方线程上则会把
+        调用方一起拖住（真机没上电、SITL 没起来时都会踩到；回归用例
+        ``tests/test_telemetry.py::test_release_never_blocks_the_caller``）。
+        所以释放放进**守护线程**执行、只等 ``timeout`` 秒：超时就记警告放手——
+        线程是 daemon，进程退出不受影响；它稍后跑完也算收尾成功。最后一个引用也在
+        这个线程里丢掉，于是 ``System.__del__`` 不会落在调用方线程上。
         """
         if drone is None:
             return
-        stop_server = getattr(drone, "_stop_mavsdk_server", None)
-        if callable(stop_server):
+
+        finished = threading.Event()
+
+        def release() -> None:
             try:
-                stop_server()
+                stop_server = getattr(drone, "_stop_mavsdk_server", None)
+                if callable(stop_server):
+                    stop_server()
             except Exception:
                 LOGGER.exception("终止 mavsdk_server 子进程失败")
+            finally:
+                finished.set()
+
+        threading.Thread(target=release, name="mavsdk-release", daemon=True).start()
+        if not finished.wait(timeout):
+            LOGGER.warning("mavsdk_server 释放未在 %.1fs 内完成，交给守护线程收尾", timeout)
 
     async def _apply_telemetry_rates(self, drone: System) -> None:
         """下发遥测速率（连接就绪后调用一次）。
