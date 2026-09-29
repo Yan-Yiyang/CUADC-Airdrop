@@ -107,20 +107,20 @@ class PerceptionConfig:
 
     三条要求：
 
-    1. **``mode="cls12"`` 需要 12 类检测权重**（仓库目前只提供单类 ``target``
-       权重；12 类权重就位前该模式编号恒为 1）。
-    2. **检测权重用 ``best2.pt``**（单类 ``target``；仓库不带权重，
-       用 :mod:`tools.fetch_models` 复制）。
+    1. **``mode="cls12"`` 需要 12 类检测权重**（编号直接来自 YOLO 类别）：权重是单类
+       ``target`` 时该模式编号恒为 1——要跑 ``cls12`` 请换成 12 类权重，否则用 ``mode="ocr"``。
+    2. **检测权重由使用者自备**（单类 ``target``）：放到 ``model_path`` 指向的位置
+       （默认 ``models/best2.pt`` 只是约定路径，可用 :mod:`tools.fetch_models` 复制进来）。
     3. **``device`` 必须显式给定**：不依赖 ultralytics 的自动检测
-       （当前实测会选中 ``cuda:0``，显式指定零成本地固定设备）。
+       （自动检测会选中 ``cuda:0``，显式指定零成本地固定设备）。
     """
 
     mode: str = "ocr"
-    # YOLO 检测权重（单类 target）
+    # YOLO 检测权重（单类 target；默认路径只是约定，可覆盖）
     model_path: str = "models/best2.pt"
     device: str = "0"
     conf_threshold: float = 0.25
-    imgsz: int = 1280  # best2.pt 训练分辨率 640；实测 640/1280 检出数一致
+    imgsz: int = 1280  # 权重按 640 训练；实测 640/1280 检出数一致
 
     # OCR 引擎（TORCH，本地权重；P5 复测：medium ~97ms/帧 @RTX3060Laptop）
     models_dir: str = "models/ppocr"

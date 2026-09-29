@@ -128,7 +128,7 @@ CUADC固定翼无人机侦查与打击控制项目（固定翼无人机"先侦�
 - **Detector**（`perception/detector.py`）：YOLO 封装。`device` **显式指定**（自动检测
   曾误选 CPU）；去畸变用**预计算 remap**（比逐帧 `undistort` 快 3~5 倍），且映射表锁定在
   标定分辨率上——换尺寸的帧直接跳过并告警，绝不用错误内参扭坏画面。`ultralytics` 惰性导入。
-- **OpenCvPostProcess**（`perception/cropproc.py`）：裁剪图后处理，移植自 2024v2。
+- **OpenCvPostProcess**（`perception/cropproc.py`）：裁剪图后处理，移植自项目早期流水线。
   去噪 → 等比放大到短边 300px → 颜色掩码饱和度逐级回退（blue 100→60→40→20，
   red 100→80→60→40→20）→ 凸包 + `approxPolyDP` 扫 `epsilon=3..40` 出五边形 →
   转正（平行边法为主、最小内角法兜底）→ **彩图**整图 OCR（v6 det 对灰度图检不出文本框）
@@ -353,14 +353,14 @@ CUADC固定翼无人机侦查与打击控制项目（固定翼无人机"先侦�
   重新放进来（后者要 SITL 真在跑，否则只是白等一轮探活）。
   配置在 `pyproject.toml` 的 `[tool.pytest.ini_options]`：`--strict-markers`、180s 全局
   超时兜底、默认 `-m "not realdata and not sitl"`；标记有 `stream`（起 ffmpeg / 占 UDP 51234）、
-  `network`（等网络错误路径）、`realdata`（**GPU + 2024v2 实战素材，分钟级**，要跑显式
+  `network`（等网络错误路径）、`realdata`（**GPU + 真实航拍素材，分钟级**，要跑显式
   `-m realdata`）、`sitl`（要 WSL 里已起 PX4 SITL 与图传，分钟级，显式 `-m sitl`）；公共 fixture 在
   `tests/conftest.py`（本地 H.264 测试流 `sender`、`live_source` 工厂、`broker`/`received`）。
   测试依赖在 `dev` 组。修 bug 时把回归用例加进对应模块——`tests/` 就是回归测试落点。
   - `test_perception.py` **全部离线**：重依赖（YOLO/RapidOCR/torch）都不加载，pipeline 的
     `detector`/`pool` 都是构造注入的假对象——这正是那两个参数存在的理由。
   - `test_perception_realdata.py`（标 `realdata`）才碰 GPU 与真实素材，验收口径是
-    "2024v2 实战视频的目标段能读出正确编号（**56/56/56**）"。⚠ 第 3 帧原记的是 `95`，
+    "真实航拍视频的目标段能读出正确编号（**56/56/56**）"。⚠ 第 3 帧原记的是 `95`，
     那是转正 180° 缺陷造成的翻转误读（物理目标是 56），已随缺陷修复一并改正——
     详见 [`docs/perception_ocr.md`](docs/perception_ocr.md)。
   - `test_telemetry.py` 覆盖遥测订阅推送、内插/外推与遥测速率下发。

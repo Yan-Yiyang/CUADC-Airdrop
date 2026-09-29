@@ -141,7 +141,7 @@ python -m airdrop.run make-world --rounds 2 --seed 3 --wind 5,2,0
 | --- | --- | --- |
 | `telemetry` | `system_address`、各流速率 | 位置/姿态速率决定帧-遥测内插精度上限 |
 | `video` | `url`、`telemetry_lag` | lag 是**链路属性**（真机 HM30 ≈0.15 s、SITL ≈0.5 s，各自标定后回填） |
-| `perception` | `mode`（`ocr`/`cls12`）、`model_path`、`device` | 权重用 `best2.pt`；`cls12` 需要 12 类权重（当前不提供） |
+| `perception` | `mode`（`ocr`/`cls12`）、`model_path`、`device` | 检测权重**自备**：`ocr` 用单类 `target`，`cls12` 要 12 类权重 |
 | `camera` | `calib_file` | `tools/calibrate.py` 产出的 `camera_calib.json` |
 | `ground` | 地面点 GPS | `ground_z` = 原点海拔 − 地面点海拔（平地假设） |
 | `targeting` | `eps_m`、`min_samples`、`selection_rule` | `median`/`max` **起飞前二选一** |
@@ -242,7 +242,8 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
 - **标定要用你自己的设备做**：内参、画面/遥测时间差（`telemetry_lag`）、手眼外参都随设备与
   安装变化；三步流程与常见坑见 [`docs/calibration_opencv.md`](docs/calibration_opencv.md)。
 - **PX4 侧需要自己配置**：gripper 输出、起飞项的航点动作、任务结束后的行为。
-- **`cls12` 的 12 类权重目前不提供**（`best2.pt` 是单类），该模式当前只能跑出编号 1。
+- **`cls12` 模式要配 12 类检测权重**：它的编号直接来自 YOLO 类别，用单类权重时编号恒为 1
+  （那种情况下请用 `mode="ocr"`）。
 - **无 CI**：测试、ruff、pyright 都在本地跑。
 - **SITL 注意**：仿真要与感知共用一台机器时**务必用无头模式**（`HEADLESS=1`，`gz sim -g` 会和
   检测抢 GPU，把仿真拖到 ~0.5x 实时、感知落后到看不到目标）；SITL 没有遥控，测试里要临时把

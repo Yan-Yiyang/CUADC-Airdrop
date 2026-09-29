@@ -9,7 +9,7 @@
 
 ## 流水线：OpenCvPostProcess 与 OcrEngine（自 架构要点）
 
-- **OpenCvPostProcess**（`perception/cropproc.py`）：裁剪图后处理，移植自 2024v2。
+- **OpenCvPostProcess**（`perception/cropproc.py`）：裁剪图后处理，移植自项目早期流水线。
   去噪 → 等比放大到短边 300px → 颜色掩码饱和度逐级回退（blue 100→60→40→20，
   red 100→80→60→40→20）→ 凸包 + `approxPolyDP` 扫 `epsilon=3..40` 出五边形 →
   转正（平行边法为主、最小内角法兜底）→ **彩图**整图 OCR（v6 det 对灰度图检不出文本框）
@@ -31,7 +31,7 @@
   另有 `"torch"` 与 `"off"`；`cls_autorotate` 决定它是否参与识别（默认开，
   即 PP-OCR 流水线会按判定把倒置文本行转正再识别）。对外只多一个
   `classify_orientation(image) -> OcrOrientation`（给几何转正做交叉验证用）。
-  置信度过滤走 `Global.text_score`（3.9.2 的 `__call__` 只收图像，2024v2 那些
+  置信度过滤走 `Global.text_score`（3.9.2 的 `__call__` 只收图像，旧版那些
   `allowlist`/`low_text`/`text_threshold` 参数**已不存在**）。
 
 ## 实测结论

@@ -115,19 +115,22 @@
 `flights/` 曾长期未被 ignore（`git status` 会列出整个飞行目录），现在已进 `.gitignore`；
 `routes/` 相反是**要入库**的：`.plan` 是飞行输入，审查时要能看到"这次飞的是哪条航线"。
 
-### 1.4 `models/` 目录实际内容（本地当前状态）
+### 1.4 `models/` 目录（权重自备）
 
-| 文件 | 大小 | 进 git | 用途 |
-| --- | --- | --- | --- |
-| `models/.gitkeep` | 0 | 是 | 占位 |
-| `models/best2.pt` | 5.95 MB | 否 | **唯一可用的 YOLO 权重**（单类 `target`）；`best.pt` / `best1.pt` 已废弃（零检出） |
-| `models/ppocr/PP-OCRv6_det_medium.pth` | 60.6 MB | 否 | OCR 检测模型（默认） |
-| `models/ppocr/PP-OCRv6_rec_medium.pth` | 73.4 MB | 否 | OCR 识别模型（默认） |
-| `models/ppocr/PP-OCRv6_{det,rec}_{small,tiny}.pth` | 1.9~20 MB | 否 | 备选尺度（`OcrEngineConfig` 可切） |
-| `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 0.56 MB | 否 | 方向分类 TORCH 版（**文件名不许规范化**，见笔记） |
-| `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 0.56 MB | 否 | 方向分类 ONNX 版（默认用它，最快） |
-| `models/ppocr/ppocrv6_dict.txt` | 70 KB | **是** | rec 字符集字典（固定识别字符集） |
-| `models/ppocr/ppocrv6_tiny_dict.txt` | 30 KB | **是** | tiny 模型字典 |
+权重都**不入库**（只有字符集字典入库）：把自备的权重复制/放到下表路径，或改
+`PerceptionConfig.model_path` / `OcrEngineConfig.models_dir` 指向你自己的位置。
+
+| 文件 | 进 git | 用途 |
+| --- | --- | --- |
+| `models/.gitkeep` | 是 | 占位 |
+| `models/best2.pt` | 否 | YOLO 检测权重默认路径（单类 `target`；文件名只是约定，可覆盖）。`cls12` 模式需要 12 类权重，见 §4.4 |
+| `models/ppocr/PP-OCRv6_det_medium.pth` | 否 | OCR 检测模型（默认） |
+| `models/ppocr/PP-OCRv6_rec_medium.pth` | 否 | OCR 识别模型（默认） |
+| `models/ppocr/PP-OCRv6_{det,rec}_{small,tiny}.pth` | 否 | 备选尺度（`OcrEngineConfig` 可切） |
+| `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 否 | 方向分类 TORCH 版（**文件名不许规范化**，见笔记） |
+| `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 否 | 方向分类 ONNX 版（默认用它，最快） |
+| `models/ppocr/ppocrv6_dict.txt` | **是** | rec 字符集字典（固定识别字符集） |
+| `models/ppocr/ppocrv6_tiny_dict.txt` | **是** | tiny 模型字典 |
 
 取权重：`python -m airdrop.run fetch-models`（**只复制、不联网**；源路径是文件内常量，可由 `--source-dir` 覆盖）。
 > Cls 权重命名与 onnxruntime 的 CUDA 前提见 [docs/perception_ocr.md](perception_ocr.md)。
@@ -1725,7 +1728,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `mode` | str | `'ocr'` | `ocr` / `cls12`（`PERCEPTION_MODES`） |
-| `model_path` | str | `'models/best2.pt'` | YOLO 权重（`best.pt` / `best1.pt` 已废弃） |
+| `model_path` | str | `'models/best2.pt'` | YOLO 权重默认路径（单类 `target`；`cls12` 模式要换成 12 类权重） |
 | `device` | str | `'0'` | YOLO 设备，显式指定 |
 | `conf_threshold` | float | `0.25` | 检测置信度门限 |
 | `imgsz` | int | `1280` | 推理尺寸（校验要求 ≥ 32） |
@@ -2044,7 +2047,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 
 | 文件 | 用途 | 进 git |
 | --- | --- | --- |
-| `models/best2.pt` | YOLO 检测权重（**唯一可用**；`best.pt`/`best1.pt` 是废弃权重，零检出） | ❌（`*.pt` 忽略） |
+| `models/best2.pt` | YOLO 检测权重默认路径（单类 `target`；`cls12` 模式要 12 类权重） | ❌（`*.pt` 忽略） |
 | `models/ppocr/PP-OCRv6_det_medium.pth`、`PP-OCRv6_rec_medium.pth` | RapidOCR TORCH 引擎权重（det/rec） | ❌（`*.pth`） |
 | `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 方向分类 ONNX（默认 `cls_engine="onnx"`） | ❌（`*.onnx`） |
 | `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 方向分类 TORCH 权重（**`pt` 是 RapidOCR 的拼写，别规范化**） | ❌ |
@@ -2222,7 +2225,7 @@ config = Config(
 ```bash
 ./.venv/Scripts/python.exe -m pytest                     # 全部（附覆盖率，当前 ≈85%；默认已排除 realdata/sitl）
 ./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"  # 再跳过要起 ffmpeg 的用例
-./.venv/Scripts/python.exe -m pytest -m realdata         # GPU + 2024v2 实战素材（分钟级）
+./.venv/Scripts/python.exe -m pytest -m realdata         # GPU + 真实航拍素材（分钟级）
 ./.venv/Scripts/python.exe -m pytest -m sitl             # WSL 里已起 PX4 SITL + 图传（分钟级）
 ./.venv/Scripts/python.exe -m pytest -k mission -v       # 只跑某个主题
 ```
@@ -2240,7 +2243,7 @@ config = Config(
 | `tests/test_recorder.py` | 飞行目录七个文件齐全、帧零重编码、事件/检测/投放写入、幂等启停 | 否（用例自建工作区内临时目录） |
 | `tests/test_replay.py` | 回放对齐结果与"直接从日志查询"的参考 broker 完全一致 | 否 |
 | `tests/test_perception.py` | pipeline 逻辑（假 detector / 假 OCR 池）、去重、编号不被覆盖 | 否 |
-| `tests/test_perception_realdata.py` | 真 YOLO + 真 OCR 在 2024v2 素材上读对编号（56/56/56） | ✅ GPU + 素材绝对路径 |
+| `tests/test_perception_realdata.py` | 真 YOLO + 真 OCR 在**自备的真实航拍素材**上读对编号（56/56/56） | ✅ GPU + 素材（路径见文件顶部常量） |
 | `tests/test_georef.py` | 相机模型加载/回退、像素→NED、边长法交叉验证（用例自建工作区内临时目录） | 否 |
 | `tests/test_calibrate.py` | 标定三步合成链路（含整个 `calibrate()` 的输出契约） | 否 |
 | `tests/test_targeting.py` | DBSCAN 语义（eps 闭区间、样本权重是绝对权重）、众数、median/max | 否 |
@@ -2301,7 +2304,7 @@ config = Config(
 | 25 | 状态在**某一拍结束时**进入 | `mission/runner.py`、`mission/states.py` | 测试断言写成"进了状态就已经调用过" |
 | 26 | `DroneController` 不在导入期读 `config` | `telemetry/controller.py`（装配走 `from_config`） | `config → video.source → telemetry` 成环 |
 | 27 | 事件写入失败绝不影响控制流 | `mission/states.py` 的 `emit_event` | recorder 关闭后抛 RuntimeError 使状态机崩溃 |
-| 28 | 权重必须 `best2.pt`；`cls12` 无 12 类权重（编号恒 1） | `config.py`、`docs/perception_ocr.md` | 换了废弃权重 → 零检出 |
+| 28 | 检测权重必须与 `mode` 匹配：`ocr` 用单类 `target`，`cls12` 用 12 类 | `config.py`、`docs/perception_ocr.md` | 权重与模式不匹配 → 零检出，或（`cls12` + 单类权重）编号恒为 1 |
 | 29 | 转正形态门限 60°±15° 是**量出来的** | `perception/cropproc.py` 的 `HOUSE_APEX_ANGLE_DEG/TOL` | 凭主观判断调门限 → 误转正（曾把 56 读成 95） |
 | 30 | 方向判别器只是**提示器**，不能当裁判 | `perception/cropproc.py`、`docs/perception_ocr.md` | 它会把目视正立的图判成倒置（帧 1160 实测 P(正立)=0.186） |
 | 31 | 任务项一律走 **`mission_raw`**，不用 MAVSDK 的 `vehicle_action` 翻译 | `mission/items.py`、`telemetry/controller.py` 的 `to_raw_item`/`_upload` | `vehicle_action=LAND` 被拆成"同坐标航点 + `NAV_LAND`"⇒ PX4 固定翼拒**整条任务**，而 `start_mission()` 仍回成功 |
@@ -2402,7 +2405,7 @@ config = Config(
 | 第二个脚本连不上飞控 / 争抢 50051 | 同一时刻只允许一个 `mavsdk_server` | 调试脚本用 `System(mavsdk_server_address="localhost", port=50051)` 接已有 server（§5.6） |
 | `mavsdk_server --version` 长时间不返回 | 那个二进制没有 `--version`，它会去起服务并阻塞 | 版本看日志首行 `mavsdk_server: MAVSDK version: vX.Y.Z`（与 Python 包版本一致） |
 | 目标坐标整体偏一段距离 | 没标定（默认外参）、或 `telemetry_lag` 是旧值 | 跑标定并把 `telemetry_lag` 回填；核对 `camera_calib.json` 的 `R_bc`/`t_bc` |
-| `models/best2.pt` 找不到 | 没取权重 | `python -m airdrop.run fetch-models`（`--source-dir` 可覆盖文件内常量） |
+| `model_path` 指向的权重找不到 | 权重没放进 `models/` | 自备权重放进去（或用 `python -m airdrop.run fetch-models --source-dir <你的目录>` 复制），也可改 `model_path` |
 | `examples.full_mission` 起不来 | 缺 `camera_calib.json`/航线为空/RTSP 地址不对 | 看 `flight.log`；`Config().validated()` 会提前挡掉取值域错误 |
 | 状态机停在 `INIT` | 没等到遥测位置或 NED 原点（`INIT` 本身不上传任何任务） | 看 `flight.log`；`init_max_s` 超时会 `ABORT(init_no_telemetry` / `init_no_origin)` |
 | 状态机停在 `PREFLIGHT` | 模型载入无响应/抛异常，或视频自检没等到足够的帧 | 看 `preflight` 事件与 `flight.log`：任一项失败 → `ABORT(preflight_failed:<check>)`；超 `preflight.max_s` → `preflight_timeout`；没有相机就把 `PreflightConfig.check_video` 关掉 |
@@ -2425,7 +2428,7 @@ config = Config(
 | SITL 演练 | **已在本地 WSL + PX4 SITL 固定翼（`gz_rc_cessna`）上真跑通过**：`RECON → HOLD_PROCESS → OVERFLY → LAND → DONE`，2 次上传 / 1 次投放 / 0 错误，投放触发时预测落点误差 1.35 m。⚠ 演练**不验感知**（SITL 没相机，目标坐标由 `TARGET_OFFSET_NED` 合成），且 SITL 里必须先手动 **arm 并起飞**（`WAIT_AIRBORNE` 要等 `in_air`/相对高度 ≥ `airborne_alt_m` 才上传侦查航线；上面那次记录是加这道检查之前跑的，重跑按新顺序） |
 | `.plan` 航线 | 解析与复杂项展开在 `tests/test_plan.py`（现场造的样例）+ 本地 `routes/land.plan` 上验证过；真实任务航线由运营方在 QGC 里提供，**只支持 `fwLandingPattern`**（VTOL 降落、测绘/结构航线显式报错） |
 | 生成航点的接受半径 | `DEFAULT_WAYPOINT_ACCEPTANCE_M = 3.0` 对固定翼偏紧——SITL 里出现过飞机绕着末航点转、迟迟不"到点"（进度停在 `current=2/total=3`）；QGC `.plan` 的航点自带 `param2`，不受这条影响。真机前建议按机型确认 `NAV_ACC_RAD` 与此值 |
-| `cls12` 模式 | 无 12 类权重（`best2.pt` 单类）→ 编号恒为 1，代码路径可跑但无实际意义 |
+| `cls12` 模式 | 用的权重是单类 → 编号恒为 1 | 换成 12 类权重，或改用 `mode="ocr"` |
 | 方向分类交叉验证 | 判别器会误报（帧 1160 实测），只能当提示器；门限 0.9 恰好挡住误报 |
 | PX4 侧配置 | gripper 输出、起飞项航点动作、任务结束后是否 RTL 都不在本包范围内 |
 | 仿真世界 | `sim/worlds/cuadc/` 的两个赛区世界已按规则（2026 版第 19~25 页）搭好并做离屏渲染核对（几何/尺寸/贴图方向，见 [`simulation_world.md`](simulation_world.md)）；天井位置与朝向按规则随机（`--seed` 复现，入库 = seed 0）；**未验证**：把 Gazebo 相机接进感知闭环、真机与世界的差异 |

@@ -38,12 +38,12 @@ __all__ = ["DetectionBatch", "Detector", "DetectorConfig"]
 class DetectorConfig:
     """YOLO 检测参数。"""
 
-    # YOLO 检测权重（单类 target）
+    # YOLO 检测权重（单类 target；默认路径只是约定，可覆盖）
     model_path: str = "models/best2.pt"
     device: str = "0"  # 显式指定：见模块 docstring
     conf_threshold: float = 0.25
     iou_threshold: float = 0.45
-    imgsz: int = 1280  # best2.pt 训练 imgsz=640；实测 640/1280 检出一致
+    imgsz: int = 1280  # 权重按 imgsz=640 训练；实测 640/1280 检出一致
     max_detections: int = 300
     # 目标框外扩比例（裁剪时保留完整轮廓）
     crop_expand_ratio: float = 0.2
