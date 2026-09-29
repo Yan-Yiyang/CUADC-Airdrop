@@ -67,11 +67,14 @@ bash sim/run_sitl.sh r2
 ./.venv/Scripts/python.exe -m airdrop.run sitl-recon
 
 # 更稳的顺序是"先起脚本、再起 SITL"：脚本先把 14540 绑住，SITL 一启动就连上
-# （PX4 的 API/offboard 链路长时间没有接收方时会停发；脚本自己也会重连）
+# （PX4 的 API/offboard 实例以 -o 14540 推心跳，长时间没有接收方就停发，mavsdk_server
+#  会永远停在 `Waiting to discover system`；脚本自己也会重连）
 ```
 
-严格**任务流程**，全程没有 offboard 设定点：上传「起飞 + 扫掠」任务 → `MISSION_START`
-（PX4 自己解锁、切任务模式、执行首项起飞）→ 本包只监视遥测与画面 → 飞完 `hold`。
+严格**任务流程**，全程没有 offboard 设定点：本脚本只扮演操作手——上传「只含起飞项」的任务 →
+**先 `arm` 再 `MISSION_START`**（⚠ 实测 `MISSION_START` 里的 `arm(mission_start)` 只切模式、不解锁：
+ulog 里 `nav_state=3` / `arming_state=1`，飞机不动、QGC 上看不到任何动静）→ 等起飞 →
+上传并启动侦查航线，其余交给 `MissionRunner`（监视遥测与画面 → 空中出目标 → 飞掠投放 → 降落）。
 视频走 Gazebo 自带的 `GstCameraSystem`（RTP/H.264 → `127.0.0.1:5600`），Windows 侧用
 ffmpeg 直接收（mirrored 网络共享端口；**不必用 HM30，也不用 QGC 转发**）。
 
@@ -96,9 +99,12 @@ ffmpeg 直接收（mirrored 网络共享端口；**不必用 HM30，也不用 QG
   `mission_feasibility_checker` 直接拒任务
   （`Mission rejected: Landing waypoint/pattern required.`），飞机连解锁都不会发生。
   置 0 = 起飞项/降落项都不再必需，只影响这台仿真机型；
+  ⚠ 顺带一条：**已解锁状态下切模式还要 `canRun(AUTO_MISSION)` 通过**——任务无效时同样切不过去
+  （控制台原话 `Switching to Mission is currently not available`），所以"任务被拒"与"切不进任务模式"
+  是同一件事的两面；
 * **`FW_LND_USETER=0` 也在仿真机型里永久置 0**：SITL 机型没有测距传感器，而 FW 自动
   降落默认要用地形估计（1），拿不到估计时会按 `FW_LND_ABORT`（默认 3 含地形位）
-  在进入降落段 10 s 后 abort 降落、在落点上方 30 m 无限盘旋——任务永远不结束
+  在进入降落段 10 s 后 abort 降落、在落点上方 30 m（`MIS_LND_ABRT_ALT`）无限盘旋——任务永远不结束
   （实测架次 某架次：`Holding at 30 m above landing waypoint.`，
   最后靠状态机 `land_timeout` 收场）。置 0 = 不要求地形估计，flare/下滑用航点高度；
 * 有 QGC 连着更好（真机流程本来就有地面站；它能满足预检的数据链检查）；
@@ -110,6 +116,11 @@ ffmpeg 直接收（mirrored 网络共享端口；**不必用 HM30，也不用 QG
 * 测试期间会临时置 0 的飞控参数有两条（跑完都还原）：`NAV_DLL_ACT`（无数据链 failsafe）
   与 `NAV_RCL_ACT`——SITL **没有遥控**（ulog `manual_control_signal_lost` 恒 true），
   默认的 RC-loss 动作（Return）会在飞几十秒后把飞机拉回场（架次 某架次 实测）。
+* **"任务上传成功、飞机却原地盘旋"这类问题的第一手证据在 PX4 的 ulog 里**：
+  `~/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<日期>/*.ulg`，用 pyulog 读
+  `logged_messages`（看 `mission_feasibility_checker` / `navigator` 的原话）与
+  `mission_result` 数据集（`valid` / `mission_id` / `seq_total` / `finished`）——
+  2026-09 那两次"整条任务被拒"就是从这里定性的。
 
 ## 装进 PX4 的是什么
 

@@ -217,6 +217,11 @@ CUADC固定翼无人机侦查与打击控制项目（固定翼无人机"先侦�
    `_stop_mavsdk_server`，幂等，这是 `System.__del__` 的同款路径）。**绝不能**只把引用置 None
    等 GC——mavsdk_server 子进程的 gRPC 端口固定 50051，旧进程不死，新会话会连上僵尸 server
    并在其被回收时级联断连。`_run_session` 用 try/finally 保证覆盖所有退出路径（含 connect 超时）。
+   ⚠ **释放必须有超时兜底**：没有飞控/SITL、`connect()` 超时之后，这条释放路径会**永久阻塞**
+   （gRPC poller 线程报 `Event loop is closed`，随后 `System.__del__` / `_stop_mavsdk_server`
+   里的调用不再返回），没有兜底就会把 `stop()` 的调用方一起拖死。`_release_drone` 因此把释放放进
+   **守护线程**、只等 `RELEASE_TIMEOUT_S`（5s）就放手。**推论：探活"有没有飞控"不要建 MAVSDK
+   会话**（`tests/test_sitl_recon.py` 用裸 UDP 听 14540 心跳）。
 2. **历史按时间查询**：用 `bisect(key=operator.attrgetter("timestamp"))` 直接探测 deque，
    禁止重建整张时间列表（曾 22µs/次 → 现 0.42µs/次）；外推分支不做任何二分。
 3. **代码风格**：注释/docstring 用中文；类型标注用现代写法（`X | None`、内置泛型、
@@ -333,28 +338,25 @@ CUADC固定翼无人机侦查与打击控制项目（固定翼无人机"先侦�
     `-c core.autocrlf=false`，CRLF 工作区会被显示成"整文件删除 + 插入"
     （`anomalyco/opencode#27276`）。本仓库已配 `core.autocrlf=false`（local）与
     VSCode `files.eol="\n"`；自查：`git ls-files --eol | awk '$2=="w/crlf"'` 应为空。
-19. **发布目录（`../airdrop-public`）同步**：公开仓库在 `C:\YYY\Python\airdrop-public`
-    （远端 `github.com/Yan-Yiyang/CUADC-Airdrop.git`，分支 `main`）。
-    **开发目录的文档与注释不要直接搬进发布目录**——发布版内容要在发布目录**单独写**：
-    去掉与本地相关的内容（飞行架次号 `20xxxxxx-xxxxxx`、"本地/本地"之类的环境指代、
-    本地路径与服务细节）和隐私内容（用户名等），只留对使用者有意义的结论。
-    `LICENSE` / `NOTICE` 是发布目录独有的（含竞赛署名条款），**不要覆盖或删除**；
-    同步流程：开发仓库提交干净 →（按上面的清理规则）同步跟踪文件 → 发布目录落一条
-    "同步到 X.Y.Z"提交 → 推送（需要代理：`git config --global http.proxy`，
-    代理没起时推送会直接失败）。
+19. **本仓库是发布副本**：内容按"只同步跟踪文件、文档单独写"的规则从开发仓库同步过来——
+    面向使用者的文档（`README.md` / `AGENTS.md` / `docs/`）在这里**独立维护**，别指望与开发仓库
+    逐字一致；`LICENSE` / `NOTICE` 是本仓库独有的（含竞赛署名条款），**不要覆盖或删除**。
+    排查问题时以**代码与专题笔记里的实测记录**为准。
 
 ## 验证方式
 
 - **测试（pytest，全部离线，无需飞控/图传硬件）**：
-  `./.venv/Scripts/python.exe -m pytest`（附覆盖率）
-  `./.venv/Scripts/python.exe -m pytest -m "not stream"`（跳过要起 ffmpeg 的用例）
+  `./.venv/Scripts/python.exe -m pytest`（附覆盖率；**默认就排除 `realdata` 与 `sitl`**）
+  `./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"`（再去掉要起 ffmpeg 的用例）
   `./.venv/Scripts/python.exe -m pytest -k alignment -v`（只跑某个主题）
+  ⚠ **命令行的 `-m` 是"覆盖"而不是"追加"**：只写 `-m "not stream"` 会把 `realdata` 与 `sitl`
+  重新放进来（后者要 SITL 真在跑，否则只是白等一轮探活）。
   配置在 `pyproject.toml` 的 `[tool.pytest.ini_options]`：`--strict-markers`、180s 全局
-  超时兜底、默认 `-m "not realdata"`；标记有 `stream`（起 ffmpeg / 占 UDP 51234）、
+  超时兜底、默认 `-m "not realdata and not sitl"`；标记有 `stream`（起 ffmpeg / 占 UDP 51234）、
   `network`（等网络错误路径）、`realdata`（**GPU + 2024v2 实战素材，分钟级**，要跑显式
-  `-m realdata`）；公共 fixture 在 `tests/conftest.py`（本地 H.264 测试流 `sender`、
-  `live_source` 工厂、`broker`/`received`）。测试依赖在 `dev` 组。
-  修 bug 时把回归用例加进对应模块——`tests/` 就是回归测试落点。
+  `-m realdata`）、`sitl`（要 WSL 里已起 PX4 SITL 与图传，分钟级，显式 `-m sitl`）；公共 fixture 在
+  `tests/conftest.py`（本地 H.264 测试流 `sender`、`live_source` 工厂、`broker`/`received`）。
+  测试依赖在 `dev` 组。修 bug 时把回归用例加进对应模块——`tests/` 就是回归测试落点。
   - `test_perception.py` **全部离线**：重依赖（YOLO/RapidOCR/torch）都不加载，pipeline 的
     `detector`/`pool` 都是构造注入的假对象——这正是那两个参数存在的理由。
   - `test_perception_realdata.py`（标 `realdata`）才碰 GPU 与真实素材，验收口径是

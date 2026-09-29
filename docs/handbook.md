@@ -2082,7 +2082,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 ```bash
 uv sync                                                # 依赖（清华镜像，见 pyproject.toml）
 ./.venv/Scripts/python.exe -m tools.fetch_models       # 把权重放进 models/
-./.venv/Scripts/python.exe -m pytest -m "not stream"   # 冒烟：全部离线用例
+./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"   # 冒烟：全部离线用例
 ```
 
 ### 6.2 入口清单：`python -m airdrop.run <子命令>`
@@ -2220,11 +2220,15 @@ config = Config(
 ### 6.5 测试怎么跑
 
 ```bash
-./.venv/Scripts/python.exe -m pytest                     # 全部（附覆盖率，当前 ≈85%）
-./.venv/Scripts/python.exe -m pytest -m "not stream"     # 跳过要起 ffmpeg 的用例（占 UDP 51234）
+./.venv/Scripts/python.exe -m pytest                     # 全部（附覆盖率，当前 ≈85%；默认已排除 realdata/sitl）
+./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"  # 再跳过要起 ffmpeg 的用例
 ./.venv/Scripts/python.exe -m pytest -m realdata         # GPU + 2024v2 实战素材（分钟级）
+./.venv/Scripts/python.exe -m pytest -m sitl             # WSL 里已起 PX4 SITL + 图传（分钟级）
 ./.venv/Scripts/python.exe -m pytest -k mission -v       # 只跑某个主题
 ```
+
+⚠ 命令行的 `-m` 是**覆盖** `addopts` 里的默认表达式，不是追加：写 `-m "not stream"` 会把 `realdata` 与 `sitl`
+一起放进来（`sitl` 那条要 SITL 真在跑，否则只是白等一轮探活）。
 
 | 测试文件 | 覆盖什么 | 需要硬件/GPU |
 | --- | --- | --- |
@@ -2246,7 +2250,7 @@ config = Config(
 | `tests/test_e2e.py` | 回放驱动全链路：帧 → 感知 → 坐标 → 统计 → 航线（另有 `realdata` 变体） | 否（变体需 GPU） |
 | `tests/test_fit.py` | 投放记录读写、反演真值回收、退化/不可辨识必拒、工具现场流程 | 否 |
 | `tests/test_examples.py` | 示例与工具不脱节（导入即校验 + **导入不加载重库** + 真跑装配函数） | 否 |
-| `tests/test_sitl_recon.py` | **SITL 侦查精度（可选，标 `sitl`，默认跳过）**：驱动 `tools/sitl_recon.py` 跑完整标准流程，断言状态机 `DONE`、三个编号全识别、任务选中 56、误差与留一验证都 < 2 m；SITL 没在跑就 skip | 否（要 WSL 里已起 PX4 SITL） |
+| `tests/test_sitl_recon.py` | **SITL 侦查精度（可选，标 `sitl`；默认被 `-m "not realdata and not sitl"` 排除，显式 `-m sitl` 才跑）**：驱动 `tools/sitl_recon.py` 跑完整标准流程，断言状态机 `DONE`、三个编号全识别、任务选中 56、误差与留一验证都 < 2 m；探活用**裸 UDP 听 14540 心跳**（不建 MAVSDK 会话），没在跑就 skip | 否（要 WSL 里已起 PX4 SITL） |
 | `tests/test_cli.py` | 集中式入口：子命令注册表（parser + handler）、`--help`/`check-docs` **不加载重库**（干净子进程实测）、参数不合法退出码 2、选项覆盖真的进了 `build_config()` | 否 |
 | `tests/test_handbook.py` | **本手册 §3 的 11 段示例逐条真跑**（文档里的代码必须能运行） | 否 |
 | `tests/test_world.py` | CUADC 赛区世界：**生成结果 == 入库文件**、目标区在起飞线两端（±200, 0）、天井区内随机摆放且间距 > 20m、五边形环壁（厚 5mm、高 400mm）、**规则里只是示意的东西不许出现**（4m/6m 打击圈、天井箭头）、同区天井同色、贴地标线不共面重叠（防 z-fighting）、两轮靶标摆位（第二轮中位数落在第 3 座）、演练航线对准中位数天井、目标区底色（常见路面色 + 少量纹理）、周边航拍底图（不压跑道/目标区、互不重叠）、底图生成器（可复现/离线校验）、俯视预览图（尺寸/可复现/参数校验）、资产逐级存在、数字板必须是**白底黑字** | 否 |
@@ -2270,7 +2274,7 @@ config = Config(
 
 | # | 规则 | 代码位置 | 违反的后果 |
 | --- | --- | --- | --- |
-| 1 | `mavsdk` 没有公开 `close()`，会话结束必须显式释放 | `telemetry/mavsdk_thread.py` 的 `stop()` / `_release_drone()` | mavsdk_server 子进程（固定 gRPC 端口 50051）变僵尸，新会话连上它并级联断连 |
+| 1 | `mavsdk` 没有公开 `close()`，会话结束必须显式释放，**且释放要有超时兜底**（守护线程 + `RELEASE_TIMEOUT_S`） | `telemetry/mavsdk_thread.py` 的 `stop()` / `_release_drone()` | mavsdk_server 子进程（固定 gRPC 端口 50051）变僵尸，新会话连上它并级联断连；⚠ 没有飞控时这条释放路径会**永久阻塞**（gRPC poller 报 `Event loop is closed`），没有兜底就会把 `stop()` 的调用方一起拖死 |
 | 2 | 历史按时间查询用 `bisect(key=attrgetter("timestamp"))` 直接探 deque | `telemetry/broker.py` | 每次查询重建整张时间表（曾 22µs → 0.42µs） |
 | 3 | 留存（`add_sink` 逐帧）与实时（`read()`/`latest()`）是两条路 | `video/source.py`、`video/buffer.py` | 用 `read()` 送入推理＝把丢帧引回来 |
 | 4 | 跨帧持有画面必须 copy | `video/source.py` 的 `VideoFrame.copy()`、`video/buffer.py` | ffmpeg 后端复用管道缓冲，历史帧全变成"最新那一张" |
@@ -2370,7 +2374,7 @@ config = Config(
 - [ ] 失败路径是否**显式**（抛错 / `ok=False` / `None` 三选一，并在 docstring 写明）？
 - [ ] 是否碰了 §7.1 里 43 条不变量中的任何一条？改了哪条就要同步 `AGENTS.md` 与对应专题笔记。
 - [ ] 碰了任务项 / 航线来源 / 启动与完成判定（§7 第 31~35 条）时，除了离线用例，**跑一次 SITL 演练**（`examples/sitl_mission.py`）——这四条都是"离线测不出来、真飞控才暴露"的。
-- [ ] 回归用例加了吗（`tests/` 是回归落点）？跑过 `pytest -m "not stream"` 吗？
+- [ ] 回归用例加了吗（`tests/` 是回归落点）？跑过 `pytest -m "not realdata and not sitl and not stream"` 吗？
 - [ ] 三份文档是否同步：`README.md`（怎么用）、`AGENTS.md`（约定与易错点）、本手册（目录/参数/产物）？
 
 ---

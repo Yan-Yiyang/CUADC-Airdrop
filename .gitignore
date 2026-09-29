@@ -68,6 +68,9 @@ _e2e/
 .sitl-recon-tmp/
 # pytest 在沙箱里删不掉、git 也读不了的缓存目录（见 AGENTS.md 的 tmp_path 一条）
 pytest-cache-files-*/
+# 性能基准的工作目录（脚本 + 下载的对比权重）。⚠ 刻意与 .pytest-tmp/ 分开：
+# .pytest-tmp/ 会被运行环境回收，放那儿的权重会被清掉。
+.perf-tmp/
 
 # 派生产物：由 tools/dump_api.py 生成（要不要入库由使用者决定，默认不入）
 docs/api_reference.md

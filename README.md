@@ -212,8 +212,10 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
 ## 测试与代码规范
 
 ```bash
-./.venv/Scripts/python.exe -m pytest                 # 全部（附覆盖率）
-./.venv/Scripts/python.exe -m pytest -m "not stream" # 跳过要起 ffmpeg 的用例
+./.venv/Scripts/python.exe -m pytest                 # 全部（附覆盖率；默认已排除 realdata/sitl）
+./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"  # 再跳过要起 ffmpeg 的用例
+./.venv/Scripts/python.exe -m pytest -m realdata     # GPU 与真实素材（分钟级）
+./.venv/Scripts/python.exe -m pytest -m sitl         # WSL 里已起 PX4 SITL 与图传（分钟级）
 ./.venv/Scripts/python.exe -m pytest -k mission -v   # 只跑某个主题
 
 ./.venv/Scripts/ruff.exe check .                     # 代码规范（配置在 pyproject.toml）
@@ -221,8 +223,12 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
 ./.venv/Scripts/pyright.exe                          # 类型检查
 ```
 
+⚠ 命令行的 `-m` 是**覆盖** `pyproject.toml` 里的默认表达式，而不是追加：只写 `-m "not stream"` 会把
+`realdata` 与 `sitl` 一起放进来（后者要 SITL 真在跑，否则只是白等一轮探活）。
+
 - 套件**全部离线**：不需要飞控与图传；`stream` 标记的用例会起本地 ffmpeg 并占用 UDP 51234，
-  `realdata` 标记的用例需要 GPU 与真实素材（默认跳过）。
+  `realdata` 标记的用例需要 GPU 与真实素材（默认跳过），`sitl` 标记的用例要 WSL 里已起 PX4 SITL
+  与图传（同样默认跳过，`-m sitl` 才跑）。
 - 端到端在 `tests/test_e2e.py`：回放素材 → 感知 → 坐标 → 统计 → 航线。
 - **`ruff check`、`ruff format --check`、`pyright` 三者都保持零告警**（都在 `dev` 依赖组里）。
 

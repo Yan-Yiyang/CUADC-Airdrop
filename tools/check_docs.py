@@ -81,6 +81,7 @@ REQUIRED_ENTRIES: tuple[str, ...] = (
     "tests/test_plan.py",
     "tests/test_cli.py",
     "tests/test_world.py",
+    "tests/test_release_sync.py",
 )
 
 #: 手册必须覆盖的主题关键词
@@ -219,7 +220,9 @@ def main(**overrides) -> int:
     report("产物/输入文件名齐全", [name for name in REQUIRED_FILES if name not in text])
 
     # 5) 入口与测试文件：子命令取自 airdrop.run 的注册表（加子命令就必须写进手册）
-    entry_missing = [name for name in REQUIRED_ENTRIES if name not in text]
+    # ⚠ 只要求**仓库里真的存在**的用例被手册覆盖：发布目录（../airdrop-public）里没有
+    # 开发侧专用的用例（如 tests/test_release_sync.py），那份手册不该被它卡住。
+    entry_missing = [name for name in REQUIRED_ENTRIES if name not in text and Path(name).exists()]
     report("测试文件被文档覆盖", entry_missing)
     from airdrop.run import SUBCOMMANDS  # 惰性导入：只有本检查需要它
 

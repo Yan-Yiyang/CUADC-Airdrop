@@ -335,6 +335,44 @@ def test_drone_released_on_session_end(monkeypatch) -> None:
     assert released, "会话结束后未显式终止 mavsdk_server 子进程"
 
 
+def test_release_never_blocks_the_caller(monkeypatch) -> None:
+    """回归：释放 mavsdk_server 卡住时，会话收尾与 ``stop()`` 都必须有超时兜底。
+
+    实测（2026-09）：没有飞控/SITL、``connect()`` 超时之后，这条释放路径会**永久阻塞**
+    （gRPC poller 线程报 ``Event loop is closed``）。挂在事件循环线程上会卡死会话收尾，
+    挂在调用方线程上会把 ``stop()`` 一起拖住——``tests/test_sitl_recon.py`` 的探活因此
+    skip 不了，全量测试永远跑不完。``_release_drone`` 现在把释放放进守护线程，
+    只等 ``RELEASE_TIMEOUT_S`` 秒。
+    """
+    import airdrop.telemetry.mavsdk_thread as mt
+
+    entered = threading.Event()
+    forever = threading.Event()
+
+    class HangingSystem:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def connect(self, system_address=None):
+            raise RuntimeError("connect failed (fake)")
+
+        def _stop_mavsdk_server(self):
+            entered.set()
+            forever.wait()  # 模拟实测到的"永不返回"
+
+    monkeypatch.setattr(mt, "System", HangingSystem)
+
+    mav = mt.MavsdkThread(reconnect=False)
+    started = time.monotonic()
+    supervisor = mav.submit(mav._serve("udpin://127.0.0.1:1"))
+    supervisor.result(timeout=30.0)  # 会话收尾不能被释放路径卡死
+    mav.stop()  # 调用方也不能被拖死
+    elapsed = time.monotonic() - started
+
+    assert entered.is_set(), "没走到释放路径，用例没覆盖到目标场景"
+    assert elapsed < mt.RELEASE_TIMEOUT_S * 2 + 5.0, f"收尾耗时 {elapsed:.1f}s，超时兜底没生效"
+
+
 # ----------------------------------------------------------------------
 # P2：连接就绪后下发遥测速率（set_rate_*）
 # ----------------------------------------------------------------------
