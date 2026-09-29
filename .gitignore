@@ -1,79 +1,28 @@
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
-.eggs/
-build/
-dist/
+.venv/
 .pytest_cache/
-.mypy_cache/
 .ruff_cache/
-
-# 测试覆盖率产物
-.coverage
-.coverage.*
-coverage.xml
+.coverage*
 htmlcov/
 
-# Virtual environments
-.venv/
-venv/
-env/
-
-# OS / editor
+# OS / 编辑器
 .DS_Store
-Thumbs.db
 .idea/
 .vscode/
 *.swp
 
-# Logs / runtime
-*.log
-logs/
-
-# 飞行记录（FlightRecorder 的输出目录，见 docs/handbook.md 第 5 节）
+# 飞行记录与模型权重（体积大，不入库；`models/ppocr/*.txt` 字符集字典要入库）
 flights/
-
-# 飞控、地面站源代码
-PX4-Autopilot-1.17.0/
-qgroundcontrol-master/
-px4.tar.gz
-qgc.tar.gz
-
-# 模型权重（体积大，不进 git；用 tools/fetch_models.py 取到 models/ 下）
-# 说明：models/ 目录与字典文件保留在库里（字典 ~70KB，决定 rec 的字符集，
-# 跟着版本走才能复现识别结果）；只忽略大块的权重文件本身。
 models/**/*.pt
 models/**/*.pth
 models/**/*.onnx
-!models/**/.gitkeep
 
-# 感知排故产物
-log/
-_cropdiag/
-_e2e/
-
-# 测试用的工作区内临时目录（受限沙箱里 tmp_path 不可枚举/删除，见 AGENTS.md）
-.replay-test-tmp/
-.calibrate-test-tmp/
-.e2e-test-tmp/
-.fit-test-tmp/
-.handbook-test-tmp/
-.plan-test-tmp/
+# 测试/演练的临时目录与派生产物
+.*-test-tmp/
 .pytest-tmp/
-.world-test-tmp/
-# SITL 演练的临时产物（日志/机上任务备份/ulog 探查脚本）
-.sitl-test-tmp/
-# SITL 侦查精度测试的临时产物（标定/SDP/检测明细/报告，见 tools/sitl_recon.py）
 .sitl-recon-tmp/
-# pytest 在沙箱里删不掉、git 也读不了的缓存目录（见 AGENTS.md 的 tmp_path 一条）
 pytest-cache-files-*/
-# 性能基准的工作目录（脚本 + 下载的对比权重）。⚠ 刻意与 .pytest-tmp/ 分开：
-# .pytest-tmp/ 会被运行环境回收，放那儿的权重会被清掉。
-.perf-tmp/
-
-# 派生产物：由 tools/dump_api.py 生成（要不要入库由使用者决定，默认不入）
 docs/api_reference.md
-
-# 俯视预览图（python -m airdrop.run preview-world 的默认产物）
 /sim/worlds/cuadc/preview.png
