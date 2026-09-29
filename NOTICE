@@ -1,0 +1,31 @@
+AirDrop —— 固定翼无人机"先侦查后空投"控制系统
+Copyright 2026 太原理工大学航模协会、燕羿洋（The AirDrop Authors）
+
+本作品按 Apache License 2.0 授权（见 LICENSE 文件）。
+
+附加参赛声明条款
+================
+
+本项目由太原理工大学航模协会开发，面向无人机竞赛场景。除 LICENSE 中的条款外，
+任何个人或队伍在以本项目（或其衍生作品）参加竞赛、提交作品或公开发布相关成果时，
+必须注明使用了本项目 "AirDrop" 并给出其来源
+（例如：太原理工大学航模协会、燕羿洋 AirDrop 项目 + 本仓库地址）。
+
+本条款是版权持有者对本作品授权提出的附加要求，并不免除 Apache License 2.0
+中的署名、保留声明与其他义务。
+
+----------------------------------------------------------------------
+
+Additional Competition Attribution Requirement
+
+AirDrop — fixed-wing UAV "recon then airdrop" control system
+Copyright 2026 Taiyuan University of Technology Model Aircraft Association
+and Yan Yiyang (The AirDrop Authors)
+
+Licensed under the Apache License, Version 2.0 (see the LICENSE file).
+
+In addition to the terms of the LICENSE, any individual or team that uses this
+project (or a derivative work) in a competition, submission, or public release
+must credit the project "AirDrop" and state its source, e.g., "AirDrop by Yan
+Yiyang / the Model Aircraft Association of Taiyuan University of Technology"
+plus the repository URL.

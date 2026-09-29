@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sdf version="1.9">
+  <model name="rc_cessna_down_cam">
+    <self_collide>false</self_collide>
+    <include merge="true">
+      <uri>model://rc_cessna</uri>
+    </include>
+
+    <!-- The camera link has to come from a merged submodel include. Declaring
+         the link inline with a joint does not apply the joint transform, which
+         leaves the camera at the model origin pointing forward.
+         NOTE: the include pose is resolved in the merged model frame, not
+         relative to base_link. rc_cessna shifts base_link up to z=+0.246, so
+         the pose below is base_link (-0.08, 0, -0.08) expressed in that frame. -->
+    <include merge="true">
+      <uri>model://rc_cessna_down_cam/camera_720p</uri>
+      <pose>-0.08 0 0.166 0 1.5707 0</pose>
+      <name>camera_720p</name>
+    </include>
+
+    <joint name="CameraJoint" type="fixed">
+      <parent>base_link</parent>
+      <child>camera_link</child>
+      <pose relative_to="base_link">0 0 0 0 1.5707 0</pose>
+    </joint>
+  </model>
+</sdf>

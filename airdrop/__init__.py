@@ -1,0 +1,566 @@
+"""AirDrop —— 基于 PX4 + MAVSDK 的固定翼无人机察打一体控制系统。
+
+模块划分
+--------
+- :mod:`airdrop.telemetry`：遥测与控制——MAVSDK 工作线程、线程安全遥测代理、指令模型；
+- :mod:`airdrop.video`：视频接收——ffmpeg 拉流（一帧不丢）、帧-遥测时间对齐、FIFO 缓冲；
+- :mod:`airdrop.record`：记录与回放——飞行目录"五个记录文件 + 投放记录"写入磁盘、按原时间轴重放；
+- :mod:`airdrop.perception`：视频处理——YOLO 检测 + （RapidOCR 读编号 | 12 类直出）；
+- :mod:`airdrop.georef`：坐标处理——像素 → NED（视线与地面求交）→ WGS84；
+- :mod:`airdrop.targeting`：目标统计——DBSCAN 聚类 + 按编号 median/max 选唯一结果；
+- :mod:`airdrop.ballistics`：弹道与投放——二次阻力 RK4 落点预测 + 实时投放判据（含强制投放）
+  + 投放记录（位置/速度/姿态）与投放试验反演（fit_ballistics）；
+- :mod:`airdrop.mission`：任务编排——状态机 + 飞掠/降落航线拼接 + 目标点解算 + 主循环；
+- :mod:`airdrop.config`：全部参数的唯一集中处。
+
+已实现：标定流水线、遥测/视频/感知/坐标/统计/弹道/任务编排、记录与回放、
+端到端离线链路（``tests/test_e2e.py``）、投放记录与弹道参数反演（``tools/fit_ballistics.py``）。
+
+核心约定（迁移自 2.x，继续有效）
+--------------------------------
+1. MAVSDK 跑在专用线程里、持有自己的 asyncio 循环；指令经其队列串行执行。
+2. 遥测是"最新可用值合并"的快照；按时间查询走定采样率历史 + 内插/外推。
+3. 视频每一帧都交给 sink（一帧不丢）；``read()``/``latest()`` 是允许丢帧的实时路径。
+4. 帧按"收到时间 − 链路延时"还原拍摄时刻，再按该时刻取遥测（见 ``video.align``）。
+5. 对齐结果（画面 + 拍摄时刻遥测）进 FIFO 环形缓冲，供感知/记录等读者异步消费。
+6. 坐标解算用标定产出的相机→机体外参，不用硬编码安装角（见 ``georef.camera``）。
+"""
+
+__version__ = "0.1"
+
+# ----------------------------------------------------------------------
+# 惰性导出（PEP 562）：import airdrop 不再加载任何重依赖
+# ----------------------------------------------------------------------
+# 背景：下面 176 个公开名字分布在 9 个子包里。若在这里逐个 import 子包，"只想取一个
+# Waypoint"也会把 cv2 / mavsdk / torch 拉进进程——CLI 光是打一份 --help 就要等整套
+# GPU / 飞控栈加载完。所以改成按需解析：属性第一次被访问时才 import 提供它的叶子模块，
+# 随后把结果缓存进本模块的命名空间（之后走正常属性查找）。
+#
+# 归属表在下面（_EXPORTS）：按名字精确找到提供它的叶子模块（取 MissionState
+# 只 import airdrop.mission.states，不会顺带加载排在前面的 cv2 / mavsdk 模块）。
+#   import airdrop 本身不加载任何子模块；from airdrop import * 会把它们全部加载。
+from . import _lazy
+
+#: 公开名字 -> 提供它的叶子模块（精确映射，不是按顺序碰运气）：
+#: 取一个 MissionState 只 import airdrop.mission.states，不会顺带加载排在前面的
+#: cv2 / mavsdk 模块。新增导出时这里和 __all__ 都要加。
+_EXPORTS: dict[str, str] = {
+    name: module
+    for module, names in (
+        (
+            "config",
+            (
+                "AlignConfig",
+                "BallisticsConfig",
+                "CameraConfig",
+                "Config",
+                "DropConfig",
+                "GripperConfig",
+                "GroundConfig",
+                "MissionConfig",
+                "OverflyConfig",
+                "PerceptionConfig",
+                "PreflightConfig",
+                "RecordConfig",
+                "RoutesConfig",
+                "TargetingConfig",
+                "TelemetryConfig",
+                "Waypoint",
+            ),
+        ),
+        (
+            "preflight",
+            (
+                "Preflight",
+                "PreflightCheck",
+                "PreflightError",
+            ),
+        ),
+        (
+            "video.source",
+            (
+                "DEFAULT_TELEMETRY_LAG",
+                "HM30_CAMERA_IP",
+                "HM30_DEFAULT_RTSP",
+                "HM30_GROUND_IP",
+                "Hm30VideoSource",
+                "VideoConfig",
+                "VideoFrame",
+                "VideoStats",
+                "open_hm30_video",
+            ),
+        ),
+        (
+            "video.align",
+            (
+                "AlignedSample",
+                "FrameTelemetryAligner",
+            ),
+        ),
+        (
+            "video.buffer",
+            (
+                "AlignmentBuffer",
+                "AlignmentWriter",
+                "BufferStats",
+                "BufferedFrame",
+                "DEFAULT_BUFFER_CAPACITY",
+                "capacity_for",
+                "raw_frame_bytes",
+            ),
+        ),
+        (
+            "telemetry.models",
+            (
+                "Command",
+                "CommandResult",
+                "TelemetrySnapshot",
+            ),
+        ),
+        (
+            "telemetry.broker",
+            (
+                "SUPPORTED_QUERY_MODES",
+                "TelemetryBroker",
+            ),
+        ),
+        (
+            "telemetry.controller",
+            (
+                "ControllerError",
+                "DroneController",
+                "DryRunController",
+                "MISSION_TYPE_MISSION",
+                "MissionController",
+                "NedOrigin",
+                "to_raw_item",
+            ),
+        ),
+        ("telemetry.mavsdk_thread", ("MavsdkThread",)),
+        (
+            "ballistics.model",
+            (
+                "BallisticsModel",
+                "Impact",
+                "MAX_FLIGHT_TIME_S",
+                "SEA_LEVEL_DENSITY",
+                "ZERO_WIND",
+                "isa_air_density",
+                "wind_from_snapshot",
+            ),
+        ),
+        (
+            "ballistics.release",
+            (
+                "ReleaseDecision",
+                "ReleaseJudge",
+                "SUMMARY_HZ",
+                "heading_unit_vector",
+            ),
+        ),
+        (
+            "ballistics.drops",
+            (
+                "DROPS_NAME",
+                "DropRecord",
+                "DropSample",
+                "IMPACTS_CSV_NAME",
+                "IMPACTS_JSONL_NAME",
+                "ImpactMeasurement",
+                "append_drop",
+                "attitude_matrix",
+                "load_drops",
+                "load_impacts",
+                "match_impacts",
+                "predict_record_impact",
+                "release_conditions",
+                "resolve_wind",
+                "write_impact_template",
+            ),
+        ),
+        (
+            "ballistics.fit",
+            (
+                "DropResidual",
+                "FIT_PARAMETERS",
+                "FitConfig",
+                "FitResult",
+                "fit_ballistics",
+            ),
+        ),
+        (
+            "georef.camera",
+            (
+                "CameraModel",
+                "default_camera_model",
+                "load_camera_model",
+            ),
+        ),
+        (
+            "georef.geo",
+            (
+                "LLARef",
+                "ned_distance",
+                "ned_to_wgs84",
+                "wgs84_to_ned",
+            ),
+        ),
+        (
+            "georef.project",
+            (
+                "GroundIntersection",
+                "SideLengthCheck",
+                "cross_check_by_side",
+                "estimate_depth_by_side",
+                "pixel_to_ned",
+                "pixel_to_ray_ned",
+                "quaternion_to_matrix",
+                "undistort_pixel",
+            ),
+        ),
+        (
+            "targeting.models",
+            (
+                "Cluster",
+                "TargetPoint",
+                "TargetingResult",
+            ),
+        ),
+        (
+            "targeting.cluster",
+            (
+                "analyze",
+                "cluster_points",
+                "select_cluster",
+            ),
+        ),
+        (
+            "mission.states",
+            (
+                "InvalidTransition",
+                "MissionState",
+                "MissionStateMachine",
+                "MissionTransition",
+                "TERMINAL_STATES",
+                "TRANSITIONS",
+            ),
+        ),
+        (
+            "mission.items",
+            (
+                "MAV_CMD_DO_CHANGE_SPEED",
+                "MAV_CMD_DO_LAND_START",
+                "MAV_CMD_DO_SET_CAM_TRIGG_DIST",
+                "MAV_CMD_IMAGE_STOP_CAPTURE",
+                "MAV_CMD_NAV_LAND",
+                "MAV_CMD_NAV_LOITER_TO_ALT",
+                "MAV_CMD_NAV_LOITER_UNLIM",
+                "MAV_CMD_NAV_TAKEOFF",
+                "MAV_CMD_NAV_WAYPOINT",
+                "MAV_CMD_VIDEO_STOP_CAPTURE",
+                "MAV_FRAME_GLOBAL",
+                "MAV_FRAME_GLOBAL_RELATIVE_ALT",
+                "MAV_FRAME_GLOBAL_TERRAIN_ALT",
+                "MAV_FRAME_MISSION",
+                "MissionItem",
+                "UNSET",
+                "command_name",
+            ),
+        ),
+        (
+            "mission.plan_file",
+            (
+                "FW_DEFAULT_LAND_ANGLE_DEG",
+                "PLAN_FIRMWARE_PX4",
+                "PLAN_VEHICLE_FIXED_WING",
+                "PlanError",
+                "QgcPlan",
+                "check_fixed_wing_landing",
+                "load_plan",
+            ),
+        ),
+        (
+            "mission.planner",
+            (
+                "DropMissionPlan",
+                "PlanningError",
+                "build_drop_mission",
+                "build_recon_mission",
+                "llaref_of",
+                "overfly_positions",
+                "overfly_waypoints",
+                "waypoint_to_ned",
+            ),
+        ),
+        (
+            "mission.targets",
+            (
+                "DEFAULT_SIDE_TOLERANCE",
+                "PerceptionTargetSource",
+                "TargetTracker",
+            ),
+        ),
+        (
+            "mission.runner",
+            (
+                "MissionMonitor",
+                "MissionRunner",
+                "MissionStats",
+                "PreflightLike",
+            ),
+        ),
+        (
+            "record.recorder",
+            (
+                "DetectionWriter",
+                "DropWriter",
+                "EventLog",
+                "FlightRecorder",
+                "RecorderStats",
+            ),
+        ),
+        (
+            "record.replay",
+            (
+                "FlightLog",
+                "FlightLogError",
+                "FrameIndexError",
+                "FrameRecord",
+                "ReplayStats",
+                "ReplayVideoSource",
+                "TelemetryPacer",
+                "load_broker_from_log",
+            ),
+        ),
+        (
+            "perception.models",
+            (
+                "Detection",
+                "PixelBox",
+            ),
+        ),
+        ("perception.number", ("correct_ocr_number",)),
+        (
+            "perception.cropproc",
+            (
+                "CropResult",
+                "OcrEngine",
+                "OcrEngineConfig",
+                "OpenCvPostProcess",
+            ),
+        ),
+        (
+            "perception.detector",
+            (
+                "DetectionBatch",
+                "Detector",
+                "DetectorConfig",
+            ),
+        ),
+        ("perception.ocr_worker", ("OcrWorkerPool",)),
+        (
+            "perception.pipeline",
+            (
+                "PerceptionConfigLike",
+                "PerceptionStats",
+                "PerceptionWorker",
+            ),
+        ),
+    )
+    for name in names
+}
+
+#: 可以直接当属性访问的子包（airdrop.video 这类）
+_SUBPACKAGES: tuple[str, ...] = (
+    "ballistics",
+    "config",
+    "georef",
+    "mission",
+    "perception",
+    "preflight",
+    "record",
+    "targeting",
+    "telemetry",
+    "video",
+)
+
+__getattr__ = _lazy.lazy_exports(__name__, _EXPORTS, subpackages=_SUBPACKAGES)
+__dir__ = _lazy.lazy_dir(__name__)
+
+__all__ = [
+    "DROPS_NAME",
+    "FIT_PARAMETERS",
+    "IMPACTS_CSV_NAME",
+    "IMPACTS_JSONL_NAME",
+    "MISSION_TYPE_MISSION",
+    "SUPPORTED_QUERY_MODES",
+    "TERMINAL_STATES",
+    "TRANSITIONS",
+    "UNSET",
+    "__version__",
+    "AlignConfig",
+    "AlignedSample",
+    "AlignmentBuffer",
+    "AlignmentWriter",
+    "BallisticsConfig",
+    "BallisticsModel",
+    "BufferStats",
+    "BufferedFrame",
+    "CameraConfig",
+    "CameraModel",
+    "Cluster",
+    "Command",
+    "CommandResult",
+    "Config",
+    "ControllerError",
+    "CropResult",
+    "DEFAULT_BUFFER_CAPACITY",
+    "DEFAULT_SIDE_TOLERANCE",
+    "DEFAULT_TELEMETRY_LAG",
+    "Detection",
+    "DetectionBatch",
+    "DetectionWriter",
+    "Detector",
+    "DetectorConfig",
+    "DroneController",
+    "DropConfig",
+    "DropMissionPlan",
+    "DropRecord",
+    "DropResidual",
+    "DropSample",
+    "DropWriter",
+    "DryRunController",
+    "EventLog",
+    "FitConfig",
+    "FitResult",
+    "FlightLog",
+    "FlightLogError",
+    "FlightRecorder",
+    "FrameIndexError",
+    "FrameRecord",
+    "FrameTelemetryAligner",
+    "FW_DEFAULT_LAND_ANGLE_DEG",
+    "GripperConfig",
+    "GroundConfig",
+    "GroundIntersection",
+    "HM30_CAMERA_IP",
+    "HM30_DEFAULT_RTSP",
+    "HM30_GROUND_IP",
+    "Hm30VideoSource",
+    "Impact",
+    "ImpactMeasurement",
+    "InvalidTransition",
+    "LLARef",
+    "MAX_FLIGHT_TIME_S",
+    "MAV_CMD_DO_CHANGE_SPEED",
+    "MAV_CMD_DO_LAND_START",
+    "MAV_CMD_DO_SET_CAM_TRIGG_DIST",
+    "MAV_CMD_IMAGE_STOP_CAPTURE",
+    "MAV_CMD_NAV_LAND",
+    "MAV_CMD_NAV_LOITER_TO_ALT",
+    "MAV_CMD_NAV_LOITER_UNLIM",
+    "MAV_CMD_NAV_TAKEOFF",
+    "MAV_CMD_NAV_WAYPOINT",
+    "MAV_CMD_VIDEO_STOP_CAPTURE",
+    "MAV_FRAME_GLOBAL",
+    "MAV_FRAME_GLOBAL_RELATIVE_ALT",
+    "MAV_FRAME_GLOBAL_TERRAIN_ALT",
+    "MAV_FRAME_MISSION",
+    "MavsdkThread",
+    "MissionConfig",
+    "MissionController",
+    "MissionItem",
+    "MissionMonitor",
+    "MissionRunner",
+    "MissionState",
+    "MissionStateMachine",
+    "MissionStats",
+    "MissionTransition",
+    "NedOrigin",
+    "OcrEngine",
+    "OcrEngineConfig",
+    "OcrWorkerPool",
+    "OpenCvPostProcess",
+    "OverflyConfig",
+    "PerceptionConfig",
+    "PerceptionConfigLike",
+    "PerceptionStats",
+    "PerceptionTargetSource",
+    "PerceptionWorker",
+    "PixelBox",
+    "PLAN_FIRMWARE_PX4",
+    "PLAN_VEHICLE_FIXED_WING",
+    "PlanError",
+    "PlanningError",
+    "Preflight",
+    "PreflightCheck",
+    "PreflightConfig",
+    "PreflightError",
+    "PreflightLike",
+    "QgcPlan",
+    "RecordConfig",
+    "RecorderStats",
+    "ReleaseDecision",
+    "ReleaseJudge",
+    "ReplayStats",
+    "ReplayVideoSource",
+    "RoutesConfig",
+    "SEA_LEVEL_DENSITY",
+    "SUMMARY_HZ",
+    "SideLengthCheck",
+    "TargetPoint",
+    "TargetTracker",
+    "TargetingConfig",
+    "TargetingResult",
+    "TelemetryBroker",
+    "TelemetryConfig",
+    "TelemetryPacer",
+    "TelemetrySnapshot",
+    "VideoConfig",
+    "VideoFrame",
+    "VideoStats",
+    "Waypoint",
+    "ZERO_WIND",
+    "analyze",
+    "append_drop",
+    "attitude_matrix",
+    "build_drop_mission",
+    "build_recon_mission",
+    "capacity_for",
+    "check_fixed_wing_landing",
+    "cluster_points",
+    "command_name",
+    "correct_ocr_number",
+    "cross_check_by_side",
+    "default_camera_model",
+    "estimate_depth_by_side",
+    "fit_ballistics",
+    "heading_unit_vector",
+    "isa_air_density",
+    "llaref_of",
+    "load_broker_from_log",
+    "load_camera_model",
+    "load_drops",
+    "load_impacts",
+    "load_plan",
+    "match_impacts",
+    "ned_distance",
+    "ned_to_wgs84",
+    "open_hm30_video",
+    "overfly_positions",
+    "overfly_waypoints",
+    "pixel_to_ned",
+    "pixel_to_ray_ned",
+    "predict_record_impact",
+    "quaternion_to_matrix",
+    "raw_frame_bytes",
+    "release_conditions",
+    "resolve_wind",
+    "select_cluster",
+    "to_raw_item",
+    "undistort_pixel",
+    "waypoint_to_ned",
+    "wgs84_to_ned",
+    "wind_from_snapshot",
+    "write_impact_template",
+]

@@ -1,0 +1,8 @@
+newmtl pic_10_transport
+Ka 1.0 1.0 1.0
+Kd 1.0 1.0 1.0
+Ks 0.0 0.0 0.0
+Ns 10.0
+d 1.0
+illum 1
+map_Kd ../textures/pic_10_transport.png

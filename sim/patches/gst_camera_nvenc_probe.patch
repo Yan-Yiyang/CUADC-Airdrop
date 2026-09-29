@@ -1,0 +1,121 @@
+diff --git a/src/modules/simulation/gz_plugins/gstreamer/GstCameraSystem.cpp b/src/modules/simulation/gz_plugins/gstreamer/GstCameraSystem.cpp
+index 369d24572e..4f0d58b525 100644
+--- a/src/modules/simulation/gz_plugins/gstreamer/GstCameraSystem.cpp
++++ b/src/modules/simulation/gz_plugins/gstreamer/GstCameraSystem.cpp
+@@ -33,6 +33,8 @@
+ 
+ #include "GstCameraSystem.hpp"
+ 
++#include <iostream>
++
+ #include <gz/plugin/Register.hh>
+ #include <gz/common/Console.hh>
+ #include <gz/transport/TopicUtils.hh>
+@@ -214,6 +216,60 @@ void GstCameraSystem::onImage(const gz::msgs::Image &msg)
+ 	}
+ }
+ 
++//////////////////////////////////////////////////
++// Check whether the NVIDIA encoder can really be brought up on this host.
++// Creating the element is not enough to tell: on some driver stacks (for
++// example a WSL setup where the NVENC path is unavailable) nvh264enc is
++// created successfully but then fails with "Selected preset not supported".
++// Without this probe the plugin would settle on an encoder that never
++// produces a single frame.
++static bool nvencH264Usable()
++{
++	GstElement *pipeline = gst_pipeline_new(nullptr);
++	GstElement *source = gst_element_factory_make("videotestsrc", nullptr);
++	GstElement *converter = gst_element_factory_make("videoconvert", nullptr);
++	GstElement *encoder = gst_element_factory_make("nvh264enc", nullptr);
++	GstElement *sink = gst_element_factory_make("fakesink", nullptr);
++
++	if (!pipeline || !source || !converter || !encoder || !sink) {
++		if (pipeline) { gst_object_unref(pipeline); }
++
++		if (source) { gst_object_unref(source); }
++
++		if (converter) { gst_object_unref(converter); }
++
++		if (encoder) { gst_object_unref(encoder); }
++
++		if (sink) { gst_object_unref(sink); }
++
++		return false;
++	}
++
++	g_object_set(G_OBJECT(source), "num-buffers", 2, NULL);
++
++	bool usable = false;
++	gst_bin_add_many(GST_BIN(pipeline), source, converter, encoder, sink, NULL);
++
++	if (gst_element_link_many(source, converter, encoder, sink, NULL) &&
++	    gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE) {
++		GstBus *bus = gst_element_get_bus(pipeline);
++		GstMessage *msg = bus ? gst_bus_timed_pop_filtered(
++					  bus, 5 * GST_SECOND,
++					  (GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS)) : nullptr;
++
++		usable = msg && GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS;
++
++		if (msg) { gst_message_unref(msg); }
++
++		if (bus) { gst_object_unref(bus); }
++	}
++
++	gst_element_set_state(pipeline, GST_STATE_NULL);
++	gst_object_unref(pipeline);
++
++	return usable;
++}
++
+ //////////////////////////////////////////////////
+ void GstCameraSystem::gstThreadFunc()
+ {
+@@ -242,16 +298,18 @@ void GstCameraSystem::gstThreadFunc()
+ 	GstElement *converter = gst_element_factory_make("videoconvert", nullptr);
+ 	GstElement *queue2 = gst_element_factory_make("queue", nullptr);
+ 
+-	// Configure source and queues for better buffering
++	// Keep the queues shallow. The default depth of 30 buffers holds about a
++	// second of full-resolution frames, which piles up memory when the encoder
++	// cannot keep up with the camera.
+ 	g_object_set(G_OBJECT(queue1),
+-		     "max-size-buffers", 30,
++		     "max-size-buffers", 3,
+ 		     "max-size-time", 0,
+ 		     "max-size-bytes", 0,
+ 		     "leaky", 2, // downstream (newer buffers)
+ 		     NULL);
+ 
+ 	g_object_set(G_OBJECT(queue2),
+-		     "max-size-buffers", 30,
++		     "max-size-buffers", 3,
+ 		     "max-size-time", 0,
+ 		     "max-size-bytes", 0,
+ 		     NULL);
+@@ -264,7 +322,7 @@ void GstCameraSystem::gstThreadFunc()
+ 
+ 	GstElement *encoder;
+ 
+-	if (_useCuda) {
++	if (_useCuda && nvencH264Usable()) {
+ 		encoder = gst_element_factory_make("nvh264enc", nullptr);
+ 
+ 		if (encoder) {
+@@ -292,6 +350,15 @@ void GstCameraSystem::gstThreadFunc()
+ 		}
+ 
+ 	} else {
++		if (_useCuda) {
++			gzwarn << "NVIDIA H.264 encoder cannot be initialized on this system, "
++			       << "falling back to the software encoder" << std::endl;
++			// The Gazebo console is not always visible in the PX4 SITL log, but
++			// which encoder ends up in use matters when the video looks wrong.
++			std::cerr << "GstCameraSystem: NVIDIA H.264 encoder unavailable, "
++				  << "using the software encoder" << std::endl;
++		}
++
+ 		encoder = gst_element_factory_make("x264enc", nullptr);
+ 		g_object_set(G_OBJECT(encoder),
+ 			     "bitrate", 4000,
