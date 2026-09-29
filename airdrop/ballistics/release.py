@@ -61,6 +61,9 @@ class ReleaseDecision:
     predicted: Impact | None = None
     horizontal_error_m: float | None = None
     passed_target: bool = False
+    #: 本次飞掠里是否出现过"还在目标前方"——``force_after_pass`` 的前提。
+    #: 没从前面接近过就不算"越过"（见 :meth:`ReleaseJudge.update`）。
+    approached: bool = False
     #: 前推 ``delay_s`` 之后用于预测的位置（NED，米）
     release_position: tuple[float, float, float] | None = None
     #: 这一拍用的前推量（秒）
@@ -71,6 +74,7 @@ class ReleaseDecision:
             "should_release": self.should_release,
             "reason": self.reason,
             "passed_target": self.passed_target,
+            "approached": self.approached,
             "delay_s": float(self.delay_s),
         }
         if self.horizontal_error_m is not None:
@@ -104,6 +108,8 @@ class ReleaseJudge:
     _last_summary: float = field(default=0.0, init=False)
     _evaluations: int = field(default=0, init=False)
     _wind_warned: bool = field(default=False, init=False)
+    #: 本次飞掠里见过"在目标前方"（即使方向不对也算"接近过"）——见 ``force_after_pass``
+    _approached: bool = field(default=False, init=False)
 
     # ------------------------------------------------------------------
     @property
@@ -120,6 +126,7 @@ class ReleaseJudge:
         self._released = False
         self._last_summary = 0.0
         self._evaluations = 0
+        self._approached = False
 
     # ------------------------------------------------------------------
     def update(
@@ -180,10 +187,16 @@ class ReleaseJudge:
         passed = (
             (release_position[0] - target[0]) * north + (release_position[1] - target[1]) * east
         ) > 0.0
+        if not passed:
+            # "越过"的前提是**本次飞掠里真的从目标前方接近过**。没有这道门槛时，
+            # 飞机进入 OVERFLY 的瞬间只要投影已在目标后方（例如刚结束盘旋、还在
+            # 飞往入场点的路上）就会在第一拍强制投放——实测 r2 世界架次
+            # 某架次：OVERFLY 第一拍以 113 m 误差假触发。
+            self._approached = True
 
         if error is not None and error <= self.config.radius_m:
             return self._release("predict", stamp, impact, error, passed, release_position, delay)
-        if passed and self.config.force_after_pass:
+        if passed and self._approached and self.config.force_after_pass:
             return self._release("fallback", stamp, impact, error, passed, release_position, delay)
 
         reason = "waiting" if impact.ok else f"no_prediction:{impact.reason}"
@@ -195,6 +208,7 @@ class ReleaseJudge:
                 predicted=impact,
                 horizontal_error_m=error,
                 passed_target=passed,
+                approached=self._approached,
                 release_position=release_position,
                 delay_s=delay,
             ),
@@ -252,6 +266,7 @@ class ReleaseJudge:
             predicted=impact,
             horizontal_error_m=error,
             passed_target=passed,
+            approached=self._approached,
             release_position=release_position,
             delay_s=delay,
         )

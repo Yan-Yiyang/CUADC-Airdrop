@@ -5,7 +5,7 @@
 * :mod:`~airdrop.mission.plan_file`：QGC ``.plan`` 解析 + 固定翼降落预检（本地照
   PX4 的判据先检查一遍，不合格就带着原因失败，而不是上传后被飞控整条拒掉）；
 * :mod:`~airdrop.mission.states`：状态、合法转移表与转移历史；
-* :mod:`~airdrop.mission.planner`：侦察段 / 飞掠段 [entry, exit] / 与降落段
+* :mod:`~airdrop.mission.planner`：侦查段 / 飞掠段 [entry, exit] / 与降落段
   拼接成一条任务（纯函数，离线可测）；
 * :mod:`~airdrop.mission.targets`：:class:`TargetTracker`——检测结果 → georef →
   目标点 → 统计结果（全链路里"坐标解算"那一段，实飞与回放共用）；

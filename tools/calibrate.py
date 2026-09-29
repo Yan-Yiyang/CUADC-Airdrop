@@ -2,7 +2,7 @@
 
 用法（输入 = ``FlightRecorder`` 录出的飞行目录，见计划第 6 章）::
 
-    ./.venv/Scripts/python.exe -m airdrop.run calibrate --flight flights/20260913-185512
+    ./.venv/Scripts/python.exe -m airdrop.run calibrate --flight flights/<架次>
     ./.venv/Scripts/python.exe -m airdrop.run calibrate --help
 
 本文件是**纯库模块**：顶部常量是默认值，:class:`CalibrateConfig` / :func:`build_config`
@@ -28,9 +28,9 @@ FlightRecorder 的标准飞行目录）。
 3. **外参**：把棋盘格位姿与**同一时刻**的遥测位姿配成对（:func:`align_body_poses`），
    再解 ``AX = XB`` 求相机→机体旋转。
 
-使用说明
---------
-* ``t_bc``（杆臂）在手持采集下估不准：``(R_a − I)t_x = R_x t_b − t_a`` 里的
+已知边界（写在这里免得被当成 bug）
+----------------------------------
+* ``t_bc``（杆臂）在手持采集下**估不准**：``(R_a − I)t_x = R_x t_b − t_a`` 里的
   ``t_a`` 只能来自遥测位置，而室内无 GPS 时它不可信。所以按计划"旋转以标定为准、
   平移以尺量为准"：标定文件里的 ``t_bc`` 写尺量值 :data:`MEASURED_T_BC`，
   估计值（:func:`solve_hand_eye` 的平移分支）照算，但只写进 ``meta`` 供**对比校验**

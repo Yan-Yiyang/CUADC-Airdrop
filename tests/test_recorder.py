@@ -397,7 +397,7 @@ def test_repeated_timestamp_increments_suffix(tmp_path: Path, broker: TelemetryB
     config = Config().validated()
 
     real_strftime = _time.strftime
-    fixed_stamp = "20260101-120000"
+    fixed_stamp = "某架次"
     counter = {"n": 0}
 
     def fake_strftime(_fmt):
@@ -417,8 +417,8 @@ def test_repeated_timestamp_increments_suffix(tmp_path: Path, broker: TelemetryB
         d2 = r2.flight_dir
 
         assert d1 is not None and d2 is not None
-        assert d1.name == "20260101-120000"
-        assert d2.name == "20260101-120000-1"
+        assert d1.name == "某架次"
+        assert d2.name == "某架次-1"
         assert d1.exists() and d2.exists()
     finally:
         _time.strftime = real_strftime  # type: ignore[assignment]

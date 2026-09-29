@@ -361,7 +361,7 @@ def _to_hold(
     step: float = 0.05,
     limit: int = 5000,
 ) -> None:
-    """推进到 HOLD_PROCESS：先在侦察段跑两拍（让看门狗看到"任务在跑"）再报飞完。
+    """推进到 HOLD_PROCESS：先在侦查段跑两拍（让看门狗看到"任务在跑"）再报飞完。
 
     这两拍是必需的：新任务刚上传时 ``is_mission_finished()`` 的读数不作数
     （见 :class:`MissionMonitor`），得先观测到一次 ``False``。
@@ -380,7 +380,7 @@ def test_state_machine_walks_the_planned_route_and_emits_events() -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     machine = MissionStateMachine(on_event=lambda kind, data: events.append((kind, data)))
 
-    # 顺序照正式流程：INIT（遥测/原点）→ PREFLIGHT（自检）→ WAIT_AIRBORNE（等在空中）→ 侦察…
+    # 顺序照正式流程：INIT（遥测/原点）→ PREFLIGHT（自检）→ WAIT_AIRBORNE（等在空中）→ 侦查…
     machine.transition(MissionState.PREFLIGHT, reason="telemetry_ready", now=0.5)
     machine.transition(MissionState.WAIT_AIRBORNE, reason="preflight_ok", now=0.7)
     machine.transition(MissionState.RECON, reason="recon_started", now=1.0)
@@ -439,7 +439,7 @@ def test_emit_event_swallows_callback_failures() -> None:
     emit_event(boom, "state", {"to_state": "RECON"})  # 不该抛
     emit_event(None, "state", {})  # 没有回调也无所谓
     machine = MissionStateMachine(on_event=boom)
-    # 同样不该抛：连跳三拍（自检 → 等起飞 → 侦察），每一跳的事件回调都在抛
+    # 同样不该抛：连跳三拍（自检 → 等起飞 → 侦查），每一跳的事件回调都在抛
     machine.transition(MissionState.PREFLIGHT, reason="ok")
     machine.transition(MissionState.WAIT_AIRBORNE, reason="ok")
     machine.transition(MissionState.RECON, reason="ok")
@@ -529,7 +529,7 @@ class FakePreflight:
 
 
 class FakeVideoSource:
-    """假视频源：只提供预检会读的两样东西（``stats.frames`` 与 ``latest()``）。"""
+    """假图传源：只提供预检会读的两样东西（``stats.frames`` 与 ``latest()``）。"""
 
     def __init__(self, *, frames: int = 12, size: tuple[int, int] | None = (1280, 720)) -> None:
         self.stats = SimpleNamespace(frames=frames)
@@ -752,7 +752,7 @@ def test_operator_mode_never_uploads_the_recon_mission() -> None:
 
     _drive(runner, clock, ticks=1)
     assert runner.state is MissionState.RECON
-    assert controller.uploads == [], "operator 模式绝不能自己上传侦察航线"
+    assert controller.uploads == [], "operator 模式绝不能自己上传侦查航线"
     assert _events_of(events, "recon_waiting_operator")
 
     _drive(runner, clock, ticks=2)
@@ -774,7 +774,7 @@ def test_operator_mode_never_uploads_the_recon_mission() -> None:
 
 
 def test_auto_mode_uploads_the_recon_mission() -> None:
-    """自动测试档（``recon_upload="auto"``）：本包上传并启动侦察航线。"""
+    """自动测试档（``recon_upload="auto"``）：本包上传并启动侦查航线。"""
     clock = FakeClock()
     controller = FakeController()
     runner = _runner(clock, controller, judge=FakeJudge())
@@ -786,7 +786,7 @@ def test_auto_mode_uploads_the_recon_mission() -> None:
 
 
 def test_airborne_gate_waits_until_in_air() -> None:
-    """``in_air=False`` 就一直等（在停机坪上不进侦察），转 True 才走。"""
+    """``in_air=False`` 就一直等（在停机坪上不进侦查），转 True 才走。"""
     clock = FakeClock()
     controller = FakeController()
     broker = FakeBroker(clock)
@@ -817,7 +817,7 @@ def test_airborne_falls_back_to_altitude_when_in_air_is_missing() -> None:
 
     _drive(runner, clock, ticks=2)
     assert runner.state is MissionState.WAIT_AIRBORNE
-    assert _events_of(events, "airborne") == [], "高度没到就不该进侦察"
+    assert _events_of(events, "airborne") == [], "高度没到就不该进侦查"
 
     broker.altitude_m = 30.0
     _drive(runner, clock, ticks=1)
@@ -846,7 +846,7 @@ def test_require_airborne_false_passes_the_gate_without_waiting() -> None:
 
     _drive(runner, clock, ticks=1)  # 一拍走完 INIT → PREFLIGHT → WAIT_AIRBORNE → RECON
 
-    assert runner.state is MissionState.RECON, "关闭等待起飞后应当立即进入侦察"
+    assert runner.state is MissionState.RECON, "关闭等待起飞后应当立即进入侦查"
     assert [str(record.to_state) for record in runner.history] == [
         "PREFLIGHT",
         "WAIT_AIRBORNE",
@@ -1074,7 +1074,7 @@ def test_build_recon_mission_marks_takeoff_on_first_item() -> None:
 
 
 def test_build_recon_mission_rejects_empty_route() -> None:
-    with pytest.raises(PlanningError, match="侦察航线为空"):
+    with pytest.raises(PlanningError, match="侦查航线为空"):
         build_recon_mission(_config(recon=0))
 
 
@@ -1155,9 +1155,9 @@ def test_runner_completes_full_mission() -> None:
 
     assert runner.state is MissionState.INIT
     _drive(runner, clock, ticks=1)
-    assert runner.state is MissionState.RECON, "遥测与原点就绪后立刻上传并启动侦察航线"
+    assert runner.state is MissionState.RECON, "遥测与原点就绪后立刻上传并启动侦查航线"
 
-    _drive(runner, clock, ticks=1)  # 侦察段跑一拍：让看门狗看到"任务在跑"
+    _drive(runner, clock, ticks=1)  # 侦查段跑一拍：让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.HOLD_PROCESS)
     assert runner.state is MissionState.HOLD_PROCESS
@@ -1221,7 +1221,7 @@ def test_runner_uploads_recon_then_merged_drop_mission() -> None:
         MAV_CMD_NAV_WAYPOINT,
         MAV_CMD_NAV_LAND,
     ]
-    # 上传 → 启动成对出现，且侦察在前、盘旋在后（顺序不能反）
+    # 上传 → 启动成对出现，且侦查在前、盘旋在后（顺序不能反）
     assert controller.calls.index("upload_mission") < controller.calls.index("start_mission")
     assert controller.calls.index("start_mission") < controller.calls.index("hold")
 
@@ -1812,7 +1812,7 @@ def test_runner_aborts_when_recon_times_out() -> None:
 
 
 def test_runner_does_not_trust_a_stale_finished_flag() -> None:
-    """回归：新任务刚上传时飞控可能仍报上一次的 True —— 不能就此判定侦察结束。"""
+    """回归：新任务刚上传时飞控可能仍报上一次的 True —— 不能就此判定侦查结束。"""
     clock = FakeClock()
     controller = FakeController(sticky_finished=True)
     controller.finished = True  # 一直回 True，从未出现过 False
@@ -1880,7 +1880,7 @@ def test_runner_aborts_when_planning_fails() -> None:
     assert runner.state is MissionState.ABORT
     assert runner.history[-1].reason == "plan_drop_failed"
     assert "备用点" in _events_of(events, "error")[0]["message"]
-    assert len(controller.uploads) == 1, "只上传过侦察航线"
+    assert len(controller.uploads) == 1, "只上传过侦查航线"
 
 
 def test_runner_without_judge_skips_the_drop_and_lands() -> None:
@@ -2302,7 +2302,7 @@ def test_run_loop_finishes_the_whole_mission_on_a_fake_clock() -> None:
     assert runner.stats.uploads == 2 and runner.stats.releases == 1
     assert runner.stats.aborts == 0
     assert runner.plan is not None and runner.plan.source == "target"
-    # 假时间推进 ≈ 侦察 60s + 处理 + 飞掠/降落 120s（节拍 5Hz → 每拍 0.2s）
+    # 假时间推进 ≈ 侦查 60s + 处理 + 飞掠/降落 120s（节拍 5Hz → 每拍 0.2s）
     elapsed = clock.now - started
     assert 180.0 <= elapsed <= 200.0
 

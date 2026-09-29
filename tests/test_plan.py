@@ -443,7 +443,7 @@ def test_build_drop_mission_rejects_unreadable_plan(workdir: Path) -> None:
 def test_build_recon_mission_uses_plan_verbatim(
     workdir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """侦察段来自 plan 时原样使用；缺起飞项只告警（不悄悄补一项进去）。"""
+    """侦查段来自 plan 时原样使用；缺起飞项只告警（不悄悄补一项进去）。"""
     items = [
         _item(MAV_CMD_NAV_WAYPOINT, 47.0, 8.0, 50.0, do_jump_id=1),
         _item(MAV_CMD_NAV_WAYPOINT, 47.002, 8.0, 50.0, do_jump_id=2),
@@ -463,7 +463,7 @@ def test_config_rejects_two_sources_for_one_leg() -> None:
     """一条腿两个来源 → 报错。静默让其中一个优先，比报错危险得多。"""
     with pytest.raises(ValueError, match="降落段只能二选一"):
         _config(land_plan="routes/land.plan")
-    with pytest.raises(ValueError, match="侦察段只能二选一"):
+    with pytest.raises(ValueError, match="侦查段只能二选一"):
         _config(recon_plan="routes/recon.plan")
     with pytest.raises(ValueError, match="fw_land_angle_deg"):
         Config(routes=RoutesConfig(fw_land_angle_deg=90.0)).validated()

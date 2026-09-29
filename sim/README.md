@@ -31,6 +31,13 @@ bash sim/run_sitl.sh r2                       # 第二轮世界 + 带下视相�
 HEADLESS=1 bash sim/run_sitl.sh r2            # 只起 server，无 GUI
 bash sim/run_sitl.sh r2 gz_rc_cessna          # 换无相机机身（用 PX4 自带模型）
 PX4_DIR=/path/to/PX4-Autopilot bash sim/run_sitl.sh r2    # PX4 不在默认位置时
+
+停 SITL：`pkill -f 'bin/px4'; pkill -x ruby`。
+
+⚠ `gz sim` 的**进程名是 `ruby`**（只有命令行里才带 "gz sim"）：`pkill -f 'gz sim'`
+会把"命令行里含这串字样"的自己也算进去，容易先杀掉发起命令的 shell（实测踩过：
+以为关了、其实 server 还在以 600%+ CPU 跑）。按 `-x ruby` 杀最稳，
+或用 `ps -eo pid,pcpu,args --sort=-pcpu` 确认没有 `gz sim ...` 再收工。
 ```
 
 只装不改：
@@ -48,6 +55,61 @@ export GZ_SIM_RESOURCE_PATH="$PWD/sim/worlds/cuadc:$GZ_SIM_RESOURCE_PATH"
 cd ~/PX4-Autopilot
 PX4_GZ_WORLD=cuadc_recon_strike_r2 make px4_sitl gz_rc_cessna_down_cam
 ```
+
+## 目标侦查精度自动测试（`sitl-recon`）
+
+一条命令量"**解算出的目标坐标离天井中心多远**"（验收口径 < 2 m）：
+
+```bash
+# WSL 里先起 SITL（带下视相机机型 + r2 世界）
+bash sim/run_sitl.sh r2
+# Windows 侧（仓库 venv）
+./.venv/Scripts/python.exe -m airdrop.run sitl-recon
+
+# 更稳的顺序是"先起脚本、再起 SITL"：脚本先把 14540 绑住，SITL 一启动就连上
+# （PX4 的 API/offboard 链路长时间没有接收方时会停发；脚本自己也会重连）
+```
+
+严格**任务流程**，全程没有 offboard 设定点：上传「起飞 + 扫掠」任务 → `MISSION_START`
+（PX4 自己解锁、切任务模式、执行首项起飞）→ 本包只监视遥测与画面 → 飞完 `hold`。
+视频走 Gazebo 自带的 `GstCameraSystem`（RTP/H.264 → `127.0.0.1:5600`），Windows 侧用
+ffmpeg 直接收（mirrored 网络共享端口；**不必用 HM30，也不用 QGC 转发**）。
+
+产物：终端报告 + `.sitl-recon-tmp/report.json`
+（任务结果与分井误差、延时敏感性——同一批检测按不同 `telemetry_lag` 重算、
+反向诊断——同一条扫掠线两个方向的偏差 ⇒ 链路延时估计）+ `flights/<ts>/` 记录。
+
+⚠ **链路延时是这里的头号精度项**：SITL 实测 ≈0.5 s（Gazebo 渲染 + GStreamer/x264 编码缓冲
++ RTP/UDP + ffmpeg 解码），**与真机 HM30 的 ≈0.15 s 完全不同**。用错延时的代价是沿航迹
+的系统偏差（实测：0.08 s → 3.5 m；0.49~0.52 s → 0.05~1.0 m）。所以报告里会给
+"**自标定**"：用已知的世界真值把本架次的链路延时解出来，并**留一个天井只做验证**；
+相机外参则严格按模型给（`sim/vehicles/rc_cessna_down_cam`）——外参若错，修正延时后
+仍会剩下恒定的像素偏差（实测修正后残差 (+9, +1) px ≈ 噪声）。
+
+与环境有关的三条：
+
+* 测试会临时把 `NAV_DLL_ACT` 置 0（SITL 里没有操作手盯数据链，免得 failsafe 中途抢
+  控制），收尾还原成机型标准值 2；
+* **`MIS_TKO_LAND_REQ` 已在仿真机型里永久置 0**：侦查段的任务只有"起飞 + 扫掠"——
+  真实流程里投弹航线要等空中出结果才能生成，降落段没法预先和侦查段拼成一条任务——而
+  `rc.fw_defaults` 对固定翼默认 2（"带了起飞就必须带降落"），不关掉的话 PX4 的
+  `mission_feasibility_checker` 直接拒任务
+  （`Mission rejected: Landing waypoint/pattern required.`），飞机连解锁都不会发生。
+  置 0 = 起飞项/降落项都不再必需，只影响这台仿真机型；
+* **`FW_LND_USETER=0` 也在仿真机型里永久置 0**：SITL 机型没有测距传感器，而 FW 自动
+  降落默认要用地形估计（1），拿不到估计时会按 `FW_LND_ABORT`（默认 3 含地形位）
+  在进入降落段 10 s 后 abort 降落、在落点上方 30 m 无限盘旋——任务永远不结束
+  （实测架次 某架次：`Holding at 30 m above landing waypoint.`，
+  最后靠状态机 `land_timeout` 收场）。置 0 = 不要求地形估计，flare/下滑用航点高度；
+* 有 QGC 连着更好（真机流程本来就有地面站；它能满足预检的数据链检查）；
+* **跑精度测试一律用无头模式**（`HEADLESS=1 bash sim/run_sitl.sh r2`）：带 GUI 时
+  `gz sim -g` 会和感知抢同一块 GPU，实测把仿真拖到 ~0.5x 实时（ulog 里"侦查飞完"
+  =53.6 模拟秒、遥测同一事件=101.6 实时秒）⇒ 检测只有 8~22 fps、感知落后 ~1900 帧，
+  `HOLD_PROCESS` 看不到目标（架次 某架次 实测）。`px4-rc.gzsim` 里
+  `if [ -z "${HEADLESS}" ]` 才起 GUI，所以置 1 即可；
+* 测试期间会临时置 0 的飞控参数有两条（跑完都还原）：`NAV_DLL_ACT`（无数据链 failsafe）
+  与 `NAV_RCL_ACT`——SITL **没有遥控**（ulog `manual_control_signal_lost` 恒 true），
+  默认的 RC-loss 动作（Return）会在飞几十秒后把飞机拉回场（架次 某架次 实测）。
 
 ## 装进 PX4 的是什么
 
@@ -98,5 +160,5 @@ python -m airdrop.run fetch-aerial      # 换一批真实航拍底图（联网�
 ```
 
 世界是**生成产物**：`.sdf` / 网格 / 材质都别手改（`tests/test_world.py` 会核验
-"生成结果 == 入库文件"）。布局与规则依据见
+"生成结果 == 入库文件"）。布局、规则依据与已知边界见
 [`docs/simulation_world.md`](../docs/simulation_world.md)。

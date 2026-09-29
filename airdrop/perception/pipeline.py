@@ -17,7 +17,7 @@
    :class:`~airdrop.video.buffer.AlignmentBuffer`。
 2. **OCR 绝不阻塞逐帧检测**。OCR 单帧约 100ms（GPU）而 YOLO 约 29ms，内联
    OCR 会让有效帧率掉到 1/4。所以裁剪图送进**独立进程**池，检测继续跑；
-   编号晚几帧回来无所谓（同一目标在整个侦察段会被看到几十次）。
+   编号晚几帧回来无所谓（同一目标在整个侦查段会被看到几十次）。
 
 OCR 逐帧送检
 ------------
@@ -277,6 +277,15 @@ class PerceptionWorker:
             if item is None:
                 return out
             out.append(item)
+
+    @property
+    def queued_results(self) -> int:
+        """结果队列里还没被消费的条数（监控用）。
+
+        队列**无界、不丢弃**：消费者（``MissionRunner`` 的 ``target_result``/``pump``）
+        不抽，结果就一直留着等抽——所以收尾时这个数字应该回落到 0。
+        """
+        return self._results.qsize()
 
     def iter_results(self, timeout: float = 0.5) -> Any:
         """迭代结果，直到 :meth:`stop` 且队列排空。"""

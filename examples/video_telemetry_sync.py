@@ -1,7 +1,7 @@
-"""视频帧 ↔ 遥测的对齐与留存示例：每一帧都进缓冲，随时回看。
+"""图传帧 ↔ 遥测的对齐与留存示例：每一帧都进缓冲，随时回看。
 
 为什么不是"读一帧 → 处理 → 再读一帧"：那样只要有一帧处理慢了，中间帧就被覆盖
-丢掉了。而目标出现的时间可能极短，漏一帧就可能漏掉目标。本项目采用察打一体流程，
+丢掉了。而目标出现的时间可能极短，漏一帧就可能漏掉目标。本项目走"先侦查后空投"，
 可以接受一定的处理延时，不能接受丢帧。所以这里的结构是：
 
 1. 建一个环形缓冲（默认 30 fps × 3 分钟 = 5400 帧）；
@@ -48,8 +48,8 @@ if TYPE_CHECKING:
 # ----------------------------------------------------------------------
 SYSTEM_ADDRESS: str | None = None  # 保留位：None = 不改 TelemetryConfig 的地址
 ADDRESS = "udpin://0.0.0.0:14540"  # MAVSDK 系统地址（与 TelemetryConfig 默认值一致）
-VIDEO_URL = HM30_DEFAULT_RTSP  # 视频 RTSP 地址
-WIDTH, HEIGHT = 1280, 720  # 视频输出尺寸（不探测，直接按这个尺寸切帧）
+VIDEO_URL = HM30_DEFAULT_RTSP  # 图传 RTSP 地址
+WIDTH, HEIGHT = 1280, 720  # 图传输出尺寸（不探测，直接按这个尺寸切帧）
 LAG = DEFAULT_TELEMETRY_LAG  # 链路固定延时（秒）
 
 BUFFER_SECONDS = 180.0  # 缓冲保留时长（秒）：30 × 180 = 5400 帧
@@ -72,7 +72,7 @@ def build_config(
     height: int = HEIGHT,
     lag: float = LAG,
 ) -> Config:
-    """视频 + 遥测那两片配置（本示例不用感知/任务）。"""
+    """图传 + 遥测那两片配置（本示例不用感知/任务）。"""
     base = Config()
     return Config(
         telemetry=replace(base.telemetry, system_address=system_address),
@@ -121,7 +121,7 @@ def reader_loop(buffer: AlignmentBuffer, stop_event: threading.Event, pace: floa
 
 
 def review(buffer: AlignmentBuffer) -> None:
-    """演示"先侦察、后回看"：把缓冲里留下的数据按时间顺序过一遍。"""
+    """演示"先侦查、后回看"：把缓冲里留下的数据按时间顺序过一遍。"""
     span = buffer.indices()
     if span is None:
         LOGGER.warning("缓冲里没有数据可回看")

@@ -2,8 +2,15 @@
 
 用法（集中式入口在 airdrop/run.py）::
 
-    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/20260913-185512
+    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/<架次>
     ./.venv/Scripts/python.exe -m airdrop.run replay --speed 2.0
+
+    # SITL 架次（相机是"内参/外参按模型推导"的模拟标定，路径在 .sitl-recon-tmp/）：
+    #   --calib     要用录这段素材时同一份标定，否则退回粗估模型、坐标不可信
+    #   --land-plan 要规划"飞掠+降落"才需要；不给就只打印飞掠段
+    #   --no-strict 帧被裁剪过的目录（索引里留着已删帧号）必须关严格模式
+    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/<架次> \
+        --calib .sitl-recon-tmp/camera_calib_sim.json --land-plan routes/land.plan --no-strict
 
 本文件是纯库模块：顶部常量是默认值，build_config(**覆盖) / main(**kwargs) 可按需传值；
 命令行由 airdrop/run.py 解析，重依赖都在函数体内导入（--help 不加载它们）。
@@ -38,7 +45,7 @@ from airdrop import Config
 # ----------------------------------------------------------------------
 # 配置（改这里）
 # ----------------------------------------------------------------------
-FLIGHT_DIR = Path("flights")  # 指向具体某次 flights/20260913-185512，或 flights/ 取最新
+FLIGHT_DIR = Path("flights")  # 指向具体某次 flights/<架次>，或 flights/ 取最新
 SPEED = 0.0  # 0=全速 / 1.0=原速 / 2.0=两倍速
 BUFFER_SECONDS = 180.0
 BUFFER_FPS = 30.0
@@ -46,6 +53,17 @@ PLAN_DROP_MISSION = True  # 出了结果就生成飞掠+降落航线（不上传
 STRICT = True  # 回放异常（缺帧/sink 抛异常）就让本次以 error 结束
 PERCEPTION_MODE: str | None = None  # None = 用 Config 默认（ocr）
 SELECTION_RULE: str | None = None  # None = 用 Config 默认（median）
+#: 相机标定文件；None = 用 Config 默认（仓库根的 ``camera_calib.json``，通常不存在，
+#: 那时会退回"60° 视场角粗估"的默认模型——坐标解算结果不可信）。
+#: ⚠ 回放要**用录这段素材时同一份标定**：SITL 架次是
+#: ``.sitl-recon-tmp/camera_calib_sim.json``（见 ``python -m airdrop.run sitl-recon``）。
+CALIB_FILE: str | None = None
+#: 降落航线 ``.plan``；None = 用 Config 默认（不配降落段 → 只打印飞掠段，不规划降落）。
+LAND_PLAN: str | None = None
+#: 边长交叉验证门限（``None`` = 用库默认 = **关**；回放优化时才给，比如 0.25）。
+#: 它是诊断：用已知目标边长独立估深度、再与地面求交互校——标定不对时会大面积不过
+#: （退回粗估模型的回放里实测每帧都不过），所以正式流程默认关掉、只在这里按需打开。
+SIDE_CHECK_TOLERANCE: float | None = None
 
 LOGGER = logging.getLogger("replay_flight")
 
@@ -54,16 +72,22 @@ def build_config(
     *,
     perception_mode: str | None = PERCEPTION_MODE,
     selection_rule: str | None = SELECTION_RULE,
+    calib_file: str | None = CALIB_FILE,
+    land_plan: str | None = LAND_PLAN,
 ) -> Config:
-    """回放用的配置（感知模式/选唯一规则可覆盖；其余用 :class:`Config` 默认值）。
+    """回放用的配置（感知模式 / 选唯一规则 / 相机标定 / 降落航线可覆盖）。
 
-    ``None`` = 不覆盖（沿用 airdrop/config.py 里的默认值），而不是"设成 None"。
+    ``None`` = 不覆盖（沿用 ``airdrop/config.py`` 里的默认值），而不是"设成 None"。
     """
     base = Config()
     if perception_mode is not None:
         base = base.replace(perception=replace(base.perception, mode=perception_mode))
     if selection_rule is not None:
         base = base.replace(targeting=replace(base.targeting, selection_rule=selection_rule))
+    if calib_file is not None:
+        base = base.replace(camera=replace(base.camera, calib_file=calib_file))
+    if land_plan is not None:
+        base = base.replace(routes=replace(base.routes, land_plan=land_plan))
     return base.validated()
 
 
@@ -92,17 +116,20 @@ def main(
     buffer_fps: float = BUFFER_FPS,
     plan_drop_mission: bool = PLAN_DROP_MISSION,
     strict: bool = STRICT,
+    side_check_tolerance: float | None = SIDE_CHECK_TOLERANCE,
     **config_overrides,
 ) -> int:
     """回放一次；``config_overrides`` 原样交给 :func:`build_config`。"""
     # 重依赖在使用时才导入：`python -m airdrop.run replay --help` 不加载它们
     from airdrop import (
+        DEFAULT_SIDE_TOLERANCE,
         AlignmentBuffer,
         AlignmentWriter,
         FrameTelemetryAligner,
         LLARef,
         PerceptionTargetSource,
         PerceptionWorker,
+        PlanningError,
         ReplayVideoSource,
         TargetTracker,
         build_drop_mission,
@@ -138,7 +165,13 @@ def main(
     writer = AlignmentWriter(buffer, aligner)
     worker = PerceptionWorker(config.perception.to_pipeline_config(), buffer=buffer)
     camera = config.camera.load_model()
-    tracker = TargetTracker(config, camera=camera)
+    tracker = TargetTracker(
+        config,
+        camera=camera,
+        side_check_tolerance=(
+            DEFAULT_SIDE_TOLERANCE if side_check_tolerance is None else float(side_check_tolerance)
+        ),
+    )
     targets = PerceptionTargetSource(worker=worker, tracker=tracker)
 
     worker.start()
@@ -199,7 +232,13 @@ def main(
             lat_deg=float(snapshot.origin_latitude_deg),
             alt_m=float(snapshot.origin_altitude_m),
         )
-        plan = build_drop_mission(config, origin=origin, target_ned=result.ned)
+        try:
+            plan = build_drop_mission(config, origin=origin, target_ned=result.ned)
+        except PlanningError as exc:
+            # 没配降落段（或降落几何过不了预检）时只做分析：回放入口不上传任务，
+            # 打印飞掠段所需的坐标就够了，不必把整次回放判成失败。
+            LOGGER.warning("跳过航线规划（%s）——目标坐标见上", exc)
+            return 0
         lon, lat, _alt = ned_to_wgs84(plan.target_ned, origin)
         LOGGER.info("飞掠航线：来源 %s，目标 WGS84 (%.6f, %.6f)", plan.source, lat, lon)
         LOGGER.info("任务项 %d 个：%s", len(plan.items), [item.as_dict() for item in plan.items])

@@ -1,26 +1,28 @@
-"""RTSP 视频拉流示例：拉流并统计链路质量，可选预览 / 存盘。
+"""思翼 HM30 图传拉流示例：拉流并统计链路质量，可选预览 / 存盘。
 
-使用前：
-1. 将视频源接入网络，确认本地可路由到相机地址；
-2. 在 ``VideoConfig``（或命令行 ``--rtsp-url``）中配置 RTSP 地址。
+装配（Windows 上位机）：
+1. 网线插 HM30 地面端 LAN 口；
+2. 电脑网卡配静态地址 ``192.168.144.20`` / 掩码 ``255.255.255.0``（同网段任意空闲地址）；
+3. 先确认能 ping 通机载相机 ``192.168.144.25``。
 
-地址不确定时本示例不做探测，可用 ffmpeg 命令行确认::
+地址不确定时本示例不替你猜：用 ffmpeg 命令行确认一次即可::
 
-    ffmpeg -rtsp_transport udp -i <RTSP 地址> -frames:v 1 -f null -
+    ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f null -
 
 运行（集中式入口在 airdrop/run.py）::
 
     ./.venv/Scripts/python.exe -m airdrop.run hm30-video
-    ./.venv/Scripts/python.exe -m airdrop.run hm30-video --rtsp-url <RTSP 地址>
+    ./.venv/Scripts/python.exe -m airdrop.run hm30-video --rtsp-url rtsp://192.168.144.25:8554/main.264
 
 本文件是纯库模块：顶部常量是默认值，build_config(**覆盖) / main(**kwargs) 按需传值；
-命令行由 airdrop/run.py 解析。cv2 只在"预览/存盘"两条分支中导入，--help 不加载它。
+命令行由 airdrop/run.py 解析。cv2 只在"预览/存盘"那两条分支里导入，--help 不加载它。
 
-拉流失败时日志中会直接给出 ffmpeg 的输出，不做地址探测或轮询。
+拉流失败会在日志里直接给出 ffmpeg 的输出，不做地址探测、不轮询猜测。
 
-注意本示例消费实时画面（``read()``）：保证看到当前一帧，但不保证每帧都被处理。
-需要逐帧不丢（目标可能仅出现一瞬）时参见 ``examples/video_telemetry_sync.py``——
-该示例将 ``AlignmentWriter`` 挂载到拉流源上，采集线程每读一帧即写入缓冲。
+注意本示例消费的是实时画面（``read()``）：它保证你看到的是当前一帧，但不保证
+每一帧都被处理过。要"一帧都不能丢"（目标可能只出现一瞬），看
+``examples/video_telemetry_sync.py``——那里把 ``AlignmentWriter`` 挂在拉流源上，
+采集线程每读一帧就写一帧进缓冲。
 """
 
 from __future__ import annotations
@@ -33,13 +35,13 @@ from airdrop import HM30_DEFAULT_RTSP, Hm30VideoSource, VideoConfig
 # ----------------------------------------------------------------------
 # 配置（改这里）
 # ----------------------------------------------------------------------
-URL = HM30_DEFAULT_RTSP  # 视频 RTSP 地址
+URL = HM30_DEFAULT_RTSP  # 图传 RTSP 地址
 WIDTH, HEIGHT = 1280, 720  # 输出尺寸（不探测源分辨率，直接按这个切帧）
 TRANSPORT = "udp"  # RTSP 传输层：udp 延迟更低、tcp 更耐丢包
 DECODER = None  # 硬解可填 "h264_cuvid" / "hevc_cuvid"（NVDEC）
 
 PREVIEW = False  # 开窗口预览（按 q 退出）
-SAVE_PATH = None  # 存成 mp4 的路径，例如 "stream.mp4"
+SAVE_PATH = None  # 存成 mp4 的路径，例如 "hm30.mp4"
 DURATION = 0.0  # 运行秒数，0=不限
 
 LOGGER = logging.getLogger("hm30_video")
@@ -53,7 +55,7 @@ def build_config(
     transport: str = TRANSPORT,
     decoder: str | None = DECODER,
 ) -> VideoConfig:
-    """视频那一片配置（本示例只用得到它）。"""
+    """图传那一片配置（本示例只用得到它）。"""
     return VideoConfig(
         url=url,
         transport=transport,
@@ -116,7 +118,7 @@ def run(  # noqa: PLR0912 - 预览、存盘、断流和时限是互斥运行路�
             if preview:
                 import cv2
 
-                cv2.imshow("RTSP", frame.image)
+                cv2.imshow("HM30", frame.image)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 

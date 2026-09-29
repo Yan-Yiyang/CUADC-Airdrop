@@ -73,6 +73,10 @@ DETECTIONS_NAME = "detections.jsonl"
 # 回放期间每次等待的切片长度（秒）。等待被切成小片，``stop()`` 才能及时生效。
 _WAIT_SLICE = 0.05
 
+#: 逐条打印"跳过帧"的上限：裁剪过的素材可能缺上千帧，逐条打会把日志刷爆
+#: （实测架次 某架次：3568 行 ERROR）。超过只计数，收尾给一条汇总。
+SKIP_LOG_LIMIT = 3
+
 # 全速回放（speed=0）时的最小帧间隔。完全不限速会让生产线程在毫秒内把整段素材
 # 播完，``read()`` 这条实时路径只能看到最后一帧、中间帧被"跳过"——那正是实飞源
 # 里要计入 dropped 的行为。给一个 1ms 的节奏下限，read() 就能正常跟帧。
@@ -798,6 +802,11 @@ class ReplayVideoSource:
                 lag=record.lag,
             )
             self._publish(frame)
+        if self._skipped:
+            LOGGER.warning(
+                "回放跳过 %d 帧（帧文件缺失或无法解码）；要让它直接失败就把 strict 打开",
+                self._skipped,
+            )
         if self._tail_s > 0:
             self._sleep_until(time.monotonic() + self._tail_s)
 
@@ -854,7 +863,12 @@ class ReplayVideoSource:
         with self._condition:
             self._skipped += 1
             self._stats.skipped = self._skipped
-        LOGGER.error("回放跳过帧 #%d：%s", record.index, reason)
+            count = self._skipped
+        # 裁剪过的素材会缺上千帧（frames_index.jsonl 仍列着被删的帧号）：逐条打会把
+        # 日志刷爆（实测 3568 行 ERROR）。只逐条打前几条，收尾给一条汇总。
+        if count <= SKIP_LOG_LIMIT:
+            suffix = "（同类不再逐条打印，收尾给总数）" if count == SKIP_LOG_LIMIT else ""
+            LOGGER.warning("回放跳过帧 #%d：%s%s", record.index, reason, suffix)
 
     def _publish(self, frame: VideoFrame) -> None:
         """把一帧交给 sink（锁外）并更新 latest()，与实飞源同一顺序。"""

@@ -1,56 +1,81 @@
-"""RTSP 视频拉流（ffmpeg 子进程）。
+"""思翼 HM30 图传拉流（ffmpeg 子进程，唯一后端）。
 
-地址与接线
+接线与地址
 ----------
-视频源需提供 RTSP 输出并可从本地路由访问。地址由 :class:`VideoConfig.url` 指定
-（默认值来自 :data:`HM30_DEFAULT_RTSP`，部署时按实际环境修改）。
-**地址配置错误时本模块不探测、不猜测**：直接失败并在拉流源上给出明确错误
-（``stats.last_error`` + 错误日志），由使用方核对。手动确认可用 ffmpeg 命令行::
+HM30 的地面端不"推"视频给上位机，而是把机载以太网（``192.168.144.0/24``）
+**透明桥接**到 LAN 口 / 内置 WiFi / USB WiFi 上：地面端 LAN 口插到电脑、电脑
+配一个同网段地址，就能直接访问机载 IP 相机。官方 FAQ 的说法是：只要 IP 相机
+输出 RTSP、能接以太网，就能配合 HM30 工作。
 
-    ffmpeg -rtsp_transport udp -i <RTSP 地址> -frames:v 1 -f null -
+所以"拉流"就是打开一条 RTSP，默认 ``rtsp://192.168.144.25:8554/main.264``
+（SIYI 云台/相机系列的约定地址）。**地址写错时本模块不探测、不猜测**：直接
+失败并在拉流源上给出明确错误（``stats.last_error`` + 错误日志），由使用方自己
+核对地址。想手动确认，用 ffmpeg 命令行试一次即可::
 
-输出尺寸同样不自动探测：默认按 720p（1280x720）切帧，需要其他分辨率时在
-:class:`VideoConfig` 中显式指定，避免产生错误的画面比例。
+    ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 \
+        -frames:v 1 -f null -
 
-实现要求
---------
-* 通过 ``subprocess`` 启动 ffmpeg，从管道读取 ``rawvideo/bgr24`` 裸帧；
-  ``-timeout``（微秒）用于断流判定；子进程可被父进程直接终止，因此拉流线程
-  不会因管道读取而阻塞；Python 侧不需要再次解码。
-* 消费者跟得上时不丢帧（管道反压使接收侧保持浅流水）；消费者跟不上时，
-  丢帧发生在 UDP 套接字层，不计入 ``stats.dropped``——
-  ``stats.dropped == 0`` 不能作为"网络未丢帧"的依据。
-* **启动阶段帧丢失范围**：连接建立后，前 ``probesize / 每帧字节数`` 帧不会进入
-  sink（ffmpeg 探测格式期间读走的字节对不可 seek 的 UDP 流是丢弃的）。
-  默认 ``-probesize 500000`` 对应约 0.5~2s（720p）。
-* 详细要求与参数见 ``docs/video_rtsp.md``。
+同理，输出尺寸也不自动探测：默认按 720p（1280x720）切帧，要换分辨率就在
+:class:`VideoConfig` 里显式改，而不是先猜一个再跑出错误的画面比例。
 
-本模块只依赖 numpy 与标准库（不导入 cv2）。
+为什么只有 ffmpeg 一个后端
+--------------------------
+``cv2.VideoCapture`` 的对照实现已删除，理由是**延迟与可控性**（2026-09 用
+UDP/H.264 测试流同口径复测过）：
 
-帧留存：sink
-------------
-采集线程读出的每一帧都会先交给注册的 sink（:meth:`Hm30VideoSource.add_sink`），
-不跳过任何帧。目标可见时间可能极短，漏一帧即可能漏掉目标；
-察打一体流程允许处理延时、不允许丢帧。
-将 :class:`~airdrop.buffer.AlignmentWriter` 注册为 sink 后，每帧会连同其拍摄时刻
-的遥测写入环形缓冲，可随时回看。
+* **流水线深度**：cv2 路线掐掉发送端后还能读出 **17 帧（≈567ms 画面滞后）**，
+  而本模块的 ffmpeg 子进程路线是 **0 帧**——管道反压让接收侧始终保持浅流水。
+  实测这个 17 帧**不是**解复用/探测/套接字/解码线程的缓冲：``OPENCV_FFMPEG_CAPTURE_OPTIONS``
+  里设 ``fflags;nobuffer|flags;low_delay``、``analyzeduration;0|probesize;500000``、
+  ``buffer_size;8192``、``threads;1``、``max_delay;0``，以及 ``CAP_PROP_BUFFERSIZE=1``，
+  积压都纹丝不动（环境变量本身是生效的，DEBUG 日志能打出
+  ``using capture options from environment``）；它是 OpenCV FFmpeg 后端的内部队列深度。
+* **断流不可控**：``read()`` 是 C 层不可中断调用，链路一断默认要**阻塞 30 秒**
+  （实测 30.008s）才返回。想改只能走 params 形式
+  （``VideoCapture(url, api, [CAP_PROP_READ_TIMEOUT_MSEC, 3000])``，实测压到 3.06s）——
+  卡住的 ``read()`` 仍然只能靠**杀 ffmpeg 进程**解决。
+* **本模块的做法**：``subprocess`` 拉起 ffmpeg，从管道读 ``rawvideo/bgr24`` 裸帧；
+  ``-timeout``（微秒）让断流能被及时判定；子进程可被父进程直接杀掉，所以拉流线程
+  永远停得下来；也省掉 Python 侧再解一遍码。
 
-sink 在采集线程中同步执行，必须足够快（缓冲写入仅执行一次 JPEG 编码，耗时毫秒级）；
-sink 抛出的异常仅记录日志，不中断拉流。
+两条边界要知道（2026-09 用带帧号的合成流实测）：
 
-:meth:`Hm30VideoSource.read` / :meth:`latest` 面向实时消费者（预览、即时引导）：
-仅保证"当前这一帧"，慢消费者会丢弃中间帧并计入 :attr:`VideoStats.dropped`。
-该路径与 sink/缓冲路径互不影响，缓冲中的历史帧不会因实时消费者掉队而缺失。
+* **消费者跟得上时不丢帧**（432/450 帧逐号连续），"浅流水"不是拿丢帧换来的；
+* **但消费者一旦跟不上（反压），丢的是 UDP 套接字层的数据报**——实测 sink 睡 150ms 时
+  450 帧只交付 76 帧、后段整段消失，**这类丢帧不计入 ``stats.dropped``**（那是管道
+  下游的计数器）。无缓冲 + UDP 下这是物理必然，别把 ``stats.dropped == 0`` 当成
+  "网络没丢帧"；
+* 连接建立后还有一段**启动盲区**：ffmpeg 探测格式时读走的字节（``-probesize 500000``）
+  对不可 seek 的 UDP 流是丢弃的，实测恰好丢 ``500KB / 每帧字节数`` 帧（低码率 165 帧、
+  高码率 15 帧）——真机约 0.5~2s。
 
-注意 ``VideoFrame.image`` 是**复用管道缓冲区的视图**，下一帧读入会覆盖；
-跨帧持有画面必须先调用 :meth:`VideoFrame.copy`。
+本模块只依赖 numpy 与标准库（不再 import cv2）。
+
+每一帧都不丢：sink
+------------------
+采集线程读出的**每一帧都会先交给注册的 sink**（:meth:`Hm30VideoSource.add_sink`），
+一帧都不会被跳过。这是本项目的硬要求：目标出现的时间可能极短，漏一帧就可能漏掉
+目标；而"先侦查后空投"的模式允许一定的处理延时，不允许丢帧。把
+:class:`~airdrop.buffer.AlignmentWriter` 挂上去，每帧就会连同它拍摄时刻的遥测
+一起写进环形缓冲，之后随便什么时候回看都在。
+
+sink 在采集线程里**同步**执行，所以它必须快（缓冲写入只做一次 JPEG 编码，几毫秒）。
+sink 抛出的异常只记日志，不会打断拉流。
+
+:meth:`Hm30VideoSource.read` / :meth:`latest` 面向**实时**消费者（预览、即时引导）：
+它们只关心"现在这一帧"，慢消费者会丢掉中间帧并计入 :attr:`VideoStats.dropped`。
+那是实时路径自己的取舍，与 sink/缓冲那条"每帧都留存"的路径互不影响——历史在
+缓冲里，不会因为某个实时消费者掉队而缺失。
+
+注意 ``VideoFrame.image`` 是**复用管道缓冲区的视图**，下一帧读入会覆盖它；
+跨帧持有画面必须先 :meth:`VideoFrame.copy`。
 
 性能提示
 --------
-管道传输裸 BGR：1080p30 约 186 MB/s，swscale 转换与管道拷贝各占部分 CPU。
-用于 YOLO/OCR 时可将 ``width``/``height`` 设为接近推理分辨率（如 960x540），
-带宽降至约 1/4。需要硬解时将 ``ffmpeg_decoder`` 设为 ``h264_cuvid`` /
-``hevc_cuvid``（需要支持相应解码器的 GPU）。
+管道里流的是裸 BGR：1080p30 约 186 MB/s，swscale 转换与管道拷贝各占一部分
+CPU。做 YOLO/OCR 时把 ``width``/``height`` 设到接近推理分辨率（如 960x540），
+带宽立刻降到 1/4。要硬解就把 ``ffmpeg_decoder`` 设成 ``h264_cuvid`` /
+``hevc_cuvid``（需要 NVIDIA GPU，开发机实测可用）。
 """
 
 from __future__ import annotations
@@ -69,15 +94,15 @@ import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 
-# 默认 RTSP 地址（按部署环境修改）
+# HM30 常见地址（地面端与机载相机同处 192.168.144.0/24）
 HM30_CAMERA_IP = "192.168.144.25"
 HM30_GROUND_IP = "192.168.144.12"
-# 默认 RTSP 主码流
+# SIYI 相机/云台默认 RTSP 主码流
 HM30_DEFAULT_RTSP = f"rtsp://{HM30_CAMERA_IP}:8554/main.264"
 
 SUPPORTED_TRANSPORTS = frozenset({"udp", "tcp"})
 
-# 视频链路固定延时的默认估计（秒）：从"机载相机曝光"到"本进程从管道里切出
+# 图传链路固定延时的默认估计（秒）：从"机载相机曝光"到"本进程从管道里切出
 # 一帧"之间的处理时间，含 H.264 编码、无线传输、解码与管道缓冲。在
 # ffmpeg 后端实测 ≈0.15s。
 # 拿到一帧后用它反推该画面真正的拍摄时刻（VideoFrame.capture_timestamp），
@@ -103,7 +128,7 @@ class VideoConfig:
     height: int = 720
     # 断流判定超时（秒），对应 ffmpeg 的 -timeout
     read_timeout: float = 3.0
-    # 视频链路的固定延时（秒），会被写进每一帧（VideoFrame.lag）
+    # 图传链路的固定延时（秒），会被写进每一帧（VideoFrame.lag）
     telemetry_lag: float = DEFAULT_TELEMETRY_LAG
     reconnect_delay: float = 1.0
     max_reconnect_delay: float = 10.0
@@ -133,7 +158,7 @@ class VideoConfig:
 
 @dataclass(frozen=True, slots=True)
 class VideoFrame:
-    """一帧视频画面。
+    """一帧图传画面。
 
     ``image`` 是 BGR 顺序的 ndarray。**它可能在下一帧到达时被覆盖**：ffmpeg
     后端是从复用的管道缓冲区上切出视图（零拷贝换带宽），所以拿到的数组只在
@@ -225,9 +250,9 @@ def _is_rtsp(url: str) -> bool:
 # 拉流源
 # ----------------------------------------------------------------------
 class Hm30VideoSource:
-    """RTSP 视频拉流源：后台线程收流，每帧交给 sink，实时读取看最新一帧。
+    """HM30 图传拉流源：后台线程收流，每帧交给 sink，实时读取看最新一帧。
 
-    典型用法（每帧都留存，供侦察与事后分析）::
+    典型用法（每帧都留存，供侦查与事后分析）::
 
         config = VideoConfig(width=1280, height=720)
         buffer = AlignmentBuffer(capacity_for(30, 180))
@@ -422,7 +447,7 @@ class Hm30VideoSource:
                 self._stream_ffmpeg()
                 delay = self._config.reconnect_delay
             except Exception as exc:
-                LOGGER.exception("视频拉流异常")
+                LOGGER.exception("图传拉流异常")
                 self._fail(str(exc))
             if self._stop_event.is_set():
                 break
@@ -493,8 +518,11 @@ class Hm30VideoSource:
         #   -rw_timeout 2s  → 12 秒内不退出，拉流线程永久卡死
         #   -timeout   2s   → 2.7 秒退出 ✓
         # -timeout 是 udp 协议与 rtsp 解复用器共有的 socket I/O 超时（微秒），
-        # 两种流都能覆盖。
-        command += ["-timeout", str(int(config.read_timeout * 1_000_000))]
+        # 两种流都能覆盖。**但它只属于网络输入**：本地文件类输入（SITL 演练用的
+        # SDP 文件）没有这个选项，加在前面会让 ffmpeg 直接
+        # "Option timeout not found" 打不开输入——所以按 URL 形态决定加不加。
+        if "://" in config.url:
+            command += ["-timeout", str(int(config.read_timeout * 1_000_000))]
         command += list(config.extra_input_args)
         command += ["-i", config.url]
         # 输出端：直接吐 bgr24 裸帧，numpy 零解析接管
@@ -540,7 +568,7 @@ class Hm30VideoSource:
             try:
                 sink(frame)
             except Exception:
-                LOGGER.exception("视频帧 sink 执行失败")
+                LOGGER.exception("图传帧 sink 执行失败")
 
     def _set_state(self, state: str) -> None:
         with self._condition:
@@ -559,9 +587,9 @@ class Hm30VideoSource:
             self._stats.last_error = message
             self._condition.notify_all()
         if never_streamed:
-            LOGGER.error("视频不可用：%s", message)
+            LOGGER.error("图传不可用：%s", message)
         else:
-            LOGGER.warning("视频中断：%s", message)
+            LOGGER.warning("图传中断：%s", message)
 
 
 # ----------------------------------------------------------------------

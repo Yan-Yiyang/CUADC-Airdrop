@@ -1,6 +1,6 @@
-"""RTSP 视频拉流的集成测试。
+"""HM30 图传拉流的集成测试。
 
-不需要真实视频硬件：:mod:`tests.conftest` 用 ffmpeg 把 testsrc 编成 H.264/MPEG-TS
+不需要 HM30 硬件：:mod:`tests.conftest` 用 ffmpeg 把 testsrc 编成 H.264/MPEG-TS
 推到本地 UDP，再让 :mod:`airdrop.video` 去拉。这条路径与真实 RTSP 一致——同一套
 FFmpeg 解复用、同一套低延迟 flag、同一套断流判定与重连逻辑。
 

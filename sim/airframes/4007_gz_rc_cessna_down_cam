@@ -13,6 +13,14 @@ PX4_SIM_MODEL=${PX4_SIM_MODEL:=rc_cessna_down_cam}
 param set-default SIM_GZ_EN 1
 param set-default SENS_EN_ARSPDSIM 1
 param set-default FW_LND_ANG 8
+# SITL 里没有测距传感器（Gazebo 机型不带 rangefinder）：FW 自动降落默认
+# FW_LND_USETER=1（用地形估计触发 flare/下滑），而拿不到地形估计时，只要
+# FW_LND_ABORT（默认 3）里的地形位还开着，进入降落段 10 s 后就会 abort 降落、
+# 在落点上方 30 m（MIS_LND_ABRT_ALT）无限盘旋——任务永远不结束（实测架次
+# 某架次：`Holding at 30 m above landing waypoint.`，最后靠状态超时
+# `land_timeout` 收场）。置 0 = 不要求地形估计（FW_LND_ABORT 的地形条件随之失效），
+# flare/下滑用航点高度。只影响这台**仿真机型**。
+param set-default FW_LND_USETER 0
 param set-default NPFG_PERIOD 12
 param set-default FW_PR_P 0.9
 param set-default FW_PR_FF 0.2
@@ -34,6 +42,14 @@ param set-default FW_T_SINK_MIN 3
 param set-default FW_W_EN 1
 param set-default FD_ESCS_EN 0
 param set-default MIS_TAKEOFF_ALT 30
+# SITL 侦查测试只飞"起飞 + 侦查扫掠"这一段：真实流程里投弹航线要等空中出结果
+# 才能生成（起飞 → 侦查 → 空中规划投弹 → 投放 → 降落），降落段没法预先和侦查段
+# 拼成一条任务。而 rc.fw_defaults 给固定翼默认 MIS_TKO_LAND_REQ=2（"带了起飞就必须
+# 带降落"），PX4 的 mission_feasibility_checker 会直接拒掉这种任务
+#（"Mission rejected: Landing waypoint/pattern required."），飞机连解锁都不会发生。
+# 置 0 = **起飞项与降落项都不再必需**（PX4 源码：case 0 -> 检查恒通过）；
+# 只影响这台**仿真机型**，真机/比赛配置不受影响。
+param set-default MIS_TKO_LAND_REQ 0
 param set-default NAV_ACC_RAD 15
 param set-default NAV_DLL_ACT 2
 param set-default RWTO_TKOFF 1

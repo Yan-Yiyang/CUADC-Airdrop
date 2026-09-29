@@ -156,6 +156,22 @@ def test_median_rule_picks_lower_median_for_even_labels() -> None:
     assert analyze(even, TargetingConfig(selection_rule="median")).code == 20
 
 
+def test_median_rule_dedupes_labels_across_multiple_clusters() -> None:
+    """同一编号分裂成多个类时，中位数按**去重后的编号**取（否则任务会选错靶标）。
+
+    实测（2026-09 SITL，r2 世界）：12 号被大倾角野点分裂成 3 个类，按"类"取中位
+    把任务结果选成了 12；规则是"每区三个编号里取中位" ⇒ 94/12/56 → 56。
+    """
+    points = (
+        _cloud(0.0, 0.0, 94, 3)
+        + _cloud(50.0, 0.0, 12, 3)
+        + _cloud(50.6, 0.0, 12, 2)  # 同编号的第二个类（野点分裂）
+        + _cloud(100.0, 0.0, 56, 3)
+    )
+    result = analyze(points, TargetingConfig(selection_rule="median"))
+    assert result.code == 56
+
+
 def test_max_rule_picks_largest_label() -> None:
     points = _cloud(0.0, 0.0, 10, 2) + _cloud(50.0, 0.0, 20, 2) + _cloud(100.0, 0.0, 30, 2)
     result = analyze(points, TargetingConfig(selection_rule="max"))

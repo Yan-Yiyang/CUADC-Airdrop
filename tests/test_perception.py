@@ -809,6 +809,34 @@ def test_pipeline_ocr_mode_emits_detections_with_codes() -> None:
     assert stats.with_code == 3
 
 
+def test_pipeline_keeps_results_queued_until_drained() -> None:
+    """结果队列**无界、不丢弃**：没人抽就一直在队列里（``queued_results`` 如实反映）。
+
+    这条是"实飞里 HOLD 之后才产出的结果不能丢"的钉子：消费者（``pump``）随时来抽，
+    之前攒下的结果都还在；收尾补抽之后队列必须归零。
+    """
+    buffer = _buffer_with(3)
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr", ocr_dedupe_s=0.0, ocr_dedupe_px=0.0),
+        buffer=buffer,
+        detector=_FakeDetector(),
+        pool=_FakePool(numbers=[42, 56, 95]),
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 10.0
+        while worker.queued_results < 3 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert worker.queued_results == 3, "处理完就该在队列里等着被抽，不能丢"
+        assert worker.stats.results == 3
+    finally:
+        worker.stop()
+
+    drained = worker.drain_results()
+    assert [d.code for d in drained] == [42, 56, 95]
+    assert worker.queued_results == 0
+
+
 def test_pipeline_cls12_mode_emits_without_ocr() -> None:
     buffer = _buffer_with(2)
     pool = _FakePool()

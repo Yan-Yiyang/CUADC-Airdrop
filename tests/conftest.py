@@ -1,6 +1,6 @@
 """pytest 公共装置（fixture）与本地测试流。
 
-本目录的测试全部离线运行：不需要飞控，也不需要视频硬件。要用到"视频"的
+本目录的测试全部离线运行：不需要飞控，也不需要 HM30 硬件。要用到"图传"的
 用例，由 :class:`StreamSender` 用 ffmpeg 把 ``testsrc`` 编成 H.264/MPEG-TS 推到
 本地 UDP，再让 :mod:`airdrop.video` 去拉——路径与真实 RTSP 完全一致（同一套
 解复用、同一套低延迟 flag、同一套断流判定与重连逻辑）。
@@ -73,7 +73,7 @@ BIND_GRACE = 0.8  # 先让接收端 bind 住 UDP 端口，再起发送端
 
 
 class StreamSender:
-    """可反复启停的本地测试流发送端（等价于真实视频源）。
+    """可反复启停的本地测试流发送端（等价于 HM30 的图传源）。
 
     用例自己决定何时起、何时停——断流重连那几组要的就是"中途把流掐掉"。
     """
@@ -131,7 +131,7 @@ def ffmpeg_exe() -> str:
     """ffmpeg 可执行文件；找不到就跳过需要它的用例。"""
     executable = _find_ffmpeg()
     if not executable:
-        pytest.skip("找不到 ffmpeg，跳过视频用例")
+        pytest.skip("找不到 ffmpeg，跳过图传用例")
     return executable
 
 

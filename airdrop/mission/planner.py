@@ -1,8 +1,8 @@
-"""航线规划：侦察航线、飞掠段（entry/exit）与降落段的拼接（计划 4.7 / Q13 / Q14）。
+"""航线规划：侦查航线、飞掠段（entry/exit）与降落段的拼接（计划 4.7 / Q13 / Q14）。
 
 四件事，全是纯函数（不碰 MAVSDK、不碰网络，离线可测）：
 
-1. :func:`build_recon_mission`：侦察航线 → 任务项（首项带起飞项）；
+1. :func:`build_recon_mission`：侦查航线 → 任务项（首项带起飞项）；
 2. :func:`overfly_positions` / :func:`overfly_waypoints`：以目标为中心、沿配置航向
    前后各半段长生成 [entry, exit]——飞机从 entry 进、飞过目标、从 exit 出，
    方向与判据里的"越过目标"（``dot(位置−目标, 航向) > 0``）严格一致，符号不能反；
@@ -216,7 +216,7 @@ def _load_plan_items(path: str, *, what: str) -> tuple[MissionItem, ...]:
 
 
 def build_recon_mission(config: Config) -> tuple[MissionItem, ...]:
-    """侦察航线 → 任务项。
+    """侦查航线 → 任务项。
 
     两个来源二选一（``Config.validated()`` 保证不会同时配置）：
 
@@ -229,22 +229,22 @@ def build_recon_mission(config: Config) -> tuple[MissionItem, ...]:
     """
     plan_path = str(config.routes.recon_plan or "")
     if plan_path:
-        items = _load_plan_items(plan_path, what="侦察航线（RoutesConfig.recon_plan）")
+        items = _load_plan_items(plan_path, what="侦查航线（RoutesConfig.recon_plan）")
         if config.mission.takeoff_first and not any(
             item.command == MAV_CMD_NAV_TAKEOFF for item in items
         ):
             LOGGER.warning(
-                "侦察航线来自 %s，但里面没有起飞项：飞控不会自动起飞——"
+                "侦查航线来自 %s，但里面没有起飞项：飞控不会自动起飞——"
                 "请操作手先起飞（手飞/RC）再启动任务，或改配置 mission.takeoff_first",
                 plan_path,
             )
-        LOGGER.info("侦察航线：来自 %s，共 %d 项", plan_path, len(items))
+        LOGGER.info("侦查航线：来自 %s，共 %d 项", plan_path, len(items))
         return items
 
     route = tuple(config.routes.recon_route)
     if not route:
         raise PlanningError(
-            "侦察航线为空（RoutesConfig.recon_route 与 recon_plan 都没配），无任务可上传"
+            "侦查航线为空（RoutesConfig.recon_route 与 recon_plan 都没配），无任务可上传"
         )
     if config.mission.takeoff_first:
         first = route[0]
@@ -255,7 +255,7 @@ def build_recon_mission(config: Config) -> tuple[MissionItem, ...]:
     else:
         items = [MissionItem.from_waypoint(waypoint) for waypoint in route]
     LOGGER.info(
-        "侦察航线：%d 个航点%s",
+        "侦查航线：%d 个航点%s",
         len(items),
         "（首项带起飞）" if config.mission.takeoff_first else "",
     )

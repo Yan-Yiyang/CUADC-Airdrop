@@ -2,8 +2,8 @@
 
 一条完整任务（Q/计划 1 章）::
 
-    INIT      等遥测 + NED 原点 → 上传并启动侦察航线
-    RECON     侦察航线在飞（约 1 分钟），mission 报飞完为止
+    INIT      等遥测 + NED 原点 → 上传并启动侦查航线
+    RECON     侦查航线在飞（约 1 分钟），mission 报飞完为止
     HOLD_PROCESS  hold()（固定翼盘旋）→ 等 targeting 出结果，上限 10s
                   ├─ 有结果 → 目标 NED
                   └─ 无结果 → 备用点（Q11：走同一套弹道判据）
@@ -429,20 +429,20 @@ class MissionRunner:
         self.abort(f"preflight_failed:{check}")
 
     def _tick_airborne(self, now: float) -> None:
-        """``WAIT_AIRBORNE``：什么都不下发，等飞机真的在空中再进侦察。
+        """``WAIT_AIRBORNE``：什么都不下发，等飞机真的在空中再进侦查。
 
-        在停机坪上就进侦察等于让飞机在地面执行任务：PX4 会在起飞前就
+        在停机坪上就进侦查等于让飞机在地面执行任务：PX4 会在起飞前就
         开始"追"第一个航点，或者干脆因为任务不可行而盘旋。
 
         ``MissionConfig.require_airborne=False`` 是地面演练/测试的临时放行开关：
         该检查立即放行，但绝不静默——记一条 ``airborne_skipped`` 事件加一条
-        WARNING 日志（正式任务必须保持 ``True``，否则飞机在停机坪上就会开始侦察）。
+        WARNING 日志（正式任务必须保持 ``True``，否则飞机在停机坪上就会开始侦查）。
         """
         if not self._config.mission.require_airborne:
             reason = "require_airborne=False（仅地面演练与离线测试使用，正式任务必须为 True）"
             self._emit("airborne_skipped", {"reason": reason})
             LOGGER.warning(
-                "跳过等待起飞（require_airborne=False）：%s；本架次飞机未起飞也会进入侦察",
+                "跳过等待起飞（require_airborne=False）：%s；本架次飞机未起飞也会进入侦查",
                 reason,
             )
             self._begin_recon(now, "airborne_skipped")
@@ -453,7 +453,7 @@ class MissionRunner:
         source = self._airborne(snapshot)
         if source is not None:
             self._emit("airborne", {"source": source})
-            LOGGER.info("已检测到飞机在空中（判据：%s），进入侦察", source)
+            LOGGER.info("已检测到飞机在空中（判据：%s），进入侦查", source)
             self._begin_recon(now, "airborne")
             return
         if self._timed_out(now, self._config.mission.airborne_timeout_s):
@@ -473,9 +473,9 @@ class MissionRunner:
         return None
 
     def _begin_recon(self, now: float, reason: str) -> None:
-        """进入侦察：``recon_upload="auto"`` 自己上传并启动，``"operator"`` 等操作手启动。
+        """进入侦查：``recon_upload="auto"`` 自己上传并启动，``"operator"`` 等操作手启动。
 
-        正式任务走 ``operator``：侦察航线由操作手在 QGC 里上传并启动，本包只等它开始、
+        正式任务走 ``operator``：侦查航线由操作手在 QGC 里上传并启动，本包只等它开始、
         然后监视进度（进度是飞控侧状态，谁上传的都一样能读到）。``auto`` 只用于自动测试。
         """
         flags = self._config.mission
@@ -490,9 +490,9 @@ class MissionRunner:
         else:
             self._emit(
                 "recon_waiting_operator",
-                {"note": "等操作手在 QGC 上传并启动侦察航线"},
+                {"note": "等操作手在 QGC 上传并启动侦查航线"},
             )
-            LOGGER.info("侦察航线由操作手上传（mission.recon_upload=operator）：等任务启动后再监视")
+            LOGGER.info("侦查航线由操作手上传（mission.recon_upload=operator）：等任务启动后再监视")
             self._start_confirmed = False
             self._start_deadline = now + float(self._config.mission.recon_max_s)
         self._monitor = MissionMonitor()

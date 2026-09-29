@@ -81,7 +81,7 @@ GROUND_ALT = 500.0  # 地面点与原点的**高差为 0** ⇒ ground_z = 0
 
 
 # ----------------------------------------------------------------------
-# 素材构造（按 FlightRecorder 的落盘格式手写；临时目录位于工作区内）
+# 素材构造（按 FlightRecorder 的落盘格式手写；不用 tmp_path，见 AGENTS）
 # ----------------------------------------------------------------------
 def _jpeg(image: np.ndarray) -> bytes:
     ok, buffer = cv2.imencode(".jpg", image)
@@ -173,7 +173,7 @@ def _write_flight(
 
 @pytest.fixture
 def workdir() -> Iterator[Path]:
-    """工作区内的临时目录；用例结束整棵删掉。"""
+    """工作区内的临时目录；用例结束整棵删掉（不用 ``tmp_path``：见 AGENTS）。"""
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     path = WORK_ROOT / uuid.uuid4().hex[:8]
     path.mkdir()
@@ -304,7 +304,7 @@ def _config(**overrides: Any) -> Config:
     params: dict[str, Any] = {
         "routes": routes,
         "overfly": OverflyConfig(heading_deg=90.0, altitude_m=20.0, leg_length_m=200.0),
-        # 侦察航线由测试上传（auto）；正式任务默认 operator，由操作手在 QGC 上传并启动
+        # 侦查航线由测试上传（auto）；正式任务默认 operator，由操作手在 QGC 上传并启动
         "mission": MissionConfig(tick_hz=20.0, recon_upload="auto"),
         "ground": GroundConfig(ground_point_alt=GROUND_ALT),
         "targeting": TargetingConfig(eps_m=0.75, min_samples=2),
@@ -378,10 +378,10 @@ class StepClock:
 # 离线全链路
 # ----------------------------------------------------------------------
 def _advance(runner: MissionRunner, controller: "StubController", clock: StepClock) -> None:
-    """推到 LAND（或 DONE）：先让看门狗看到一次"任务在跑"，再报侦察航线飞完。"""
+    """推到 LAND（或 DONE）：先让看门狗看到一次"任务在跑"，再报侦查航线飞完。"""
     runner.update()  # INIT → RECON
     runner.update()  # RECON：``mission_finished()`` 先回一次 False
-    controller.finished = True  # 侦察航线飞完
+    controller.finished = True  # 侦查航线飞完
     for _ in range(60):
         runner.update()
         clock.sleep(0.05)
@@ -429,7 +429,7 @@ def test_replay_drives_full_chain_to_target_coordinates(workdir: Path) -> None:
     )
     _advance(runner, controller, clock)
     assert runner.state is MissionState.LAND, runner.history[-1].reason
-    # 正式流程的前两跳（自检 → 等在空中）也要走：INIT 不再直接跳到侦察
+    # 正式流程的前两跳（自检 → 等在空中）也要走：INIT 不再直接跳到侦查
     assert [str(record.to_state) for record in runner.history] == [
         "PREFLIGHT",
         "WAIT_AIRBORNE",
@@ -443,7 +443,7 @@ def test_replay_drives_full_chain_to_target_coordinates(workdir: Path) -> None:
     assert plan is not None and plan.source == "target"
     assert plan.target_ned[0] == pytest.approx(POSE_NORTH, abs=0.05)
     assert plan.target_ned[1] == pytest.approx(POSE_EAST, abs=0.05)
-    assert len(controller.uploads) == 2, "先侦察航线、再飞掠+降落"
+    assert len(controller.uploads) == 2, "先侦查航线、再飞掠+降落"
     assert [item.command for item in controller.uploads[1]][-1] == MAV_CMD_NAV_LAND
 
     targeting_event = [data for kind, data in events if kind == "targeting"]
@@ -543,6 +543,48 @@ def test_tracker_skips_points_without_attitude_and_without_position() -> None:
     }
 
 
+def test_tracker_side_check_is_off_by_default() -> None:
+    """边长互校**默认关掉**（正式流程不刷日志）；回放优化时才显式给门限。
+
+    同一份"边长与求交深度明显不符"的观测：默认既不计 ``side_mismatch`` 也不发事件；
+    ``side_check_tolerance>0`` 时才作诊断（仍然只记不剔点）。
+    """
+    capture = 1000.0
+    snapshot = _pose_snapshot(capture)
+    box = PixelBox(140.0, 80.0, 180.0, 120.0)
+    detection = Detection(
+        frame_index=1,
+        capture_timestamp=capture,
+        pixel=box.center,
+        box=box,
+        confidence=0.9,
+        telemetry=snapshot,
+        code=56,
+        # 20 m 处的 1 m 目标在主点附近约 14 px（fx≈277），100 px 差一个数量级 → 必不通过
+        side_px=100.0,
+        extra={"undistorted": True},
+    )
+
+    events: list[str] = []
+    default = TargetTracker(
+        _config(), camera=CAMERA, on_event=lambda kind, _data: events.append(kind)
+    )
+    assert default.side_check_tolerance == 0.0, "默认关掉：连计数都不做"
+    assert default.add(detection) is not None
+    assert default.stats["side_mismatch"] == 0
+    assert "side_check" not in events
+
+    enabled = TargetTracker(
+        _config(),
+        camera=CAMERA,
+        side_check_tolerance=0.25,
+        on_event=lambda kind, _data: events.append(kind),
+    )
+    assert enabled.add(detection) is not None, "打开诊断也仍然不剔点"
+    assert enabled.stats["side_mismatch"] == 1
+    assert "side_check" in events
+
+
 def test_target_source_busy_follows_perception_backlog() -> None:
     """``busy()``：缓冲没处理完或 OCR 没回来就算"还在干活"。"""
 
@@ -607,11 +649,11 @@ REAL_FRAMES = (1840, 1841, 1842, 1843)
 class RealYoloOcrDetector:
     """真 YOLO + 真 OCR 的"检测器"，但 **OCR 在进程内跑**。
 
-    ⚠ 有意为之的取舍：``PerceptionWorker`` 在 ``ocr`` 模式下会拉起独立 OCR 进程池，
-    而本用例要求在同一进程内完成"检测 + 裁剪 + OCR"。因此这里让检测器一次做完，
-    再由 pipeline 以 ``cls12`` 模式直出——进程池路径由 ``tests/test_perception.py``
-    的假池用例覆盖，OCR 精度由 ``tests/test_perception_realdata.py`` 覆盖；
-    本用例验证"真实像素能否一路走到坐标"。
+    ⚠ 有意为之的取舍：``PerceptionWorker`` 在 ``ocr`` 模式下会拉起**独立 OCR 进程池**，
+    而受限沙箱里子进程管道不可用（Windows 上 multiprocessing 走命名管道）。所以这里让
+    检测器在进程内把"检测 + 裁剪 + OCR"一次做完，再由 pipeline 以 ``cls12`` 模式直出——
+    **进程池那条路**由 ``tests/test_perception.py`` 的假池用例覆盖，**OCR 精度**由
+    ``tests/test_perception_realdata.py`` 覆盖；这一条验的是"真实像素能不能一路走到坐标"。
     """
 
     def __init__(self) -> None:

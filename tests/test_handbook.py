@@ -10,8 +10,9 @@
 约定
 ----
 * 用例名与被验证的小节一一对应，改了手册那一段就改这里的同名函数；
-* 需要临时目录的用例使用本文件的 workdir fixture（工作区内建目录、用完即删）；
-* 全部离线：不需要飞控、视频、GPU。
+* 需要临时目录的用例用本文件的 workdir fixture（不用 tmp_path：受限沙箱里它会挂在
+  fixture 上，见 AGENTS.md 的"验证方式"）；
+* 全部离线：不需要飞控、图传、GPU。
 """
 
 from __future__ import annotations
@@ -195,7 +196,7 @@ def _mission_config() -> Config:
         ),
         overfly=OverflyConfig(heading_deg=90.0, altitude_m=20.0, leg_length_m=200.0),
         ground=GroundConfig(ground_point_alt=500.0),
-        # 离线示例：侦察航线由示例自己上传（auto）；正式任务用默认的 operator（操作手在 QGC 启动）
+        # 离线示例：侦查航线由示例自己上传（auto）；正式任务用默认的 operator（操作手在 QGC 启动）
         mission=MissionConfig(recon_upload="auto"),
         # 自检四项全关（示例里没有相机/模型）：关掉 ≠ 通过，只是离线跑通
         preflight=PreflightConfig(
@@ -208,10 +209,10 @@ def _mission_config() -> Config:
 
 
 def ex_mission_plan() -> None:
-    """航线规划（纯函数）：侦察任务项 + 飞掠/降落合并任务。"""
+    """航线规划（纯函数）：侦查任务项 + 飞掠/降落合并任务。"""
     config = _mission_config()
     items = build_recon_mission(config)
-    print("  侦察任务项 %d 个，首项命令 %s" % (len(items), command_name(items[0].command)))
+    print("  侦查任务项 %d 个，首项命令 %s" % (len(items), command_name(items[0].command)))
     origin = LLARef(lon_deg=8.0, lat_deg=47.0, alt_m=500.0)
     plan = build_drop_mission(config, origin=origin, target_ned=(300.0, 0.0, 0.0))
     print(
@@ -520,7 +521,7 @@ def test_handbook_ballistics_snippet() -> None:
 
 
 def test_handbook_mission_plan_snippet() -> None:
-    """§3.8 航线规划：侦察航线 + 飞掠/降落合并。"""
+    """§3.8 航线规划：侦查航线 + 飞掠/降落合并。"""
     ex_mission_plan()
 
 

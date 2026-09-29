@@ -1,4 +1,4 @@
-"""AirDrop 3.0 全局配置——全部参数的唯一集中处。
+"""CUADC固定翼无人机侦查与打击控制项目：全局配置——全部参数的唯一集中处。
 
 约定
 ----
@@ -47,7 +47,7 @@ SELECTION_RULES = frozenset({"median", "max"})
 ALIGN_TIMEOUT_ACTIONS = frozenset({"drop"})
 WIND_SOURCES = frozenset({"telemetry", "zero"})
 ABORT_ACTIONS = frozenset({"hold", "rtl", "none"})
-#: 侦察航线由谁上传：operator = 操作手在 QGC 上传并启动（正式任务）；auto = 本包上传（自动测试）
+#: 侦查航线由谁上传：operator = 操作手在 QGC 上传并启动（正式任务）；auto = 本包上传（自动测试）
 RECON_UPLOAD_MODES = frozenset({"operator", "auto"})
 
 
@@ -235,7 +235,8 @@ class GroundConfig:
 class TargetingConfig:
     """聚类与结果筛选（scikit-learn DBSCAN）。
 
-    ``selection_rule``：跨聚类标签取中位数（``"median"``）或最大值（``"max"``）对应的类，
+    ``selection_rule``：跨聚类标签取中位数（``"median"``，在**去重后**的编号上取，下中位）
+    或最大值（``"max"``）对应的类，
     **起飞前按任务选定**，代码不做隐式回退。结果坐标 = 类内成员坐标均值。
     """
 
@@ -317,9 +318,9 @@ class Waypoint:
 
 @dataclass(frozen=True, slots=True)
 class RoutesConfig:
-    """预设航线：侦察段与降落段，**每条腿二选一**（配置航点 或 QGC ``.plan``）。
+    """预设航线：侦查段与降落段，**每条腿二选一**（配置航点 或 QGC ``.plan``）。
 
-    * ``recon_route`` / ``recon_plan``：侦察段。plan 模式下是操作手在 QGroundControl
+    * ``recon_route`` / ``recon_plan``：侦查段。plan 模式下是操作手在 QGroundControl
       里画好、另存为 ``.plan`` 的完整航线，本包**原样使用**（不自动补起飞项）；
     * ``landing_route`` / ``land_plan``：飞掠段**之后**要飞的那一段（返航 + 降落）。
       plan 模式下飞掠段插在它前面，合成一条任务上传——"必须让飞控认可的降落剖面"
@@ -356,7 +357,7 @@ class MissionConfig:
     用于演练/仿真）。链路本身断了时这条指令也发不出去，那种情况交给飞控自己的
     failsafe。
 
-    ``takeoff_first`` / ``land_last``：侦察航线首个航点带**起飞项**（固定翼起飞
+    ``takeoff_first`` / ``land_last``：侦查航线首个航点带**起飞项**（固定翼起飞
     由它承担，计划 4.1）、降落航线末航点带**降落项**。
 
     ``require_airborne``：``WAIT_AIRBORNE`` 那道门的逃生开关。默认为 ``True``
@@ -366,7 +367,7 @@ class MissionConfig:
 
     tick_hz: float = 20.0
     init_max_s: float = 30.0  # 等遥测 + NED 原点
-    recon_max_s: float = 600.0  # 侦察航线（约 1 分钟）的兜底上限
+    recon_max_s: float = 600.0  # 侦查航线（约 1 分钟）的兜底上限
     hold_process_max_s: float = 10.0  # HOLD_PROCESS 等结果的上限（计划 4.7）
     #: 至少等这么久再接受"没有结果"的判断——否则缓冲里还没被消费的帧会被当成"没看到目标"
     hold_process_min_s: float = 2.0
@@ -380,7 +381,7 @@ class MissionConfig:
     airborne_alt_m: float = 5.0
     #: ``False`` = 不等飞机起飞就放行 ``WAIT_AIRBORNE``（**地面演练/测试开关**，正式任务必须为 True）
     require_airborne: bool = True
-    #: 侦察航线谁上传：``"operator"``（默认，正式任务：操作手在 QGC 上传并启动）/ ``"auto"``
+    #: 侦查航线谁上传：``"operator"``（默认，正式任务：操作手在 QGC 上传并启动）/ ``"auto"``
     recon_upload: str = "operator"
     #: 遥测超过这么久没更新就按链路故障处理（对齐侧 1s 就丢帧了，这里留两次余量）
     telemetry_stale_s: float = 5.0
@@ -525,7 +526,7 @@ class Config:
             raise ValueError(f"gripper.release_settle_s 不能为负: {self.gripper.release_settle_s}")
         if self.routes.recon_route and self.routes.recon_plan:
             raise ValueError(
-                "侦察段只能二选一：routes.recon_route（配置航点）与 "
+                "侦查段只能二选一：routes.recon_route（配置航点）与 "
                 f"routes.recon_plan（{self.routes.recon_plan}）同时给了"
             )
         if self.routes.landing_route and self.routes.land_plan:

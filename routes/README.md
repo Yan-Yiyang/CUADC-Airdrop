@@ -4,18 +4,17 @@
 
 | 文件 | 配置项 | 用途 |
 | --- | --- | --- |
-| `recon.plan` | `RoutesConfig.recon_plan` | 侦察段：整条航线**原样使用**（缺起飞项时只告警，不自动补） |
+| `recon.plan` | `RoutesConfig.recon_plan` | 侦查段：整条航线**原样使用**（缺起飞项时只告警，不自动补） |
 | `land.plan` | `RoutesConfig.land_plan` | 飞掠段**之后**的部分（返航 + 降落）：项目把飞掠段插在它**前面**，合成一条任务上传 |
 
 ⚠ **一条腿只能二选一**：给了 `.plan` 就不能再配 `recon_route` / `landing_route`（`Config.validated()` 会报错）——让两个来源静默竞争比报错危险得多。
 
 ## 保存方式
 
-QGC 里画好航线 → **Save / 另存为** → 选择本仓库的 `routes/` 目录：
+QGC 里画好航线 → **Save / 另存为** → 选择本目录：
 
-* Windows 版 QGC：直接另存到仓库下的 `routes\`；
-* WSL 里的 QGC：把仓库放在 Windows 盘上时，选 `/mnt/<盘符>/<仓库路径>/routes/`
-  （例如仓库在 `D:\code\airdrop` 就是 `/mnt/d/code/airdrop/routes/`）。
+* Windows 版 QGC：`C:\YYY\Python\2026test\routes\`
+* WSL 里的 QGC（本地就是这样跑的）：同一目录是 `/mnt/c/YYY/Python/2026test/routes/`
 
 ## 对文件内容的要求
 

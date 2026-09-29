@@ -3,13 +3,13 @@
 示例是给人照抄的，最容易随接口演进而悄悄失效（改了构造参数、搬了模块，示例却没人跑）。
 这里只做离线可做的那部分校验：
 
-* 模块能导入（说明 import 的 API 都还在，且没有在导入期连飞控/开视频）；
+* 模块能导入（说明 import 的 API 都还在，且没有在导入期连飞控/开图传）；
 * 导入不加载重依赖（torch / cv2 / mavsdk / ultralytics / rapidocr）：重活都在
   函数体内，命令行只需要读常量——airdrop.run 的 --help 靠这条保持廉价；
 * 有 ``main()``（``examples`` 的约定：``main(**kwargs)`` + 顶部常量 = 默认值）；
 * 模块级常量区块存在，且 ``build_config(**覆盖)`` 真的覆盖得动。
 
-不执行 ``main()``：那几个示例要飞控、视频或真实素材，跑起来就不是单测了。
+不执行 ``main()``：那几个示例要飞控、图传或真实素材，跑起来就不是单测了。
 """
 
 from __future__ import annotations
@@ -107,7 +107,7 @@ def test_full_mission_builds_a_valid_config() -> None:
     assert config.video.url == full_mission.RTSP_URL
     assert config.video.telemetry_lag == full_mission.TELEMETRY_LAG_S
     assert config.overfly.heading_deg == full_mission.OVERFLY_HEADING_DEG
-    # 正式入口的两条默认：自检全开、侦察航线等操作手在 QGC 上传并启动、必须等起飞
+    # 正式入口的两条默认：自检全开、侦查航线等操作手在 QGC 上传并启动、必须等起飞
     assert config.preflight.load_detector and config.preflight.load_camera
     assert config.preflight.check_video
     assert config.mission.recon_upload == "operator"
@@ -134,7 +134,7 @@ def test_full_mission_build_config_honours_overrides() -> None:
     assert config.routes.land_plan == "routes/land.plan" and not config.routes.landing_route
     assert config.mission.recon_upload == "auto"
     assert config.mission.require_airborne is False
-    assert not config.preflight.check_video, "不接视频时视频自检无从做起"
+    assert not config.preflight.check_video, "不接图传时视频自检无从做起"
 
 
 def test_full_mission_default_route_passes_landing_precheck() -> None:
@@ -177,7 +177,7 @@ def test_sitl_scenario_builds_config_and_synthetic_target() -> None:
     assert config.telemetry.system_address == sitl_mission.SYSTEM_ADDRESS
     assert config.routes.landing_route or config.routes.land_plan, "降落段必须有一个来源"
     assert config.overfly.heading_deg == sitl_mission.OVERFLY_HEADING_DEG
-    # 演练档：侦察航线由本包上传；起飞前自检四项全关（SITL 没有相机/模型/视频）
+    # 演练档：侦查航线由本包上传；起飞前自检四项全关（SITL 没有相机/模型/图传）
     assert config.mission.recon_upload == "auto"
     assert not any(
         (

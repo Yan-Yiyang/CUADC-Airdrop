@@ -472,6 +472,35 @@ def test_replay_delivers_every_frame_with_original_timestamps(workdir: Path) -> 
     assert not np.array_equal(images[0], images[-1])
 
 
+def test_replay_missing_frames_are_counted_but_not_log_spammed(
+    workdir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """裁剪过的素材（索引仍列着已删帧号）：非严格模式跳过并计数，但**不逐条刷日志**。
+
+    实测架次 某架次 的裁剪目录曾刷 3568 行 ERROR；现在只逐条打前
+    ``SKIP_LOG_LIMIT`` 条，收尾给一条"共跳过 N 帧"的汇总。
+    """
+    from airdrop.record.replay import SKIP_LOG_LIMIT
+
+    flight_dir, *_ = _write_flight(workdir, frames=8)
+    for name in ("000003.jpg", "000004.jpg"):
+        (flight_dir / "frames" / name).unlink()
+
+    source = ReplayVideoSource(flight_dir, speed=0.0, strict=False)
+    seen: list[int] = []
+    source.add_sink(lambda frame: seen.append(frame.index))
+    with caplog.at_level(logging.WARNING, logger="airdrop.record.replay"):
+        _play_to_completion(source)
+
+    stats = source.stats
+    assert stats.frames == 6 and stats.skipped == 2
+    assert stats.state == "finished"
+    assert seen == [1, 2, 5, 6, 7, 8]
+    per_frame = [r for r in caplog.records if r.getMessage().startswith("回放跳过帧")]
+    assert len(per_frame) <= SKIP_LOG_LIMIT, "逐条日志要有上限，不能一帧一行"
+    assert any("回放跳过 2 帧" in r.getMessage() for r in caplog.records), "收尾要有汇总"
+
+
 def test_replay_frames_have_consistent_capture_timestamp(workdir: Path) -> None:
     """``timestamp - lag`` 必须等于索引里的拍摄时刻：对齐器就吃这个值。"""
     flight_dir, *_ = _write_flight(workdir, frames=3, lag=0.2)

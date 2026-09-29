@@ -30,7 +30,7 @@ LOGGER = logging.getLogger("basic_usage")
 
 
 def build_config(*, system_address: str = ADDRESS) -> Config:
-    """只装遥测那一片（本示例不用视频/感知/任务）。"""
+    """只装遥测那一片（本示例不用图传/感知/任务）。"""
     base = Config()
     return base.replace(
         telemetry=replace(base.telemetry, system_address=system_address)

@@ -34,7 +34,7 @@ from airdrop import Config
 # 配置（改这里）
 # ----------------------------------------------------------------------
 SYSTEM_ADDRESS: str | None = None  # None = 用 TelemetryConfig 的默认地址
-RTSP_URL = None  # None = 使用 VideoConfig 的默认地址
+RTSP_URL = None  # None = 用 VideoConfig 默认的 HM30 地址
 TELEMETRY_LAG_S = 0.15  # 本次采集不要用旧标定值去改它：时间差正是要标的东西
 ATTITUDE_RATE_HZ = 50.0  # 标定建议 ≥50Hz（姿态内差直接进外参）
 POSITION_RATE_HZ = 20.0
@@ -120,7 +120,7 @@ def main(
         source.add_sink(writer)
         source.start()
         if not source.wait_ready(timeout=30.0):
-            LOGGER.error("视频没有出帧：%s", source.stats.last_error or "未知原因")
+            LOGGER.error("图传没有出帧：%s", source.stats.last_error or "未知原因")
             return 1
         deadline = time.monotonic() + max_seconds
         while source.running and time.monotonic() < deadline:
@@ -149,7 +149,7 @@ def main(
         recorder.flight_dir,
     )
     if stats.frames == 0:
-        LOGGER.error("一帧都没收到，检查视频地址与相机（见 README 的视频链路一节）")
+        LOGGER.error("一帧都没收到，检查图传地址与相机（见 README 的 HM30 一节）")
         exit_code = 1
     return exit_code
 

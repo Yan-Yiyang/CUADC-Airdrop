@@ -20,10 +20,13 @@ georef 又会让纯几何层依赖目标语义。所以放在这里，并且实�
    就等于纠正两遍。默认 ``undistort=None`` 表示自动判断：读 ``Detection.extra``
    里检测器留下的 ``undistorted`` 标记（:meth:`~airdrop.perception.Detector.detect`
    会写），检测器纠正过就不再纠正。
-2. 边长交叉验证只是诊断，默认不剔点。计划 4.4 要求用已知边长（1m）独立估深度、
-   与地面求交互校；差异超门限会记事件与计数，但默认不把点丢掉——误判一个真实
-   观测的代价比多一个野点大，而 targeting 的 DBSCAN 本来就靠"看到几十次"筛野点。
-   要严格按门限剔点，把 ``reject_on_side_mismatch=True`` 打开。
+2. 边长交叉验证**默认关掉**（``side_check_tolerance=0``）。它是"用已知边长（1m）独立
+   估深度、再与地面求交互校"的*诊断*，只在**回放优化**时选择性打开（例如定位标定/几何
+   问题：标定不对时它会大面积不通过）；正式流程里大倾角帧天然会超门限（实测架次
+   某架次：35 个观测里 15 次），它既不影响解算也不该刷日志。打开后仍只记
+   事件与计数、**不剔点**——误判一个真实观测的代价比多一个野点大，而 targeting 的
+   DBSCAN 本来就靠"看到几十次"筛野点；要真的按门限剔点再加
+   ``reject_on_side_mismatch=True``。
 """
 
 from __future__ import annotations
@@ -43,8 +46,10 @@ LOGGER = logging.getLogger(__name__)
 
 __all__ = ["PerceptionTargetSource", "TargetTracker"]
 
-#: 目标边长法的允许相对误差（与 ``cross_check_by_side`` 的默认值一致）
-DEFAULT_SIDE_TOLERANCE = 0.25
+#: 边长交叉验证的默认门限（**0 = 关掉**，见模块 docstring 第 2 条）。
+#: 它是**回放优化**用的诊断：要打开就显式给门限（如 0.25），例如回放入口的
+#: ``--side-check 0.25``；正式流程保持关掉（大倾角帧必超门限，只会刷日志）。
+DEFAULT_SIDE_TOLERANCE = 0.0
 
 
 @dataclass(slots=True)
@@ -250,15 +255,27 @@ class PerceptionTargetSource:
     """把"感知工作线程 + 目标跟踪"包成 :class:`MissionRunner` 要的两个回调。
 
     ``MissionRunner(target_result=source.result, target_busy=source.busy)`` 即可：
-    实飞时 ``worker`` 吃的是视频缓冲，回放时吃的是回放缓冲，其余代码一模一样。
+    实飞时 ``worker`` 吃的是图传缓冲，回放时吃的是回放缓冲，其余代码一模一样。
+
+    ``on_detection``：每条 :class:`~airdrop.perception.models.Detection` 在**进 tracker
+    之前**会被回调一次（异常只记日志、不影响解算）——生产链路用它把检出写进飞行记录的
+    ``detections.jsonl``（``FlightRecorder.detections.append``），否则那个文件永远是空的。
     """
 
     worker: PerceptionWorker
     tracker: TargetTracker
+    on_detection: Callable[[Detection], None] | None = None
 
     def pump(self) -> int:
         """抽干结果队列并解算（每拍调一次，或由 :meth:`result` 顺便调）。"""
-        return self.tracker.extend(self.worker.drain_results())
+        detections = self.worker.drain_results()
+        if self.on_detection is not None:
+            for detection in detections:
+                try:
+                    self.on_detection(detection)
+                except Exception:
+                    LOGGER.exception("检出记录回调失败（不影响解算）")
+        return self.tracker.extend(detections)
 
     def result(self) -> TargetingResult:
         self.pump()

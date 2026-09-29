@@ -19,8 +19,8 @@
     ./.venv/Scripts/python.exe -m airdrop.run --help
     ./.venv/Scripts/python.exe -m airdrop.run full-mission --help
     ./.venv/Scripts/python.exe -m airdrop.run full-mission --rtsp-url rtsp://... --no-preflight
-    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/20260913-185512 --speed 2
-    ./.venv/Scripts/python.exe -m airdrop.run calibrate --flight flights/20260913-185512 --strict
+    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/<架次> --speed 2
+    ./.venv/Scripts/python.exe -m airdrop.run calibrate --flight flights/<架次> --strict
     ./.venv/Scripts/python.exe -m airdrop.run check-docs
 
 退出码
@@ -86,7 +86,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
     "full-mission": Subcommand(
         name="full-mission",
         module="examples.full_mission",
-        help="完整任务：自检 → 等起飞 → 侦察 → 飞掠投放 → 降落（正式任务档）",
+        help="完整任务：自检 → 等起飞 → 侦查 → 飞掠投放 → 降落（正式任务档）",
         options=(
             Option(
                 ("--system-address",),
@@ -94,7 +94,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 "MAVSDK 系统地址（飞控连接）",
                 source="SYSTEM_ADDRESS",
             ),
-            Option(("--rtsp-url",), "rtsp_url", "RTSP 视频地址", source="RTSP_URL"),
+            Option(("--rtsp-url",), "rtsp_url", "HM30 图传 RTSP 地址", source="RTSP_URL"),
             Option(
                 ("--telemetry-lag",),
                 "telemetry_lag_s",
@@ -111,7 +111,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(
                 ("--recon-upload",),
                 "recon_upload",
-                "侦察航线谁上传：operator=操作手在 QGC 启动（正式任务）/ auto=本包上传（自动测试）",
+                "侦查航线谁上传：operator=操作手在 QGC 启动（正式任务）/ auto=本包上传（自动测试）",
                 kind="choice",
                 choices=("operator", "auto"),
                 source="RECON_UPLOAD",
@@ -119,7 +119,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(
                 ("--no-video",),
                 "use_video",
-                "本架次不接视频（跳过视频与感知，起飞前自检的四项检查也相应关闭）",
+                "本架次不接图传（跳过图传与感知，起飞前自检的四项检查也相应关闭）",
                 kind="flag-off",
                 source="USE_VIDEO",
             ),
@@ -133,7 +133,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(
                 ("--require-airborne",),
                 "require_airborne",
-                "是否等到飞机确实在空中才进侦察（地面演练用 --no-require-airborne）",
+                "是否等到飞机确实在空中才进侦查（地面演练用 --no-require-airborne）",
                 kind="bool",
                 source="REQUIRE_AIRBORNE",
             ),
@@ -156,7 +156,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
     "sitl": Subcommand(
         name="sitl",
         module="examples.sitl_mission",
-        help="PX4 SITL 演练：合成目标 + DryRunController（不装弹、不用视频）",
+        help="PX4 SITL 演练：合成目标 + DryRunController（不装弹、不用图传）",
         options=(
             Option(
                 ("--system-address",),
@@ -173,7 +173,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(
                 ("--recon-upload",),
                 "recon_upload",
-                "侦察航线谁上传：auto=本包上传（演练档）/ operator=等 QGC 启动",
+                "侦查航线谁上传：auto=本包上传（演练档）/ operator=等 QGC 启动",
                 kind="choice",
                 choices=("operator", "auto"),
                 source="RECON_UPLOAD",
@@ -191,6 +191,53 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 "合成目标相对盘旋点的 NED 偏移，格式 N,E,D（米）",
                 kind="vec3",
                 source="TARGET_OFFSET_NED",
+            ),
+            Option(
+                ("--no-record",),
+                "record",
+                "不写飞行目录（默认记录五个文件）",
+                kind="flag-off",
+                source="RECORD",
+            ),
+        ),
+    ),
+    "sitl-recon": Subcommand(
+        name="sitl-recon",
+        module="tools.sitl_recon",
+        help="SITL 侦查精度自动测试：真飞机 + 真感知，量「解算坐标 vs 天井中心」误差",
+        options=(
+            Option(
+                ("--system-address",),
+                "system_address",
+                "MAVSDK 系统地址（SITL 默认 udpin://0.0.0.0:14540）",
+                source="SYSTEM_ADDRESS",
+            ),
+            Option(
+                ("--lag",),
+                "lag_s",
+                "图传链路延时估计（秒；报告里还会给 lag 扫描）",
+                kind="float",
+                source="TELEMETRY_LAG_S",
+            ),
+            Option(
+                ("--recon-timeout",),
+                "recon_timeout_s",
+                "RECON 段的上限（秒，状态机在这一段等侦查航线飞完）",
+                kind="float",
+                source="RECON_TIMEOUT_S",
+            ),
+            Option(
+                ("--video-wait",),
+                "video_wait_s",
+                "等第一帧画面的上限（秒）",
+                kind="float",
+                source="VIDEO_WAIT_S",
+            ),
+            Option(
+                ("--work-dir",),
+                "work_dir",
+                "产物目录（标定/SDP/检测明细/报告）",
+                source="WORK_DIR",
             ),
             Option(
                 ("--no-record",),
@@ -250,6 +297,27 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 choices=("median", "max"),
                 source="SELECTION_RULE",
             ),
+            Option(
+                ("--calib",),
+                "calib_file",
+                "相机标定文件（要用录这段素材时同一份；SITL 架次是 .sitl-recon-tmp/camera_calib_sim.json）",
+                kind="str",
+                source="CALIB_FILE",
+            ),
+            Option(
+                ("--land-plan",),
+                "land_plan",
+                "降落航线 .plan（不给就只打印飞掠段，不规划降落）",
+                kind="str",
+                source="LAND_PLAN",
+            ),
+            Option(
+                ("--side-check",),
+                "side_check_tolerance",
+                "边长互校门限（默认关；回放优化时才给，如 0.25）",
+                kind="float",
+                source="SIDE_CHECK_TOLERANCE",
+            ),
         ),
     ),
     "basic": Subcommand(
@@ -270,9 +338,9 @@ SUBCOMMANDS: dict[str, Subcommand] = {
     "hm30-video": Subcommand(
         name="hm30-video",
         module="examples.hm30_video",
-        help="RTSP 视频拉流：统计链路质量（可选预览/存盘）",
+        help="HM30 图传拉流：统计链路质量（可选预览/存盘）",
         options=(
-            Option(("--rtsp-url",), "url", "视频 RTSP 地址", source="URL"),
+            Option(("--rtsp-url",), "url", "图传 RTSP 地址", source="URL"),
             Option(
                 ("--preview",), "preview", "开窗口预览（按 q 退出）", kind="flag", source="PREVIEW"
             ),
@@ -290,7 +358,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
         help="帧-遥测对齐与逐帧留存演示（每一帧都进环形缓冲）",
         options=(
             Option(("--system-address",), "system_address", "MAVSDK 系统地址", source="ADDRESS"),
-            Option(("--rtsp-url",), "video_url", "视频 RTSP 地址", source="VIDEO_URL"),
+            Option(("--rtsp-url",), "video_url", "图传 RTSP 地址", source="VIDEO_URL"),
             Option(
                 ("--telemetry-lag",), "lag", "画面-遥测链路延时（秒）", kind="float", source="LAG"
             ),
@@ -317,7 +385,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(
                 ("--rtsp-url",),
                 "rtsp_url",
-                "RTSP 视频地址（None = 用默认地址）",
+                "图传 RTSP 地址（None = 用默认 HM30 地址）",
                 source="RTSP_URL",
             ),
             Option(
@@ -713,7 +781,7 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="python -m airdrop.run",
-        description="AirDrop 集中式入口：子命令 + 选项，参数到配置走关键字覆盖",
+        description="CUADC固定翼无人机侦查与打击控制项目：集中式入口（子命令 + 选项，参数到配置走关键字覆盖）",
         epilog="子命令的 --help 给出该入口的全部选项与默认值来源。",
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<子命令>")

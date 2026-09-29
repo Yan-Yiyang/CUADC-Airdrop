@@ -64,6 +64,8 @@ _e2e/
 .world-test-tmp/
 # SITL 演练的临时产物（日志/机上任务备份/ulog 探查脚本）
 .sitl-test-tmp/
+# SITL 侦查精度测试的临时产物（标定/SDP/检测明细/报告，见 tools/sitl_recon.py）
+.sitl-recon-tmp/
 # pytest 在沙箱里删不掉、git 也读不了的缓存目录（见 AGENTS.md 的 tmp_path 一条）
 pytest-cache-files-*/
 

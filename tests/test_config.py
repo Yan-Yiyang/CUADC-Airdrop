@@ -102,10 +102,10 @@ def test_telemetry_config_defaults_match_requirement() -> None:
 
 
 def test_preflight_and_airborne_defaults_match_the_new_flow() -> None:
-    """正式流程的三个默认值："检查全开"、"等起飞"、"侦察航线人工上传"。
+    """正式流程的三个默认值："检查全开"、"等起飞"、"侦查航线人工上传"。
 
-    它们都是安全侧的默认：默认不放过任何一项检查、默认不在停机坪上进侦察、
-    默认不覆盖操作手画好的侦察航线（``auto`` 只给自动测试用）。
+    它们都是安全侧的默认：默认不放过任何一项检查、默认不在停机坪上进侦查、
+    默认不覆盖操作手画好的侦查航线（``auto`` 只给自动测试用）。
     """
     preflight = PreflightConfig()
     assert preflight.load_detector and preflight.load_ocr and preflight.load_camera
@@ -124,7 +124,7 @@ def test_require_airborne_defaults_to_true() -> None:
     """``require_airborne`` 默认 True：正式任务必须等飞机真的在空中。
 
     ``False`` 是地面演练/离线测试的临时放行开关（``WAIT_AIRBORNE`` 立即放行 + 记
-    ``airborne_skipped``），默认值绝不能反过来——那等于让飞机在停机坪上开始侦察。
+    ``airborne_skipped``），默认值绝不能反过来——那等于让飞机在停机坪上开始侦查。
     """
     assert MissionConfig().require_airborne is True
     assert Config().mission.require_airborne is True

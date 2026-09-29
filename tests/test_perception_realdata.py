@@ -46,7 +46,9 @@ def _read_frame(capture: cv2.VideoCapture, index: int):
 def test_real_video_reads_target_codes() -> None:
     """实战视频的目标段：检出的真目标必须读出正确编号（56/56/56）。
 
-    本用例不写入磁盘，因此不接收 ``tmp_path`` 参数。
+    刻意不要 ``tmp_path`` 参数：受限沙箱里该 fixture 建目录会
+    ``PermissionError: [WinError 5]``（``--basetemp`` 也绕不开，pytest 收尾时
+    自己也要枚举它）。本用例本来就不写入磁盘，去掉参数才能在沙箱里跑。
     """
     pytest.importorskip("ultralytics")
     pytest.importorskip("rapidocr")

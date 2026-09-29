@@ -20,6 +20,9 @@ dependencies = [
     "vgamepad",
 ]
 
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
@@ -135,8 +138,8 @@ max-statements = 60
 max-returns = 8
 
 [tool.ruff.lint.per-file-ignores]
-# tests/conftest.py 在导入 `airdrop` 之前需要先准备工作区内的临时目录，
-# 因此这两行 import 必须留在文件后部
+# tests/conftest.py 要在临时目录建好之后再把 `airdrop` 加进 sys.path（沙箱相关），
+# 那两行 import 必须留在后面
 "tests/conftest.py" = ["E402"]
 # 测试：本来就要碰私有状态（`broker._history` 这类）与裸断言，
 # 复合断言是守卫式写法（`assert x is not None and x.ok`），拆开就丢了语义；
@@ -232,16 +235,18 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     # realdata 用例要 GPU + 真实素材（分钟级、依赖外部文件；视频用
-    # 环境变量 AIRDROP_REALDATA_VIDEO 指定），默认跳过；要跑就显式 `-m realdata`
+    # 环境变量 AIRDROP_REALDATA_VIDEO 指定），默认跳过；要跑就显式 `-m realdata`。
+    # sitl 用例要 WSL+PX4 SITL+图传在跑（分钟级），同样默认跳过：`-m sitl`
     "-m",
-    "not realdata",
+    "not realdata and not sitl",
     "--cov=airdrop",
     "--cov-report=term-missing:skip-covered",
 ]
 markers = [
-    "stream: 需要 ffmpeg 与本机 UDP 端口（会起子进程，秒级）",
+    "stream: 需要 ffmpeg 与本地 UDP 端口（会起子进程，秒级）",
     "network: 走网络错误路径，需要等超时或连接被拒",
     "realdata: 需要 GPU + 真实素材/权重（视频路径用 AIRDROP_REALDATA_VIDEO 指定、PP-OCR 权重），分钟级",
+    "sitl: 需要 WSL 里已经起好的 PX4 SITL + Gazebo 图传（本测试只驱动，不负责启动；分钟级）",
 ]
 # 全局超时兜底：拉流用例一旦卡住（管道读不回、子进程不退）要能失败而不是挂死。
 # Windows 上没有 SIGALRM，必须用 thread 方式。

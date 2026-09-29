@@ -9,7 +9,7 @@
   Cd/m/A 的退化）、**测量文件的各种写法**（经纬度 / NED / CSV / 模板）、
   以及 ``tools/fit_ballistics.py`` 这条现场流程真能跑通。
 
-全部离线、不用硬件；临时目录位于工作区内。
+全部离线、不用硬件；临时目录放在工作区内（不用 ``tmp_path``，见 AGENTS.md）。
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ WIND = (2.0, -1.5, 0.0)
 
 @pytest.fixture
 def workdir() -> Iterator[Path]:
-    """工作区内的临时目录；用例结束整棵删掉。"""
+    """工作区内的临时目录；用例结束整棵删掉（不用 ``tmp_path``：见 AGENTS）。"""
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     path = WORK_ROOT / uuid.uuid4().hex[:8]
     path.mkdir()
@@ -689,10 +689,11 @@ def test_recorder_opens_the_drop_log_in_the_flight_dir(workdir: Path) -> None:
 
 
 def test_flight_recorder_writes_the_drop_log(workdir: Path) -> None:
-    """真起一次 ``FlightRecorder``（工作区内）：投放记录与检测/事件并列落盘。
+    """真起一次 ``FlightRecorder``（工作区内，不用 tmp_path）：投放记录与检测/事件并列落盘。
 
-    ⚠ 与 ``tests/test_recorder.py`` 中的完整飞行目录用例是同一契约；此处单独覆盖的原因：
-    投放记录是反演的唯一输入，该链路应能在工作区内独立跑通。
+    ⚠ 与 ``tests/test_recorder.py`` 里那条完整飞行目录用例是同一个契约；这里再写一遍
+    是因为受限沙箱里 ``tmp_path`` 不可用（那 20 个 error），而**投放记录是反演的唯一
+    输入**，这条链路必须在本地就能跑绿。
     """
     from airdrop import AlignmentBuffer, TelemetryBroker
 
@@ -724,7 +725,7 @@ def _flight_dir(workdir: Path, *, with_impacts: bool, rows: int = 4) -> Path:
     """造一个（够真的）飞行目录：只有 drops.jsonl 与 impacts.jsonl。"""
     records = _spread_campaign()[:rows]
     samples = _measure(records)
-    flight = workdir / "20260901-101010"
+    flight = workdir / "某架次"
     flight.mkdir(parents=True, exist_ok=True)
     for record in records:
         append_drop(flight / DROPS_NAME, record)
@@ -753,7 +754,7 @@ def test_fit_tool_runs_the_whole_field_workflow(workdir: Path, capsys) -> None:
     )
     printed = capsys.readouterr().out
     assert code == 0
-    assert "20260901-101010#1" in printed
+    assert "某架次#1" in printed
     assert "结论：ok=True reliable=True" in printed
     assert "BallisticsConfig(" in printed
 
@@ -801,7 +802,7 @@ def test_fit_tool_reports_an_unreliable_fit(workdir: Path, capsys) -> None:
 
     records = _flat_campaign()
     samples = _measure(records)
-    flight = workdir / "20260901-202020"
+    flight = workdir / "某架次"
     flight.mkdir()
     for record in records:
         append_drop(flight / DROPS_NAME, record)

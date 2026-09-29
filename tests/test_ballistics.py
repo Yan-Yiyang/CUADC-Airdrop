@@ -314,16 +314,39 @@ def test_judge_passes_ground_altitude_into_the_prediction() -> None:
 
 
 def test_fallback_after_passing_target() -> None:
-    """沿飞掠方向越过目标却还没投 → 强制投放（落点判据够不着时）。"""
+    """从目标前方飞过来、沿航向越过却还没投 → 强制投放（落点判据够不着时）。"""
     judge, _, events = _judge(force_after_pass=True)
+    # 先在目标前方（还没越过）：判据只等待
+    before = judge.update(
+        _snapshot(position=(-100.0, 0.0, -50.0), velocity=(12.0, 0.0, 0.0)),
+        (0.0, 300.0, 0.0),
+        now=99.0,
+    )
+    assert not before.should_release and not before.passed_target
+
     snapshot = _snapshot(position=(100.0, 0.0, -50.0), velocity=(12.0, 0.0, 0.0))
     target = (0.0, 300.0, 0.0)  # 已经越过（北向 100 > 0），但横向很远
 
     decision = judge.update(snapshot, target, now=100.0)
     assert decision.should_release and decision.reason == "fallback"
-    assert decision.passed_target
+    assert decision.passed_target and decision.approached
     kinds = [kind for kind, _ in events]
     assert "release" in kinds
+
+
+def test_fallback_waits_until_the_target_is_really_passed() -> None:
+    """进入飞掠时已在目标后方（**没从前面接近过**）不算"越过"——不许假触发。
+
+    实测（r2 世界架次 某架次）：OVERFLY 开始时飞机刚结束盘旋、还在飞往
+    入场点，投影已在目标后方 ⇒ 旧口径在第一拍就强制投放，误差 113 m。
+    """
+    judge, _, _ = _judge(force_after_pass=True)
+    snapshot = _snapshot(position=(100.0, 0.0, -50.0), velocity=(12.0, 0.0, 0.0))
+    decision = judge.update(snapshot, (0.0, 300.0, 0.0), now=100.0)
+
+    assert not decision.should_release, "没接近过就投 = 实测 113 m 级误差"
+    assert decision.passed_target and not decision.approached
+    assert not judge.released
 
 
 def test_fallback_can_be_disabled() -> None:
