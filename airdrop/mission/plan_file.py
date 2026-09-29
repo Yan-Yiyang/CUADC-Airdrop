@@ -79,6 +79,10 @@ FW_DEFAULT_LAND_ANGLE_DEG = 8.0
 #: PX4 判据里的 0.1° 浮点余量（``FeasibilityChecker.cpp`` 原文）。
 _GLIDE_SLOPE_MARGIN_DEG = 0.1
 
+#: 球面半径。**刻意**与 PX4 的 ``CONSTANTS_RADIUS_OF_EARTH`` 取同一个值
+#: （``PX4-Autopilot-1.17.0/src/lib/geo/geo.h``），让本地降落预检与飞控的
+#: ``get_distance_to_next_waypoint``（``geo.cpp``）用同一把尺子——
+#: **不要**换成 WGS84 椭球/``pyproj.Geod``，那会在门限边界附近与飞控的接受/拒绝不一致。
 _EARTH_RADIUS_M = 6371000.0
 _RELATIVE_FRAMES = (MAV_FRAME_GLOBAL_RELATIVE_ALT,)
 _ABSOLUTE_FRAMES = (MAV_FRAME_GLOBAL, MAV_FRAME_GLOBAL_TERRAIN_ALT)
@@ -400,7 +404,14 @@ def load_plan(path: str | Path) -> QgcPlan:
 
 
 def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """两点水平距离（米）。haversine，10km 量级误差 << 1m，够本判据用。"""
+    """两点水平距离（米）：球面 haversine，半径 :data:`_EARTH_RADIUS_M`。
+
+    ⚠ **刻意不换 ``pyproj.Geod``**：PX4 的降落可行性判据用的就是同款球面公式
+    （``lib/geo/geo.cpp`` 的 ``get_distance_to_next_waypoint``），本地预检必须与
+    飞控判断一致；椭球大地线更接近真实地表距离，但会在这个判据上引入与飞控不同的
+    结果。两者差 ≤0.3%（400m 量级约 1m、10km 约 2m），远小于预检门限的余量
+    （``FW_LND_ANG=8°`` 时约 2.4%）。
+    """
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = phi2 - phi1
     dlambda = math.radians(lon2 - lon1)

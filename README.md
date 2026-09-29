@@ -47,8 +47,9 @@ airdrop/
   ballistics/          # model（RK4 二次阻力）/ release（判据）/ drops（投放记录）/ fit（参数反演）
   mission/             # states（状态机）/ planner（航线）/ targets（坐标解算）/ runner（主循环）
   record/              # recorder（五个记录文件 + drops.jsonl）/ replay（回放源 + 遥测回填）
-tools/                 # 纯库模块：fetch_models / calibrate / fit_ballistics / dump_api / check_docs
+tools/                 # 纯库模块：fetch_models / calibrate / fit_ballistics / make_world / dump_api / check_docs
 examples/              # 纯库模块：full_mission / replay_flight / calibration_capture / sitl_mission / 其余演示
+sim/                   # 仿真模块：赛区世界（生成产物）+ 带下视相机的机型 + airframe + install/run 脚本
 tests/                 # 全部离线（GPU 与真实素材的用例标 realdata，默认跳过）
 ```
 
@@ -78,7 +79,7 @@ python -m airdrop.run full-mission --land-plan routes/land.plan       # --dry-ru
 python -m airdrop.run full-mission --no-video --no-preflight          # 无图传/免自检的演练档
 
 # 3) SITL 演练：只走控制链路（合成目标 + 投放只记日志，默认不等起飞）
-python -m airdrop.run sitl --target-offset 300,0,0
+python -m airdrop.run sitl --target-offset 0,-20,0      # 航线已对准 sim/worlds/cuadc 的赛区
 
 # 4) 标定采集：录一个标准飞行目录给 calibrate 用
 python -m airdrop.run calibration-capture
@@ -86,6 +87,10 @@ python -m airdrop.run calibrate --flight flights/<那份目录> --strict
 
 # 5) 投放试验反演：量完实际落点后估计弹道参数（只读数据，不接硬件）
 python -m airdrop.run fit-ballistics --impacts flights/<那份目录>/impacts.jsonl --mass-kg 0.365
+
+# 6) 重建 CUADC 赛区的 Gazebo 世界（换天井布局与朝向/换轮次/加风/换光照与底图；SITL 启动见 docs/simulation_world.md）
+python -m airdrop.run make-world                       # 入库的两个世界（r1 图片靶 / r2 数字靶）
+python -m airdrop.run make-world --rounds 2 --seed 3 --wind 5,2,0
 ```
 
 其余演示：`basic`（遥测/指令）、`hm30-video`（拉流与统计）、`video-sync`（对齐 + 入缓冲 + 读者线程）。

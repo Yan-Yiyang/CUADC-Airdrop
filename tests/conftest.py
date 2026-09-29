@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import time
@@ -14,6 +15,36 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+TEST_TEMP_ROOTS = (
+    ".replay-test-tmp",
+    ".calibrate-test-tmp",
+    ".e2e-test-tmp",
+    ".fit-test-tmp",
+    ".handbook-test-tmp",
+    ".plan-test-tmp",
+    ".pytest-tmp",
+    ".world-test-tmp",
+)
+
+
+def _cleanup_test_temp_dirs() -> None:
+    """清理测试在工作区根目录创建的临时目录。"""
+    for name in TEST_TEMP_ROOTS:
+        shutil.rmtree(REPO_ROOT / name, ignore_errors=True)
+    for path in REPO_ROOT.glob("pytest-cache-files-*"):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_test_temp_dirs() -> Iterator[None]:
+    """测试会话前后清理工作区内的临时目录。"""
+    _cleanup_test_temp_dirs()
+    try:
+        yield
+    finally:
+        _cleanup_test_temp_dirs()
+
 
 from airdrop import TelemetryBroker
 from airdrop.video.source import Hm30VideoSource, VideoConfig, _find_ffmpeg

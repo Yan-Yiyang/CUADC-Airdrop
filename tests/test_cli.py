@@ -87,6 +87,10 @@ def test_subcommand_list_covers_the_old_entries() -> None:
         "calibrate",
         "fit-ballistics",
         "fetch-models",
+        "make-world",
+        "make-backdrops",
+        "fetch-aerial",
+        "preview-world",
         "dump-api",
         "check-docs",
     }
@@ -181,6 +185,8 @@ def test_missing_subcommand_exits_with_two() -> None:
         (["full-mission", "--unknown-option"], "未知选项"),
         (["sitl", "--target-offset", "300,0"], "三元组少一个数"),
         (["calibrate", "--pattern", "9"], "二元组少一个数"),
+        (["make-world", "--sun", "218"], "太阳参数少一个数"),
+        (["preview-world", "--round", "abc"], "轮次不是整数"),
         (["replay", "--speed", "fast"], "浮点参数写错"),
     ],
 )
@@ -243,6 +249,45 @@ def test_full_mission_options_override_the_config() -> None:
     )
     # 运行期开关不进 config，但要真的传给了 main()
     assert kwargs["dry_run"] is True and kwargs["use_video"] is False
+
+
+def test_make_world_options_override_the_config() -> None:
+    """make-world 的太阳/天井开关真的进了 build_config()。"""
+    from tools import make_world
+
+    kwargs = run.resolve_kwargs(
+        "make-world",
+        ["--seed", "7", "--sun", "90,12", "--well-arrows", "--wind", "5,2,0"],
+    )
+    config = make_world.build_config(**_config_kwargs("tools.make_world", kwargs))
+    assert config.seed == 7
+    assert config.sun_azel_deg == (90.0, 12.0)
+    assert config.sun_random is False, "默认不随机；只有给了 --sun-random 才随机"
+    assert config.well_arrows is True
+    assert config.wind_enu_m_s == (5.0, 2.0, 0.0)
+
+    random_kwargs = run.resolve_kwargs("make-world", ["--sun-random"])
+    random_config = make_world.build_config(**_config_kwargs("tools.make_world", random_kwargs))
+    assert random_config.sun_random is True
+
+    patches_kwargs = run.resolve_kwargs("make-world", ["--aerial-patches", "3"])
+    patches_config = make_world.build_config(**_config_kwargs("tools.make_world", patches_kwargs))
+    assert patches_config.aerial_patches == 3
+
+
+def test_backdrop_options_override_the_config() -> None:
+    """make-backdrops / fetch-aerial 的选项真的进了各自的 build_config()。"""
+    from tools import fetch_aerial, make_backdrops
+
+    kwargs = run.resolve_kwargs(
+        "make-backdrops", ["--seed", "3", "--size", "256", "--parts", "ground"]
+    )
+    config = make_backdrops.build_config(**_config_kwargs("tools.make_backdrops", kwargs))
+    assert config.seed == 3 and config.size == 256 and config.parts == "ground"
+
+    kwargs = run.resolve_kwargs("fetch-aerial", ["--size", "640", "--tile-width-m", "200"])
+    config = fetch_aerial.build_config(**_config_kwargs("tools.fetch_aerial", kwargs))
+    assert config.size == 640 and config.tile_width_m == pytest.approx(200.0)
 
 
 def test_sitl_options_override_the_config() -> None:

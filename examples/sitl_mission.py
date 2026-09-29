@@ -1,4 +1,4 @@
-'SITL 演练：对着 PX4 SITL 把控制链路整条跑一遍（不装弹、不用图传）。\n\n用法（集中式入口在 airdrop/run.py）::\n\n    # 1) 先起 PX4 SITL（WSL / Linux 里；机型按你的空域选，固定翼用 gazebo 的 x500 之类）\n    #    make px4_sitl gz_x500\n    # 2) 在 Windows 侧跑（MAVSDK 默认连 udpin://0.0.0.0:14540）\n    ./.venv/Scripts/python.exe -m airdrop.run sitl\n    ./.venv/Scripts/python.exe -m airdrop.run sitl --target-offset 300,0,0\n\n本文件是纯库模块：build_config(**覆盖) / main(**kwargs) 的默认值就是文件顶部常量；\n命令行由 airdrop/run.py 解析。重依赖都在函数体内导入（--help 不加载它们）。\n\n它演练什么、不演练什么\n----------------------\n演练（与实飞同一条代码路径）：状态机推进、侦查航线上传与启动、盘旋（hold）、\n结果坐标 → 飞掠航线规划 → 与降落航线合并上传、投放判据（真弹道、真风降级）、\n一次性锁存、投放后的降落段、事件日志与记录五个记录文件。\n\n不演练：感知（SITL 里没有相机与目标画面）与开仓（SITL 没有 gripper 硬件）。\n所以目标坐标由 ``TARGET_OFFSET_NED`` 合成（相对"盘旋点"），投放走\n:class:`~airdrop.DryRunController`——只记日志、不下发指令，其余全真。\n\n⚠ 演练默认不等起飞：``REQUIRE_AIRBORNE = False``（地面演练开关）让 ``WAIT_AIRBORNE``\n那道门立即放行——飞机停在停机坪上也能把状态机整条跑完，不必手动 arm/起飞，也不会空等到\n``airborne_timeout_s``（默认 1800s）。放行不是静默的：会记一条 ``airborne_skipped`` 事件\n加一条 WARNING 日志。正式任务绝不能关这个开关（见 ``examples/full_mission.py``）——\n在停机坪上进侦查会让 PX4 在地面"追"第一个航点。\n起飞前自检在演练里不注入（``preflight=None`` → 记一条 ``preflight_skipped``）。\n落地后请核对 ``RESULT`` 输出与 ``flights/<本次>/events.jsonl``。\n'
+'SITL 演练：对着 PX4 SITL 把控制链路整条跑一遍（不装弹、不用图传）。\n\n用法（集中式入口在 airdrop/run.py）::\n\n    # 1) 先起 PX4 SITL，并让 Gazebo 用本项目的 CUADC 赛区世界（WSL / Linux 里）：\n    #    把 sim/worlds/cuadc 挂进 PX4 的 worlds 目录与资源路径，例如：\n    #      ln -sf <repo>/sim/worlds/cuadc/cuadc_recon_strike_r2.sdf     #             ~/PX4-Autopilot/Tools/simulation/gz/worlds/\n    #      export GZ_SIM_RESOURCE_PATH=<repo>/sim/worlds/cuadc:$GZ_SIM_RESOURCE_PATH\n    #      PX4_GZ_WORLD=cuadc_recon_strike_r2 make px4_sitl gz_rc_cessna_down_cam\n    #    （默认机型是带下视相机的 gz_rc_cessna_down_cam；一条命令的版本：\n    #      bash sim/run_sitl.sh r2。世界布局、规则出处与完整启动说明见\n    #      docs/simulation_world.md）\n    # 2) 在 Windows 侧跑（MAVSDK 默认连 udpin://0.0.0.0:14540）\n    ./.venv/Scripts/python.exe -m airdrop.run sitl\n    ./.venv/Scripts/python.exe -m airdrop.run sitl --target-offset 0,-20,0\n\n本文件是纯库模块：build_config(**覆盖) / main(**kwargs) 的默认值就是文件顶部常量；\n命令行由 airdrop/run.py 解析。重依赖都在函数体内导入（--help 不加载它们）。\n\n本演练飞的是哪个赛区\n--------------------\n默认航点对着 ``sim/worlds/cuadc/cuadc_recon_strike_r2.sdf``（ENU 原点 = 起降区中心 =\n跑道中点；跑道沿 x 轴 200m x 30m，A / B 两个 60 x 60m 目标区在起飞线两端、\n各距起降区约 200m：**A 区（蓝）在 +x、B 区（红）在 -x**）：\n侦查段沿 N=25 / N=-27 两排在 A 区上空扫两遍，盘旋点停在 A 区"中位数"天井\n（``r2`` 世界的 56 号）以东 20m；合成目标 = 盘旋点 + ``TARGET_OFFSET_NED``\n（正西 20m）正好落在那座天井上。\n⚠ 天井在区内的位置是**随机的**（规则 3.3），这里写死的是 ``seed=0``（默认）那一批：\n换世界或换种子后天井坐标会变，改这一处常量即可（``tests/test_world.py`` 会核验\n这批常量对准的是入库世界的 56 号天井）。\n\n它演练什么、不演练什么\n----------------------\n演练（与实飞同一条代码路径）：状态机推进、侦查航线上传与启动、盘旋（hold）、\n结果坐标 → 飞掠航线规划 → 与降落航线合并上传、投放判据（真弹道、真风降级）、\n一次性锁存、投放后的降落段、事件日志与记录五个记录文件。\n\n不演练：感知（SITL 里没有相机与目标画面）与开仓（SITL 没有 gripper 硬件）。\n所以目标坐标由 ``TARGET_OFFSET_NED`` 合成（相对"盘旋点"），投放走\n:class:`~airdrop.DryRunController`——只记日志、不下发指令，其余全真。\n\n⚠ 演练默认不等起飞：``REQUIRE_AIRBORNE = False``（地面演练开关）让 ``WAIT_AIRBORNE``\n那道门立即放行——飞机停在停机坪上也能把状态机整条跑完，不必手动 arm/起飞，也不会空等到\n``airborne_timeout_s``（默认 1800s）。放行不是静默的：会记一条 ``airborne_skipped`` 事件\n加一条 WARNING 日志。正式任务绝不能关这个开关（见 ``examples/full_mission.py``）——\n在停机坪上进侦查会让 PX4 在地面"追"第一个航点。\n起飞前自检在演练里不注入（``preflight=None`` → 记一条 ``preflight_skipped``）。\n落地后请核对 ``RESULT`` 输出与 ``flights/<本次>/events.jsonl``。\n'
 
 from __future__ import annotations
 
@@ -22,33 +22,42 @@ from airdrop import (
 # ----------------------------------------------------------------------
 SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"  # MAVSDK 连 SITL 的地址
 
-# 侦查航线（SITL 里随便一小圈即可；高度是相对起飞点）
+# 赛区：sim/worlds/cuadc/cuadc_recon_strike_r2.sdf（ENU 原点 = 起降区中心 = 跑道中点，
+# 跑道沿 x 轴；A / B 两个 60x60m 目标区在起飞线两端 (±200, 0)，A 蓝在 +x、B 红在 -x；
+# 天井在区内随机摆放，下面是 seed=0（默认）那一批的坐标）。
+# 侦查航线：起飞后沿 N=16 / N=-16 两排在 A 区上空扫两遍（50m 相对高度），
+# 终点停在 A 区"中位数"天井（r2 世界的 56 号，E=200.30, N=-10.80）以东 20m ——
+# 于是合成目标（盘旋点 + TARGET_OFFSET_NED，正西 20m）正好落在那座天井上。
 RECON_ROUTE = (
-    Waypoint(lat=47.397742, lon=8.545594, alt_m=50.0),
-    Waypoint(lat=47.398742, lon=8.545594, alt_m=50.0),
-    Waypoint(lat=47.398742, lon=8.546594, alt_m=50.0),
+    Waypoint(lat=47.3979710405, lon=8.5481507733, alt_m=50.0),  # 起飞点：跑道东侧 150m
+    Waypoint(lat=47.3981149469, lon=8.5484819519, alt_m=50.0),  # A 区西北外侧 (E=175, N=16)
+    Waypoint(lat=47.3981149305, lon=8.5491840390, alt_m=50.0),  # 沿 N=16 向东扫过 A 区
+    Waypoint(lat=47.3978271054, lon=8.5491840225, alt_m=50.0),  # 东端南转 (E=228, N=-16)
+    Waypoint(lat=47.3978738455, lon=8.5490820474, alt_m=50.0),  # 向西收在盘旋点
 )
-BACKUP_POINT = Waypoint(lat=47.398000, lon=8.546000, alt_m=0.0)
+#: 没有目标时用的备用点：A 区中心 (E=200, N=0)
+BACKUP_POINT = Waypoint(lat=47.3979710271, lon=8.5488131178, alt_m=0.0)
 #: 降落段。固定翼有硬性几何要求（PX4 会照这套判据拒整条任务）：
 #: 降落项的前一项必须严格高于落点，且 ``(前项高 − 落点高)/水平距离 ≤ tan(FW_LND_ANG+0.1°)``
 #: （默认 8°，约 0.142）。两种来源二选一：
 #:
 #: * ``LAND_PLAN`` 非空：用操作手在 QGC 里画好、另存为 ``.plan`` 的航线
 #:   （``routes/land.plan``；里面的"固定翼降落航线"复杂项会在本地展开成 MAVLink 项）。
-#:   飞掠段插在它前面，合成一条任务上传。
-#: * ``LAND_PLAN`` 为空：用下面的 ``LANDING_ROUTE`` 生成——进场 40m 高、离落点约 394m
-#:   ⇒ 下滑斜率 tan≈0.102（约 5.8°）✓（2026-09 之前的 40m/183m = tan 0.219 ≈ 12.4°
-#:   会被飞控判"下滑角过陡"）。
+#:   飞掠段插在它前面，合成一条任务上传。入库的 ``routes/land.plan`` 已对准本赛区跑道
+#:   （进场 30m 高、落点在跑道西段，下滑斜率 tan≈0.103）。
+#: * ``LAND_PLAN`` 为空：用下面的 ``LANDING_ROUTE`` 生成——进场 20m 高、离落点 270m
+#:   ⇒ 下滑斜率 tan≈0.074 ✓（2026-09 之前的 40m/183m = tan 0.219 ≈ 12.4° 会被飞控判
+#:   "下滑角过陡"）。
 LAND_PLAN = "routes/land.plan"
 LANDING_ROUTE = (
-    Waypoint(lat=47.396500, lon=8.545000, alt_m=40.0),
-    Waypoint(lat=47.393600, lon=8.542000, alt_m=0.0),
+    Waypoint(lat=47.3979709888, lon=8.5421896728, alt_m=20.0),  # 进场：跑道西侧 300m、20m 高
+    Waypoint(lat=47.3979710570, lon=8.5457663331, alt_m=0.0),  # 落点：跑道中心线 x=-30m
 )
 OVERFLY_HEADING_DEG = 0.0
 #: 侦查航线谁上传：演练档用 auto（由本包上传）；正式任务用 operator（操作手在 QGC 启动）
 RECON_UPLOAD = "auto"
-#: 合成目标相对"盘旋点"的 NED 偏移（北, 东, 地）；飞掠航向方向上放 300m
-TARGET_OFFSET_NED = (300.0, 0.0, 0.0)
+#: 合成目标相对"盘旋点"的 NED 偏移（北, 东, 地）：正西 20m = A 区中位数天井（r2 = 56 号）
+TARGET_OFFSET_NED = (0.0, -20.0, 0.0)
 #: 地面演练开关：``False`` = 不等飞机起飞就放行 ``WAIT_AIRBORNE`` 那道门。
 #: 演练常在地面（或只起了 SITL 还没手动起飞）时跑，若保持默认的 ``True``，
 #: 状态机会一直等到 ``airborne_timeout_s``（默认 1800s）才失败——演练根本跑不起来。

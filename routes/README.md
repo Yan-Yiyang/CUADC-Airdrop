@@ -37,3 +37,14 @@ QGC 里画好航线 → **Save / 另存为** → 选择本目录：
 上传/投放: 2 / 1   判据评估 408 次    ABORT/错误: 0 / 0
 投放触发时预测落点误差 1.35 m（高度 20 m、飞行时间 2.15 s）
 ```
+
+## 对准 CUADC 赛区
+
+`land.plan` 的经纬度已对准 `sim/worlds/cuadc/cuadc_recon_strike_r*.sdf` 的起降区
+（ENU 原点 = 跑道中点；世界原点与 PX4 默认世界一致，见 `docs/simulation_world.md`）：
+
+* 前两个航点：跑道中心线以西 650m / 500m、50m 高（返航进入段）；
+* 降落复杂项：进场点在西侧 340m、30m 高，落点在跑道西段（x = -40m），下滑斜率
+  tan≈0.103 ✓（PX4 上限 ≈0.142）；
+* 换场地时这两处要一起改：世界的 `spherical_coordinates` + 本文件的经纬度 +
+  `examples/sitl_mission.py` 的航点常量。

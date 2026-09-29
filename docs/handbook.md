@@ -58,11 +58,12 @@
 | --- | --- | --- | --- |
 | `airdrop/` | 唯一的运行时代码包（9 个子包，见 §3） | `__init__.py`（171 个公开名）、`config.py`（全部参数） | 是 |
 | `airdrop/config.py` | **全部参数的唯一集中处**（frozen dataclass + 取值域校验） | `Config`、`Config.validated` | 是 |
-| `tools/` | 一次性离线工具（**纯库模块**：文件内常量 = 默认值，暴露 `build_config(**覆盖)` / `main(**kwargs)`；命令行解析归 §6.2 的 `airdrop/run.py`） | `fetch_models.py`、`calibrate.py`、`fit_ballistics.py`、`dump_api.py`、`check_docs.py` | 是 |
+| `tools/` | 一次性离线工具（**纯库模块**：文件内常量 = 默认值，暴露 `build_config(**覆盖)` / `main(**kwargs)`；命令行解析归 §6.2 的 `airdrop/run.py`） | `fetch_models.py`、`calibrate.py`、`fit_ballistics.py`、`make_world.py`、`dump_api.py`、`check_docs.py` | 是 |
 | `examples/` | 七个入口示例（同样是纯库模块：常量 = 默认值；重依赖只在函数体内导入，所以 `import` 它们**不加载** cv2/mavsdk/torch） | `full_mission.py`、`replay_flight.py`、`sitl_mission.py` | 是 |
 | `airdrop/run.py` | **唯一的命令行入口**：argparse 子命令 → 关键字覆盖到各入口的 `build_config`/`main`（见 §6.2） | `run.py`、`airdrop/_lazy.py`（PEP 562 惰性导出） | 是 |
-| `tests/` | pytest 套件（19 个测试文件，全部离线；`realdata` 标记默认跳过） | `conftest.py`、`test_e2e.py`、`test_fit.py`、`test_plan.py` | 是 |
-| `docs/` | 专题笔记（4 篇实测记录）+ 本手册 | `handbook.md`、`calibration_opencv.md`、`video_hm30_ffmpeg.md`、`perception_ocr.md`、`ballistics_fit.md` | 是 |
+| `tests/` | pytest 套件（20 个测试文件，全部离线；`realdata` 标记默认跳过） | `conftest.py`、`test_e2e.py`、`test_fit.py`、`test_plan.py`、`test_world.py` | 是 |
+| `docs/` | 专题笔记（5 篇实测记录）+ 本手册 | `handbook.md`、`simulation_world.md`、`calibration_opencv.md`、`video_hm30_ffmpeg.md`、`perception_ocr.md`、`ballistics_fit.md` | 是 |
+| `sim/` | **仿真模块**：世界（生成产物：两个 `.sdf` + 网格/贴图）+ 带下视相机的机型 + PX4 airframe + 装机/启动脚本；生成器是 `tools/make_world.py`，布局与启动见 [`simulation_world.md`](simulation_world.md)，模块说明见 [`../sim/README.md`](../sim/README.md) | `sim/worlds/cuadc/cuadc_recon_strike_r1.sdf`、`r2.sdf` | 是 |
 | `routes/` | **操作手在 QGC 里画好的 `.plan` 航线**（`recon.plan` / `land.plan`），由配置按需导入 | `land.plan` | 是（航线是飞行输入，跟着版本走） |
 | `models/` | 本地模型权重与字典（**字典入库、权重不入库**） | `best2.pt`、`ppocr/*.pth`、`ppocr/ppocrv6_dict.txt` | 字典是；权重否 |
 | `.venv/` | 项目虚拟环境（uv 创建，Python 3.14.6，**里面没有 pip**） | — | 否 |
@@ -70,7 +71,7 @@
 | `qgroundcontrol-master/` | QGC 地面站源码，同上（`MissionManager/LandingComplexItem.cc` 是 `.plan` 复杂项展开的权威依据） | — | 否 |
 | `flights/` | **运行期产物**：`record.dir` 默认值，每次飞行一个子目录 | 见 §5.1 | 否（已 ignore） |
 | `log/` | 运行期产物：`perception.crop_dir` 默认 `log/target`（裁剪排故图） | — | 否（已 ignore） |
-| `.e2e-test-tmp/`、`.fit-test-tmp/`、`.calibrate-test-tmp/`、`.replay-test-tmp/`、`.pytest-tmp/`、`.plan-test-tmp/`、`.handbook-test-tmp/` | 测试用的**工作区内**临时目录（见 §5.6） | — | 否（已 ignore） |
+| `.e2e-test-tmp/`、`.fit-test-tmp/`、`.calibrate-test-tmp/`、`.replay-test-tmp/`、`.pytest-tmp/`、`.plan-test-tmp/`、`.handbook-test-tmp/`、`.world-test-tmp/` | 测试用的**工作区内**临时目录（见 §5.6） | — | 否（已 ignore） |
 | `.sitl-test-tmp/` | SITL 演练的临时产物（演练日志、机上任务备份、ulog 探查脚本） | — | 否（已 ignore） |
 | `.idea/`、`.vscode/`、`.workbuddy/` | 编辑器/工具配置 | — | 否（已 ignore） |
 
@@ -103,7 +104,7 @@
 | `flights/` | **飞行记录产物**（`FlightRecorder` 的输出目录，一次飞行几十~几百 MB） |
 | `.coverage*`、`coverage.xml`、`htmlcov/` | 覆盖率产物 |
 | `.venv/`、`__pycache__/`、`*.py[cod]`、`.pytest_cache/` 等 | 环境与缓存 |
-| `.replay-test-tmp/`、`.calibrate-test-tmp/`、`.e2e-test-tmp/`、`.fit-test-tmp/`、`.plan-test-tmp/`、`.handbook-test-tmp/`、`.pytest-tmp/`、`.sitl-test-tmp/`、`pytest-cache-files-*/` | 测试与演练临时目录（§5.6） |
+| `.replay-test-tmp/`、`.calibrate-test-tmp/`、`.e2e-test-tmp/`、`.fit-test-tmp/`、`.plan-test-tmp/`、`.handbook-test-tmp/`、`.world-test-tmp/`、`.pytest-tmp/`、`.sitl-test-tmp/`、`pytest-cache-files-*/` | 测试与演练临时目录（§5.6） |
 | `PX4-Autopilot-1.17.0/`、`qgroundcontrol-master/`、`px4.tar.gz`、`qgc.tar.gz` | 参考源码与压缩包 |
 
 ⚠ **一处没有被 ignore、需要人工注意**：
@@ -1278,6 +1279,8 @@ FW_DEFAULT_LAND_ANGLE_DEG = 8.0       # PX4 FW_LND_ANG 出厂默认
   落点；下滑**斜率**（tan，垂直差/水平距离）≤ `tan(FW_LND_ANG + 0.1°)`（默认 8° ⇒ 上限约 0.142，
   即约 8.1°）；进场项只能是 `NAV_WAYPOINT` 或 `NAV_LOITER_TO_ALT`（后者按
   `sqrt(圆心距² − 半径²)` 修正水平距离，与 PX4 一致）；`LOITER_TO_ALT` 进场时落点必须在盘旋圈**外**。
+  距离用与 PX4 `get_distance_to_next_waypoint` 同款的**球面 haversine**（半径 6371000，
+  `_EARTH_RADIUS_M`）——刻意不换椭球/Geod，保证预检与飞控是同一把尺子。
   `preceding` 用来说明"`items` 之前还有一项"（飞掠段插在降落段前面时就是飞掠段的 exit）。
 - 不合格的航线在**规划阶段**就带着原因失败（`PlanningError`），而不是上传后被飞控整条拒掉、
   飞机原地盘旋——2026-09 的 SITL 演练里为此空等了 15 分钟。
@@ -2035,6 +2038,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `.calibrate-test-tmp/` | `tests/test_calibrate.py` 的 `workdir` fixture | 合成标定飞行目录（渲染棋盘格帧） |
 | `.plan-test-tmp/` | `tests/test_plan.py` 的 `workdir` fixture | 现场造的 QGC `.plan`（含复杂项） |
 | `.handbook-test-tmp/` | `tests/test_handbook.py` 的 `workdir` fixture | 手册 §3 示例真跑时的工作目录 |
+| `.world-test-tmp/` | `tests/test_world.py` 的 `workdir` fixture | 生成到别处的赛区世界（含贴图复制） |
 | `.replay-test-tmp/` | `tests/test_replay.py` | 手写的最小飞行目录 |
 | `.sitl-test-tmp/` | **人工**（SITL 演练） | 演练日志、机上任务备份、ulog 探查脚本；不是测试 fixture |
 | `.pytest-tmp/` | 历史遗留（`--basetemp` 落点） | 已可删除，无用 |
@@ -2084,6 +2088,10 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | `python -m airdrop.run hm30-video` | `examples/hm30_video.py` | HM30 图传 | 链路统计；`--preview` 开窗、`--save-path` 存 mp4 | 0 |
 | `python -m airdrop.run video-sync` | `examples/video_telemetry_sync.py` | HM30 图传 + 飞控 | 对齐 + 逐帧入缓冲 + 读者线程演示 | 0；首帧超时/一帧没收到 = 1 |
 | `python -m airdrop.run fetch-models` | `tools/fetch_models.py` | 本地素材目录（`--source-dir`；**只复制、不联网**） | 权重复制进 `models/` | 0 |
+| `python -m airdrop.run make-world` | `tools/make_world.py` | — | `sim/worlds/cuadc/` 里的两个 CUADC 赛区世界 + 网格/材质（`--out-dir` 会把贴图一起复制过去）；布局与 SITL 启动见 [`simulation_world.md`](simulation_world.md) | 0 成功 / 1 参数非法或缺资产 |
+| `python -m airdrop.run make-backdrops` | `tools/make_backdrops.py` | —（离线；要 Pillow） | `sim/worlds/cuadc/materials/textures/` 里的目标区地面纹理 `ground_*.png` + 程序化航拍底图 `aerial_*.png`；`--parts ground` 只写前者（不覆盖抓来的真实航拍图） | 0 / 1 参数非法 |
+| `python -m airdrop.run fetch-aerial` | `tools/fetch_aerial.py` | **联网**（USGS NAIP 影像服务；公有领域） | 用真实航拍影像覆盖 `aerial_*.png`（比赛区域外那块干扰底图） | 0 / 1 联网或下载失败 |
+| `python -m airdrop.run preview-world` | `tools/preview_world.py` | —（要 Pillow；只读世界文件，不重新生成） | 俯视预览图 `sim/worlds/cuadc/preview.png`（带中文标注：天井编号/两位数、航拍块编号、图例；**标注只在这张 PNG 里**） | 0 / 1 世界文件读不了 |
 | `python -m airdrop.run dump-api` | `tools/dump_api.py` | — | 把公开签名与默认值自省成 `docs/api_reference.md`（核对文档用） | 0 |
 | `python -m airdrop.run check-docs` | `tools/check_docs.py` | — | 核验 `docs/handbook.md` 与代码是否一致 | 0 一致 / 1 有缺口 |
 
@@ -2105,6 +2113,21 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | `--strict` | replay / calibrate | 回放异常即失败 / 标定降级（外参或时间差没标出来）即返回 2 |
 | `--impacts FILE` | fit-ballistics | 实测落点文件 |
 | `--mass-kg` | fit-ballistics | `BallisticsConfig.mass_kg`（**实测值，不参与反演**） |
+| `--seed N` | make-world | 天井位置与朝向的随机种子（默认 0 = 入库布局） |
+| `--rounds {both,1,2}` | make-world | 生成哪几轮（第一轮图片靶标 / 第二轮数字靶标） |
+| `--wind E,N,U` | make-world | 世界的恒定风（东,北,天 m/s；默认静风） |
+| `--out-dir DIR` | make-world | 世界与资产写到哪个目录（默认 `sim/worlds/cuadc`） |
+| `--well-arrows` | make-world | 画"天井箭头"（规则文本有、规则图 2/4 没有；默认不画） |
+| `--sun AZ,EL` | make-world | 太阳位置（方位角,仰角 度；换阴影环境用，如 `90,12` = 东侧长阴影） |
+| `--sun-random` | make-world | 太阳由 seed + 轮次随机（方位全向、仰角 15~80°；换 seed 换光照） |
+| `--aerial-patches N` | make-world | 比赛区域外铺几块航拍干扰底图（0 = 不铺；默认 12） |
+| `--size N` | make-backdrops / fetch-aerial | 底图贴图边长（像素，默认 512） |
+| `--seed N` | make-backdrops | 底图随机种子（`ground_*` / 程序化 `aerial_*` 长什么样） |
+| `--parts {all,ground,aerial}` | make-backdrops | 只写哪一类底图（默认 all） |
+| `--tile-width-m M` | fetch-aerial | 每张真实航拍图覆盖的地面宽度（米，默认 160） |
+| `--world-dir DIR` | preview-world | 预览哪个世界目录（默认 `sim/worlds/cuadc`） |
+| `--round {1,2}` | preview-world | 预览哪一轮（默认 2） |
+| `--out FILE` | preview-world | 输出 PNG 路径（默认 `sim/worlds/cuadc/preview.png`） |
 
 参数不合法（未知子命令、未知选项、取值越界）一律由 argparse 以 **2** 退出。
 
@@ -2138,6 +2161,16 @@ HOLD_PROCESS → OVERFLY（飞掠 + 投放）→ LAND → DONE
 
 ⚠ 关掉的自检项**不算通过**：每项都会落一条 `preflight` 事件（`ok=null`），
 正式任务起飞前请核对该事件；`preflight_skipped` 则表示根本没注入预检对象。
+
+**SITL 用哪个世界**：`examples/sitl_mission.py` 的航线与合成目标已对准
+`sim/worlds/cuadc/cuadc_recon_strike_r2.sdf`（CUADC 赛区：跑道 + A/B 两个 60x60m 目标区
+分列起飞线两端、8 座天井在区内随机摆放，第二轮数字靶标；航线常量按 seed 0 手写，
+`tests/test_world.py` 会核验它对准 A 区中位数天井）。起 SITL 前要把世界挂进 PX4 的 worlds 目录并把
+`sim/worlds/cuadc` 加进 `GZ_SIM_RESOURCE_PATH`——两条命令的完整步骤、几何与规则出处见
+[`simulation_world.md`](simulation_world.md)；一键版本是 `bash sim/run_sitl.sh r2`
+（机型默认 `gz_rc_cessna_down_cam`：带 1280x720 下视相机，感知取图用的那个）。
+**视频流是 PX4 官方机制**：`gz_bridge/server.config` 自动加载 `GstCameraSystem`，把世界里的
+第一台相机编码成 RTP/H.264 推到 UDP 5600，QGC 设 “UDP h.264 / 5600” 就能看（详见世界文档 §5.1）。
 
 ### 6.4 改配置的三种方式
 
@@ -2186,6 +2219,7 @@ config = Config(
 | `tests/test_examples.py` | 示例与工具不脱节（导入即校验 + **导入不加载重库** + 真跑装配函数） | 否 |
 | `tests/test_cli.py` | 集中式入口：子命令注册表（parser + handler）、`--help`/`check-docs` **不加载重库**（干净子进程实测）、参数不合法退出码 2、选项覆盖真的进了 `build_config()` | 否 |
 | `tests/test_handbook.py` | **本手册 §3 的 11 段示例逐条真跑**（文档里的代码必须能运行） | 否 |
+| `tests/test_world.py` | CUADC 赛区世界：**生成结果 == 入库文件**、目标区在起飞线两端（±200, 0）、天井区内随机摆放且间距 > 20m、五边形环壁（厚 5mm、高 400mm）、**规则里只是示意的东西不许出现**（4m/6m 打击圈、天井箭头）、同区天井同色、贴地标线不共面重叠（防 z-fighting）、两轮靶标摆位（第二轮中位数落在第 3 座）、演练航线对准中位数天井、目标区底色（常见路面色 + 少量纹理）、周边航拍底图（不压跑道/目标区、互不重叠）、底图生成器（可复现/离线校验）、俯视预览图（尺寸/可复现/参数校验）、资产逐级存在、数字板必须是**白底黑字** | 否 |
 
 ### 6.6 一次真实任务的推荐顺序
 

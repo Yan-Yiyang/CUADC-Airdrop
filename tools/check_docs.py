@@ -80,6 +80,7 @@ REQUIRED_ENTRIES: tuple[str, ...] = (
     "tests/test_handbook.py",
     "tests/test_plan.py",
     "tests/test_cli.py",
+    "tests/test_world.py",
 )
 
 #: 手册必须覆盖的主题关键词

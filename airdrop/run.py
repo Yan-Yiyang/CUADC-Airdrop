@@ -62,7 +62,7 @@ class Option:
     flags: tuple[str, ...]
     dest: str
     help: str
-    #: str / int / float / path / choice / flag / flag-off / bool / pair / vec3 / const
+    #: str / int / float / path / choice / flag / flag-off / bool / pair / vec2 / vec3 / const
     kind: str = "str"
     choices: tuple[str, ...] = ()
     #: 默认值取自入口模块的这个常量（``const`` 用它作为"开关打开时要传的值"）
@@ -457,6 +457,164 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             ),
         ),
     ),
+    "make-world": Subcommand(
+        name="make-world",
+        module="tools.make_world",
+        help="生成 CUADC 赛区 Gazebo 世界（round1 图片靶标 / round2 数字靶标）",
+        options=(
+            Option(
+                ("--out-dir",),
+                "out_dir",
+                "输出目录（默认 sim/worlds/cuadc）",
+                kind="path",
+                source="OUT_DIR",
+            ),
+            Option(
+                ("--seed",),
+                "seed",
+                "随机种子（决定各天井朝向；默认 0 = 入库布局）",
+                kind="int",
+                source="SEED",
+            ),
+            Option(
+                ("--rounds",),
+                "rounds",
+                "生成哪几轮：both / 1 / 2",
+                kind="choice",
+                choices=("both", "1", "2"),
+                source="ROUNDS",
+            ),
+            Option(
+                ("--wind",),
+                "wind_enu_m_s",
+                "世界恒定风（东,北,天 m/s），默认静风",
+                kind="vec3",
+                source="WIND_ENU_M_S",
+            ),
+            Option(
+                ("--well-arrows",),
+                "well_arrows",
+                '在天井里画"天井箭头"（规则文本提到、规则图 2/4 里没有；默认不画）',
+                kind="flag",
+                source="WELL_ARROWS",
+            ),
+            Option(
+                ("--sun",),
+                "sun_azel_deg",
+                "太阳位置（方位角,仰角 度；方位从北起顺时针，仰角 0~90）——换阴影环境用，"
+                "例如 90,12 = 东侧低角度长阴影",
+                kind="vec2",
+                source="SUN_AZEL_DEG",
+            ),
+            Option(
+                ("--sun-random",),
+                "sun_random",
+                "太阳位置由 seed 随机（方位全向、仰角 15~80°，换 seed 换光照）；"
+                "开了它 --sun 的固定值不生效",
+                kind="flag",
+                source="SUN_RANDOM",
+            ),
+            Option(
+                ("--aerial-patches",),
+                "aerial_patches",
+                "比赛区域外铺几块航拍干扰底图（0 = 不铺；默认 6）",
+                kind="int",
+                source="AERIAL_PATCHES",
+            ),
+        ),
+    ),
+    "make-backdrops": Subcommand(
+        name="make-backdrops",
+        module="tools.make_backdrops",
+        help="生成场景底图贴图：目标区地面纹理 + 比赛区域外的随机航拍干扰底图",
+        options=(
+            Option(
+                ("--out-dir",),
+                "out_dir",
+                "输出目录（默认 sim/worlds/cuadc）",
+                kind="path",
+                source="OUT_DIR",
+            ),
+            Option(
+                ("--seed",),
+                "seed",
+                "随机种子（决定底图长什么样；默认 0）",
+                kind="int",
+                source="SEED",
+            ),
+            Option(
+                ("--size",),
+                "size",
+                "贴图边长（像素，默认 512）",
+                kind="int",
+                source="SIZE_PX",
+            ),
+            Option(
+                ("--parts",),
+                "parts",
+                "写哪一类：all / ground（只目标区纹理，不动 fetch-aerial 抓来的航拍图）/ aerial",
+                kind="choice",
+                choices=("all", "ground", "aerial"),
+                source="PARTS",
+            ),
+        ),
+    ),
+    "preview-world": Subcommand(
+        name="preview-world",
+        module="tools.preview_world",
+        help="把赛区世界渲染成俯视预览图（PNG，带中文标注，供人眼核对布局）",
+        options=(
+            Option(
+                ("--world-dir",),
+                "world_dir",
+                "世界目录（默认 sim/worlds/cuadc）",
+                kind="path",
+                source="WORLD_DIR",
+            ),
+            Option(
+                ("--round",),
+                "round_no",
+                "预览哪一轮（1 = 图片靶标 / 2 = 数字靶标）",
+                kind="int",
+                source="ROUND",
+            ),
+            Option(
+                ("--out",),
+                "out_path",
+                "输出 PNG 路径（默认 sim/worlds/cuadc/preview.png，已进 .gitignore）",
+                kind="path",
+                source="OUT_PATH",
+            ),
+        ),
+    ),
+    "fetch-aerial": Subcommand(
+        name="fetch-aerial",
+        module="tools.fetch_aerial",
+        help="抓真实航拍底图（USGS NAIP，公有领域，需联网）替换程序化底图",
+        options=(
+            Option(
+                ("--out-dir",),
+                "out_dir",
+                "输出目录（默认 sim/worlds/cuadc）",
+                kind="path",
+                source="OUT_DIR",
+            ),
+            Option(
+                ("--size",),
+                "size",
+                "贴图边长（像素，默认 512）",
+                kind="int",
+                source="SIZE_PX",
+            ),
+            Option(
+                ("--tile-width-m",),
+                "tile_width_m",
+                "每张底图覆盖的地面宽度（米，默认 160）",
+                kind="float",
+                source="TILE_WIDTH_M",
+            ),
+        ),
+    ),
     "dump-api": Subcommand(
         name="dump-api",
         module="tools.dump_api",
@@ -513,6 +671,8 @@ def _add_option(parser: argparse.ArgumentParser, module: Any, option: Option) ->
         parser.add_argument(*option.flags, type=Path, **common)
     elif option.kind == "pair":
         parser.add_argument(*option.flags, type=_pair, metavar="A,B", **common)
+    elif option.kind == "vec2":
+        parser.add_argument(*option.flags, type=_vec2, metavar="AZ,EL", **common)
     elif option.kind == "vec3":
         parser.add_argument(*option.flags, type=_vec3, metavar="N,E,D", **common)
     elif option.kind == "str":
@@ -527,6 +687,14 @@ def _pair(text: str) -> tuple[int, int]:
     if len(parts) != 2:
         raise argparse.ArgumentTypeError(f"要两个整数（形如 9,6）：{text!r}")
     return int(parts[0]), int(parts[1])
+
+
+def _vec2(text: str) -> tuple[float, float]:
+    """``"218,55"`` → ``(218.0, 55.0)``（例如太阳的 方位角,仰角）。"""
+    parts = text.replace("，", ",").split(",")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"要两个数（形如 218,55）：{text!r}")
+    return float(parts[0]), float(parts[1])
 
 
 def _vec3(text: str) -> tuple[float, float, float]:

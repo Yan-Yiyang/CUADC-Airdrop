@@ -1,0 +1,1426 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sdf version="1.9">
+  <world name="cuadc_recon_strike_r2">
+    <!-- CUADC 固定翼无人机侦察与打击赛区（2026 规则）；由 tools/make_world.py 生成 -->
+    <physics type="ode">
+      <max_step_size>0.004</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>250</real_time_update_rate>
+    </physics>
+    <gravity>0 0 -9.8</gravity>
+    <magnetic_field>6e-06 2.3e-05 -4.2e-05</magnetic_field>
+    <atmosphere type="adiabatic"/>
+    <scene>
+      <sky>
+        <clouds>
+          <speed>12</speed>
+        </clouds>
+      </sky>
+      <grid>false</grid>
+      <ambient>0.45 0.45 0.45 0.6</ambient>
+      <background>0.35 0.45 0.6 0.8</background>
+      <shadows>true</shadows>
+    </scene>
+    <!-- 风：默认静风；改这里（或重跑 make-world 时用 wind 选项）就给弹道加风 -->
+    <wind>
+      <linear_velocity>0 0 0</linear_velocity>
+    </wind>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>1 1</size>
+            </plane>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>0.6</mu>
+                <mu2>0.6</mu2>
+              </ode>
+            </friction>
+            <bounce/>
+            <contact>
+              <collide_bitmask>65535</collide_bitmask>
+              <ode>
+                <min_depth>0.005</min_depth>
+                <kp>1e8</kp>
+              </ode>
+            </contact>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <cast_shadows>false</cast_shadows>
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>1400 1400</size>
+            </plane>
+          </geometry>
+          <material>
+            <diffuse>0.35 0.55 0.25 1</diffuse>
+            <specular>0 0 0 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="cuadc_field_markings">
+      <static>true</static>
+      <link name="link">
+        <visual name="runway">
+          <pose>0 0 0.01 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>200 30 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.62 0.58 0.5 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="landing_zone">
+          <pose>0 0 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>50 50 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.72 0.7 0.64 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="centerline_1">
+          <pose>-80 0 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.3 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="centerline_2">
+          <pose>-60 0 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.3 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="centerline_3">
+          <pose>-40 0 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.3 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="centerline_4">
+          <pose>-20 0 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.3 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="centerline_5">
+          <pose>0 0 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.3 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="centerline_6">
+          <pose>20 0 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.3 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="centerline_7">
+          <pose>40 0 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.3 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="centerline_8">
+          <pose>60 0 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.3 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="centerline_9">
+          <pose>80 0 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.3 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="threshold_w_s">
+          <pose>-90 -8 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2 6 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="threshold_w_n">
+          <pose>-90 8 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2 6 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="threshold_e_s">
+          <pose>90 -8 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2 6 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="threshold_e_n">
+          <pose>90 8 0.07 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2 6 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.92 0.92 0.92 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="control_zone">
+          <pose>0 -34 0.05 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>20 16 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.55 0.12 0.12 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="zone_a_ground">
+          <pose>200 0 0.006 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_ground_soil.obj</uri>
+              <scale>66 66 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="zone_a_line_w">
+          <pose>170 0 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.25 59.5 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="zone_a_line_e">
+          <pose>230 0 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.25 59.5 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="zone_a_line_s">
+          <pose>200 -30 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>60 0.25 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="zone_a_line_n">
+          <pose>200 30 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>60 0.25 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="flag_a_sw_pole">
+          <pose>170 -30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="flag_a_sw_pennant">
+          <pose>170.45 -30 2.7 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.9 0.03 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.8 0.1 0.1 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="flag_a_sw_collision">
+          <pose>170 -30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+        </collision>
+        <visual name="flag_a_se_pole">
+          <pose>230 -30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="flag_a_se_pennant">
+          <pose>230.45 -30 2.7 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.9 0.03 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.8 0.1 0.1 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="flag_a_se_collision">
+          <pose>230 -30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+        </collision>
+        <visual name="flag_a_nw_pole">
+          <pose>170 30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="flag_a_nw_pennant">
+          <pose>170.45 30 2.7 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.9 0.03 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.8 0.1 0.1 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="flag_a_nw_collision">
+          <pose>170 30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+        </collision>
+        <visual name="flag_a_ne_pole">
+          <pose>230 30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="flag_a_ne_pennant">
+          <pose>230.45 30 2.7 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.9 0.03 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.8 0.1 0.1 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="flag_a_ne_collision">
+          <pose>230 30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+        </collision>
+        <visual name="zone_b_ground">
+          <pose>-200 0 0.006 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_ground_concrete_old.obj</uri>
+              <scale>66 66 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="zone_b_line_w">
+          <pose>-230 0 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.25 59.5 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="zone_b_line_e">
+          <pose>-170 0 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.25 59.5 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="zone_b_line_s">
+          <pose>-200 -30 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>60 0.25 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="zone_b_line_n">
+          <pose>-200 30 0.03 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>60 0.25 0.004</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.95 0.95 0.95 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="flag_b_sw_pole">
+          <pose>-230 -30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="flag_b_sw_pennant">
+          <pose>-229.55 -30 2.7 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.9 0.03 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.8 0.1 0.1 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="flag_b_sw_collision">
+          <pose>-230 -30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+        </collision>
+        <visual name="flag_b_se_pole">
+          <pose>-170 -30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="flag_b_se_pennant">
+          <pose>-169.55 -30 2.7 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.9 0.03 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.8 0.1 0.1 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="flag_b_se_collision">
+          <pose>-170 -30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+        </collision>
+        <visual name="flag_b_nw_pole">
+          <pose>-230 30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="flag_b_nw_pennant">
+          <pose>-229.55 30 2.7 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.9 0.03 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.8 0.1 0.1 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="flag_b_nw_collision">
+          <pose>-230 30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+        </collision>
+        <visual name="flag_b_ne_pole">
+          <pose>-170 30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <diffuse>0.9 0.9 0.9 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="flag_b_ne_pennant">
+          <pose>-169.55 30 2.7 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.9 0.03 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.8 0.1 0.1 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="flag_b_ne_collision">
+          <pose>-170 30 1.5 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>0.03</radius>
+              <length>3</length>
+            </cylinder>
+          </geometry>
+        </collision>
+      </link>
+    </model>
+
+    <model name="cuadc_surroundings">
+      <static>true</static>
+      <link name="link">
+        <visual name="aerial_1">
+          <pose>-101.575 156.787 0.01 0 0 5.338</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_1.obj</uri>
+              <scale>100.14 100.14 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_2">
+          <pose>319.946 -55.612 0.013 0 0 6.168</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_1.obj</uri>
+              <scale>112.668 112.668 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_3">
+          <pose>9.98 -189.685 0.016 0 0 1.643</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_5.obj</uri>
+              <scale>65.336 65.336 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_4">
+          <pose>209.844 -179.652 0.019 0 0 4.858</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_1.obj</uri>
+              <scale>109.857 109.857 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_5">
+          <pose>-225.757 -145.044 0.022 0 0 1.729</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_5.obj</uri>
+              <scale>66.675 66.675 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_6">
+          <pose>105.029 120.211 0.025 0 0 2.993</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_4.obj</uri>
+              <scale>102.661 102.661 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_7">
+          <pose>-302.103 -75.272 0.028 0 0 5.511</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_3.obj</uri>
+              <scale>60.47 60.47 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_8">
+          <pose>-368.797 -188.173 0.031 0 0 1.967</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_1.obj</uri>
+              <scale>77.873 77.873 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_9">
+          <pose>-396.594 180.786 0.034 0 0 0.938</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_4.obj</uri>
+              <scale>82.765 82.765 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_10">
+          <pose>370.626 107.15 0.037 0 0 2.692</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_5.obj</uri>
+              <scale>105.678 105.678 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_11">
+          <pose>-139.707 -246.989 0.04 0 0 3.364</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_5.obj</uri>
+              <scale>118.627 118.627 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="aerial_12">
+          <pose>97.381 244.93 0.043 0 0 0.011</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_aerial_2.obj</uri>
+              <scale>61.386 61.386 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <model name="well_a1">
+      <static>true</static>
+      <pose>213.115 6.907 0 0 0 5.925</pose>
+      <link name="well_link">
+        <visual name="floor">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.12 0.25 0.7 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="floor_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="wall">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.78 0.78 0.74 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="wall_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+        </collision>
+      </link>
+      <model name="plate">
+        <static>true</static>
+        <pose>0 0 0.06 0 0 0</pose>
+        <link name="plate_link">
+        <visual name="board">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.12 0.25 0.7 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="sheet_0">
+          <pose>0 0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_9.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="sheet_1">
+          <pose>0 -0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_4.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        </link>
+      </model>
+    </model>
+
+    <model name="well_a2">
+      <static>true</static>
+      <pose>178.011 -13.993 0 0 0 1.903</pose>
+      <link name="well_link">
+        <visual name="floor">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.12 0.25 0.7 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="floor_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="wall">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.78 0.78 0.74 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="wall_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+        </collision>
+      </link>
+      <model name="plate">
+        <static>true</static>
+        <pose>0 0 0.06 0 0 0</pose>
+        <link name="plate_link">
+        <visual name="board">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.12 0.25 0.7 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="sheet_0">
+          <pose>0 0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_1.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="sheet_1">
+          <pose>0 -0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_2.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        </link>
+      </model>
+    </model>
+
+    <model name="well_a3">
+      <static>true</static>
+      <pose>200.302 -10.804 0 0 0 2.564</pose>
+      <link name="well_link">
+        <visual name="floor">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.12 0.25 0.7 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="floor_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="wall">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.78 0.78 0.74 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="wall_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+        </collision>
+      </link>
+      <model name="plate">
+        <static>true</static>
+        <pose>0 0 0.06 0 0 0</pose>
+        <link name="plate_link">
+        <visual name="board">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.12 0.25 0.7 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="sheet_0">
+          <pose>0 0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_5.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="sheet_1">
+          <pose>0 -0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_6.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        </link>
+      </model>
+    </model>
+
+    <model name="well_a4">
+      <static>true</static>
+      <pose>180.887 15.835 0 0 0 5.09</pose>
+      <link name="well_link">
+        <visual name="floor">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.12 0.25 0.7 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="floor_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="wall">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.78 0.78 0.74 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="wall_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+        </collision>
+      </link>
+    </model>
+
+    <model name="well_b1">
+      <static>true</static>
+      <pose>-199.492 20.444 0 0 0 4.426</pose>
+      <link name="well_link">
+        <visual name="floor">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.7 0.12 0.12 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="floor_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="wall">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.78 0.78 0.74 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="wall_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+        </collision>
+      </link>
+      <model name="plate">
+        <static>true</static>
+        <pose>0 0 0.06 0 0 0</pose>
+        <link name="plate_link">
+        <visual name="board">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.7 0.12 0.12 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="sheet_0">
+          <pose>0 0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_3.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="sheet_1">
+          <pose>0 -0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_8.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        </link>
+      </model>
+    </model>
+
+    <model name="well_b2">
+      <static>true</static>
+      <pose>-178.182 13.769 0 0 0 5.878</pose>
+      <link name="well_link">
+        <visual name="floor">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.7 0.12 0.12 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="floor_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="wall">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.78 0.78 0.74 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="wall_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+        </collision>
+      </link>
+      <model name="plate">
+        <static>true</static>
+        <pose>0 0 0.06 0 0 0</pose>
+        <link name="plate_link">
+        <visual name="board">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.7 0.12 0.12 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="sheet_0">
+          <pose>0 0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_7.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="sheet_1">
+          <pose>0 -0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_0.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        </link>
+      </model>
+    </model>
+
+    <model name="well_b3">
+      <static>true</static>
+      <pose>-191.929 -15.223 0 0 0 3.249</pose>
+      <link name="well_link">
+        <visual name="floor">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.7 0.12 0.12 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="floor_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="wall">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.78 0.78 0.74 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="wall_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+        </collision>
+      </link>
+      <model name="plate">
+        <static>true</static>
+        <pose>0 0 0.06 0 0 0</pose>
+        <link name="plate_link">
+        <visual name="board">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.7 0.12 0.12 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <visual name="sheet_0">
+          <pose>0 0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_6.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <visual name="sheet_1">
+          <pose>0 -0.15 0.021 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/sheet_digit_1.obj</uri>
+              <scale>0.6 0.3 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        </link>
+      </model>
+    </model>
+
+    <model name="well_b4">
+      <static>true</static>
+      <pose>-221.784 4.201 0 0 0 4.378</pose>
+      <link name="well_link">
+        <visual name="floor">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.7 0.12 0.12 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="floor_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_plate.obj</uri>
+              <scale>1 1 3</scale>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="wall">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <diffuse>0.78 0.78 0.74 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+            <emissive>0 0 0 1</emissive>
+          </material>
+        </visual>
+        <collision name="wall_collision">
+          <geometry>
+            <mesh>
+              <uri>materials/meshes/pentagon_well_wall.obj</uri>
+            </mesh>
+          </geometry>
+        </collision>
+      </link>
+    </model>
+
+    <light name="sun" type="directional">
+      <pose>0 0 500 0 -0 0</pose>
+      <cast_shadows>true</cast_shadows>
+      <intensity>1</intensity>
+      <direction>0.353 0.452 -0.819</direction>
+      <diffuse>0.95 0.95 0.9 1</diffuse>
+      <specular>0.3 0.3 0.3 1</specular>
+      <attenuation>
+        <range>2000</range>
+        <linear>0</linear>
+        <constant>1</constant>
+        <quadratic>0</quadratic>
+      </attenuation>
+    </light>
+
+    <spherical_coordinates>
+      <surface_model>EARTH_WGS84</surface_model>
+      <world_frame_orientation>ENU</world_frame_orientation>
+      <latitude_deg>47.397971057728974</latitude_deg>
+      <longitude_deg>8.546163739800146</longitude_deg>
+      <elevation>0</elevation>
+    </spherical_coordinates>
+  </world>
+</sdf>
