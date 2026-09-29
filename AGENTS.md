@@ -339,7 +339,6 @@ CUADC固定翼无人机侦查与打击控制项目（固定翼无人机"先侦�
     （`anomalyco/opencode#27276`）。本仓库已配 `core.autocrlf=false`（local）与
     VSCode `files.eol="\n"`；自查：`git ls-files --eol | awk '$2=="w/crlf"'` 应为空。
 
-
 ## 验证方式
 
 - **测试（pytest，全部离线，无需飞控/图传硬件）**：
