@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from airdrop import Command, MavsdkThread, TelemetryBroker
+from airdrop import Command, MavsdkThread, TelemetryBroker, TelemetrySnapshot
 from airdrop.config import TelemetryConfig
 
 
@@ -230,6 +230,39 @@ def test_angle_wrap_interpolation() -> None:
     snap = broker.get_snapshot_at((s1.timestamp + s2.timestamp) / 2)
     assert snap.yaw_deg is not None
     assert abs(abs(snap.yaw_deg) - 180.0) < 1.0
+
+
+def test_discrete_fields_are_never_interpolated() -> None:
+    """``in_air`` / ``mission_current`` / ``mission_total`` 不是连续量，不能内插。
+
+    ``isinstance(a, (int, float))`` 拦不住它们（bool 是 int 的子类），于是曾经：
+    ``in_air: True → False`` 内插出 ``0.5``（真值）⇒ "等起飞"判据把整个过渡
+    窗口判成"在空中"；``mission_current: 2 → 4`` 内插出 ``3.0`` ⇒
+    ``int(3.0)`` 让任务完成判定提前一格。
+    """
+    broker = TelemetryBroker(history_maxlen=100, history_interval=0.0)
+    broker._history.append(
+        TelemetrySnapshot(
+            timestamp=1.0, in_air=True, mission_current=2, mission_total=4, roll_deg=10.0
+        )
+    )
+    broker._history.append(
+        TelemetrySnapshot(
+            timestamp=2.0, in_air=False, mission_current=4, mission_total=4, roll_deg=20.0
+        )
+    )
+
+    mid = broker.get_snapshot_at(1.5)
+    assert mid.in_air is True, f"in_air 内插成了 {mid.in_air!r}（必须是 bool）"
+    assert isinstance(mid.mission_current, int)
+    assert mid.mission_current == 2, f"mission_current 内插成了 {mid.mission_current!r}"
+    assert mid.mission_total == 4
+    # 连续量照常内插（别把修复做过头）
+    assert mid.roll_deg == pytest.approx(15.0)
+
+    # 外推取右端原值
+    after = broker.get_snapshot_at(3.0)
+    assert after.in_air is False
 
 
 def test_quaternion_slerp() -> None:

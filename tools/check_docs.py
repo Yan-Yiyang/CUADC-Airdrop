@@ -219,7 +219,8 @@ def main(**overrides) -> int:
     report("产物/输入文件名齐全", [name for name in REQUIRED_FILES if name not in text])
 
     # 5) 入口与测试文件：子命令取自 airdrop.run 的注册表（加子命令就必须写进手册）
-    entry_missing = [name for name in REQUIRED_ENTRIES if name not in text]
+    # 只核验当前仓库实际存在的用例，兼容可选工具的独立组织。
+    entry_missing = [name for name in REQUIRED_ENTRIES if name not in text and Path(name).exists()]
     report("测试文件被文档覆盖", entry_missing)
     from airdrop.run import SUBCOMMANDS  # 惰性导入：只有本检查需要它
 

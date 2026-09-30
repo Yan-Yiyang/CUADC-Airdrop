@@ -643,6 +643,15 @@ class FlightRecorder:
             except OSError:
                 LOGGER.exception("telemetry 写入失败")
                 continue
+            except Exception:
+                # ⚠ 只能兜到这里：线程里逃出去的异常会直接结束本线程，而
+                # threading 的默认 excepthook 把 traceback 打到 sys.stderr、
+                # **不进 flight.log** ⇒ 这次飞行的遥测在某刻静默停止记录，
+                # 事后复盘只看到 stats 不再增长。UnicodeEncodeError（ValueError
+                # 的子类）就够触发：文件按 utf-8 文本模式打开且 ensure_ascii=False，
+                # 快照里任何不可编码的字符串都会炸。
+                LOGGER.exception("telemetry 写入异常（已兜住，写盘线程继续）")
+                continue
 
     # ------------------------------------------------------------------
     # 目录 / 文件

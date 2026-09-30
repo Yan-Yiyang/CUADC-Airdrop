@@ -52,6 +52,10 @@ LOGGER = logging.getLogger(__name__)
 #: 时只告警一次，提醒确认它还在跑。
 _RESULT_BACKLOG_WARN = 2000
 
+#: 纯像素去重（``ocr_dedupe_s <= 0``）时保留的最近位置条数上限——没有时间窗可
+#: 淘汰，用条数兜住内存。
+_DEDUPE_MAX_RECENT = 64
+
 __all__ = ["PerceptionConfigLike", "PerceptionStats", "PerceptionWorker"]
 
 
@@ -74,11 +78,21 @@ class PerceptionConfigLike:
     #: OCR **积压告警阈值**（不是队列容量：请求/结果队列都无界、不丢弃，见 ocr_worker）
     ocr_queue_size: int = 500
     # 仅在显式开启时生效；默认关闭，避免误伤运动模糊下唯一清晰帧。
+    # 两个阈值是**与**关系：ocr_dedupe_s = 时间窗（秒），ocr_dedupe_px = 像素半径。
+    # 只设其一也有效——只设 px 时不做时间窗判断（最近若干条里位置够近就算重复）。
     ocr_dedupe_s: float = 0.0
     ocr_dedupe_px: float = 0.0
     min_side_px: float = 10.0
     max_side_px: float = 400.0
     engine: OcrEngineConfig = field(default_factory=OcrEngineConfig)
+    #: 相机内参/畸变（标定产出）。给了就走 :class:`Detector` 的**预计算 remap**
+    #: 快路径（比逐帧 undistort 快 3~5 倍），并在 ``Detection.extra["undistorted"]``
+    #: 上打标记，下游 georef 据此不再逐点去畸变。
+    #: 曾经这三个字段不存在、装配时也没人传，于是整条快路径是死代码：每帧都退回
+    #: 逐点 ``cv2.undistortPoints``，且"帧尺寸与标定不符"这条保护无人把守。
+    camera_matrix: np.ndarray | None = None
+    dist_coeffs: np.ndarray | None = None
+    calib_size: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in ("ocr", "cls12"):
@@ -137,6 +151,9 @@ class PerceptionWorker:
                 device=config.device,
                 conf_threshold=config.conf_threshold,
                 imgsz=config.imgsz,
+                camera_matrix=config.camera_matrix,
+                dist_coeffs=config.dist_coeffs,
+                calib_size=config.calib_size,
             )
         )
         self._pool = pool
@@ -368,17 +385,23 @@ class PerceptionWorker:
         return config.ocr_dedupe_s > 0 or config.ocr_dedupe_px > 0
 
     def _should_skip(self, detection: Detection) -> bool:
-        """在启用去重时，跳过相邻时间/位置近似重复的 OCR 请求。"""
+        """在启用去重时，跳过相邻时间/位置近似重复的 OCR 请求。
+
+        两个阈值是**与**关系：都要越过才算重复。``ocr_dedupe_s <= 0`` 时不做
+        时间窗判断（纯位置去重），``ocr_dedupe_px <= 0`` 时不做位置判断。
+        """
         if not self._dedupe_enabled():
             return False
         config = self._config
         u, v = detection.pixel
         now = detection.capture_timestamp
         self._expire(now)
+        window = config.ocr_dedupe_s
+        radius = config.ocr_dedupe_px
         for stamp, su, sv in self._recent:
-            if now - stamp > config.ocr_dedupe_s:
+            if window > 0 and now - stamp > window:
                 continue
-            if abs(su - u) <= config.ocr_dedupe_px and abs(sv - v) <= config.ocr_dedupe_px:
+            if radius > 0 and abs(su - u) <= radius and abs(sv - v) <= radius:
                 return True
         return False
 
@@ -386,12 +409,21 @@ class PerceptionWorker:
         """记住一条已提交送检的目标位置，用于后续最近窗口去重。"""
         u, v = detection.pixel
         self._recent.append((detection.capture_timestamp, u, v))
+        if len(self._recent) > _DEDUPE_MAX_RECENT:
+            # 没有时间窗时（只按 ocr_dedupe_px 去重）没有"过期"的概念，
+            # 用条数上限兜住内存；这条路径过去是被 _expire 无条件 clear() 掉的，
+            # 于是"只设 ocr_dedupe_px"会静默完全不去重、且没有任何日志。
+            del self._recent[: len(self._recent) - _DEDUPE_MAX_RECENT]
 
     def _expire(self, now: float) -> None:
-        """淘汰超出时间窗口的历史位置，避免缓存无限增长。"""
+        """淘汰超出时间窗口的历史位置，避免缓存无限增长。
+
+        ``ocr_dedupe_s <= 0``（纯位置去重）时**不清空**：改由
+        :meth:`_remember` 的条数上限兜底。清空会让刚记下的条目下一拍就没了，
+        纯位置去重形同虚设。
+        """
         window = self._config.ocr_dedupe_s
         if window <= 0:
-            self._recent.clear()
             return
         keep_from = now - window
         if self._recent and self._recent[0][0] < keep_from:

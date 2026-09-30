@@ -379,6 +379,56 @@ def test_align_times_out_and_drops_when_telemetry_stalls(
     assert s.max_wait_s >= 0.15
 
 
+def test_align_does_not_wait_or_drop_when_capture_predates_history(
+    broker: TelemetryBroker,
+) -> None:
+    """拍摄时刻比历史**最早**一条还早（视频先到、遥测后到）：不等待、不丢弃。
+
+    这是 ffmpeg 启动盲区 + 飞控等定位解造成的常态：架次开头若干秒的帧，其
+    拍摄时刻早于第一条有效遥测。遥测只会越来越晚，等再久也追不上一个更早的
+    时刻——所以这一类**不能**进等待分支，否则会被误判成"遥测停顿"而白白丢帧
+    （本项目硬要求"一帧不落"）。它该走向后外推，计入 ``too_old``。
+    """
+    now = time.time()
+    base = now - 1.0
+    fill_history(broker, base, count=11, step=0.1)  # 历史覆盖 (base, base+1]
+    capture_ts = base - 2.0  # 比历史最早一条还早 2s
+    frame = make_frame(capture_ts + DEFAULT_TELEMETRY_LAG)
+
+    aligner = FrameTelemetryAligner(broker, max_wait=1.0, on_timeout="drop")
+    t0 = time.perf_counter()
+    sample = aligner.align(frame)
+    elapsed = time.perf_counter() - t0
+
+    assert sample is not None, "比历史更早的帧不该被等待超时丢弃"
+    assert sample.extrapolated is True
+    assert sample.offset == pytest.approx(2.0, abs=1e-6)
+    assert elapsed < 0.05, f"不该为这一方向等待，却等了 {elapsed * 1000:.0f}ms"
+    s = aligner.stats
+    assert s.too_old == 1
+    assert s.waits == 0, "遥测只会更晚，等一个更早的时刻没有意义"
+    assert s.wait_timeouts == 0, "这不是遥测停顿，不该记成 wait_timeouts"
+    assert s.aligned == 1
+
+
+def test_align_too_old_still_honours_max_extrapolation(
+    broker: TelemetryBroker,
+) -> None:
+    """比历史更早的方向同样受 ``max_extrapolation`` 硬保护（超限就丢）。"""
+    now = time.time()
+    base = now - 1.0
+    fill_history(broker, base, count=11, step=0.1)
+    frame = make_frame((base - 2.0) + DEFAULT_TELEMETRY_LAG)
+
+    aligner = FrameTelemetryAligner(broker, max_wait=1.0, max_extrapolation=0.5, on_timeout="drop")
+    assert aligner.align(frame) is None
+
+    s = aligner.stats
+    assert s.extrapolation_drops == 1
+    assert s.too_old == 1
+    assert s.wait_timeouts == 0
+
+
 def test_align_empty_history_skips_wait_and_reports_no_telemetry(
     broker: TelemetryBroker,
 ) -> None:

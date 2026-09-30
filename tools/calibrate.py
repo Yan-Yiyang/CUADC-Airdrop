@@ -1187,28 +1187,57 @@ def _pose_matrix_from_rotation(rotation: np.ndarray, translation: Sequence[float
 # ----------------------------------------------------------------------
 # 飞行目录读取
 # ----------------------------------------------------------------------
-def load_flight_frames(flight_dir: Path, limit: int = 200) -> list[np.ndarray]:
-    """读飞行目录里的帧（``frames_index.jsonl`` + ``frames/``）。"""
-    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
-
+def load_flight_index(flight_dir: Path, limit: int | None = None) -> list[tuple[float, str]]:
+    """读帧索引，返回 ``[(capture_timestamp, 相对文件名), ...]``。"""
     index_path = flight_dir / "frames_index.jsonl"
     if not index_path.is_file():
         raise FileNotFoundError(f"缺少帧索引: {index_path}")
-    frames: list[np.ndarray] = []
+    entries: list[tuple[float, str]] = []
     for line in index_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
         record = json.loads(line)
-        path = flight_dir / "frames" / record["filename"]
+        entries.append((float(record["capture_timestamp"]), str(record["filename"])))
+        if limit is not None and len(entries) >= limit:
+            break
+    return entries
+
+
+def load_flight_frames_paired(flight_dir: Path, limit: int = 200) -> list[tuple[float, np.ndarray]]:
+    """读帧，**连同它自己的拍摄时刻**一起返回。
+
+    ⚠ 必须成对读。原来这里有两个各自独立的函数（``load_flight_frames`` 按
+    "成功解码数"计数并跳过坏帧，``load_flight_timestamps`` 按"索引行数"计数），
+    于是素材中间有几帧损坏时，两个列表长度**仍然相等**、``zip(strict=True)``
+    不会报错，但 ``frames[k]`` 配的是另一行的时刻——实测 2 帧损坏就造成 0.2s
+    的时间错位，Δt 与手眼外参全建立在错配上，产出一份"看起来正常、其实错误"
+    的 ``camera_calib.json``，且没有任何告警。现在一次遍历、时刻与图像取自
+    同一条索引记录，结构上不可能错位；解不出的帧连同它的时刻一起跳过。
+    """
+    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+
+    frames_dir = flight_dir / "frames"
+    paired: list[tuple[float, np.ndarray]] = []
+    skipped = 0
+    for stamp, name in load_flight_index(flight_dir):
+        path = frames_dir / name
         if not path.is_file():
+            skipped += 1
             continue
         image = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
-        if image is not None:
-            frames.append(image)
-        if len(frames) >= limit:
+        if image is None:
+            skipped += 1
+            continue
+        paired.append((stamp, image))
+        if len(paired) >= limit:
             break
-    return frames
+    if skipped:
+        LOGGER.warning(
+            "帧索引里有 %d 帧缺失或解不出（已连同其拍摄时刻一起跳过，剩余配对不受影响）",
+            skipped,
+        )
+    return paired
 
 
 def load_flight_telemetry(flight_dir: Path) -> list[TelemetrySnapshot]:
@@ -1219,17 +1248,9 @@ def load_flight_telemetry(flight_dir: Path) -> list[TelemetrySnapshot]:
 
 
 def load_flight_timestamps(flight_dir: Path, limit: int = 200) -> list[float]:
-    """读帧索引里的拍摄时刻。"""
-    index_path = flight_dir / "frames_index.jsonl"
-    stamps: list[float] = []
-    for line in index_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        stamps.append(float(json.loads(line)["capture_timestamp"]))
-        if len(stamps) >= limit:
-            break
-    return stamps
+    """读帧索引里的拍摄时刻（与 :func:`load_flight_frames_paired` 配对使用时，
+    优先用后者——它保证时刻与图像来自同一条索引记录）。"""
+    return [stamp for stamp, _ in load_flight_index(flight_dir, limit)]
 
 
 # ----------------------------------------------------------------------
@@ -1248,9 +1269,12 @@ def calibrate(
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
 
     LOGGER.info("读取标定素材: %s", flight_dir)
-    frames = load_flight_frames(flight_dir, max_frames)
-    if not frames:
+    paired = load_flight_frames_paired(flight_dir, max_frames)
+    if not paired:
         raise ValueError(f"{flight_dir} 里没有可用帧")
+    # 帧与拍摄时刻来自同一条索引记录，**结构上不可能错位**
+    timestamps = [stamp for stamp, _ in paired]
+    frames = [image for _, image in paired]
     LOGGER.info("共 %d 帧", len(frames))
 
     # ---- 步骤一 ----
@@ -1266,7 +1290,6 @@ def calibrate(
 
     # ---- 步骤二 ----
     LOGGER.info("步骤二：画面-遥测时间差")
-    timestamps = load_flight_timestamps(flight_dir, max_frames)
     board_points = board_object_points(pattern_size, square_size)
     board_rotations: list[np.ndarray] = []
     pose_times: list[float] = []

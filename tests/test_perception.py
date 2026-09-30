@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from airdrop.config import Config
 from airdrop.perception import (
     CropResult,
     Detection,
@@ -426,6 +427,21 @@ def test_postprocess_unavailable_engine_returns_empty_result() -> None:
     assert not result.ok
 
 
+def test_recognize_reports_no_pentagon_when_no_level_finds_one() -> None:
+    """一个五边形都没圈出来时报 ``stage="no_pentagon"``（而不是含糊的 "none"）。
+
+    ``recognize()`` 曾经先跑一遍 ``_detect_pentagon`` 只取布尔值、把算出的多边形
+    丢掉，紧接着 ``_geometry_ocr`` 又从同一档饱和度重算整条链。那次多余的一遍
+    现在由 ``_geometry_ocr`` 自己用 ``no_pentagon`` 表达——"从没找到"与
+    "找到了但没读出编号"（``none``）是两回事，排故时要能分开。
+    """
+    post = OpenCvPostProcess(engine=OcrEngine(OcrEngineConfig(model_dir="models/nope")))
+    result = post.recognize(np.full((80, 120, 3), 127, np.uint8))
+
+    assert result.number is None
+    assert result.stage == "no_pentagon", f"期望 no_pentagon，实际 {result.stage!r}"
+
+
 def test_postprocess_rejects_unknown_color() -> None:
     with pytest.raises(ValueError, match="blue/red"):
         OpenCvPostProcess(color="green")
@@ -572,6 +588,55 @@ def test_detector_undistort_skips_on_size_mismatch() -> None:
     assert not done and out is image, "尺寸不符时必须跳过，不能硬套内参"
     # 映射表保持在原尺寸上，没有被悄悄替换
     assert detector._remap_shape == (640, 480)
+
+
+def test_detector_refuses_to_build_remap_at_a_non_calibration_size() -> None:
+    """给了 ``calib_size``：非标定分辨率**连表都不建**（而不是按首帧尺寸默默建）。
+
+    没有这道守卫时，"首帧分辨率就与标定不符"会静默按错误尺寸建表——内参是按
+    标定分辨率算的，硬套会把画面扭坏，而 :class:`TargetTracker` 会拿这些像素
+    去解算坐标。
+    """
+    detector = Detector(
+        DetectorConfig(
+            camera_matrix=np.array([[600.0, 0, 640], [0, 600, 360], [0, 0, 1]]),
+            dist_coeffs=np.zeros(5),
+            calib_size=(1280, 720),
+        )
+    )
+    assert not detector.prepare_undistort(640, 360), "非标定分辨率不该建表"
+    assert detector._remap is None
+
+    image = np.zeros((360, 640, 3), np.uint8)
+    out, done = detector.undistort(image)
+    assert not done and out is image
+
+    # 标定分辨率本身照常可用
+    assert detector.prepare_undistort(1280, 720)
+    assert detector._remap_shape == (1280, 720)
+
+
+def test_pipeline_config_carries_camera_intrinsics() -> None:
+    """``to_pipeline_config(camera)`` 必须把内参/畸变/标定尺寸带进检测器。
+
+    曾经这三个字段不存在，装配处也没人传 ⇒ 整条"预计算 remap"快路径是死代码，
+    每帧都退回逐点 undistortPoints。现在断言 Detection.extra["undistorted"]
+    会被置位（georef 据此不再逐点纠正）。
+    """
+    from airdrop.georef import CameraModel
+
+    camera = CameraModel(
+        camera_matrix=[[600.0, 0.0, 640.0], [0.0, 600.0, 360.0], [0.0, 0.0, 1.0]],
+        dist_coeffs=[[0.0, 0.0, 0.0, 0.0, 0.0]],
+        image_size=(1280, 720),
+    )
+    cfg = Config().perception.to_pipeline_config(camera)
+    assert cfg.camera_matrix is not None
+    assert cfg.calib_size == (1280, 720)
+
+    # 不给相机时保持 None（退回逐帧 undistortPoints，功能仍正确）
+    plain = Config().perception.to_pipeline_config()
+    assert plain.camera_matrix is None and plain.calib_size is None
 
 
 def test_detector_undistort_force_recomputes() -> None:
@@ -929,6 +994,56 @@ def test_pipeline_dedupe_allows_distinct_targets() -> None:
     finally:
         worker.stop()
     assert len(pool.submitted) == 2, "两个不同位置的目标应当分别送检"
+
+
+def test_pipeline_dedupe_works_with_only_the_pixel_threshold() -> None:
+    """只设 ``ocr_dedupe_px``（时间窗为 0）也必须真的去重。
+
+    ``_dedupe_enabled`` 是"任一非零即开"，但 ``_expire`` 曾对
+    ``ocr_dedupe_s <= 0`` 无条件 ``clear()``，于是刚记下的位置下一拍就没了，
+    纯像素去重**静默完全不生效**、且没有任何日志。这里只给 px，钉住该行为。
+    """
+    buffer = _buffer_with(5)
+    pool = _FakePool(numbers=[42] * 5)
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr", ocr_dedupe_s=0.0, ocr_dedupe_px=30.0),
+        buffer=buffer,
+        detector=_FakeDetector(),
+        pool=pool,
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 10.0
+        while worker.stats.deduped < 4 and time.monotonic() < deadline:
+            time.sleep(0.02)
+    finally:
+        worker.stop()
+    assert len(pool.submitted) == 1, "只设 ocr_dedupe_px 时仍应只送检首个目标"
+    assert worker.stats.deduped == 4
+
+
+def test_pipeline_pixel_only_dedupe_cache_is_bounded() -> None:
+    """纯像素去重没有时间窗可淘汰，位置缓存必须有条数上限兜住内存。"""
+    from airdrop.perception import pipeline as pipeline_mod
+
+    config = PerceptionConfigLike(mode="ocr", ocr_dedupe_s=0.0, ocr_dedupe_px=30.0)
+    worker = PerceptionWorker(
+        config,
+        buffer=_buffer_with(1),
+        detector=_FakeDetector(),
+        pool=_FakePool(numbers=[42]),
+    )
+    detection = Detection(
+        frame_index=0,
+        capture_timestamp=100.0,
+        pixel=(100.0, 100.0),
+        box=PixelBox(95, 95, 105, 105),
+        confidence=0.9,
+        telemetry=TelemetrySnapshot(),
+    )
+    for _ in range(pipeline_mod._DEDUPE_MAX_RECENT * 3):
+        worker._remember(detection)
+    assert len(worker._recent) == pipeline_mod._DEDUPE_MAX_RECENT
 
 
 def test_pipeline_recent_cache_stays_empty_when_dedupe_disabled() -> None:

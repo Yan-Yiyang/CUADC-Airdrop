@@ -25,7 +25,7 @@ import logging
 import multiprocessing as mp
 import queue
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from multiprocessing.context import SpawnProcess
 from typing import Any
 
@@ -72,7 +72,12 @@ class OcrResult:
     worker_id: int = 0
     elapsed_ms: float = 0.0
     error: str | None = None
-    rectified: np.ndarray | None = field(default=None, repr=False)
+    # ⚠ 这里**刻意没有** rectified（原图）：它要经 mp.Queue 的 feeder 线程
+    # pickle 过进程边界，而主进程侧的 _apply_result 从不读它——裁剪图已放大到
+    # 短边 300px，转正图是 0.5~1.5MB 的 BGR 数组，每条结果白白序列化一遍
+    # （20 结果/秒 ≈ 10~30MB/s 纯 IPC 开销，还放大无界结果队列的内存占用）。
+    # 排故要转正图请在**进程内**直接调 OpenCvPostProcess.recognize
+    # （tests/test_perception_realdata.py 就是这么做的）。
 
 
 def ocr_worker_main(
@@ -124,7 +129,6 @@ def ocr_worker_main(
                 payload=request.payload,
                 worker_id=worker_id,
                 elapsed_ms=(time.perf_counter() - started) * 1000.0,
-                rectified=crop_result.rectified,
             )
         except Exception as exc:
             log.exception("OCR 处理异常 帧#%d", request.frame_index)

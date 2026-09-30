@@ -163,8 +163,9 @@ def main(
     aligner = FrameTelemetryAligner(broker, max_wait=config.align.max_wait, mode=config.align.mode)
     buffer = AlignmentBuffer(capacity_for(buffer_fps, buffer_seconds), storage="jpeg")
     writer = AlignmentWriter(buffer, aligner)
-    worker = PerceptionWorker(config.perception.to_pipeline_config(), buffer=buffer)
     camera = config.camera.load_model()
+    # 与实飞同一条装配：把标定交给检测器（预计算 remap + calib_size 守卫）
+    worker = PerceptionWorker(config.perception.to_pipeline_config(camera), buffer=buffer)
     tracker = TargetTracker(
         config,
         camera=camera,

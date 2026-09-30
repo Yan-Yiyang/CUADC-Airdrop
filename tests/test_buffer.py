@@ -230,9 +230,77 @@ def test_wait_new() -> None:
     assert lagging is not None and lagging.index == 3
 
 
-# ----------------------------------------------------------------------
-# 拉流源 → 缓冲的装配
-# ----------------------------------------------------------------------
+def test_wait_new_decodes_outside_the_lock() -> None:
+    """``wait_new`` 解码画面时**不得持有**那把 Condition 锁（采集线程也要拿它）。
+
+    720p 的 ``cv2.imdecode`` 要几毫秒；放在锁内等于让采集线程的 ``put()`` 替
+    读者的解码买单。实测（720p）：锁内解码时拿锁等待 p95 4.5ms / 最大 5.1ms，
+    锁外解码后 p95 0.006ms / 最大 0.018ms。
+
+    这里不用计时判定（会 flaky），而是在 ``_materialize`` 里让**另一个线程**试着
+    拿锁：拿得到就说明读线程当时没持锁。
+    """
+    buffer = AlignmentBuffer(capacity=8)
+    buffer.put(make_sample(1000.0))
+    original = AlignmentBuffer.__dict__["_materialize"]  # 取 staticmethod 对象本身
+    held: list[bool] = []
+
+    def probe(stored):
+        got: list[bool] = []
+
+        def try_lock() -> None:
+            if buffer._lock.acquire(timeout=0.05):
+                buffer._lock.release()
+                got.append(True)
+            else:
+                got.append(False)
+
+        t = threading.Thread(target=try_lock)
+        t.start()
+        t.join(timeout=2.0)
+        held.append(got[0] if got else False)
+        return original(stored)
+
+    AlignmentBuffer._materialize = staticmethod(probe)
+    try:
+        assert buffer.wait_new(0, timeout=1.0) is not None
+    finally:
+        AlignmentBuffer._materialize = original
+
+    assert held == [True], "wait_new 在解码时仍持有 Condition 锁，会阻塞采集线程的 put()"
+
+
+def test_wait_new_skips_undecodable_records_instead_of_spinning() -> None:
+    """坏记录（解不出画面）应被跳过并计数，而不是把 None 交给调用方空转。
+
+    调用方拿到 None 只能 ``continue`` 且游标不前进 ⇒ 对着同一条坏记录热自旋。
+    """
+    buffer = AlignmentBuffer(capacity=8)
+    for i in range(3):
+        buffer.put(make_sample(1000.0 + i))
+    # 把 2 号记录的载荷换成解不出来的字节
+    stored = buffer._records[1]
+    object.__setattr__(stored, "payload", b"not-a-jpeg")
+
+    original = AlignmentBuffer.__dict__["_materialize"]
+    AlignmentBuffer._materialize = staticmethod(lambda s: original(s) if s.index != 2 else None)
+    try:
+        seen: list[int] = []
+        cursor = 0
+        # 只有 1、3 两条可取（2 号是坏记录），所以取 2 次；第 3 次应当超时返回 None
+        for _ in range(2):
+            record = buffer.wait_new(cursor, timeout=0.5)
+            assert record is not None, "坏记录之后还有好记录，不该返回 None 让调用方空转"
+            seen.append(record.index)
+            cursor = record.index
+        assert buffer.wait_new(cursor, timeout=0.1) is None
+    finally:
+        AlignmentBuffer._materialize = original
+
+    assert seen == [1, 3], f"应跳过 2 号拿到 1、3，实际 {seen}"
+    assert buffer.stats.decode_failures == 1
+
+
 def test_alignment_writer() -> None:
     """AlignmentWriter：正常帧全写，取不到遥测才跳过。"""
     broker = TelemetryBroker(history_maxlen=200, history_interval=0.0)

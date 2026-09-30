@@ -515,8 +515,11 @@ class PerceptionSetup:
         """按配置装配（``on_detection`` 一般接 ``recorder.detections.append``）。"""
         from airdrop import PerceptionTargetSource, PerceptionWorker, TargetTracker
 
-        worker = PerceptionWorker(config.perception.to_pipeline_config(), buffer=buffer)
-        tracker = TargetTracker(config, camera=config.camera.load_model())
+        # 同一个 camera 实例给检测器与 TargetTracker：解析两次不仅浪费，还可能出现
+        # "预检核对的模型与解算用的不是同一个"（full_mission 注释里明确要避免）
+        camera = config.camera.load_model()
+        worker = PerceptionWorker(config.perception.to_pipeline_config(camera), buffer=buffer)
+        tracker = TargetTracker(config, camera=camera)
         source = PerceptionTargetSource(worker=worker, tracker=tracker, on_detection=on_detection)
         return cls(worker=worker, tracker=tracker, source=source)
 
@@ -860,7 +863,15 @@ def _reverse_diagnostic(
     用检测时飞机的航向把坐标偏差投到"航迹方向"上：东向那遍偏 +，西向那遍偏 −，
     两者之差的一半除以速度就是延时估计。只做**诊断**，不拿它改结果。
     """
-    rows = [row for row in detections if row.get("code") == code and row.get("yaw_deg") is not None]
+    # ⚠ yaw_deg 嵌在 telemetry 子字典里（Detection.as_dict() 口径，同文件的
+    # _roll_stats 就是这么读的）。曾经在顶层取 row.get("yaw_deg")，恒为 None ⇒
+    # rows 恒空 ⇒ 这个反向诊断恒返回 {}，报告里"链路延时自标定"一栏永远空着，
+    # 且没有任何异常或告警。
+    rows = [
+        row
+        for row in detections
+        if row.get("code") == code and row.get("telemetry", {}).get("yaw_deg") is not None
+    ]
     if not rows:
         return {}
     groups: dict[str, list[tuple[float, float]]] = {}

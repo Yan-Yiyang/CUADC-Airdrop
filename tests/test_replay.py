@@ -205,6 +205,35 @@ def test_flight_log_rejects_bad_json_line(workdir: Path) -> None:
         FlightLog.open(flight_dir)
 
 
+def test_flight_log_tolerates_a_torn_last_index_line(workdir: Path) -> None:
+    """录制中断留下的半行末行要容错：不能因此让**整份素材**作废。
+
+    录制器每 16 帧才 flush 一次索引（无 fsync、无临时文件+rename），断电/进程被
+    杀时最坏情况就是最后一行只写了一半。而遥测日志早就对这种截断做了容错，帧
+    索引却对任何一行 JSON 错误都 raise ⇒ 这次飞行的素材全部回放不了，包括
+    前面完整写好的部分。崩溃恢复恰恰是录制系统存在的理由。
+    """
+    flight_dir, *_ = _write_flight(workdir, frames=3)
+    index = flight_dir / "frames_index.jsonl"
+    lines = index.read_text(encoding="utf-8").splitlines()
+    # 保留前两行完整 + 第三行截断（且文件不以换行结尾）
+    index.write_text("\n".join(lines[:2]) + "\n" + lines[2][:20], encoding="utf-8")
+
+    log = FlightLog.open(flight_dir)
+    assert [r.index for r in log.frames] == [1, 2], "前两行应当照常读出"
+
+
+def test_flight_log_still_rejects_a_torn_middle_index_line(workdir: Path) -> None:
+    """中间行坏掉仍然是真损坏，必须报错（只有末行截断可容错）。"""
+    flight_dir, *_ = _write_flight(workdir, frames=3)
+    lines = (flight_dir / "frames_index.jsonl").read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[1][:20]
+    (flight_dir / "frames_index.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(FrameIndexError, match="不是合法 JSON"):
+        FlightLog.open(flight_dir)
+
+
 def test_flight_log_rejects_missing_field(workdir: Path) -> None:
     flight_dir, *_ = _write_flight(workdir, frames=3)
     (flight_dir / "frames_index.jsonl").write_text(
@@ -880,6 +909,107 @@ def test_replay_from_buffer_mode(workdir: Path) -> None:
     assert [idx for idx, _ in seen] == [1, 2, 3, 4]
     for idx, capture in seen:
         assert capture == pytest.approx(log.frames[idx - 1].capture_timestamp)
+
+
+def test_replay_from_buffer_mode_ends_despite_extra_buffer_records(workdir: Path) -> None:
+    """缓冲里持续多出索引外的帧时，回放**必须自己结束**。
+
+    终止条件曾经挂在"wait_new 有没有返回 None"上：索引外的帧走 continue，于是
+    wait_new 一直不返回 None，"已播够数"那个检查根本没机会跑 ⇒ 无限循环。
+    _run 不置 finished，read() 永远不返回 None，基于 read() 的消费者全部挂住，
+    只能靠外部 stop() 硬收。
+    """
+    from airdrop import AlignedSample, VideoFrame
+
+    flight_dir, *_ = _write_flight(workdir, frames=3)
+
+    buffer = AlignmentBuffer(capacity=64, storage="jpeg")
+    # 索引内的 1..3，之后再灌 10 条索引外的（模拟联机调试时接的是实时画面）
+    for index in list(range(1, 4)) + list(range(100, 110)):
+        buffer.put(
+            AlignedSample(
+                frame=VideoFrame(
+                    index=index,
+                    image=_image(index),
+                    timestamp=1000.0 + index * 0.033,
+                    lag=0.2,
+                ),
+                snapshot=_snapshot(1000.0 + index * 0.033, index=index),
+                timestamp=1000.0 + index * 0.033,
+                lag=0.2,
+                mode="interpolate",
+            )
+        )
+
+    source = ReplayVideoSource(flight_dir, speed=0.0, buffer=buffer)
+    seen: list[int] = []
+    source.add_sink(lambda f: seen.append(f.index))
+    _play_to_completion(source)
+
+    assert seen == [1, 2, 3], f"应只播素材里的 3 帧，实际 {seen}"
+    assert source.stats.state == "finished"
+
+
+def test_replay_from_buffer_mode_ends_when_expected_frames_were_evicted(
+    workdir: Path,
+) -> None:
+    """素材帧被缓冲驱逐后，wait_new 会跳号——那些帧永远补不回来，必须记账后结束。
+
+    第二个不终止路径：``pending`` 永远等不空 ⇒ 同样无限循环。
+    """
+    from airdrop import AlignedSample, VideoFrame
+
+    flight_dir, *_ = _write_flight(workdir, frames=5)
+    log = FlightLog.open(flight_dir)
+
+    # 缓冲容量 3：先灌 5 帧，前 2 帧立刻被驱逐
+    buffer = AlignmentBuffer(capacity=3, storage="jpeg")
+    for record in log.frames:
+        buffer.put(
+            AlignedSample(
+                frame=VideoFrame(
+                    index=record.index,
+                    image=_image(record.index),
+                    timestamp=record.timestamp,
+                    lag=record.lag,
+                ),
+                snapshot=_snapshot(record.capture_timestamp, index=record.index),
+                timestamp=record.capture_timestamp,
+                lag=record.lag,
+                mode="interpolate",
+            )
+        )
+
+    source = ReplayVideoSource(flight_dir, speed=0.0, buffer=buffer)
+    seen: list[int] = []
+    source.add_sink(lambda f: seen.append(f.index))
+    _play_to_completion(source)
+
+    assert seen == [3, 4, 5], f"应只播还留在缓冲里的 3 帧，实际 {seen}"
+    assert source.stats.skipped == 2, "被驱逐的 2 帧要记账"
+
+
+def test_replay_sink_mode_does_not_wait_for_a_nonexistent_read_consumer(
+    workdir: Path,
+) -> None:
+    """纯 sink 消费（全链路回放 / record 落盘）不该按"未读帧数"白等。
+
+    ``_delivered`` 只在 read() 里推进，纯 sink 路径一次都不调 ⇒ outstanding 等于
+    全部已播帧数，按 0.01s/未读帧 算出来的 deadline 是 0.5+0.01×N：6 分钟 30fps
+    的素材就是白等 108 秒。
+    """
+    flight_dir, *_ = _write_flight(workdir, frames=40)
+    source = ReplayVideoSource(flight_dir, speed=0.0)
+    source.add_sink(lambda f: None)  # 只有 sink，没有 read()
+
+    t0 = time.perf_counter()
+    _play_to_completion(source)
+    elapsed = time.perf_counter() - t0
+
+    assert source.stats.state == "finished"
+    assert source.stats.frames == 40
+    # 40 帧 × 0.01s = 0.4s 额外空等；修复后只剩固定 0.5s 宽限期
+    assert elapsed < 5.0, f"纯 sink 回放收尾空等过久：{elapsed:.2f}s"
 
 
 def test_replay_finished_state_distinguishable_from_stopped(workdir: Path) -> None:

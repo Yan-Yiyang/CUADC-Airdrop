@@ -90,6 +90,9 @@ SUPPORTED_STORAGE = frozenset({"jpeg", "raw"})
 _capture_timestamp = operator.attrgetter("capture_timestamp")
 _index = operator.attrgetter("index")
 
+#: 解码失败告警的节流：第一次必打，之后每 N 条打一条
+_DECODE_FAIL_LOG_EVERY = 30
+
 
 def capacity_for(fps: float = DEFAULT_FPS, seconds: float = DEFAULT_SECONDS) -> int:
     """按"帧率 × 秒数"换算容量，例如 30 fps × 180 s → 5400 帧。"""
@@ -150,6 +153,9 @@ class BufferStats:
     evicted: int = 0
     bytes: int = 0
     last_index: int = 0
+    #: 取出时 JPEG 解码失败的记录数（读取方跳过后计数）。正常情况下恒为 0：
+    #: 载荷是本进程 :func:`cv2.imencode` 出来的，编码失败时还会退化成 ndarray 兜底。
+    decode_failures: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +230,7 @@ class AlignmentBuffer:
         self._next_index = 0
         self._put = 0
         self._evicted = 0
+        self._decode_failures = 0
         self._logged_estimate = False
 
     # ------------------------------------------------------------------
@@ -301,6 +308,7 @@ class AlignmentBuffer:
                 evicted=self._evicted,
                 bytes=self._bytes,
                 last_index=self._next_index,
+                decode_failures=self._decode_failures,
             )
 
     def latest(self) -> BufferedFrame | None:
@@ -404,26 +412,48 @@ class AlignmentBuffer:
         的消费者（典型如 :class:`~airdrop.record.FlightRecorder`）应当
         用 :meth:`AlignmentBuffer.iter_between` 配合自己的序号游标，而不是
         仅靠 ``wait_new``。
+
+        **坏记录会被跳过**：某条记录的 JPEG 解不出来时，本方法推进游标继续找
+        下一条，而不是把 ``None`` 交给调用方——否则调用方只能 ``continue``
+        且游标不前进，会对着同一条坏记录**热自旋**（满负载 CPU + 日志刷爆）。
+        跳过的条数计入 :attr:`BufferStats.decode_failures`。
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        stored: StoredFrame | None = None
-        with self._condition:
-            while True:
-                records = self._records
-                if records:
-                    first_index = records[0].index
-                    target = max(after_index + 1, first_index)
-                    idx = bisect.bisect_left(records, target, key=_index)
-                    if idx < len(records):
-                        stored = records[idx]
-                        break
-                remaining = None
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return None
-                self._condition.wait(remaining)
-            return self._materialize(stored)
+        while True:
+            stored: StoredFrame | None = None
+            with self._condition:
+                while True:
+                    records = self._records
+                    if records:
+                        first_index = records[0].index
+                        target = max(after_index + 1, first_index)
+                        idx = bisect.bisect_left(records, target, key=_index)
+                        if idx < len(records):
+                            stored = records[idx]
+                            break
+                    remaining = None
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return None
+                    self._condition.wait(remaining)
+            # ⚠ 解码必须在**锁外**：jpeg 模式下 cv2.imdecode 要几毫秒，而这把锁
+            # 采集线程的 put() 也要拿。在锁内解码等于让采集线程替读者的解码买单
+            # ——实测 30fps 下 put() 从 0.00ms 涨到平均 11.7ms（720p），
+            # 30% 左右的帧周期被白占。latest()/at() 同样在锁外解码。
+            frame = self._materialize(stored)
+            if frame is not None:
+                return frame
+            after_index = stored.index
+            with self._condition:
+                self._decode_failures += 1
+                count = self._decode_failures
+            if count == 1 or count % _DECODE_FAIL_LOG_EVERY == 0:
+                LOGGER.error(
+                    "缓冲记录 #%d 的 JPEG 解码失败，已跳过（累计 %d 条）",
+                    stored.index,
+                    count,
+                )
 
     # ------------------------------------------------------------------
     # 内部实现

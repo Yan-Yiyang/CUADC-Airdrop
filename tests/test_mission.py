@@ -68,7 +68,7 @@ from airdrop import (
     to_raw_item,
     waypoint_to_ned,
 )
-from airdrop.georef import ned_to_wgs84, wgs84_to_ned
+from airdrop.georef import CameraModel, ned_to_wgs84, wgs84_to_ned
 from airdrop.mission import emit_event
 
 # 测试用原点：随便取一个中纬度点，高度 500m
@@ -650,6 +650,20 @@ def test_real_preflight_video_check_needs_enough_frames() -> None:
     assert checks[-1].name == "video" and checks[-1].ok is True
 
 
+def _camera_model(size: tuple[int, int] | None = (1280, 720)):
+    """一个真 :class:`CameraModel`（字段名以它为准，别用 SimpleNamespace 凑）。
+
+    预检里"画面分辨率与标定一致"那道检查读的是 ``image_size``；曾经两边都写成
+    ``width``/``height``（生产代码与测试里的假对象一起错），于是那道检查永久
+    空转、测试还全绿。用真模型才能钉住这个契约。
+    """
+    return CameraModel(
+        camera_matrix=[[100.0, 0.0, 320.0], [0.0, 100.0, 240.0], [0.0, 0.0, 1.0]],
+        dist_coeffs=[[0.0, 0.0, 0.0, 0.0, 0.0]],
+        image_size=size,
+    )
+
+
 def test_real_preflight_video_check_rejects_a_resolution_mismatch() -> None:
     """有标定时核对最新帧尺寸：与标定不一致 → 失败（内参是按标定分辨率算的）。"""
     config = PreflightConfig(
@@ -663,11 +677,52 @@ def test_real_preflight_video_check_rejects_a_resolution_mismatch() -> None:
     preflight = _preflight(
         config,
         source=FakeVideoSource(frames=5, size=(640, 360)),
-        camera_model=SimpleNamespace(width=1280, height=720),
+        camera_model=_camera_model((1280, 720)),
     )
 
     with pytest.raises(PreflightError, match="不一致"):
         preflight.run()
+
+
+def test_real_preflight_video_check_passes_when_resolution_matches() -> None:
+    """尺寸一致 ⇒ 通过（对照组：上一条若因字段名错空转，这条会一起失败）。"""
+    config = PreflightConfig(
+        load_detector=False,
+        load_ocr=False,
+        load_camera=False,
+        check_video=True,
+        video_probe_s=0.5,
+        video_min_frames=1,
+    )
+    preflight = _preflight(
+        config,
+        source=FakeVideoSource(frames=5, size=(1280, 720)),
+        camera_model=_camera_model((1280, 720)),
+    )
+
+    checks = preflight.run()
+    video = next(c for c in checks if c.name == "video")
+    assert video.ok is True
+
+
+def test_real_preflight_skips_resolution_check_without_calib_size() -> None:
+    """相机模型没有 image_size（粗估默认模型）⇒ 跳过分辨率核对，不误判失败。"""
+    config = PreflightConfig(
+        load_detector=False,
+        load_ocr=False,
+        load_camera=False,
+        check_video=True,
+        video_probe_s=0.5,
+        video_min_frames=1,
+    )
+    preflight = _preflight(
+        config,
+        source=FakeVideoSource(frames=5, size=(640, 360)),
+        camera_model=_camera_model(None),
+    )
+
+    checks = preflight.run()
+    assert next(c for c in checks if c.name == "video").ok is True
 
 
 def test_preflight_passes_then_waits_for_airborne_and_enters_recon() -> None:

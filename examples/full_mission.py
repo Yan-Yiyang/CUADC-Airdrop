@@ -231,7 +231,9 @@ def main(
         writer = AlignmentWriter(buffer, aligner)
 
         # 5) 感知 → 坐标解算 → 目标统计（回放与实飞共用这一条）
-        worker = PerceptionWorker(config.perception.to_pipeline_config(), buffer=buffer)
+        #    传入已载入的 camera：检测器据此走预计算 remap 快路径，并带上
+        #    calib_size 以便拒掉"帧尺寸与标定不符"的画面
+        worker = PerceptionWorker(config.perception.to_pipeline_config(camera), buffer=buffer)
         tracker = TargetTracker(config, camera=camera, on_event=on_event)
         targets = PerceptionTargetSource(
             worker=worker,

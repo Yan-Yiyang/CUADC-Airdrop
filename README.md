@@ -224,9 +224,10 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
 ## 测试与代码规范
 
 ```bash
-./.venv/Scripts/python.exe -m pytest                 # 全部（附覆盖率，当前 ≈85%）
-./.venv/Scripts/python.exe -m pytest -m "not stream" # 跳过要起 ffmpeg 的用例
+./.venv/Scripts/python.exe -m pytest                 # 全部（附覆盖率，当前 ≈85%；默认已排除 realdata/sitl）
+./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"  # 再跳过要起 ffmpeg 的用例
 ./.venv/Scripts/python.exe -m pytest -m realdata     # GPU + 旧版 实战素材（分钟级）
+./.venv/Scripts/python.exe -m pytest -m sitl         # WSL 里已起 PX4 SITL + 图传（分钟级）
 ./.venv/Scripts/python.exe -m pytest -k mission -v   # 只跑某个主题
 
 ./.venv/Scripts/ruff.exe check .                     # 代码规范（配置在 pyproject.toml）

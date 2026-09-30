@@ -792,6 +792,13 @@ class OpenCvPostProcess:
 
         流程：去噪 → 等比放大到短边 300px → 掩码回退找五边形 → 几何转正 →
         转正图整图 OCR。``side_px`` 会还原成原始像素边长供坐标解算使用。
+
+        ⚠ 这里**只调一次** :meth:`_geometry_ocr`：它内部本来就按饱和度逐级回退，
+        "一个五边形都没找到"由它以 ``stage="no_pentagon"`` 报出来。曾经这里先跑
+        一遍 ``_detect_pentagon`` 只取布尔值、把算出的多边形丢掉（``_, ok =``），
+        紧接着 ``_geometry_ocr`` 又从同一档饱和度把整条链重算一遍——单次
+        ``edge_detection`` 约 1.2ms，"第 4 档才命中"（正是回退存在的理由）时
+        白扔约 4.7ms，占几何段一半以上。
         """
         if image is None or image.size == 0:
             return CropResult(None, -1.0, None, "", 0.0, stage="empty")
@@ -805,9 +812,7 @@ class OpenCvPostProcess:
                     picture, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
                 )
             self.scale = scale
-            _, ok = self._detect_pentagon(picture)
-            if not ok:
-                return CropResult(None, -1.0, None, "", 0.0, stage="no_pentagon")
+            self.image = picture  # edge_detection() 与 visualize() 都读它
             result = self._geometry_ocr(picture)
             if result.side_px > 0:
                 result = CropResult(
@@ -826,13 +831,19 @@ class OpenCvPostProcess:
             return CropResult(None, -1.0, None, "", 0.0, stage="error")
 
     def _geometry_ocr(self, image: np.ndarray) -> CropResult:
-        """几何路径：掩码回退 → 五边形 → 转正 → 整图 OCR。"""
+        """几何路径：掩码回退 → 五边形 → 转正 → 整图 OCR。
+
+        饱和度逐级回退，一个级别都没圈出五边形时返回 ``stage="no_pentagon"``；
+        圈出了但没有候选通过置信度/形态门限时返回 ``stage="none"``。
+        """
         best = CropResult(None, -1.0, None, "", 0.0, stage="none")
+        found_pentagon = False
         for s_min in self._sat_levels():
             self.s_min = s_min
             approx, ok = self.edge_detection()
             if not ok:
                 continue
+            found_pentagon = True
             side_px = float(cv2.arcLength(approx, True)) / 5.0
             center = self._center_of_polygon(approx)
             apex, pair, _ = self._find_apex_by_parallel(approx)
@@ -871,6 +882,9 @@ class OpenCvPostProcess:
             # 级别给出假的"95"并一度抢先返回，真房子在 s_min=60 给出正确的 56）。
             if best.number is not None and best.house_ok:
                 return best
+        if not found_pentagon:
+            # 饱和度回退全试完，一个五边形都没圈出来（与 recognize() 早退时同义）
+            return CropResult(None, -1.0, None, "", 0.0, stage="no_pentagon")
         return best
 
     # ------------------------------------------------------------------

@@ -22,12 +22,12 @@ __all__ = ["DetectionBatch", "Detector", "DetectorConfig"]
 class DetectorConfig:
     """YOLO 检测参数。"""
 
-    # YOLO 检测权重（单类 target）
+    # YOLO 检测权重（单类 target；默认路径只是约定，可覆盖）
     model_path: str = "models/best2.pt"
     device: str = "0"  # 显式指定：见模块 docstring
     conf_threshold: float = 0.25
     iou_threshold: float = 0.45
-    imgsz: int = 1280  # best2.pt 训练 imgsz=640；实测 640/1280 检出一致
+    imgsz: int = 1280  # 权重按 imgsz=640 训练；实测 640/1280 检出一致
     max_detections: int = 300
     # 目标框外扩比例（裁剪时保留完整轮廓）
     crop_expand_ratio: float = 0.2
@@ -35,6 +35,10 @@ class DetectorConfig:
     camera_matrix: np.ndarray | None = None
     dist_coeffs: np.ndarray | None = None
     undistort: bool = True
+    #: 标定时的图像尺寸 (width, height)。给了它，:meth:`prepare_undistort` 就只在
+    #: 这个分辨率上建映射表：内参只对标定分辨率有效，换了尺寸硬套会把画面扭坏。
+    #: 给了它而尺寸对不上时**拒绝建表**并告警，而不是"按首帧尺寸默默建一张"。
+    calib_size: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +69,7 @@ class Detector:
         self._remap: tuple[np.ndarray, np.ndarray] | None = None
         self._remap_shape: tuple[int, int] | None = None
         self._undistort_skipped_logged = False
+        self._calib_size_rejected_logged = False
 
     # ------------------------------------------------------------------
     # 状态
@@ -148,6 +153,19 @@ class Detector:
         if not config.undistort or config.camera_matrix is None:
             return False
         size = (int(width), int(height))
+        if config.calib_size is not None and tuple(config.calib_size) != size:
+            # 每帧都会走到这里（undistort 每次都调 prepare_undistort），所以要节流
+            if not self._calib_size_rejected_logged:
+                self._calib_size_rejected_logged = True
+                LOGGER.warning(
+                    "帧尺寸 %dx%d 与标定分辨率 %s 不符，拒绝建立去畸变映射表"
+                    "（内参只对标定分辨率有效，硬套会把画面扭坏）；本架次不去畸变。"
+                    "要按新分辨率去畸变，请先重新标定或显式清掉 calib_size",
+                    size[0],
+                    size[1],
+                    tuple(config.calib_size),
+                )
+            return False
         if self._remap is not None and self._remap_shape == size:
             return True
         if self._remap is not None and not force:

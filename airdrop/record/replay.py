@@ -217,24 +217,35 @@ def _read_frame_index(path: Path) -> list[FrameRecord]:
     records: list[FrameRecord] = []
     last_capture: float | None = None
     with open(path, encoding="utf-8") as handle:
-        for line_no, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise FrameIndexError(
-                    f"frames_index.jsonl 第 {line_no} 行不是合法 JSON: {exc}"
-                ) from exc
-            record = FrameRecord.from_dict(data, line_no=line_no)
-            if last_capture is not None and record.capture_timestamp < last_capture:
-                raise FrameIndexError(
-                    f"frames_index.jsonl 第 {line_no} 行时间戳倒流："
-                    f"{record.capture_timestamp} < {last_capture}"
-                )
-            last_capture = record.capture_timestamp
-            records.append(record)
+        raw_lines = handle.readlines()
+    for line_no, raw_line in enumerate(raw_lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        is_last = line_no == len(raw_lines)
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError as exc:
+            # 录制器每 16 帧才 flush 一次索引（无 fsync、无临时文件+rename），
+            # 断电/进程被杀时最坏情况是**最后一行只写了一半**。而遥测日志早就
+            # 对这种截断做了容错（"不该因为最后一行被截断就整份作废"），帧索引
+            # 却对任何一行 JSON 错误都 raise ⇒ 这次飞行的全部素材都回放不了，
+            # 包括前面完整写好的 99.9%。崩溃恢复恰恰是录制系统存在的理由。
+            # 只对"末行且文件不以换行结尾"降级；中间行仍然 raise（那才是真损坏）。
+            if is_last and not raw_lines[-1].endswith("\n"):
+                LOGGER.warning("frames_index.jsonl 末行不完整（录制中断？），已跳过该行：%s", exc)
+                break
+            raise FrameIndexError(
+                f"frames_index.jsonl 第 {line_no} 行不是合法 JSON: {exc}"
+            ) from exc
+        record = FrameRecord.from_dict(data, line_no=line_no)
+        if last_capture is not None and record.capture_timestamp < last_capture:
+            raise FrameIndexError(
+                f"frames_index.jsonl 第 {line_no} 行时间戳倒流："
+                f"{record.capture_timestamp} < {last_capture}"
+            )
+        last_capture = record.capture_timestamp
+        records.append(record)
     if not records:
         raise FrameIndexError(f"帧索引为空: {path}")
     return records
@@ -733,11 +744,16 @@ class ReplayVideoSource:
     def _wait_for_consumer(self, grace_s: float = 0.5) -> None:
         """等 ``read()`` 把已投递的帧消费完（或等超时/被 stop）。
 
-        默认只等 ``grace_s + 0.01s/帧``：没有 read() 消费者的场合（纯 sink
-        离线跑）不该为此白等，而慢消费者只要还在读就能一直把它等下去——
-        每取走一帧都会 ``notify``，循环会重新计时到同一个 deadline。
+        ⚠ **没有 read() 消费者时要立刻返回**。``_delivered`` 只在 :meth:`read`
+        里推进，而 sink 路径（离线回放全链路、record 落盘）全程不调 read——
+        那种场合 ``outstanding`` 等于全部已播帧数，按"0.01s/未读帧"算出来的
+        deadline 是 ``0.5 + 0.01×N``：6 分钟 30fps 的素材（N≈10800）就是**白等
+        108 秒**。判据用"有没有被 read() 取过"（``_delivered > 0``）：取过就说明
+        有消费者，按原逻辑等它追平；一次都没取过就只留一个固定宽限期。
         """
-        outstanding = max(self._produced - self._delivered, 0)
+        with self._condition:
+            has_consumer = self._delivered > 0
+            outstanding = max(self._produced - self._delivered, 0) if has_consumer else 0
         deadline = time.monotonic() + grace_s + 0.01 * outstanding
         with self._condition:
             while self._delivered < self._produced and not self._stop_event.is_set():
@@ -821,17 +837,36 @@ class ReplayVideoSource:
         assert self._buffer is not None
         self._set_state("playing")
         expected = {record.index for record in self._log.frames}
+        #: 素材里**还没播出去**的帧号。终止条件挂在它身上，而不是挂在
+        #: "wait_new 有没有返回 None" 上——后者会永远不成立：
+        #:   ① 缓冲持续产出索引外的帧（联机调试时正是如此：缓冲接的是实时画面，
+        #:      帧号会超过一份旧素材的索引），那些帧走 continue，于是 wait_new
+        #:      一直不返回 None，"已播够数"这个检查根本没机会跑 ⇒ 无限循环；
+        #:   ② 期望的帧被缓冲驱逐后 wait_new 会跳号，那些帧永远补不回来 ⇒
+        #:      "已播够数"永远不成立 ⇒ 同样无限循环。
+        #: 两种情况都只能靠外部 stop() 硬收，_run 不会置 finished，read() 也
+        #: 永远不返回 None，基于 read() 的消费者全部挂住。
+        pending = set(expected)
         cursor = 0
         last_capture: float | None = None
         while not self._stop_event.is_set():
             record = self._buffer.wait_new(after_index=cursor, timeout=0.5)
             if record is None:
-                if self._produced >= len(expected):
+                if not pending:
                     break
                 continue
+            if record.index > cursor + 1:
+                # wait_new 跳号 ⇒ (cursor, record.index) 里的记录已被驱逐，
+                # 素材中那些帧在这条路径上永远等不到了，从待播集合里划掉。
+                for gone in range(cursor + 1, record.index):
+                    # 注意：set.discard() 永远返回 None，不能拿它的返回值当判据
+                    if gone in pending:
+                        pending.discard(gone)
+                        self._note_evicted(gone)
             cursor = record.index
-            if record.index not in expected:
+            if record.index not in pending:
                 continue
+            pending.discard(record.index)
             if self._telemetry is not None:
                 self._telemetry_published += self._telemetry.publish_until(record.capture_timestamp)
             frame = VideoFrame(
@@ -842,8 +877,18 @@ class ReplayVideoSource:
             )
             self._publish(frame)
             last_capture = record.capture_timestamp
+            if not pending:
+                break
         if self._telemetry is not None and last_capture is not None:
             self._telemetry_published += self._telemetry.finish(last_capture)
+
+    def _note_evicted(self, index: int) -> None:
+        """缓冲驱逐导致某个素材帧永远等不到：记账并告警（同类只打前几条）。"""
+        self._skipped += 1
+        self._stats.skipped = self._skipped
+        count = self._skipped
+        suffix = "（同类不再逐条打印，收尾给总数）" if count > SKIP_LOG_LIMIT else ""
+        LOGGER.warning("回放跳过帧 #%d：缓冲里已被驱逐，补不回来%s", index, suffix)
 
     # ------------------------------------------------------------------
     # 内部工具

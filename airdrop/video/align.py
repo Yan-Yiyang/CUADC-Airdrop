@@ -49,6 +49,14 @@ RTCP 时间戳解决，不是这里能修好的。
 ``on_timeout="drop"`` 丢弃该帧（不拿外推凑数），并记 warning 日志与
 :attr:`FrameTelemetryAligner.stats`，让链路故障显式暴露出来。
 
+⚠ **等待只针对"拍摄时刻比历史最新还新"这一个方向**。反方向（拍摄时刻比
+历史**最早**一条还早，即视频先到、遥测后到）不进等待分支：遥测只会越来越晚，
+等再久也追不上一个更早的时刻，而早退到"等满上限→丢弃"会把这些帧**白白丢掉**
+并误报成"遥测停顿"。那一类交给 :attr:`~airdrop.telemetry.TelemetryBroker`
+的向后外推处理，由 ``max_extrapolation`` 决定放行还是丢弃，并单独计入
+:attr:`AlignStats.too_old`。ffmpeg 的启动盲区（≈``probesize``）加上飞控要等
+定位/姿态解，使得"视频先到"在每次架次的开头都是常态，所以这条边界必须分清。
+
 代价要说清楚：等待发生在调用 :meth:`align` 的线程里。挂成 sink 时就是
 阻塞采集线程——正常 10~30Hz 遥测下只有几十毫秒，但遥测真停顿时每帧
 都会等满上限（拉流会随之积压）。这是刻意的取舍：遥测停顿本身就是事故，
@@ -98,6 +106,10 @@ class AlignStats:
     no_telemetry: int = 0  # 历史为空（一条遥测都还没有）
     waits: int = 0  # 发生过等待的帧数
     wait_timeouts: int = 0  # 等到超时、按 on_timeout 丢弃的帧数
+    #: 拍摄时刻比历史**最早**一条还早的帧数（视频先到、遥测后到的启动段）。
+    #: 这类帧**不参与等待**（遥测只会更晚，等没有意义），交给外推判据处理，
+    #: 所以单独计数——不要混进 ``wait_timeouts``，那个计数的含义是"遥测停顿"。
+    too_old: int = 0
     extrapolation_drops: int = 0  # 超出 max_extrapolation 被丢弃的帧数
     max_wait_s: float = 0.0  # 单次等待的最长耗时（秒）
 
@@ -150,9 +162,10 @@ class FrameTelemetryAligner:
         历史边界超过该秒数时 :meth:`align` 返回 None（宁可让调用方跳过这一帧，
         也不要拿不可信的遥测去引导）。
     max_wait:
-        等待上限（秒）。拍摄时刻比历史最新时间还新时，先等一小会儿让遥测
+        等待上限（秒）。拍摄时刻比历史**最新**时间还新时，先等一小会儿让遥测
         追上，从而能内插而不是外推；超过该上限仍没等到就按 ``on_timeout``
-        处理。默认 0.0 = 不等待（直接外推）。
+        处理。默认 0.0 = 不等待（直接外推）。**只作用于"比历史更新"这个方向**，
+        反方向（比历史最早还早）等也没意义，见模块文档"关于等待"一节。
     on_timeout:
         等待超时后的动作。目前支持 ``"drop"``：丢弃该帧（返回 None）。
         正常遥测（10~30Hz）下等待只有几十毫秒；真的等到超时说明遥测流本身
@@ -197,6 +210,7 @@ class FrameTelemetryAligner:
         self._no_telemetry = 0
         self._waits = 0
         self._wait_timeouts = 0
+        self._too_old = 0
         self._extrapolation_drops = 0
         self._max_wait_seen = 0.0
 
@@ -234,6 +248,7 @@ class FrameTelemetryAligner:
                 no_telemetry=self._no_telemetry,
                 waits=self._waits,
                 wait_timeouts=self._wait_timeouts,
+                too_old=self._too_old,
                 extrapolation_drops=self._extrapolation_drops,
                 max_wait_s=self._max_wait_seen,
             )
@@ -248,8 +263,13 @@ class FrameTelemetryAligner:
 
         1. ``frame`` 为 None；
         2. 遥测历史为空（一条遥测都还没收到）；
-        3. 查询时刻比历史还新、且等满 ``max_wait`` 仍未追上（``on_timeout="drop"``）；
+        3. 拍摄时刻比历史**最新**还新、且等满 ``max_wait`` 仍未追上
+           （``on_timeout="drop"``）；
         4. 查询时刻超出历史范围且超过 ``max_extrapolation``。
+
+        ⚠ 拍摄时刻比历史**最早**一条还早（视频先到）**不在**上面这四条里：
+        它走向后向外推（计入 :attr:`AlignStats.too_old`），不等待也不因等待
+        超时而丢弃——详见模块文档"关于等待"一节。
 
         传入 :meth:`Hm30VideoSource.latest` 拿到的"当前画面"同样适用。
         """
@@ -260,13 +280,22 @@ class FrameTelemetryAligner:
         timestamp = frame.timestamp - lag
 
         # 历史为空：一条遥测都没收到；等也没用，直接跳过（细分到 no_telemetry）
-        if self._broker.history_span() is None:
+        span = self._broker.history_span()
+        if span is None:
             self._bump("no_telemetry")
             return None
 
-        if self._max_wait > 0 and not self._covered(timestamp):
+        if timestamp < span[0]:
+            # 拍摄时刻比历史**最早**一条还早：视频先到、遥测后到（ffmpeg 探测盲区
+            # + 等定位/姿态解的组合下这是常态）。遥测只会越来越晚，等没有意义，
+            # 所以不进等待分支——否则会被误判成"遥测停顿"而白白丢帧（那正是
+            # 本项目"一帧不落"要防的事）。交给下面的外推判据（max_extrapolation）
+            # 决定放行还是丢弃，并单独计数便于复盘。
+            self._bump("too_old")
+        elif timestamp > span[1] and self._max_wait > 0:
             self._wait_for_coverage(timestamp)
-            if not self._covered(timestamp):
+            waited = self._broker.history_span()
+            if waited is None or timestamp > waited[1]:
                 # 等到超时：遥测没追上拍摄时刻，这些帧本来也对不齐，
                 # 按约定丢弃（不拿外推凑数），并让问题可见。
                 self._bump("wait_timeouts")
@@ -304,11 +333,6 @@ class FrameTelemetryAligner:
     # ------------------------------------------------------------------
     # 内部实现
     # ------------------------------------------------------------------
-    def _covered(self, timestamp: float) -> bool:
-        """历史是否覆盖该时刻（能内插，而不是只能外推）。"""
-        span = self._broker.history_span()
-        return span is not None and span[0] <= timestamp <= span[1]
-
     def _wait_for_coverage(self, timestamp: float) -> None:
         """等待遥测历史追上拍摄时刻，最长 ``max_wait`` 秒。"""
         started = time.monotonic()
@@ -330,6 +354,8 @@ class FrameTelemetryAligner:
                 self._waits += 1
             elif field == "wait_timeouts":
                 self._wait_timeouts += 1
+            elif field == "too_old":
+                self._too_old += 1
             elif field == "extrapolation_drops":
                 self._extrapolation_drops += 1
             if max_wait is not None and max_wait > self._max_wait_seen:

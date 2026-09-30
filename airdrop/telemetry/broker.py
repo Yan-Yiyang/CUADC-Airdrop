@@ -34,6 +34,13 @@ SUPPORTED_QUERY_MODES = frozenset({"interpolate", "nearest"})
 # 时间估计时不参与数值内插的时间类字段
 _SKIP_INTERP_FIELDS = {"timestamp", "attitude_timestamp_us"}
 
+# 离散量字段：不是连续量，内插出来的是无意义的小数。**必须显式排除**——
+# 下面那道 isinstance(a, (int, float)) 闸门拦不住它们，因为 bool 是 int 的子类：
+#   in_air: True → False 会内插出 0.5（真值）⇒ "等起飞"判据把过渡窗口判成在空中
+#   mission_current: 2 → 4 会内插出 3.0 ⇒ int(3.0) 让任务完成判定提前一格
+# 取 copy_from 那一端的原值（内插取 left、外推取 right），语义与"只有一端有值"一致。
+_DISCRETE_FIELDS = frozenset({"in_air", "mission_current", "mission_total"})
+
 # 欧拉角字段：混合时必须走"最短弧"，否则 179° → -179° 会错误地经过 0°
 _ANGULAR_FIELDS = frozenset({"roll_deg", "pitch_deg", "yaw_deg"})
 
@@ -430,7 +437,11 @@ class TelemetryBroker:
 
         for f in fields(TelemetrySnapshot):
             name = f.name
-            if name in _SKIP_INTERP_FIELDS or name in _QUATERNION_FIELD_SET:
+            if (
+                name in _SKIP_INTERP_FIELDS
+                or name in _QUATERNION_FIELD_SET
+                or name in _DISCRETE_FIELDS
+            ):
                 continue
             a = getattr(left, name)
             b = getattr(right, name)

@@ -177,6 +177,51 @@ def test_detect_corners_finds_rendered_board() -> None:
     assert corners.shape == (PATTERN[0] * PATTERN[1], 1, 2)
 
 
+def test_load_flight_frames_keeps_each_image_paired_with_its_own_timestamp(
+    workdir: Path,
+) -> None:
+    """帧与拍摄时刻必须来自**同一条**索引记录（坏帧不许造成错位）。
+
+    曾经是两个独立函数：一个按"成功解码数"计数并跳过坏帧，另一个按"索引行数"
+    计数。素材中间有 2 帧损坏时两个列表长度仍相等、``zip(strict=True)`` 不报错，
+    但 ``frames[k]`` 配的是另一行的时刻——实测造成 0.2s 错位，Δt 与手眼外参
+    全建立在错配上，产出一份看起来正常的错误 ``camera_calib.json``。
+    """
+    from tools.calibrate import load_flight_frames_paired, load_flight_index
+
+    flight = workdir / "flight"
+    (flight / "frames").mkdir(parents=True)
+    bad = {2, 3}
+    count = 10
+    lines = []
+    for i in range(count):
+        name = f"{i:06d}.jpg"
+        if i in bad:
+            (flight / "frames" / name).write_bytes(b"not-a-jpeg")  # 存在但解不出
+        else:
+            cv2.imwrite(
+                str(flight / "frames" / name),
+                np.full((64, 64, 3), (i * 20) % 255, np.uint8),
+            )
+        lines.append(json.dumps({"filename": name, "capture_timestamp": 100.0 + i * 0.1}))
+    (flight / "frames_index.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    truth = {100.0 + i * 0.1: i for i in range(count)}
+    paired = load_flight_frames_paired(flight, limit=5)
+    assert len(paired) == 5
+    for stamp, image in paired:
+        assert image is not None
+        # 这一帧的真实索引行必须与它带的时刻一致
+        expected_row = truth[stamp]
+        assert expected_row not in bad, f"时刻 {stamp} 属于被损坏的行 {expected_row}"
+        # 像素值能反查回它是第几帧 ⇒ 图像与时刻确实同源
+        assert int(image[0, 0, 0]) == (expected_row * 20) % 255
+
+    # 索引里解不出的两行被连同其时刻一起跳过，而不是留下空洞
+    assert [round(s, 3) for s, _ in paired] == [100.0, 100.1, 100.4, 100.5, 100.6]
+    assert len(load_flight_index(flight)) == count
+
+
 def test_rendered_board_projects_inside_frame() -> None:
     """板子四角必须投影在画幅内——被裁掉一半的板子检不出角点。"""
     frames, poses = _render_views(8)

@@ -107,20 +107,20 @@ class PerceptionConfig:
 
     三条要求：
 
-    1. **``mode="cls12"`` 需要 12 类检测权重**（仓库目前只提供单类 ``target``
-       权重；12 类权重就位前该模式编号恒为 1）。
-    2. **检测权重用 ``best2.pt``**（单类 ``target``；仓库不带权重，
-       用 :mod:`tools.fetch_models` 复制）。
+    1. **``mode="cls12"`` 需要 12 类检测权重**（编号直接来自 YOLO 类别）：权重是单类
+       ``target`` 时该模式编号恒为 1——要跑 ``cls12`` 请换成 12 类权重，否则用 ``mode="ocr"``。
+    2. **检测权重由使用者自备**（单类 ``target``）：放到 ``model_path`` 指向的位置
+       （默认 ``models/best2.pt`` 只是约定路径，可用 :mod:`tools.fetch_models` 复制进来）。
     3. **``device`` 必须显式给定**：不依赖 ultralytics 的自动检测
-       （当前实测会选中 ``cuda:0``，显式指定零成本地固定设备）。
+       （自动检测会选中 ``cuda:0``，显式指定零成本地固定设备）。
     """
 
     mode: str = "ocr"
-    # YOLO 检测权重（单类 target）
+    # YOLO 检测权重（单类 target；默认路径只是约定，可覆盖）
     model_path: str = "models/best2.pt"
     device: str = "0"
     conf_threshold: float = 0.25
-    imgsz: int = 1280  # best2.pt 训练分辨率 640；实测 640/1280 检出数一致
+    imgsz: int = 1280  # 权重按 640 训练；实测 640/1280 检出数一致
 
     # OCR 引擎（TORCH，本地权重；P5 复测：medium ~97ms/帧 @RTX3060Laptop）
     models_dir: str = "models/ppocr"
@@ -162,9 +162,20 @@ class PerceptionConfig:
             use_cuda=self.ocr_use_cuda,
         )
 
-    def to_pipeline_config(self):
-        """装配 :class:`~airdrop.perception.PerceptionWorker` 需要的参数切片。"""
+    def to_pipeline_config(self, camera=None):
+        """装配 :class:`~airdrop.perception.PerceptionWorker` 需要的参数切片。
+
+        ``camera`` 是已载入的 :class:`~airdrop.georef.CameraModel`（可为 None）。
+        给了它，检测器就走**预计算 remap** 快路径（比逐帧 undistort 快 3~5 倍），
+        并在 ``Detection.extra["undistorted"]`` 上打标记让 georef 不再逐点去畸变；
+        同时把 ``calib_size`` 带过去，让"帧尺寸与标定不符"能被拒掉而不是拿错
+        内参硬套。不给就退回逐帧 undistortPoints（功能正确，只是慢）。
+        """
         from .perception import PerceptionConfigLike
+
+        matrix = None if camera is None else camera.camera_matrix
+        dist = None if camera is None else camera.dist_coeffs
+        calib_size = None if camera is None else camera.image_size
 
         return PerceptionConfigLike(
             mode=self.mode,
@@ -181,6 +192,9 @@ class PerceptionConfig:
             min_side_px=self.min_side_px,
             max_side_px=self.max_side_px,
             engine=self.ocr_engine_config(),
+            camera_matrix=matrix,
+            dist_coeffs=dist,
+            calib_size=None if calib_size is None else (int(calib_size[0]), int(calib_size[1])),
         )
 
 
@@ -476,6 +490,7 @@ class Config:
                 f"ballistics.wind_source 只支持 {sorted(WIND_SOURCES)}: "
                 f"{self.ballistics.wind_source!r}"
             )
+        self._validated_ballistics()
         if self.perception.ocr_workers < 1:
             raise ValueError(f"perception.ocr_workers 至少为 1: {self.perception.ocr_workers}")
         if self.perception.ocr_queue_size < 1:
@@ -556,6 +571,25 @@ class Config:
             )
         self.video.validated()
         return self
+
+    def _validated_ballistics(self) -> None:
+        """弹道参数的取值域检查（单独一个方法，好让 ``validated`` 保持扁平）。
+
+        重点是 ``gravity``：取 0 或负数时弹道永远不穿过地面，于是每次
+        ``predict_impact`` 都要跑满 120s 超时上限（实测 67.8ms/次——20Hz 的
+        投放判据就是每秒烧掉 1.36s CPU）并且**静默永不投放**。
+        """
+        b = self.ballistics
+        if b.mass_kg <= 0:
+            raise ValueError(f"ballistics.mass_kg 必须为正: {b.mass_kg}")
+        if b.gravity <= 0:
+            raise ValueError(f"ballistics.gravity 必须为正: {b.gravity}")
+        if b.drag_coefficient < 0:
+            raise ValueError(f"ballistics.drag_coefficient 不能为负: {b.drag_coefficient}")
+        if b.cross_area_m2 < 0:
+            raise ValueError(f"ballistics.cross_area_m2 不能为负: {b.cross_area_m2}")
+        if b.rk_dt <= 0:
+            raise ValueError(f"ballistics.rk_dt 必须为正: {b.rk_dt}")
 
     def replace(self, **changes) -> "Config":
         """派生新配置（浅层替换顶层片段）。"""

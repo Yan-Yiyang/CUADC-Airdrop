@@ -180,14 +180,27 @@ class Preflight:
             return 0
 
     def _expected_size(self) -> tuple[int, int] | None:
+        """标定时的图像尺寸 ``(width, height)``；没有标定尺寸就返回 None（跳过核对）。
+
+        ⚠ 字段名必须对上 :class:`~airdrop.georef.CameraModel` 的 ``image_size``——
+        这里曾经读的是并不存在的 ``width``/``height``，``getattr`` 恒返回 None，
+        于是下面"画面分辨率与标定一致"那道检查成了**永久空转**：写错内参的
+        画面照样放行，而这正是它唯一要拦的东西。
+        """
         model = self._camera_model
         if model is None:
             return None
-        width = getattr(model, "width", None)
-        height = getattr(model, "height", None)
-        if width and height:
-            return (int(width), int(height))
-        return None
+        size = getattr(model, "image_size", None)
+        if not size:
+            return None
+        try:
+            width, height = int(size[0]), int(size[1])
+        except TypeError, ValueError, IndexError:  # pragma: no cover - 防御性
+            LOGGER.warning("相机模型的 image_size 不是 (width, height)：%r", size)
+            return None
+        if width <= 0 or height <= 0:
+            return None
+        return (width, height)
 
     def _frame_size(self) -> tuple[int, int] | None:
         latest = getattr(self._video_source, "latest", None)
