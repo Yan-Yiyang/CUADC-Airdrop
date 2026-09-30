@@ -116,6 +116,13 @@ class Detection:
                 "roll_deg": tlm.roll_deg,
                 "pitch_deg": tlm.pitch_deg,
                 "yaw_deg": tlm.yaw_deg,
+                # 速度：**姿态 yaw 的独立参照**。离线诊断
+                # ``tools/sitl_recon.py`` 的 ``_heading_consistency`` 用
+                # ``atan2(vy, vx)`` 的航迹角和 yaw 比——PX4 的 yaw 在起飞后有一段
+                # 瞬态能偏 25~35°（实测 6 个架次），落点误差会被它放大，而那不是
+                # 坐标解算的锅。少这两个字段这条诊断就只能靠活的 broker，离线复算不了。
+                "vx_m_s": tlm.vx_m_s,
+                "vy_m_s": tlm.vy_m_s,
             },
             **({"extra": dict(self.extra)} if self.extra else {}),
         }

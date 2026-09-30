@@ -254,7 +254,7 @@ class TargetingConfig:
     **起飞前按任务选定**，代码不做隐式回退。结果坐标 = 类内成员坐标均值。
     """
 
-    eps_m: float = 0.75  # 聚类半径，预期目标间距下 0.5~1.0
+    eps_m: float = 1.5  # 聚类半径：同一目标的重复观测散布（实测 0.2~1.0 m），远小于目标间距 20~40 m
     min_samples: int = 2  # 噪声点（label=-1）剔除
     selection_rule: str = "median"
     weight_by_confidence: bool = False  # 开时按置信度加权（聚类与均值同时加权）

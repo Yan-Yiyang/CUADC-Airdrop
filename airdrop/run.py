@@ -585,7 +585,9 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(
                 ("--aerial-patches",),
                 "aerial_patches",
-                "比赛区域外铺几块航拍干扰底图（0 = 不铺；默认 6）",
+                # 默认值由 _add_option 自动附在帮助末尾（从模块常量读），
+                # 这里不要再手写数字——原来写的"默认 6"与常量 12 对不上。
+                "比赛区域外铺几块航拍干扰底图（0 = 不铺）",
                 kind="int",
                 source="AERIAL_PATCHES",
             ),

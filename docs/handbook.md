@@ -61,7 +61,7 @@
 | `tools/` | 一次性离线工具（**纯库模块**：文件内常量 = 默认值，暴露 `build_config(**覆盖)` / `main(**kwargs)`；命令行解析归 §6.2 的 `airdrop/run.py`） | `fetch_models.py`、`calibrate.py`、`fit_ballistics.py`、`make_world.py`、`dump_api.py`、`check_docs.py` | 是 |
 | `examples/` | 七个入口示例（同样是纯库模块：常量 = 默认值；重依赖只在函数体内导入，所以 `import` 它们**不加载** cv2/mavsdk/torch） | `full_mission.py`、`replay_flight.py`、`sitl_mission.py` | 是 |
 | `airdrop/run.py` | **唯一的命令行入口**：argparse 子命令 → 关键字覆盖到各入口的 `build_config`/`main`（见 §6.2） | `run.py`、`airdrop/_lazy.py`（PEP 562 惰性导出） | 是 |
-| `tests/` | pytest 套件（20 个测试文件，全部离线；`realdata` 标记默认跳过） | `conftest.py`、`test_e2e.py`、`test_fit.py`、`test_plan.py`、`test_world.py` | 是 |
+| `tests/` | pytest 套件（21 个测试文件，全部离线；`realdata` 标记默认跳过） | `conftest.py`、`test_e2e.py`、`test_fit.py`、`test_plan.py`、`test_world.py`、`test_sim_scripts.py` | 是 |
 | `docs/` | 专题笔记（5 篇实测记录）+ 本手册 | `handbook.md`、`simulation_world.md`、`calibration_opencv.md`、`video_hm30_ffmpeg.md`、`perception_ocr.md`、`ballistics_fit.md` | 是 |
 | `sim/` | **仿真模块**：世界（生成产物：两个 `.sdf` + 网格/贴图）+ 带下视相机的机型 + PX4 airframe + 装机/启动脚本；生成器是 `tools/make_world.py`，布局与启动见 [`simulation_world.md`](simulation_world.md)，模块说明见 [`../sim/README.md`](../sim/README.md) | `sim/worlds/cuadc/cuadc_recon_strike_r1.sdf`、`r2.sdf` | 是 |
 | `routes/` | **操作手在 QGC 里画好的 `.plan` 航线**（`recon.plan` / `land.plan`），由配置按需导入 | `land.plan` | 是（航线是飞行输入，跟着版本走） |
@@ -2039,6 +2039,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `.plan-test-tmp/` | `tests/test_plan.py` 的 `workdir` fixture | 现场造的 QGC `.plan`（含复杂项） |
 | `.handbook-test-tmp/` | `tests/test_handbook.py` 的 `workdir` fixture | 手册 §3 示例真跑时的工作目录 |
 | `.world-test-tmp/` | `tests/test_world.py` 的 `workdir` fixture | 生成到别处的赛区世界（含贴图复制） |
+| `.sim-script-tmp/` | `tests/test_sim_scripts.py` 的 `workdir` fixture | 复制一份 `sim/` + 驱动脚本，放工作区内是为了让 WSL 能从 `/mnt/c/…` 读到 |
 | `.replay-test-tmp/` | `tests/test_replay.py` | 手写的最小飞行目录 |
 | `.sitl-test-tmp/` | **人工**（SITL 演练） | 演练日志、机上任务备份、ulog 探查脚本；不是测试 fixture |
 | `.pytest-tmp/` | 历史遗留（`--basetemp` 落点） | 已可删除，无用 |
@@ -2232,6 +2233,7 @@ config = Config(
 | `tests/test_cli.py` | 集中式入口：子命令注册表（parser + handler）、`--help`/`check-docs` **不加载重库**（干净子进程实测）、参数不合法退出码 2、选项覆盖真的进了 `build_config()` | 否 |
 | `tests/test_handbook.py` | **本手册 §3 的 11 段示例逐条真跑**（文档里的代码必须能运行） | 否 |
 | `tests/test_world.py` | CUADC 赛区世界：**生成结果 == 入库文件**、目标区在起飞线两端（±200, 0）、天井区内随机摆放且间距 > 20m、五边形环壁（厚 5mm、高 400mm）、**规则里只是示意的东西不许出现**（4m/6m 打击圈、天井箭头）、同区天井同色、贴地标线不共面重叠（防 z-fighting）、两轮靶标摆位（第二轮中位数落在第 3 座）、演练航线对准中位数天井、目标区底色（常见路面色 + 少量纹理）、周边航拍底图（不压跑道/目标区、互不重叠）、底图生成器（可复现/离线校验）、俯视预览图（尺寸/可复现/参数校验）、资产逐级存在、数字板必须是**白底黑字** | 否 |
+| `tests/test_sim_scripts.py` | `sim/install_px4.sh` 的生命周期：**在 WSL 里跑**（软链语义只能在 ext4 上验，Windows 的 Git Bash 里 `ln -s` 会退化成复制）、`bash -n` 语法、装→幂等重装→PX4 升级后重装→卸载的 20 条行为断言（软链真建出来且没有嵌套、CMakeLists 真还原、**备份不停在第一次**且旧备份另存 `.stale`、卸载不回滚 PX4 自己的条目、遇实体副本不自动删也**不中途 abort**、世界文件缺失要报错且不留名字里带 `*` 的垃圾软链、提示语不断言代码没做的事、仓库侧缺资产时不删实体副本）。**没有 WSL 就整组跳过**（`skipif`，不是 marker，不影响默认 `-m` 过滤） | 否 |
 
 ### 6.6 一次真实任务的推荐顺序
 

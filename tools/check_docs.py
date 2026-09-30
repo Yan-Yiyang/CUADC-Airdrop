@@ -174,7 +174,10 @@ def main(**overrides) -> int:
     if not doc_path.exists():
         print(f"找不到手册：{doc_path}", file=sys.stderr)
         return 1
-    text = DOC_PATH.read_text(encoding="utf-8")
+    # ⚠ 必须读 doc_path，不能读模块常量 DOC_PATH：那会让 doc_path 变成"半个选项"——
+    # 存在性检查用传入的路径、内容却用默认手册，最坏情况是"核验通过了但核验的不是
+    # 你以为的那本"。main() 的 docstring 承诺关键字与 build_config 一致。
+    text = doc_path.read_text(encoding="utf-8")
     failures: list[str] = []
 
     def report(title: str, missing: list[str]) -> None:

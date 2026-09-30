@@ -63,6 +63,10 @@ __all__ = [
 #: 不节流就是每秒几十条完整 traceback，见 OcrEngine.read_text 的说明）
 _OCR_FAIL_LOG_EVERY = 30
 
+#: 掩码清理用的形态学核（常量）。原来在 edge_detection 里每档重建一次，而它
+#: 与 s_min、与图像都无关。
+_MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
 
 # ----------------------------------------------------------------------
 # RapidOCR 引擎封装
@@ -471,6 +475,10 @@ class OpenCvPostProcess:
         self.max_upscale = float(max_upscale)
         self._engine = engine if engine is not None else OcrEngine(engine_config)
         self.image: np.ndarray | None = None
+        # 与 s_min 无关的预处理缓存（按 self.image 的身份失效），见 _prepared
+        self._prep_src: np.ndarray | None = None
+        self._prep_blurred: np.ndarray | None = None
+        self._prep_hsv: np.ndarray | None = None
         self.s_min = self.BLUE_S_MIN_LEVELS[0]
         self.scale = 1.0
 
@@ -488,18 +496,19 @@ class OpenCvPostProcess:
     # 颜色提取
     # ------------------------------------------------------------------
     @staticmethod
-    def _extract_blue(image: np.ndarray, s_min: int) -> np.ndarray:
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    def _extract_blue(blurred: np.ndarray, hsv: np.ndarray, s_min: int) -> np.ndarray:
         mask = cv2.inRange(hsv, np.array([90, s_min, 50]), np.array([130, 255, 255]))
-        blue = cv2.bitwise_and(image, image, mask=mask)
+        blue = cv2.bitwise_and(blurred, blurred, mask=mask)
         return cv2.cvtColor(blue, cv2.COLOR_BGR2GRAY)
 
     @staticmethod
-    def _extract_red_level(image: np.ndarray, s_min: int) -> np.ndarray:
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    def _extract_red_level(blurred: np.ndarray, hsv: np.ndarray, s_min: int) -> np.ndarray:
         m1 = cv2.inRange(hsv, np.array([0, s_min, 100]), np.array([10, 255, 255]))
         m2 = cv2.inRange(hsv, np.array([160, s_min, 100]), np.array([179, 255, 255]))
-        red = cv2.bitwise_and(image, image, mask=m1 + m2)
+        # bitwise_or 而不是 m1 + m2：uint8 相加会溢出（255+255 → 254）。当前不可达
+        # （两段 hue 区间 0-10 与 160-179 互斥），但改动 hue 边界就会变成真 bug，
+        # 而 bitwise_or 只看每个像素的位，"非零即命中"的语义也更正确
+        red = cv2.bitwise_and(blurred, blurred, mask=cv2.bitwise_or(m1, m2))
         return cv2.cvtColor(red, cv2.COLOR_BGR2GRAY)
 
     def _sat_levels(self) -> tuple[int, ...]:
@@ -661,6 +670,24 @@ class OpenCvPostProcess:
     # ------------------------------------------------------------------
     # 五边形检测
     # ------------------------------------------------------------------
+    def _prepared(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """把与 ``s_min`` **无关**的计算做一次：模糊 + BGR→HSV，返回 ``(blurred, hsv)``。
+
+        饱和度回退最多试 4 档，而 ``GaussianBlur`` 与 ``cvtColor(BGR2HSV)`` 的结果
+        **逐档完全相同**（只有 ``inRange`` 的阈值随 ``s_min`` 变）。原来逐档各算一遍：
+        实测 300px 裁剪图上 cvtColor 约 0.14ms、GaussianBlur 约 0.03ms，4 档就是
+        白扔约 0.7ms/图——而这段本来就不该随档位重做。
+
+        按**数组身份**缓存（``is`` 比较，不比内容）：``self.image`` 每张新图换一次
+        引用，同一张图的 4 个档位命中同一份缓存。
+        """
+        if self._prep_src is not image:
+            self._prep_src = image
+            self._prep_blurred = cv2.GaussianBlur(image, (3, 3), 0)
+            self._prep_hsv = cv2.cvtColor(self._prep_blurred, cv2.COLOR_BGR2HSV)
+        assert self._prep_blurred is not None and self._prep_hsv is not None
+        return self._prep_blurred, self._prep_hsv
+
     def edge_detection(self) -> tuple[np.ndarray, bool]:
         """按当前 ``s_min`` 提取颜色并找五边形；返回 ``(approx, ok)``。
 
@@ -670,17 +697,16 @@ class OpenCvPostProcess:
         image = self.image
         if image is None:
             return np.empty((0, 1, 2), np.int32), False
-        blurred = cv2.GaussianBlur(image, (3, 3), 0)
+        blurred, hsv = self._prepared(image)
         if self.color == "blue":
-            gray = self._extract_blue(blurred, self.s_min)
+            gray = self._extract_blue(blurred, hsv, self.s_min)
         elif self.color == "red":
-            gray = self._extract_red_level(blurred, self.s_min)
+            gray = self._extract_red_level(blurred, hsv, self.s_min)
         else:
             raise ValueError(f"未知目标颜色: {self.color}")
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-        opening = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
-        erosion = cv2.erode(opening, kernel, iterations=1)
+        opening = cv2.morphologyEx(gray, cv2.MORPH_OPEN, _MORPH_KERNEL)
+        erosion = cv2.erode(opening, _MORPH_KERNEL, iterations=1)
         contours, _ = cv2.findContours(erosion, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return np.empty((0, 1, 2), np.int32), False

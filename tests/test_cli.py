@@ -366,3 +366,48 @@ def test_defaults_come_from_the_module_constants() -> None:
     cal = run.resolve_kwargs("calibrate", [])
     assert cal["pattern_size"] == calibrate.PATTERN_SIZE
     assert cal["flight_dir"] == calibrate.FLIGHT_DIR
+
+
+def test_fetch_models_reports_a_wrong_source_dir_as_failure(tmp_path: Path) -> None:
+    """``--source-dir`` 打错时必须**失败**，不能报"都已在位"并返回 0。
+
+    原来 ``copy_missing`` 只返回 copied，源缺失时逐个打印 ``[跳过] 源缺失`` 后
+    ``total == 0`` ⇒ 打印"（都已在位，无需复制）"并返回 0——"取权重失败"被静默
+    转成成功。AGENTS.md 描述的流程是"起飞前逐条核对"，这个 0 会让它看起来像成功。
+    """
+    from tools import fetch_models
+
+    absent = tmp_path / "definitely-not-here"
+    code = fetch_models.main(source_dir=absent, source_ocr_dir=absent, target_dir=tmp_path / "out")
+    assert code == 2, f"源目录不存在应返回 2，实际 {code}"
+
+
+def test_fetch_models_returns_zero_when_source_is_complete(tmp_path: Path) -> None:
+    """来源齐全时返回 0（对照组：上一条若恒返回非 0，这条会失败）。"""
+    from tools import fetch_models
+
+    source = tmp_path / "src"
+    source.mkdir()
+    for name in fetch_models.YOLO_FILES:
+        (source / name).write_bytes(b"x")
+    for name in fetch_models.OCR_FILES:
+        (source / name).write_bytes(b"y")
+
+    code = fetch_models.main(source_dir=source, source_ocr_dir=source, target_dir=tmp_path / "out")
+    assert code == 0
+    assert (tmp_path / "out" / "best2.pt").is_file()
+    assert (tmp_path / "out" / "ppocr" / "ppocrv6_dict.txt").is_file()
+
+
+def test_check_docs_honours_an_explicit_doc_path(tmp_path: Path) -> None:
+    """``check_docs(doc_path=...)`` 要真的校验**传入的那本**，不是模块常量。
+
+    原来存在性检查用 ``doc_path``、读内容却用模块常量 ``DOC_PATH`` ⇒ 最坏情况是
+    "核验通过了但核验的不是你以为的那本"，是个半个选项。而 main() 的 docstring
+    承诺"关键字与 build_config 一致"。
+    """
+    from tools import check_docs
+
+    decoy = tmp_path / "decoy.md"
+    decoy.write_text("这里没有手册该有的任何内容", encoding="utf-8")
+    assert check_docs.main(doc_path=decoy) == 1, "显然不合格的内容不该通过"

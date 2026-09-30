@@ -763,25 +763,49 @@ def test_sitl_recon_truth_table_matches_the_world() -> None:
         assert abs(well.north_m - north_m) < 0.05, f"{code} 号天井北向坐标与世界不一致"
 
 
-def test_sitl_recon_legs_cover_every_well_and_reverse_once() -> None:
-    """每条扫掠线都要真的压过天井（水平偏差 ≤ 2 m），且有一组同线反向（延时诊断）。"""
+def test_sitl_recon_route_covers_every_well_and_flies_both_directions() -> None:
+    """侦查航线要真的看得见三个靶标，而且有**反向**观测（延时诊断要用）。
+
+    ⚠ 判据随固定翼转弯几何改过一次（2026-09-30）。原来两条要求是"每条扫掠线在
+    **2 m** 内压过天井" + "存在一组**同线**反向"。同线反向必然要求 180° 掉头，而掉头的
+    横向挪移**恒为 2R**（两段反向圆弧横移之和与圆心角无关，R≈22.9 m ⇒ 46 m）——靶区
+    南北只跨 19 m、15 m 高度的视场半幅只有 17.8 m，两条线拉开 46 m 之后第二条线
+    **一个靶标都看不见**。两条要求互斥，所以现在改成：
+
+    * 覆盖判据从"2 m"放宽到**相机视场半幅**（真的看得见就算数）；
+    * 反向观测不再要求同线，只要求存在一段**东向分量为负**、且同样扫过靶标的腿。
+    """
     from tools import sitl_recon
 
+    def distance_to_leg(point: tuple[float, float], leg) -> float:
+        (ax, ay), (bx, by) = leg
+        dx, dy = bx - ax, by - ay
+        length_sq = dx * dx + dy * dy
+        t = (
+            0.0
+            if length_sq == 0.0
+            else max(0.0, min(1.0, ((point[0] - ax) * dx + (point[1] - ay) * dy) / length_sq))
+        )
+        return math.dist(point, (ax + t * dx, ay + t * dy))
+
+    half_width = sitl_recon.effective_half_width_m()
     for code, (east_m, north_m) in sitl_recon.WELLS_A_ENU.items():
-        covering = [
-            leg
-            for leg in sitl_recon.RECON_LEGS_ENU
-            if min(leg[0][0], leg[1][0]) - 1.0 <= east_m <= max(leg[0][0], leg[1][0]) + 1.0
-            and abs(leg[0][1] - north_m) <= 2.0
-        ]
-        assert covering, f"{code} 号天井没有扫掠线压过（改航线要照着真值表来）"
-    reversed_pair = [
-        (leg_a, leg_b)
-        for leg_a in sitl_recon.RECON_LEGS_ENU
-        for leg_b in sitl_recon.RECON_LEGS_ENU
-        if leg_a[0] == leg_b[1] and leg_a[1] == leg_b[0]
+        target = (east_m, north_m)
+        nearest = min(distance_to_leg(target, leg) for leg in sitl_recon.RECON_LEGS_ENU)
+        assert nearest <= half_width, (
+            f"{code} 号天井离航线 {nearest:.1f} m，超出视场半幅 {half_width:.1f} m"
+            "（改航线要照着真值表来）"
+        )
+    # 反向观测：存在一段东向分量为负、且离每个靶标都在视场内的腿
+    backward = [
+        leg
+        for leg in sitl_recon.RECON_LEGS_ENU
+        if leg[1][0] < leg[0][0]
+        and all(
+            distance_to_leg(truth, leg) <= half_width for truth in sitl_recon.WELLS_A_ENU.values()
+        )
     ]
-    assert reversed_pair, "扫掠线里缺一组同线反向（延时诊断要用）"
+    assert backward, "没有一段东向为负、又能扫到靶标的腿（反向诊断/延时诊断要用）"
 
 
 def test_sitl_recon_route_and_camera_writers() -> None:

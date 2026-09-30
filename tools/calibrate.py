@@ -837,16 +837,29 @@ def _rotation_axis(rotation: np.ndarray) -> np.ndarray:
 
 
 def _axis_spread_deg(axes: Sequence[np.ndarray]) -> float:
-    """一组转轴之间的最大夹角（度）。转轴是双向的，所以正负号不影响结果。"""
-    spread = 0.0
-    for index, first in enumerate(axes):
-        for second in axes[index + 1 :]:
-            norm = float(np.linalg.norm(first) * np.linalg.norm(second))
-            if norm <= 1e-12:
-                continue
-            cosine = abs(float(np.dot(first, second))) / norm
-            spread = max(spread, math.degrees(math.acos(max(-1.0, min(1.0, cosine)))))
-    return spread
+    """一组转轴之间的最大夹角（度）。转轴是双向的，所以正负号不影响结果。
+
+    ⚠ 原来写成纯 Python 双重循环。``axes`` 的长度是通过 ``min_pair_rotation_deg``
+    过滤后剩下的运动对数，上限 ``MAX_MOTION_PAIRS = 2000``：200 个位姿 → 抽样后
+    约 1990 对 → 近 200 万次内层迭代，每次含 2 次 ``np.linalg.norm`` + 1 次
+    ``np.dot`` + ``acos``，按 ~6µs 算就是十几秒，而它在每次 ``solve_hand_eye``
+    里都无条件跑。这条判据本身是廉价的安全检查，不该是热点。
+
+    改成一次性向量化：归一化 → Gram 矩阵 → 取上三角 → arccos 取最大值。
+    数学上与原来逐对算的完全一致（同样的 ``|dot| / (|a||b|)``）。
+    """
+    if len(axes) < 2:
+        return 0.0
+    vectors = np.asarray(axes, dtype=np.float64).reshape(-1, 3)
+    norms = np.linalg.norm(vectors, axis=1)
+    keep = norms > 1e-12
+    vectors, norms = vectors[keep], norms[keep]
+    if len(vectors) < 2:
+        return 0.0
+    unit = vectors / norms[:, None]
+    gram = np.abs(unit @ unit.T)
+    upper = np.triu_indices(len(unit), k=1)
+    return float(np.degrees(np.arccos(np.clip(gram[upper], -1.0, 1.0))).max())
 
 
 def _translation_span(poses: Sequence[np.ndarray]) -> float:
@@ -957,20 +970,50 @@ def telemetry_pose_at(
     只做**范围内**内插；时刻落在遥测覆盖之外返回 None（不外推——标定不能被外推出来的
     姿态污染）。``snapshots`` 需按 ``timestamp`` 升序（``FlightLog.iter_telemetry`` 即升序）。
     """
-    usable = [item for item in snapshots if body_pose_matrix(item) is not None]
+    return _telemetry_pose_from_index(_index_telemetry(snapshots), timestamp)
+
+
+def _index_telemetry(
+    snapshots: Sequence[TelemetrySnapshot],
+) -> tuple[list[float], list[TelemetrySnapshot], list[np.ndarray]]:
+    """把遥测序列整成 ``(times, usable, poses)``，**只算一次**。
+
+    ⚠ 原来每次调用都重建这三样：``[item for item in snapshots if
+    body_pose_matrix(item) is not None]`` 会把**全部**快照过一遍，而
+    ``body_pose_matrix`` 每次都 ``np.eye(4)`` + 一次 ``quaternion_to_matrix``。
+    ``align_body_poses`` 对每个棋盘格位姿调一次本函数——采集默认 180s、遥测按
+    ``record.telemetry_hz=10`` 落盘约 1800 条，200 个位姿就是 **36 万次**
+    ``quaternion_to_matrix`` + 36 万次 ``np.eye(4)``，几秒纯浪费。
+
+    这也直接违反本项目自订的规矩（AGENTS.md 易错点 2：「禁止重建整张时间列表」）。
+    现在由 :func:`align_body_poses` 建一次并传下来。
+    """
+    usable: list[TelemetrySnapshot] = []
+    poses: list[np.ndarray] = []
+    for item in snapshots:
+        pose = body_pose_matrix(item)
+        if pose is None:
+            continue
+        usable.append(item)
+        poses.append(pose)
+    return [item.timestamp for item in usable], usable, poses
+
+
+def _telemetry_pose_from_index(
+    index: tuple[list[float], list[TelemetrySnapshot], list[np.ndarray]], timestamp: float
+) -> np.ndarray | None:
+    """在 :func:`_index_telemetry` 建好的索引上做区间内插（不外推）。"""
+    times, usable, poses = index
     if len(usable) < 2:
         return None
-    times = [item.timestamp for item in usable]
-    index = bisect_left(times, timestamp)
-    if index == 0 or index >= len(usable):
+    position = bisect_left(times, timestamp)
+    if position == 0 or position >= len(usable):
         return None
-    lower, upper = usable[index - 1], usable[index]
+    lower, upper = usable[position - 1], usable[position]
+    lower_pose, upper_pose = poses[position - 1], poses[position]
     span = upper.timestamp - lower.timestamp
     weight = 0.0 if span <= 0.0 else (timestamp - lower.timestamp) / span
     weight = min(1.0, max(0.0, weight))
-    lower_pose = body_pose_matrix(lower)
-    upper_pose = body_pose_matrix(upper)
-    assert lower_pose is not None and upper_pose is not None
     # body_pose_matrix 已保证四个四元数分量非空，这里逐项显式判一次，
     # 好让类型检查器也按"非空"收窄（属性访问不具备那种传递性）。
     lower_q = _quaternion_of(lower)
@@ -1002,8 +1045,10 @@ def align_body_poses(
     """
     paired_board: list[tuple[float, np.ndarray, np.ndarray]] = []
     paired_body: list[np.ndarray] = []
+    # 遥测索引只建一次（见 _index_telemetry 的说明：原来每个位姿都重建一遍整张表）
+    index = _index_telemetry(snapshots)
     for stamp, rvec, tvec in board_poses:
-        pose = telemetry_pose_at(snapshots, stamp - lag_s)
+        pose = _telemetry_pose_from_index(index, stamp - lag_s)
         if pose is None:
             continue
         paired_board.append((stamp, rvec, tvec))

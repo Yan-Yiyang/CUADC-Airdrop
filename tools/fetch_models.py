@@ -74,14 +74,24 @@ OCR_FILES = (
 )
 
 
-def copy_missing(source: Path, target: Path, names: tuple[str, ...]) -> int:
+def copy_missing(source: Path, target: Path, names: tuple[str, ...]) -> tuple[int, int]:
+    """复制缺失的权重。返回 ``(copied, missing)``。
+
+    ⚠ ``missing`` 是为了让 :func:`main` 能区分"都已在位"与"**源目录写错了**"。
+    原来只返回 copied，``--source-dir`` 打错一个字时会对 13 个文件逐个打印
+    ``[跳过] 源缺失``，然后 ``total == 0`` ⇒ 打印"（都已在位，无需复制）"并
+    **返回 0** —— "取权重失败"被静默转成成功。AGENTS.md 描述的流程是"起飞前逐条
+    核对"，这个 0 会让它看起来像成功。
+    """
     copied = 0
+    missing = 0
     target.mkdir(parents=True, exist_ok=True)
     for name in names:
         src = source / name
         dst = target / name
         if not src.is_file():
             print(f"  [跳过] 源缺失: {src}")
+            missing += 1
             continue
         if dst.is_file() and dst.stat().st_size == src.stat().st_size:
             print(f"  [已有] {dst}（{dst.stat().st_size / 1e6:.1f} MB）")
@@ -89,7 +99,7 @@ def copy_missing(source: Path, target: Path, names: tuple[str, ...]) -> int:
         shutil.copy2(src, dst)
         print(f"  [复制] {src.name} -> {dst}（{dst.stat().st_size / 1e6:.1f} MB）")
         copied += 1
-    return copied
+    return copied, missing
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,13 +139,24 @@ def main(**overrides) -> int:
     print(f"OCR  权重源: {source_ocr_dir}")
     print(f"目标目录   : {settings.target_dir.resolve()}")
     print()
-    total = copy_missing(Path(source_dir), Path(settings.target_dir), tuple(settings.yolo_files))
-    total += copy_missing(
-        Path(source_ocr_dir),
-        Path(settings.target_dir) / "ppocr",
-        tuple(settings.ocr_files),
-    )
+    total = 0
+    missing = 0
+    for source, target, names in (
+        (Path(source_dir), Path(settings.target_dir), tuple(settings.yolo_files)),
+        (Path(source_ocr_dir), Path(settings.target_dir) / "ppocr", tuple(settings.ocr_files)),
+    ):
+        got, miss = copy_missing(source, target, names)
+        total += got
+        missing += miss
     print(f"\n共复制 {total} 个文件")
+    if missing:
+        # 源目录写错 / 权重还没下载：这是**失败**，不能让退出码 0 把它变成成功
+        print(
+            f"有 {missing} 个文件在来源目录里找不到（路径写错了？权重还没下载？）。"
+            "上面的目标目录是空的或不全，起飞前自检的 OCR 载入会失败。",
+            file=sys.stderr,
+        )
+        return 2
     if total == 0:
         print("（都已在位，无需复制）")
     print("\n记得在 Config 里核对路径：")

@@ -14,6 +14,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -985,6 +986,62 @@ class _FakeProcess:
 
     def is_alive(self) -> bool:
         return self._alive
+
+
+def test_prepared_cache_reuses_work_that_does_not_depend_on_s_min() -> None:
+    """与 ``s_min`` 无关的预处理（模糊 + BGR→HSV）在同一张图上只做一次。
+
+    饱和度回退最多试 4 档，而 GaussianBlur 与 cvtColor(BGR2HSV) 的结果**逐档完全
+    相同**（只有 inRange 的阈值随 s_min 变）。原来逐档各算一遍：实测 300px 裁剪图
+    上 cvtColor 约 0.14ms、GaussianBlur 约 0.03ms，4 档白扔约 0.7ms/图。叠加此前
+    去掉的那遍重复检测，recognize() 中位耗时从 9.2ms 降到 5.3ms。
+    """
+    post = OpenCvPostProcess(engine=OcrEngine(OcrEngineConfig(model_dir="models/nope")))
+    picture = np.zeros((64, 64, 3), np.uint8)
+
+    first_blur, first_hsv = post._prepared(picture)
+    second_blur, second_hsv = post._prepared(picture)
+    assert first_blur is second_blur, "同一张图不该重算模糊"
+    assert first_hsv is second_hsv, "同一张图不该重算 BGR→HSV"
+
+    post.image = np.zeros((64, 64, 3), np.uint8)  # 新数组 ⇒ 缓存必须失效
+    other_blur, _ = post._prepared(post.image)
+    assert other_blur is not first_blur, "换图后必须重算"
+
+    # 逐档取出的掩码仍要各不相同（说明只缓存了公共部分，没有把 s_min 也冻住）
+    # BGR(160,120,120) 是 HSV S=64 的淡蓝：s_min=100 抓不到，s_min=60 能抓到。
+    # 注意 _extract_blue 返回的是 BGR2GRAY **亮度**，所以用"抓得到/抓不到"比较，
+    # 不去断言具体像素值。
+    post.image = np.zeros((64, 64, 3), np.uint8)
+    post.image[20:40, 20:40] = (160, 120, 120)
+    blurred, hsv = post._prepared(post.image)
+    assert post._extract_blue(blurred, hsv, 100)[30, 30] == 0, "S=64 的淡蓝不该被 s_min=100 抓到"
+    assert post._extract_blue(blurred, hsv, 60)[30, 30] > 0, "S=64 的淡蓝应被 s_min=60 抓到"
+    # 两档共用同一份 hsv（缓存生效），但阈值各自生效
+    assert post._prepared(post.image)[0] is blurred
+
+
+def test_extract_red_level_finds_a_red_object() -> None:
+    """红通道提取：纯红目标要被完整取出来（掩码用按位或，不用 uint8 相加）。
+
+    改成 ``bitwise_or`` 是防御性的：两段 hue 区间（0-10 与 160-179）互斥，所以
+    同一像素最多命中一段，``m1 + m2`` 与 ``m1 | m2`` 当前等价——但 255+255 会溢出
+    成 254，改动 hue 边界就会变成真 bug，而按位或"非零即命中"的语义也更正确。
+    """
+    post = OpenCvPostProcess(color="red", engine=OcrEngine(OcrEngineConfig(model_dir="nope")))
+    image = np.zeros((40, 40, 3), np.uint8)
+    image[10:30, 10:30] = (0, 0, 255)  # BGR 纯红
+    blurred, hsv = post._prepared(image)
+    gray = post._extract_red_level(blurred, hsv, 20)
+
+    # 返回的是 BGR2GRAY 亮度（纯红约 29），所以比"比背景亮"，不比绝对值
+    assert gray[20, 20] > gray[0, 0], "目标中心应比背景亮"
+    assert gray[0, 0] == 0, "背景不该被取到"
+    # 蓝通道的同一块不该被当成红色目标
+    blue = np.zeros((40, 40, 3), np.uint8)
+    blue[10:30, 10:30] = (255, 0, 0)
+    b_blur, b_hsv = post._prepared(blue)
+    assert post._extract_red_level(b_blur, b_hsv, 20)[20, 20] == 0
 
 
 def test_pipeline_sends_every_frame_to_ocr_by_default() -> None:
