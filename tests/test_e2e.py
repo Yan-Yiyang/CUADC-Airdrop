@@ -71,6 +71,7 @@ from airdrop import (
 # 素材与相机（两处口径共用）
 WORK_ROOT = Path(__file__).resolve().parents[1] / ".e2e-test-tmp"
 CAMERA = default_camera_model(320, 180)
+_CAMERA_CX, _CAMERA_CY = 160.0, 90.0
 
 #: 合成位姿：飞机在 NED (100, 200)、离地 50m、水平、机头朝北；原点海拔 500m
 POSE_NORTH = 100.0
@@ -485,6 +486,59 @@ def test_chain_reports_no_result_when_target_is_never_labelled(workdir: Path) ->
         if runner.plan is not None:
             break
     assert runner.plan is not None and runner.plan.source == "backup", "无编号 → 备用点"
+
+
+def test_tracker_caches_the_result_while_the_point_set_is_unchanged() -> None:
+    """点数没变时 ``result()`` 走缓存（不重跑 DBSCAN）；一变就重算。
+
+    ``MissionRunner._tick_hold`` 每拍（20Hz）调一次 ``_read_result``，而
+    HOLD_PROCESS 期间飞机悬停、点集基本不变 ⇒ 不缓存就是每秒重算同一个答案
+    20 次。``analyze`` 是纯函数、``_points`` 只增不减，所以按点数做键是安全的。
+    """
+    import airdrop.mission.targets as targets_mod
+
+    config = _config()
+    tracker = TargetTracker(config, camera=CAMERA)
+    calls: list[int] = []
+    real_analyze = targets_mod.analyze
+
+    def counting(points, targeting):
+        calls.append(len(points))
+        return real_analyze(points, targeting)
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(targets_mod, "analyze", counting, raising=True)
+    try:
+        tracker.result()  # 空点集，算一次
+        for _ in range(19):  # 模拟 19 拍 HOLD_PROCESS
+            tracker.result()
+        assert calls == [0], f"点数没变却重算了 {len(calls)} 次：{calls}"
+
+        tracker.extend([_detection_for(tracker, 100.0) for _ in range(3)])
+        assert calls == [0], "还没加新点，不该重算"
+
+        after = tracker.result()
+        assert len(calls) == 2, f"点数变了应当重算一次，实际 {calls}"
+        assert after is tracker.result(), "再取一次应命中缓存（同一对象）"
+        assert calls == [0, 3]
+
+        tracker.reset()
+        tracker.result()
+        assert calls == [0, 3, 0], "reset() 后必须丢弃缓存"
+    finally:
+        monkey.undo()
+
+
+def _detection_for(tracker: TargetTracker, stamp: float) -> Detection:
+    """一条能解算出目标点的检测（水平朝下看，目标在主点 ⇒ 正下方）。"""
+    return Detection(
+        frame_index=int(stamp * 1000),
+        capture_timestamp=stamp,
+        pixel=(_CAMERA_CX, _CAMERA_CY),
+        box=PixelBox(0, 0, 10, 10),
+        confidence=0.9,
+        telemetry=_pose_snapshot(stamp),
+    )
 
 
 def test_tracker_skips_points_without_attitude_and_without_position() -> None:

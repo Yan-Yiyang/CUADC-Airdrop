@@ -209,6 +209,38 @@ def test_iter_between_is_snapshot() -> None:
     assert [r.index for r in iterator] == list(range(2, 11))
 
 
+def test_iter_between_survives_concurrent_eviction() -> None:
+    """迭代途中并发写入把未取到的记录驱逐了，**也不能静默截断**。
+
+    原来只固定了上界 ``latest_index()``，每批仍去读当前的 ``self._records``：
+    游标被驱逐时无声跳过整段；保留下来的记录又全都 ``> last`` 时中途 ``return``，
+    调用方拿到一个"看起来完整"的短列表，没有任何告警或计数——而这个方法的
+    用途恰恰是"回看历史"（天生是慢消费者），容量打满时必然踩到。
+    """
+    buffer = AlignmentBuffer(capacity=5)
+    for i in range(5):  # 索引 1..5，正好装满
+        buffer.put(make_sample(1000.0 + i))
+
+    iterator = buffer.iter_between(batch=1)
+    assert next(iterator).index == 1
+    # 迭代器还握着游标时，写者把 2..4 驱逐掉（容量 5，只剩 5 和新来的）
+    for i in range(5, 20):
+        buffer.put(make_sample(1000.0 + i))
+
+    rest = [r.index for r in iterator]
+    assert rest == [2, 3, 4, 5], f"快照式迭代应把开始时保留的记录都吐出来，实际 {rest}"
+
+
+def test_iter_between_honours_start_and_end() -> None:
+    buffer = AlignmentBuffer(capacity=10)
+    for i in range(10):  # capture 1000..1009，索引 1..10
+        buffer.put(make_sample(1000.0 + i))
+    assert [r.index for r in buffer.iter_between(start=1002.0, end=1004.0)] == [3, 4, 5]
+    assert [r.index for r in buffer.iter_between(start=None, end=1001.0)] == [1, 2]
+    assert [r.index for r in buffer.iter_between(start=1008.0)] == [9, 10]
+    assert [r.index for r in buffer.iter_between()] == list(range(1, 11))
+
+
 def test_wait_new() -> None:
     buffer = AlignmentBuffer(capacity=4)
     assert buffer.wait_new(0, timeout=0.1) is None, "空缓冲应超时返回 None"

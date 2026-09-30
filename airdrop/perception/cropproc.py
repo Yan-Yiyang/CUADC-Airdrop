@@ -59,6 +59,10 @@ __all__ = [
     "OpenCvPostProcess",
 ]
 
+#: OCR 失败告警的节流：第一次必打，之后每 N 次一条（引擎坏掉时逐帧热路径上
+#: 不节流就是每秒几十条完整 traceback，见 OcrEngine.read_text 的说明）
+_OCR_FAIL_LOG_EVERY = 30
+
 
 # ----------------------------------------------------------------------
 # RapidOCR 引擎封装
@@ -152,6 +156,9 @@ class OcrEngine:
         self._config = config or OcrEngineConfig()
         self._engine: Any = None
         self._failed = False
+        #: 失败日志节流用的状态（见 _log_ocr_failure）
+        self._ocr_fail_signature = ""
+        self._ocr_fail_count = 0
 
     @property
     def config(self) -> OcrEngineConfig:
@@ -166,6 +173,29 @@ class OcrEngine:
     def failed(self) -> bool:
         """是否已经尝试加载并失败（不再反复重试）。"""
         return self._failed
+
+    def _log_ocr_failure(self, what: str, exc: Exception) -> None:
+        """按错误签名节流地记一条失败（签名变了就重新必打）。
+
+        逐帧热路径上，引擎坏掉时不节流就是日志洪水；而完全不打又会让人以为
+        "只是没读出编号"。所以：首次必打（含 traceback），之后同签名每
+        ``_OCR_FAIL_LOG_EVERY`` 次一条、且只给摘要不格式化 traceback。
+        """
+        signature = f"{what}:{type(exc).__name__}:{exc}"
+        if signature != self._ocr_fail_signature:
+            self._ocr_fail_signature = signature
+            self._ocr_fail_count = 1
+            LOGGER.exception(what)
+            return
+        self._ocr_fail_count += 1
+        if self._ocr_fail_count % _OCR_FAIL_LOG_EVERY == 0:
+            LOGGER.warning(
+                "%s（已累计 %d 次，同类错误不再逐条打印）：%s: %s",
+                what,
+                self._ocr_fail_count,
+                type(exc).__name__,
+                exc,
+            )
 
     def ensure(self) -> Any:
         """惰性初始化引擎；失败抛出（调用方决定是否降级）。
@@ -344,16 +374,22 @@ class OcrEngine:
 
         绝不抛出：单帧 OCR 失败不该打断整条拉流/处理链路，上层按"没读出
         编号"处理即可（``Detection.code is None``）。
+
+        ⚠ 失败日志按错误签名**节流**（首次必打，之后每 ``_OCR_FAIL_LOG_EVERY``
+        次一条）。这两个 except 在逐帧热路径上：引擎坏掉（CUDA OOM / 权重缺失 /
+        DLL 冲突）时，不节流就是每秒几十条完整 traceback——光是格式化与写盘就
+        会吃掉 worker 的 CPU，进一步恶化积压。对照本项目对风估计的同类处理
+        （"按零风降级并**只记一次**日志（20Hz 每拍都记会淹没日志）"）。
         """
         try:
             engine = self.ensure()
-        except Exception:
-            LOGGER.exception("OCR 引擎不可用")
+        except Exception as exc:  # noqa: BLE001 - 必须兜住一切并降级为"没读出编号"
+            self._log_ocr_failure("OCR 引擎不可用", exc)
             return []
         try:
             result = engine(image)
-        except Exception:
-            LOGGER.exception("OCR 单帧识别失败")
+        except Exception as exc:  # noqa: BLE001 - 同上：单帧失败不打断整条链路
+            self._log_ocr_failure("OCR 单帧识别失败", exc)
             return []
         if not result:
             return []

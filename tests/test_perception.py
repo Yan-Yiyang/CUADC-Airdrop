@@ -788,6 +788,13 @@ class _FakePool:
         self._started = False
 
     @property
+    def alive(self) -> int:
+        return 1 if self._started else 0
+
+    def check_alive(self) -> int:
+        return self.alive
+
+    @property
     def stats(self) -> dict[str, int]:
         return {
             "submitted": len(self.submitted),
@@ -925,6 +932,59 @@ def test_pipeline_cls12_mode_emits_without_ocr() -> None:
     # 单类权重 → 类别 0 → code = 0+1 = 1
     assert [d.code for d in results] == [1, 1]
     assert pool.submitted == [], "cls12 不该走 OCR"
+
+
+def test_pipeline_surfaces_dead_ocr_workers(caplog: pytest.LogCaptureFixture) -> None:
+    """OCR worker 全死时要把故障喊出来，而不是"永远零产出"。
+
+    worker 死亡的路径很现实（CUDA OOM、RapidOCR/torch 原生崩溃、结果队列写入
+    自身抛错——那行不在 try 内）。掉了之后它名下的请求永远不返回，pending 单调
+    上升；而积压告警只打**一条**就置位不再打 ⇒ 没有这条 ERROR，操作手从日志里
+    根本看不出已经死了。
+    """
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    pool = OcrWorkerPool(workers=2, queue_size=1)
+    pool._started = True
+    procs: list[Any] = [_FakeProcess(alive=True), _FakeProcess(alive=True)]
+    pool._processes = procs
+    assert pool.alive == 2
+    assert pool.stats["alive"] == 2
+
+    with caplog.at_level(logging.ERROR):
+        pool.check_alive()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], "都活着不该报错"
+
+    procs[1] = _FakeProcess(alive=False)
+    with caplog.at_level(logging.ERROR):
+        assert pool.check_alive() == 1
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "worker 掉了必须打 ERROR"
+    assert "1/2" in errors[0]
+
+    # 同一数值不重复打，避免刷屏
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        pool.check_alive()
+        pool.check_alive()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], "同一数值应已节流"
+
+    # 恶化到全死是**新信息**，必须再报一次（这是最该被看见的情形）
+    procs[0] = _FakeProcess(alive=False)
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        assert pool.check_alive() == 0
+    assert any("0/2" in r.getMessage() for r in caplog.records)
+
+
+class _FakeProcess:
+    """只提供 ``is_alive()`` 的进程替身（OcrWorkerPool 的存活巡检只用到它）。"""
+
+    def __init__(self, alive: bool) -> None:
+        self._alive = alive
+
+    def is_alive(self) -> bool:
+        return self._alive
 
 
 def test_pipeline_sends_every_frame_to_ocr_by_default() -> None:

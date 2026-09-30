@@ -368,19 +368,30 @@ class AlignmentBuffer:
 
         整个迭代过程不持有锁，因此采集线程不会被读者的解码拖慢。
 
-        这是**快照式**迭代：只覆盖开始迭代那一刻已入库的记录，之后新写入的
-        内容不在本次迭代范围内（要跟随最新数据请用 :meth:`wait_new`）。
+        这是**快照式**迭代：开始迭代那一刻把保留的记录列表**整体拷一份引用**
+        （5400 个指针约 43KB，**不拷图像/字节**），之后只遍历这份快照，所以
+
+        - 之后新写入的内容不在本次范围内（要跟随最新数据请用 :meth:`wait_new`）；
+        - 并发写入造成的驱逐不会让本次迭代**静默截断**。原来只固定了上界
+          ``latest_index()``，每批仍去读当前的 ``self._records``：游标被驱逐时
+          会无声跳过整段，保留下来的记录又全都 ``> last`` 时会中途 ``return``，
+          调用方拿到一个"看起来完整"的短列表，没有任何告警或计数。
         """
         if batch < 1:
             raise ValueError(f"batch 至少为 1: {batch}")
-        cursor = self._cursor_before(start)
-        last = self.latest_index()
-        while cursor <= last:
-            records = self._records_after(cursor, batch, last)
-            if not records:
-                return
+        with self._lock:
+            # 整体拷一份记录引用：这是"快照式"名副其实的关键（不拷像素/字节）
+            snapshot = list(self._records)
+        if not snapshot:
+            return
+        position = 0
+        while position < len(snapshot):
+            batch_records = snapshot[position : position + batch]
+            position += len(batch_records)
             crossed_end = False
-            for stored in records:
+            for stored in batch_records:
+                if start is not None and stored.capture_timestamp < start:
+                    continue
                 if end is not None and stored.capture_timestamp > end:
                     crossed_end = True
                     break
@@ -389,7 +400,6 @@ class AlignmentBuffer:
                     yield frame
             if crossed_end:
                 return
-            cursor = records[-1].index
 
     def wait_new(self, after_index: int = 0, timeout: float | None = None) -> BufferedFrame | None:
         """阻塞等待比 ``after_index`` 更新的记录，返回**最早**满足条件的那条。
@@ -512,27 +522,6 @@ class AlignmentBuffer:
         if idx < len(records) and records[idx].index == index:
             return records[idx]
         return None
-
-    def _cursor_before(self, start: float | None) -> int:
-        """返回"已经消费到哪"的起始游标：最后一条 ``capture_timestamp < start``
-        的序号；``start`` 为 None 或早于全部记录时返回 0。"""
-        with self._lock:
-            records = self._records
-            if not records:
-                return self._next_index
-            if start is None:
-                return 0
-            pos = bisect.bisect_left(records, start, key=_capture_timestamp)
-            if pos <= 0:
-                return 0
-            return records[pos - 1].index
-
-    def _records_after(self, after_index: int, batch: int, max_index: int) -> list[StoredFrame]:
-        """取序号在 ``(after_index, max_index]`` 内、最靠前的至多 ``batch`` 条。"""
-        with self._lock:
-            records = self._records
-            pos = bisect.bisect_right(records, after_index, key=_index)
-            return [stored for stored in records[pos : pos + batch] if stored.index <= max_index]
 
     def _evict_locked(self) -> None:
         """按帧数上限与字节上限从最旧一端驱逐。"""

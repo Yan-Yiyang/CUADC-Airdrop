@@ -181,6 +181,8 @@ class OcrWorkerPool:
         self._dropped = 0  # 保留计数：不丢弃策略下恒为 0（一旦非 0 说明有新的丢弃路径）
         self._results = 0
         self._backlog_warned = False
+        #: 上次报过的存活数（None = 上次是全活）；按数值变化报，见 check_alive
+        self._dead_reported: int | None = None
         self._started = False
 
     # ------------------------------------------------------------------
@@ -191,14 +193,50 @@ class OcrWorkerPool:
         return self._started
 
     @property
+    def alive(self) -> int:
+        """当前**活着**的 worker 进程数（运行期可随时取）。
+
+        ⚠ 这个数必须能被外部看见：worker 死亡的路径是真实存在的（CUDA OOM、
+        RapidOCR/torch 的原生崩溃、``result_q.put_nowait`` 自身抛错——那行不在
+        try 内）。一旦某个 worker 死了，它名下的请求永远不返回 → ``pending``
+        单调上升；而积压告警 ``_backlog_warned`` 只打**一条**就置位不再打 ⇒
+        全死时表现为"永远零产出"，而操作手从日志里看不出已经死了。
+        """
+        return sum(1 for process in self._processes if process.is_alive())
+
+    @property
     def stats(self) -> dict[str, int]:
         return {
             "workers": self._workers,
+            "alive": self.alive,
             "submitted": self._submitted,
             "dropped": self._dropped,
             "results": self._results,
             "pending": self._submitted - self._results,
         }
+
+    def check_alive(self) -> int:
+        """巡检存活数；掉worker / 存活数变化时打 ERROR（同一数值不重复打，避免刷屏）。
+
+        返回存活数。跑在感知线程里，只是 ``is_alive()`` 的整数比较，很便宜。
+        按"数值变化"而不是"首次"来报，是为了不漏掉**恶化**那一档：从 1/2 掉到
+        0/2（全死）是新信息，必须再喊一次；而同一个数值每拍重复喊就是刷屏了。
+        """
+        alive = self.alive
+        if self._started and alive < self._workers:
+            if alive != self._dead_reported:
+                self._dead_reported = alive
+                LOGGER.error(
+                    "OCR 工作进程掉了：%d/%d 存活（pending=%d）。这些 worker 名下的请求"
+                    "永远不会有结果，编号会静默缺失；本架次不自动重启进程池，"
+                    "落地复盘时看这条日志（存活数再变化时会再报一次）",
+                    alive,
+                    self._workers,
+                    self._submitted - self._results,
+                )
+        elif alive >= self._workers:
+            self._dead_reported = None
+        return alive
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -239,6 +277,7 @@ class OcrWorkerPool:
                 process.join(1.0)
         self._processes.clear()
         self._started = False
+        self._dead_reported = None
 
     def __enter__(self) -> "OcrWorkerPool":
         return self.start()

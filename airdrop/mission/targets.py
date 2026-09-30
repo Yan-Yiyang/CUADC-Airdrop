@@ -80,6 +80,9 @@ class TargetTracker:
     _undistort_warned: bool = field(default=False, init=False)
     _ground_warned: bool = field(default=False, init=False)
     _attitude_missing: int = field(default=0, init=False)
+    #: ``(点数, 结果)`` 缓存——点数没变说明输入没变（_points 只增不减），
+    #: analyze 是纯函数，所以结果必然相同。见 :meth:`result`。
+    _result_cache: tuple[int, TargetingResult] | None = field(default=None, init=False)
 
     # ------------------------------------------------------------------
     # 攒点
@@ -148,8 +151,22 @@ class TargetTracker:
     # 结果
     # ------------------------------------------------------------------
     def result(self) -> TargetingResult:
-        """当前统计结果（``analyze(points, config.targeting)``）——实飞与回放同一条路。"""
-        return analyze(tuple(self._points), self.config.targeting)
+        """当前统计结果（``analyze(points, config.targeting)``）——实飞与回放同一条路。
+
+        ⚠ **按点数缓存**。``analyze`` 是纯函数，而 ``_points`` 只增不减（``add`` /
+        ``extend`` 追加，``reset`` 清空）⇒ 点数没变就说明输入没变，结果必然相同。
+        不缓存的话：``MissionRunner._tick_hold`` 每拍（20Hz）调一次 ``_read_result``，
+        HOLD_PROCESS 期间飞机悬停、点集基本不变，等于**每秒重算同一个 DBSCAN 20 次**
+        （几千点在 2D 上 fit 一次几十毫秒），纯烧 CPU 还每秒刷 20 行日志。
+        点集一变就自动重算，所以结果永远是最新的。
+        """
+        count = len(self._points)
+        cached = self._result_cache
+        if cached is not None and cached[0] == count:
+            return cached[1]
+        value = analyze(tuple(self._points), self.config.targeting)
+        self._result_cache = (count, value)
+        return value
 
     @property
     def points(self) -> tuple[TargetPoint, ...]:
@@ -168,6 +185,7 @@ class TargetTracker:
     def reset(self) -> None:
         """清空（换架次/换目标时用）。"""
         self._points.clear()
+        self._result_cache = None
         self._no_fix = 0
         self._side_mismatch = 0
         self._attitude_missing = 0

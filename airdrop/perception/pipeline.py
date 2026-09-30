@@ -116,6 +116,10 @@ class PerceptionStats:
     invalid_side: int = 0  # 像素边长超出有效区间而被丢弃的
     #: OCR 请求丢弃数——**不丢弃策略下恒为 0**，保留作监控（一旦非 0 说明有新的丢弃路径）
     ocr_dropped: int = 0
+    #: OCR 工作进程**存活**数（cls12 模式或未注入池时为 0）。
+    #: 小于 workers 说明有 worker 掉了，它名下的请求永远不会有结果——见
+    #: :meth:`PerceptionWorker._check_pool_health`。
+    ocr_alive: int = 0
     lag_frames: int = 0  # 处理落后最新帧多少帧
     last_error: str | None = None
 
@@ -328,6 +332,7 @@ class PerceptionWorker:
                 if frame is None:
                     # 缓冲里暂时没有新帧：先把 OCR 结果收回来，保持结果流不断
                     self._collect_remaining(timeout=0.0)
+                    self._check_pool_health()
                     continue
                 self._cursor = frame.index
                 try:
@@ -337,10 +342,32 @@ class PerceptionWorker:
                     with self._stats_lock:
                         self._stats.last_error = f"{type(exc).__name__}: {exc}"
                 self._collect_remaining(timeout=0.0)
+                self._check_pool_health()
         except Exception as exc:
             LOGGER.exception("感知线程异常退出")
             with self._stats_lock:
                 self._stats.last_error = f"{type(exc).__name__}: {exc}"
+
+    def _check_pool_health(self) -> None:
+        """巡检 OCR 进程池存活数（有 worker 掉了会打一条节流的 ERROR）。
+
+        worker 死亡的路径很现实（CUDA OOM、RapidOCR/torch 原生崩溃、结果队列
+        写入自身抛错）。掉了之后它名下的请求永远不返回，而积压告警只打一条就
+        不再打 ⇒ 全死时表现为"永远零产出"，日志里看不出已经死了。这里每拍
+        一次整数比较，把故障显式喊出来。
+        """
+        if self._pool is None:
+            return
+        # pool 是可注入的测试接缝：自定义实现可能没有存活巡检接口。缺失就跳过
+        # （而不是让 AttributeError 打死感知线程——那会静默丢掉后面所有帧）。
+        alive = getattr(self._pool, "alive", None)
+        if alive is None:
+            return
+        with self._stats_lock:
+            self._stats.ocr_alive = int(alive)
+        check = getattr(self._pool, "check_alive", None)
+        if check is not None:
+            check()
 
     def _process_frame(self, frame: BufferedFrame) -> None:
         """一帧的完整处理：检测 → 按模式产出。"""
