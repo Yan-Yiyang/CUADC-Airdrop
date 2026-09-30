@@ -1958,6 +1958,41 @@ def test_runner_without_judge_skips_the_drop_and_lands() -> None:
     assert controller.count("gripper_release") == 0
 
 
+def test_runner_with_gripper_disabled_skips_the_drop_and_lands() -> None:
+    """``GripperConfig(enabled=False)``（不装弹演练）也要干净收尾，不能 ABORT。
+
+    controller.gripper_release() 在 enabled=False 时返回 False，它的 docstring
+    明说"调用方（状态机）据此判失败"——于是判据在**目标上空**把它当失败：
+    飞完整条飞掠段后 ABORT(hold)，飞机留在空中盘旋，而不是继续飞降落段。
+    而配置者写 enabled=False 的本意只是"这次不投"。
+
+    它应当与 ``release_judge=None`` 走同一条路（记 drop_skipped → LAND）。
+
+    注意 :class:`FakeController` 不模拟 ``enabled``（gripper_release 恒返回
+    release_ok），所以这里真正被钉住的是"**根本不下发投放指令**、而是走跳过
+    分支"——修复前 runner 会照常调 gripper_release，既没有 drop_skipped 事件，
+    真实控制器那边还会返回 False 把任务带进 ABORT。
+    """
+    clock = FakeClock()
+    controller = FakeController()
+    events: list[tuple[str, dict[str, Any]]] = []
+    config = _config().replace(gripper=GripperConfig(enabled=False))
+    runner = _runner(clock, controller, judge=FakeJudge(), events=events, config=config)
+
+    _drive(runner, clock, ticks=2)
+    controller.finish_mission()
+    _drive_until(runner, clock, MissionState.LAND)
+
+    assert runner.state is MissionState.LAND, "gripper 关掉不该让任务 ABORT"
+    assert _events_of(events, "drop_skipped")[0]["reason"] == "gripper_disabled"
+
+    _drive(runner, clock, ticks=1)
+    controller.finish_mission()
+    _drive_until(runner, clock, MissionState.DONE)
+    assert runner.state is MissionState.DONE
+    assert controller.count("gripper_release") == 0, "本架次根本不该下发投放指令"
+
+
 def test_abort_is_idempotent_and_ignored_after_done() -> None:
     clock = FakeClock()
     controller = FakeController()

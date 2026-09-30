@@ -126,6 +126,13 @@ class TelemetryBroker:
         self._history: deque[TelemetrySnapshot] = deque(maxlen=history_maxlen)
         self._history_interval = max(history_interval, 0.0)
         self._last_history_timestamp = 0.0
+        #: 节流用的**单调**影子时钟。墙钟（``time.time()``）只用来打时间戳——
+        #: 快照的时间轴必须与视频帧的 ``time.time()`` 同轴，不能换。但节流判据
+        #: 不能用它：Windows 上受 NTP/手动改表/虚拟机时间同步影响，墙钟**可以
+        #: 往回跳**（本项目的 SITL 就在 WSL 虚拟机里跑，回跳是家常便饭），而
+        #: ``now - _last >= interval`` 一旦遇上回退就会在接下来整段时间里恒为假
+        #: ⇒ 历史**彻底停止增长**，而 connected 仍是 True、align() 也不报错。
+        self._last_history_mono = 0.0
         self._subscribers: list[SnapshotCallback] = []
 
     # ------------------------------------------------------------------
@@ -258,6 +265,7 @@ class TelemetryBroker:
             self._latest = TelemetrySnapshot()
             self._history.clear()
             self._last_history_timestamp = 0.0
+            self._last_history_mono = 0.0
             self._condition.notify_all()
 
     def update_global_position(self, position: Any) -> TelemetrySnapshot:
@@ -348,10 +356,27 @@ class TelemetryBroker:
             mutator(snapshot)
             snapshot.timestamp = time.time()
             self._latest = snapshot
-            # 历史按固定采样率写入：各条高频遥测流在此合并成均匀序列
-            if snapshot.timestamp - self._last_history_timestamp >= self._history_interval:
+            # 墙钟回退 ⇒ 历史不再是升序，而内插的正确性完全建立在升序上
+            # （_evaluate_snapshot_locked 用 history[0]/history[-1] 当最小/最大）。
+            # 乱序历史没法信任，清掉比留着算错好；顺带把节流影子钟归零，
+            # 免得又停写。
+            if snapshot.timestamp < self._last_history_timestamp:
+                LOGGER.warning(
+                    "墙钟回退 %.3fs（%s → %s）：已清空遥测历史以免内插拿到乱序数据",
+                    self._last_history_timestamp - snapshot.timestamp,
+                    time.strftime("%H:%M:%S", time.localtime(self._last_history_timestamp)),
+                    time.strftime("%H:%M:%S", time.localtime(snapshot.timestamp)),
+                )
+                self._history.clear()
+                self._last_history_timestamp = 0.0
+                self._last_history_mono = 0.0
+            # 历史按固定采样率写入：各条高频遥测流在此合并成均匀序列。
+            # 节流用单调钟，墙钟只负责打时间戳。
+            mono = time.monotonic()
+            if mono - self._last_history_mono >= self._history_interval:
                 self._history.append(snapshot)
                 self._last_history_timestamp = snapshot.timestamp
+                self._last_history_mono = mono
             # 锁内复制订阅者列表，避免遍历时与 subscribe/unsubscribe 竞态。
             subscribers = tuple(self._subscribers)
             self._condition.notify_all()

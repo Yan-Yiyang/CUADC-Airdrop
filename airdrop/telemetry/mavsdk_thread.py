@@ -188,22 +188,37 @@ class MavsdkThread:
 
     def stop(self, timeout: float = 5.0) -> None:
         """停止连接管理、遥测采集和事件循环，并等待工作线程退出。"""
-        self._stop_requested.set()
+        # ⚠ 必须与 connect() 拿**同一把锁**做同一段操作。原来这里不持锁，于是：
+        #   A(connect) 判完 _supervisor.done() 为 True，正准备装入新的 _serve；
+        #   B(stop)  置位 _stop_requested、取走并 cancel 掉**旧** supervisor、
+        #             停循环、join、清引用——B 认为已经干净了；
+        #   A 接着把 _stop_requested 清掉（抹掉 B 的停止意图）并装入新的 _serve
+        #     → System() → mavsdk_server 子进程起来占死固定的 gRPC 50051，
+        #     而 _thread/_loop 引用已被 B 清成 None ⇒ 之后没人能停它。
+        # 参见 AGENTS.md 易错点 1 / 14。
+        with self._supervisor_lock:
+            self._stop_requested.set()
+            supervisor, self._supervisor = self._supervisor, None
+            if supervisor is not None:
+                supervisor.cancel()
+                # 取消/异常都视为已停止（BLE001 是刻意的：这里不该因为收尾失败而抛出）
+                with contextlib.suppress(Exception):
+                    supervisor.result(timeout=timeout)
 
-        supervisor, self._supervisor = self._supervisor, None
-        if supervisor is not None:
-            supervisor.cancel()
-            # 取消/异常都视为已停止（BLE001 是刻意的：这里不该因为收尾失败而抛出）
-            with contextlib.suppress(Exception):
-                supervisor.result(timeout=timeout)
-
-        if self._loop is not None and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        # 绑局部变量：self._loop 会被循环线程在 _run_loop 的 finally 里置 None，
+        # 三次独立读之间可能插进来（200/201 行），AttributeError 会让下面
+        # _release_drone / _ready.clear 全部不执行——那恰恰是 AGENTS.md 易错点 1
+        # 反复强调的头号事故（mavsdk_server 残留占死 50051）。
+        loop = self._loop
+        if loop is not None and not loop.is_closed() and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
 
         thread = self._thread
+        thread_exited = True
         if thread is not None:
             thread.join(timeout=timeout)
             if thread.is_alive():
+                thread_exited = False
                 # 线程没停就别清引用（清了 start() 会再起一个，且 _loop 正被它用着）。
                 # 保留 _loop/_thread，稍后可再调 stop()；其余收尾照常做。
                 LOGGER.warning("MAVSDK 线程未在 %.1fs 内退出，保留引用（可再调 stop()）", timeout)
@@ -214,7 +229,12 @@ class MavsdkThread:
         drone, self._drone = self._drone, None
         self._release_drone(drone)  # 幂等；正常路径上会话 finally 已释放过
         self._ready.clear()
-        self._started.clear()
+        # ⚠ 线程没退出时**不能**清 _started：start() 的第一句是
+        # "if self._thread and self._thread.is_alive(): return"，而它 return 之前
+        # 不会 set _started ⇒ 清了之后 "join 超时 → 再调 start()" 这条补救路径
+        # 会空转返回，随后 submit() 打到正在关闭/已关闭的循环上。
+        if thread_exited:
+            self._started.clear()
 
     @property
     def connected(self) -> bool:
@@ -369,7 +389,6 @@ class MavsdkThread:
                 timeout=self.connect_timeout,
             )
             self._drone = drone
-            self.broker.reset()
 
             await self._wait_connected(drone)
             LOGGER.info("飞控已连接：%s", address)
@@ -392,6 +411,16 @@ class MavsdkThread:
         finally:
             self._ready.clear()
             self._drone = None
+            # ⚠ 代理的历史必须随会话一起作废。原来 reset() 放在 connect() **成功
+            # 之后**，于是重连窗口（reconnect_delay 5s + connect_timeout 30s，
+            # 最长 35s）里 broker 还留着上一条会话的历史：connected 已被清成 False，
+            # 但 align() 只看 history_span()、完全不看 connected ⇒ 它会从旧历史
+            # 向后外推最多 35 秒，产出 extrapolated=True、offset 很大的样本，而
+            # 默认 max_extrapolation=None 不过滤。任务路径上有 telemetry_stale_s
+            # 看门狗兜着（会 ABORT），但纯感知链路（sitl_recon 的精度测试、联机
+            # 调试）没有这层兜底，会把两次会话的遥测混进同一段目标统计。
+            # 放进 finally ⇒ 无论会话以何种方式结束（成功/异常/被取消）都作废。
+            self.broker.reset()
             self._release_drone(drone)
 
     @staticmethod

@@ -232,6 +232,129 @@ def test_angle_wrap_interpolation() -> None:
     assert abs(abs(snap.yaw_deg) - 180.0) < 1.0
 
 
+def test_wall_clock_regression_does_not_freeze_or_corrupt_history() -> None:
+    """墙钟回退不能让历史停写，更不能留下乱序数据。
+
+    节流判据曾用 ``snapshot.timestamp - _last >= interval``，而 ``time.time()``
+    在 Windows 上受 NTP / 手动改表 / 虚拟机时间同步影响**可以往回跳**（本项目的
+    SITL 就在 WSL 虚拟机里跑）。回退 t 秒 ⇒ 接下来 t 秒一条都不入库，而
+    ``connected`` 仍是 True、``align()`` 也不报错——遥测静默停摆。
+
+    更糟的是回退后历史不再是升序，而内插的正确性完全建立在升序上：
+    ``_evaluate_snapshot_locked`` 用 ``history[0]`` / ``history[-1]`` 当最小/最大，
+    乱序后这两个边界判断本身就错 ⇒ 本该内插的查询被送进外推分支，且
+    ``dt`` 可能为负，产出"看起来完全正常"的错误快照。
+    """
+    import airdrop.telemetry.broker as broker_mod
+
+    base = 1_700_000_000.0
+    wall = {"t": base}
+    mono = {"t": 1000.0}
+    real_time, real_mono = time.time, time.monotonic
+    broker_mod.time.time = lambda: wall["t"]  # type: ignore[assignment]
+    broker_mod.time.monotonic = lambda: mono["t"]  # type: ignore[assignment]
+    try:
+        broker = TelemetryBroker(history_maxlen=200, history_interval=0.1)
+        for i in range(20):
+            wall["t"] = base + i * 0.1
+            mono["t"] = 1000.0 + i * 0.1
+            broker.update_global_position(make_position(30.0 + i * 0.001, 8.0, 500.0, 10.0))
+        before = len(broker._history)
+        assert before > 5, "正常情况下历史应当增长"
+
+        # 墙钟回退 1 小时，monotonic 照常前进
+        for i in range(20):
+            wall["t"] = base - 3600.0 + i * 0.1
+            mono["t"] = 1002.0 + i * 0.1
+            broker.update_global_position(make_position(31.0 + i * 0.001, 8.0, 500.0, 10.0))
+
+        stamps = [s.timestamp for s in broker._history]
+        assert stamps == sorted(stamps), f"历史乱序：{stamps}"
+        # 关键：即使墙钟仍处于回退状态，节流也必须照常推进（用单调钟）
+        assert len(broker._history) > 5, "墙钟回退后历史停写了（节流判据用错了时钟）"
+    finally:
+        broker_mod.time.time = real_time  # type: ignore[assignment]
+        broker_mod.time.monotonic = real_mono  # type: ignore[assignment]
+
+
+def test_stop_takes_the_supervisor_lock_that_connect_holds() -> None:
+    """``stop()`` 必须与 ``connect()`` 拿同一把 ``_supervisor_lock``。
+
+    原来 stop() 全程不持锁，可复现的时序是：
+      A(connect) 判完 ``_supervisor.done()`` 为 True，正准备装入新的 _serve；
+      B(stop)   置位 _stop_requested、取走并 cancel 掉**旧** supervisor、停循环、
+                join、清引用——B 认为已经干净了；
+      A 接着把 _stop_requested 清掉（抹掉 B 的停止意图）并装入新的 _serve
+        → System() → mavsdk_server 子进程占死固定的 gRPC 50051，
+        而 _thread/_loop 引用已被 B 清成 None ⇒ 之后没人能停它。
+    （AGENTS.md 易错点 1 / 14 描述的正是这类事故。）
+
+    竞态本身难确定性复现，这里钉住它的必要条件：stop() 也要进这把锁。
+    """
+    mav = MavsdkThread(reconnect=False)
+    entered = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+
+    def blocker() -> None:
+        with mav._supervisor_lock:
+            entered.set()
+            release.wait(timeout=5.0)
+
+    holder = threading.Thread(target=blocker, daemon=True)
+    holder.start()
+    assert entered.wait(timeout=5.0), "前置条件：先占住 _supervisor_lock"
+
+    def stopper() -> None:
+        mav.stop(timeout=0.1)
+        done.set()
+
+    worker = threading.Thread(target=stopper, daemon=True)
+    worker.start()
+    time.sleep(0.2)
+    assert not done.is_set(), "stop() 没有等 _supervisor_lock —— 与 connect() 存在竞态"
+
+    release.set()
+    assert done.wait(timeout=5.0), "释放锁后 stop() 应当完成"
+    holder.join(timeout=2.0)
+    worker.join(timeout=2.0)
+
+
+def test_broker_history_is_discarded_when_a_session_ends() -> None:
+    """会话一结束就作废代理历史，重连窗口里不得继续拿上一条会话的数据外推。
+
+    ``broker.reset()`` 原来在 ``connect()`` **成功之后**才调，于是重连窗口
+    （reconnect_delay 5s + connect_timeout 30s，最长 35s）里 broker 还留着上一条
+    会话的历史。``connected`` 已被清成 False，但 ``align()`` 只看
+    ``history_span()``、完全不看 connected ⇒ 它会从旧历史向后外推最多 35 秒，
+    产出 extrapolated=True / offset 很大的样本，而默认 max_extrapolation=None
+    不过滤。任务路径有 telemetry_stale_s 看门狗兜着（会 ABORT），纯感知链路没有。
+    """
+    import asyncio
+
+    from airdrop.telemetry import mavsdk_thread as mt
+
+    broker = TelemetryBroker(history_maxlen=50, history_interval=0.0)
+    mav = mt.MavsdkThread(broker=broker, reconnect=False)
+    broker.publish(TelemetrySnapshot(timestamp=100.0, north_m=1.0))
+    broker.publish(TelemetrySnapshot(timestamp=100.1, north_m=2.0))
+    assert broker.history_span() is not None, "前置条件：会话期间历史是有的"
+
+    def boom(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("模拟 mavsdk_server 起不来（无飞控）")
+
+    monkey = pytest.MonkeyPatch()
+    # 只让 System() 失败，_run_session 本身照真实控制流跑完（含 finally）
+    monkey.setattr(mt, "System", boom, raising=True)
+    try:
+        asyncio.run(mav._serve("udpin://0.0.0.0:14540"))
+    finally:
+        monkey.undo()
+
+    assert broker.history_span() is None, "会话结束后历史必须已作废（不能跨会话外推）"
+    assert mav.connected is False
+
+
 def test_discrete_fields_are_never_interpolated() -> None:
     """``in_air`` / ``mission_current`` / ``mission_total`` 不是连续量，不能内插。
 

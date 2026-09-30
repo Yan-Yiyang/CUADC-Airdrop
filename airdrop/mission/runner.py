@@ -685,12 +685,23 @@ class MissionRunner:
         elif state is MissionState.OVERFLY:
             # 飞掠与降落同属一条上传的任务，共用这个兜底上限
             self._deadline = now + float(self._config.mission.land_max_s)
-            if self._judge is not None:
+            if self._judge is not None and self._config.gripper.enabled:
                 self._judge.reset()
             else:
-                LOGGER.warning("没有投放判据（release_judge=None）：本架次只飞航线、不自动投放")
-                self._emit("drop_skipped", {"reason": "no_judge"})
-                self._transition(MissionState.LAND, "no_release_judge", now)
+                # ⚠ 两条"本架次不投放"的路径要一起处理，否则语义不对称：
+                #   release_judge=None      → 干净地记 drop_skipped 并进 LAND；
+                #   gripper.enabled=False   → controller.gripper_release() 返回
+                #     False，判据在目标上空把它当**失败** ⇒ 飞完整条飞掠段后
+                #     ABORT(hold)，飞机留在空中盘旋而不是继续飞降落段。
+                # 后者显然不是配置者想要的（"不装弹演练"），所以按同一条路走。
+                # 事件里的 reason 取值保持原样（no_judge），新增一个 gripper_disabled。
+                if self._judge is not None:
+                    event_reason, why = "gripper_disabled", "GripperConfig.enabled=False"
+                else:
+                    event_reason, why = "no_judge", "release_judge=None"
+                LOGGER.warning("本架次不自动投放（%s）：只飞航线，继续降落段", why)
+                self._emit("drop_skipped", {"reason": event_reason})
+                self._transition(MissionState.LAND, event_reason, now)
         elif state is MissionState.ABORT:
             self._stats.aborts += 1
             self._do_abort_action()
