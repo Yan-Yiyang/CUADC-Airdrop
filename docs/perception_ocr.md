@@ -17,7 +17,7 @@
   **顶角几何**：目标是"正方形 + 架在**正方形上边**上的等边三角形"。等边三角形
   内角恒为 **60°**，在正确的绕行顺序（`apex, tl, bl, br, tr`）下五边形内角是
   60°（顶角）/ 90°(bl) / 90°(br) / 150°(tl) / 150°(tr)，合计 540°，
-  最小内角就是顶角，兜底路径的 40~130° 门限对标准形态是**通过**的。
+  最小内角就是顶角，兜底路径的 40–130° 门限对标准形态是**通过**的。
   合成用例 `test_pentagon_interior_angles` 把 60/90/90/150/150 钉死。
   **两个遇到过的问题（都会让顶角量错）**：
   1. 顶点顺序写成 `apex, tl, tr, br, bl` 是**自交**多边形，顶角的"邻居"变成两个
@@ -27,10 +27,12 @@
      现已改成用 ``pts[i]`` 的**真实前后邻居**。
 - **OcrEngine**（`cropproc.py`）：RapidOCR 薄封装，**det/rec 走 TORCH 引擎 + 显式本地 `.pth` 路径**。
   `default_models.yaml` 里没有 `torch:` 段，TORCH 只能靠 `model_path` 指定本地权重。
-  **方向分类（Cls）现已接入**，默认 `cls_engine="onnx"`（实测最快，见本文件末节"实测结论"里的速度表），
-  另有 `"torch"` 与 `"off"`；`cls_autorotate` 决定它是否参与识别（默认开，
-  即 PP-OCR 流水线会按判定把倒置文本行转正再识别）。对外只多一个
-  `classify_orientation(image) -> OcrOrientation`（给几何转正做交叉验证用）。
+  **方向分类（Cls）已接入，但只作检查/调试（交叉验证与排故），默认不参与识别**：正式链路的转向由
+  几何转正保证（平行边法 + 顶角 `60°±15°` 门限），所以 `cls_autorotate` 默认 `False`，省掉逐帧
+  分类计算（实测依据见下一条"方向分类默认关"）；要它按判定把倒置文本行转正再识别就显式设 `True`。
+  `cls_engine` 决定用哪个后端（`"onnx"` 默认、实测最快，另有 `"torch"`/`"off"`），**只在启用它时才生效**；
+  `"off"` 连会话都不建，但 `classify_orientation()` 会明确拒绝（不静默给值）。对外只多一个
+  `classify_orientation(image) -> OcrOrientation`（**诊断入口**，给几何转正做交叉验证用）。
   置信度过滤走 `Global.text_score`（3.9.2 的 `__call__` 只收图像，旧版 那些
   `allowlist`/`low_text`/`text_threshold` 参数**已不存在**）。
 

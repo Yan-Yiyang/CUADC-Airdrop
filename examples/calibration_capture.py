@@ -35,7 +35,7 @@ from airdrop import Config
 # ----------------------------------------------------------------------
 SYSTEM_ADDRESS: str | None = None  # None = 用 TelemetryConfig 的默认地址
 RTSP_URL = None  # None = 用 VideoConfig 默认的 HM30 地址
-TELEMETRY_LAG_S = 0.15  # 本次采集不要用旧标定值去改它：时间差正是要标的东西
+TELEMETRY_LAG_S = 0.15  # 只影响写进索引的 capture_timestamp；时间差标定走"收到时刻"，与它无关
 ATTITUDE_RATE_HZ = 50.0  # 标定建议 ≥50Hz（姿态内差直接进外参）
 POSITION_RATE_HZ = 20.0
 BUFFER_SECONDS = 300.0  # 缓冲够长，免得采到一半被驱逐

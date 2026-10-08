@@ -95,6 +95,35 @@ python -m airdrop.run make-world --rounds 2 --seed 3 --wind 5,2,0
 
 其余演示：`basic`（遥测/指令）、`hm30-video`（拉流与统计）、`video-sync`（对齐 + 入缓冲 + 读者线程）。
 
+## 正式任务现场顺序（`full-mission`）
+
+正式档（`recon_upload="operator"`，默认）：**侦查航线由操作手在 QGC 上传并启动**——本包不 arm、
+不 takeoff、也不上传它，只等飞机真的在空中、然后监视这条航线的进度。现场照这个次序走
+（判据与超时的完整说明见 [`docs/handbook.md`](docs/handbook.md) §6.3）：
+
+1. **链路先就绪，再启动程序**：飞控/数传/图传上电、MAVSDK 地址可达之后才
+   `python -m airdrop.run full-mission --land-plan routes/land.plan`。`thread.connect()` 是阻塞调用
+   （连不上以异常退出，退出码 1）；`INIT` 的 30s 上限（`init_max_s`）在状态机装配时就起算，
+   链路没就绪时程序不会替你等。
+2. **看连接与原点**：日志 `飞控已连接：…` + 事件 `origin` → 遥测位置与 NED 原点就绪。
+3. **等起飞前自检通过再起飞**：`PREFLIGHT` 载入 detector/ocr/camera 并做视频自检，逐项落
+   `preflight` 事件（`--no-preflight` 只是跳过，`ok=null` ≠ 通过）。自检不过会在地面就 `ABORT`
+   并下安全动作；飞机已经在空中时失败 = 空中盘旋、本次任务提前结束。
+4. **操作手在 QGC 上传侦查航线（含起飞项）→ Start Mission**：飞机自动起飞并进 `MISSION`。
+   上传在程序启动前/后都行，但要在侦查段飞完之前让本包看到它。
+5. **程序自动接手**：检测到在空中（`in_air` 为主，取不到时相对高度 ≥ 5m）→ `airborne` →
+   `RECON`（`recon_waiting_operator`）→ 确认飞控在 `MISSION`（`mission_confirmed`）→ 监视进度。
+   ⚠ 进 `RECON` 后 **`recon_max_s`（默认 600s）内**必须确认到 `MISSION`，否则
+   `ABORT(mission_not_started)`（默认 `hold` = 固定翼盘旋）——**只手动起飞、不启动任务同样会超时**。
+6. **侦查飞完**：`hold` 盘旋等统计（上限 10s）→ 本包**唯一一次上传**（飞掠 + 降落合成一条任务，
+   会覆盖飞控里当时那条）→ 飞掠投放 → 降落 → `DONE`；全程写 `flights/<时间戳>/`。
+7. **别等侦查段飞完才启动程序**：完成判定要求"先见到一次未完成"（防陈旧读数），已经飞完的任务
+   不会被采信，程序会空等到 `recon_max_s` 超时才 `ABORT`（`recon_timeout` 或
+   `mission_not_started`，看飞控当时还在不在任务模式）。
+
+演练档：`--dry-run` 只拦投放指令（其余真下发）；`--no-video --no-preflight` 是无图传/免自检组合；
+`sitl` 子命令默认不等起飞（`require_airborne=False`，**只给地面演练**）。
+
 ## 配置
 
 **所有参数都在 `airdrop/config.py`**，装配成一个 `Config` 传下去；非法取值在
@@ -128,10 +157,17 @@ python -m airdrop.run make-world --rounds 2 --seed 3 --wind 5,2,0
 
 ## 状态机
 
-`INIT → RECON → HOLD_PROCESS → OVERFLY → LAND → DONE`，任意环节异常 → `ABORT`。
+`INIT → PREFLIGHT → WAIT_AIRBORNE → RECON → HOLD_PROCESS → OVERFLY → LAND → DONE`，
+任意环节异常 → `ABORT`。
 
-- `RECON`：上传侦查航线（首航点带**起飞项**）并启动，按 `is_mission_finished()` 判定完成；
-  新任务刚上传时的**陈旧 True** 不会被 `MissionMonitor` 采信（要求先见到一次 `False`）。
+- `INIT`：等遥测位置 + NED 原点（**不上传任何任务**）；`init_max_s` 超时 → `ABORT`。
+- `PREFLIGHT`：起飞前自检（载入 detector/ocr/camera + 视频自检）；任一项失败 → `ABORT`。
+- `WAIT_AIRBORNE`：什么都不下发，等飞机真的在空中（`in_air` 为主，取不到时用相对高度
+  ≥ `airborne_alt_m` 兜底）；`airborne_timeout_s` 超时 → `ABORT`。
+- `RECON`：正式档（`recon_upload="operator"`）**不上传**，等操作手在 QGC 启动侦查航线并监视
+  进度；`"auto"` 档才由本包上传并启动（首航点带**起飞项**，只用于自动测试）。完成判定读
+  飞控侧 `mission_raw` 进度（`current == total`）——新任务刚上传时的**陈旧 True** 不会被
+  `MissionMonitor` 采信（要求先见到一次 `False`）。
 - `HOLD_PROCESS`：`hold()` 盘旋，等 targeting 出结果；处理完且无结果就提前结束，
   上限 `hold_process_max_s`（默认 10s），超时取当前已有结果。
 - `OVERFLY`：结果坐标（无则备用点）→ `[entry, exit]` 飞掠航点 + 降落航线**拼成一条任务**上传，

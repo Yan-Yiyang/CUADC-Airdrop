@@ -476,8 +476,12 @@ def _cls_params(config: OcrEngineConfig) -> dict:
 
 
 def test_cls_engine_selects_engine_and_model() -> None:
-    """``cls_engine`` 决定引擎与权重文件；``off`` 只关自动旋转。"""
-    onnx = _cls_params(OcrEngineConfig(cls_engine="onnx", cls_use_cuda=True))
+    """``cls_engine`` 决定引擎与权重文件；``cls_autorotate`` 决定它是否参与识别。
+
+    ⚠ 这里**显式**写 ``cls_autorotate=True``：本用例测的是"引擎选择"，不该依赖默认值
+    （默认是 False，见下一条用例）。
+    """
+    onnx = _cls_params(OcrEngineConfig(cls_engine="onnx", cls_use_cuda=True, cls_autorotate=True))
     assert onnx["Cls.engine_type"] == "engine:onnxruntime"
     assert onnx["EngineConfig.onnxruntime.use_cuda"] is True
     assert onnx["Global.use_cls"] is True
@@ -493,6 +497,23 @@ def test_cls_engine_selects_engine_and_model() -> None:
     off = _cls_params(OcrEngineConfig(cls_engine="off"))
     assert off["Global.use_cls"] is False
     assert "Cls.engine_type" not in off, "off 时不该选引擎（仍会给本地路径避免联网下载）"
+
+
+def test_cls_is_diagnostic_only_by_default() -> None:
+    """方向分类默认**不参与识别**：正式流程靠几何转正，cls 只作诊断/交叉验证。
+
+    实测依据（2026-10，旧版 三帧 + 把裁剪图整体转 180° 的样例）：``cls_autorotate``
+    开/关**读号逐位相同**（56/56/56，置信度也一致），关掉每帧约省一成耗时；而
+    ``cls_thresh=0.9`` 本来就挡不住真实倒立条（判定分只有 0.19–0.86），自动转正的
+    保护力有限。所以默认关；但引擎与方向 API 都保留，复盘时仍可
+    ``classify_orientation()`` 核对方向（真要连会话都不建就设 ``cls_engine="off"``）。
+    """
+    default = OcrEngineConfig()
+    assert default.cls_autorotate is False
+    assert default.cls_enabled() is True, "默认只是不参与识别，不是禁用方向 API"
+    params = _cls_params(default)
+    assert params["Global.use_cls"] is False
+    assert params["Cls.engine_type"] == "engine:onnxruntime", "引擎仍在，供诊断用"
 
 
 def test_cls_engine_rejects_unknown_name() -> None:

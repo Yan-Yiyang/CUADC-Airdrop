@@ -10,7 +10,8 @@
 
 字段来源与现状
 --------------
-- ``video.telemetry_lag``：ffmpeg 后端实测 ≈0.15s；**标定流程步骤二会给出实测值并覆盖**；
+- ``video.telemetry_lag``：ffmpeg 后端实测 ≈0.15s；**标定流程步骤二会给出实测值并覆盖**
+  （标定用**收到帧的时刻**测量，给的是绝对对齐量 = 视频链路延时 − 遥测链路延时，可直接回填）；
 - ``ballistics``：350ml 矿泉水瓶的占位参数，**需投放试验微调**；
 - ``overfly.leg_length_m``：保证平飞的段长，**需实验验证**；
 - ``perception.mode`` / ``targeting.selection_rule``：**起飞前按任务选定**。

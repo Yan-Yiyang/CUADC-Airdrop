@@ -32,6 +32,11 @@
   - ``allowlist`` 没有对应配置项，改由 :func:`correct_ocr_number` 过滤非数字
     （它本来就在做这件事，且更严格）；
   - ``rec_batch_num`` 走 ``Rec.rec_batch_num`` 配置。
+* 方向分类（Cls）**只作诊断/交叉验证，不参与正式流程**：正式链路的方向由几何转正
+  （平行边法 + 顶角 ``60°±15°`` 门限）决定，``cls_autorotate`` 默认 ``False``，省掉逐帧
+  分类计算。依据（2026-10 实测）：旧版 三帧 + 把裁剪图整体转 180° 的样例，cls 开/关
+  **读号逐位相同**（56/56/56，置信度也一致），关掉每帧约省一成耗时。要让它参与识别
+  就显式设 ``cls_autorotate=True``。
 * 方向分类（Cls）的权重文件名保持 RapidOCR 原样（TORCH 版是
   ``ch_ptocr_mobile_v2.0_cls_mobile.pth``，引擎按文件名 stem 查架构）；
   用哪个引擎由 :class:`OcrEngineConfig` 的 ``cls_engine`` 决定（默认 ONNX）。
@@ -80,6 +85,9 @@ class OcrEngineConfig:
     rec_model: str = "PP-OCRv6_rec_medium.pth"
     rec_keys: str = "ppocrv6_dict.txt"
     #: 方向分类（Cls）用哪个引擎：``"onnx"`` / ``"torch"`` / ``"off"``。
+    #: ⚠ 只在**启用方向分类**时才有意义（诊断/交叉验证，或显式打开 ``cls_autorotate``）：
+    #: 正式流程不用它，方向由几何转正保证。想连会话都不建（进一步省 onnxruntime/GPU
+    #: 开销）就设 ``"off"``——代价是 ``classify_orientation()`` 会明确拒绝（不是静默给值）。
     #: 默认 ONNX：实测（同权重、6 张一批）ONNX-CUDA 0.96ms/张、ONNX-CPU 1.28、
     #: TORCH-CUDA 2.28、TORCH-CPU 4.14，而三者判定逐位相同（同分数 0.9801/0.9799）。
     cls_engine: str = "onnx"
@@ -93,9 +101,14 @@ class OcrEngineConfig:
     #: 判定为 180° 的置信度门限（低置信度不动图，只记录判定）
     cls_thresh: float = 0.9
     #: 是否让 OCR 流水线按判定自动旋转文本行（``Global.use_cls``）。
-    #: 关掉时方向判别仍可用（:meth:`OcrEngine.classify_orientation`），只是不参与识别，
-    #: 适合"先只观测、不改结果"的交叉验证。
-    cls_autorotate: bool = True
+    #: **默认 False：方向分类只作诊断/交叉验证，不参与正式流程。** 正式链路的方向由
+    #: 几何转正保证（平行边法 + 顶角 ``60°±15°`` 门限，见 ``OpenCvPostProcess``），
+    #: 关掉它省下逐帧的分类计算；方向判别本身仍可用
+    #: （:meth:`OcrEngine.classify_orientation`），复盘时照样能核对方向。
+    #: 依据（2026-10 实测）：旧版 三帧 + 把裁剪图整体转 180° 的样例，开/关**读号逐位
+    #: 相同**（56/56/56，置信度也一致），关掉每帧约省一成耗时；而 ``cls_thresh=0.9``
+    #: 本来就挡不住真实倒立条（实测判定分只有 0.19–0.86），自动转正的保护力有限。
+    cls_autorotate: bool = False
     use_cuda: bool = True
     device_id: int = 0
     text_score: float = 0.1
@@ -344,7 +357,10 @@ class OcrEngine:
             )
 
     def classify_orientation(self, image: np.ndarray) -> OcrOrientation:
-        """判断一张文本行是否倒置——独立于几何转正的第二判据。
+        """判断一张文本行是否倒置——**诊断/调试入口**，正式流程不调用它。
+
+        正式链路的方向由几何转正决定（``cls_autorotate`` 默认关，方向分类不参与识别）；
+        本方法只在离线交叉验证与排故时用，所以它**要求** ``cls_engine != "off"``。
 
         ⚠ 输入应当是文本行（编号框那种扁长条），不是整幅转正图：
         ``ch_ppocr_mobile_v2.0_cls`` 是按文本行训练的（内部缩放到 48×192）。

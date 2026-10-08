@@ -24,7 +24,10 @@ FlightRecorder 的标准飞行目录）。
 --------------------
 1. **内参**：棋盘格多视图 Zhang 标定，得到 ``K``、畸变；
 2. **时间差 Δt**：用**刚体角速度模长与安装角无关**这条性质（``|ω_cam| = |ω_body|``），
-   互相关画面角速度与飞控角速度得到画面-遥测的时间差。**必须先于外参**——它对外参零依赖；
+   互相关画面角速度与飞控角速度得到画面-遥测的时间差。**必须先于外参**——它对外参零依赖。
+   ⚠ 画面侧一律用**收到帧的时刻**（``received_timestamp``）：``capture_timestamp`` 是录制时按配置的
+   ``telemetry_lag`` 假设出来的拍摄时刻，拿它测只会测出"该假设的残差"（换一次配置就平移一个 lag），
+   详见 :func:`load_flight_stamps` 与 :func:`measure_frame_telemetry_lag`；
 3. **外参**：把棋盘格位姿与**同一时刻**的遥测位姿配成对（:func:`align_body_poses`），
    再解 ``AX = XB`` 求相机→机体旋转。
 
@@ -88,6 +91,14 @@ STRICT = False
 #: 时间差搜索范围（秒）与步长
 LAG_SEARCH_S = 0.5
 LAG_STEP_S = 0.005
+#: 帧索引的两条时间轴（标定一律用 ``received``，理由见 :func:`load_flight_stamps`）：
+#: ``received`` = 本机**收到**该帧的时刻（原始量，不受任何配置影响）；
+#: ``capture`` = 录制时按配置的 ``telemetry_lag`` 假设出来的拍摄时刻（= received − lag）。
+TIME_BASE_RECEIVED = "received"
+TIME_BASE_CAPTURE = "capture"
+#: 两条时间轴互核的容差（秒）：``基准 + capture 轴残差`` 应当等于 ``received 轴测得的绝对值``
+#: （实测差 ≤0.5 ms）；超了说明素材的记账方式与预期不符，只告警不改结果。
+LAG_CROSS_CHECK_TOL_S = 0.03
 #: 运动对的最小旋转激励（度）：低于此值的帧对对手眼标定无信息
 MIN_PAIR_ROTATION_DEG = 5.0
 #: 相对旋转**轴**的最小张角（度）。OpenCV 文档：至少要 2 个不平行的旋转轴才有唯一解；
@@ -97,10 +108,19 @@ MIN_AXIS_SPREAD_DEG = 15.0
 MAX_MOTION_PAIRS = 2000
 #: 尺量杆臂（米），标定文件里的 t_bc 就用它（手持标定估不准平移）
 MEASURED_T_BC = (0.0, 0.0, 0.0)
-#: 杆臂**估计值**可采信的判据：平移方程残差（米）≤ max(下限, 该比例 × 画面平移跨度)。
-#: ``t_a`` 是真是假都解得出一个 ``t_x``，区别在残差——所以判据必须落在残差上。
+#: 杆臂**估计值**可采信的判据之一：平移方程残差（米）≤ max(下限, 该比例 × 画面平移跨度)。
+#: ``t_a`` 是真是假都解得出一个 ``t_x``，区别在残差——所以这条判据落在残差上。
 LEVER_ARM_RESIDUAL_RATIO = 0.05
 LEVER_ARM_RESIDUAL_FLOOR_M = 0.02
+#: 杆臂**估计值**的第二道判据：遥测位置跨度的下限（米）。低于它就说"机体没真的动过"。
+#: ⚠ 这一条**不能由残差替代**：残差是右端项在 ``A`` 列空间正交补上的投影，而"遥测位置恒零/
+#: 几乎不动"带来的右端扰动可以**整体落在列空间里**——残差一位不变（实测逐对最大差 3e-16 m），
+#: 解却偏 |v|（实测 0.664 m）。判据与实测见 docs/calibration_opencv.md。
+BODY_SPAN_FLOOR_M = 0.01
+#: 遥测位置跨度 / 画面位置跨度 的允许区间：两者本该**同量级**（只差杆臂随姿态转动带来的小量），
+#: 差一个数量级就说明其中一侧不可用（室内手持无 GPS 时是遥测那一侧）。
+BODY_SPAN_RATIO_MIN = 0.1
+BODY_SPAN_RATIO_MAX = 10.0
 
 
 # ----------------------------------------------------------------------
@@ -133,6 +153,33 @@ class LagResult:
         return self.samples > 0 and math.isfinite(self.lag_s)
 
 
+@dataclass(frozen=True, slots=True)
+class FrameStamp:
+    '帧索引里一条记录的时间信息（三个量都留着，便于核对，见 :func:`load_flight_stamps`）。'
+
+    received_timestamp: float
+    capture_timestamp: float
+    lag_s: float
+
+
+@dataclass
+class LagMeasurement:
+    """第 2 步（画面-遥测时间差）的完整结果：两条时间轴各测一次 + 互核。
+
+    * :attr:`absolute`：**received 轴**的测量 = 视频链路延时 − 遥测链路延时
+      = 运行时要写进 ``VideoConfig.telemetry_lag`` 的**绝对对齐量**；
+    * :attr:`residual`：capture 轴的测量 = 绝对量 − 录制时的 ``lag`` 基准（诊断用）；
+    * :attr:`baseline_s`：录制时的 ``lag`` 基准；三者应满足
+      ``baseline_s + residual ≈ absolute``（见 :data:`LAG_CROSS_CHECK_TOL_S`）。
+    """
+
+    absolute: LagResult
+    residual: LagResult | None
+    baseline_s: float
+    cross_check_ok: bool
+    time_base: str = TIME_BASE_RECEIVED
+
+
 @dataclass
 class ExtrinsicsResult:
     r_bc: np.ndarray
@@ -144,7 +191,8 @@ class ExtrinsicsResult:
     residual_rotation_deg: float
     #: 相对旋转轴的最大张角（度），用来判断激励是否只绕一根轴
     axis_spread_deg: float = 0.0
-    #: 杆臂估计是否可采信（平移方程自洽），判据见 :func:`run_extrinsics`
+    #: 杆臂估计是否可采信：**残差自洽 + 遥测位置真的动过且与画面同量级**，
+    #: 两条判据的由来见 :func:`run_extrinsics` 与 :func:`telemetry_span_ok`
     t_bc_reliable: bool = False
     #: 平移方程 ``(R_a−I)t_x + t_a − R_x t_b`` 的最大残差（米）
     residual_translation_m: float = float("nan")
@@ -152,6 +200,8 @@ class ExtrinsicsResult:
     body_span_m: float = 0.0
     #: 画面（PnP）位置跨度（米）
     camera_span_m: float = 0.0
+    #: 遥测位置跨度是否通过"真的动过 + 与画面同量级"这一关（见 :func:`telemetry_span_ok`）
+    body_span_ok: bool = False
     methods: dict[str, float] = field(default_factory=dict)  # 方法名 → 残差（度）
 
     @property
@@ -691,11 +741,79 @@ def estimate_lag_by_correlation(
         denom = left - 2.0 * middle + right
         if abs(denom) > 1e-12:
             lag += 0.5 * (left - right) / denom * step_s
+    # ⚠ 收窄成 Python float：numpy 标量既过不了 JSON 序列化，也让 `is True` 类断言失效
+    lag = float(lag)
     return LagResult(
         lag_s=lag,
         peak=float(values[best]),
         samples=int(camera_speeds.size),
         curve=curve,
+    )
+
+
+def measure_frame_telemetry_lag(
+    received_times: Sequence[float],
+    capture_times: Sequence[float],
+    board_rotations: Sequence[np.ndarray],
+    snapshots: Sequence[TelemetrySnapshot],
+    *,
+    baseline_s: float,
+    search_s: float = LAG_SEARCH_S,
+    step_s: float = LAG_STEP_S,
+) -> LagMeasurement:
+    """第 2 步：同一批棋盘格旋转，在**两条时间轴**上各测一次，并互核。
+
+    为什么必须用 received 轴（这是本项目踩过的坑）
+    ---------------------------------------------
+    ``capture_times`` 是录制时**按配置的 ``telemetry_lag`` 假设出来的**拍摄时刻
+    （``= received − lag``，见 :class:`FrameStamp`）。拿它去测时间差，测出来的是
+    "该假设的残差"：**换一次配置，结果就跟着平移一个 lag**——真机上表现为"回填上一次
+    标定值再标一次，Δt 自己收敛到 0"，但那不代表标定对了，只代表配置与假设一致了。
+    用 ``received_times``（原始量）测出来的才是**绝对对齐量**：
+
+        ``绝对对齐量 = 视频链路延时 d_video − 遥测链路延时 d_tel``
+
+    它正是第 3 步配对与运行时 :attr:`airdrop.video.VideoConfig.telemetry_lag` 需要的值
+    （运行时按 ``拍摄时刻 = 收到时刻 − telemetry_lag`` 取遥测；遥测自身的滞后必须一起抵掉）。
+    受控实验（固定 d_video/d_tel、只改录制时配置的 lag）：received 轴的结果不变、
+    capture 轴的结果恰好平移一个 lag；详见 ``docs/calibration_opencv.md``。
+
+    互核
+    ----
+    ``baseline_s + residual ≈ absolute``（两条轴只差一个基准），实测差 ≤0.5 ms。
+    对不上说明素材的记账方式与预期不符（例如索引里的 ``lag`` 与录制配置不一致），
+    只告警、不改结果——绝对量仍以 received 轴为准。
+    """
+    # ⚠ 时刻与姿态必须**同一个筛选条件**取出来：两者分开筛会静默错配（四元数缺几条时）
+    paired_body = [
+        (item.timestamp, quaternion_to_matrix_local(quaternion))
+        for item in snapshots
+        if (quaternion := _quaternion_of(item)) is not None
+    ]
+    body_times, body_speeds = angular_speed_from_poses(
+        [stamp for stamp, _ in paired_body],
+        [rotation for _, rotation in paired_body],
+    )
+    received_t, received_w = angular_speed_from_poses(received_times, board_rotations)
+    absolute = estimate_lag_by_correlation(
+        received_t, received_w, body_times, body_speeds, search_s=search_s, step_s=step_s
+    )
+    residual: LagResult | None = None
+    cross_check_ok = False
+    if capture_times:
+        capture_t, capture_w = angular_speed_from_poses(capture_times, board_rotations)
+        residual = estimate_lag_by_correlation(
+            capture_t, capture_w, body_times, body_speeds, search_s=search_s, step_s=step_s
+        )
+        if absolute.ok and residual.ok:
+            cross_check_ok = bool(
+                abs(baseline_s + residual.lag_s - absolute.lag_s) <= LAG_CROSS_CHECK_TOL_S
+            )
+    return LagMeasurement(
+        absolute=absolute,
+        residual=residual,
+        baseline_s=float(baseline_s),
+        cross_check_ok=cross_check_ok,
     )
 
 
@@ -789,8 +907,17 @@ def solve_hand_eye(
     ``R_a t_x + t_a = R_x t_b + t_x`` ⇒ ``(R_a − I) t_x = R_x t_b − t_a``。
     注意它**必须用到 ``t_a``**，也就是遥测位置。室内手持采集没有 GPS，``t_a`` 不可信，
     所以 ``t_x`` 在本项目里**只当校验用**：标定文件的杆臂是尺量值，这里算出来的估计值
-    与它对比（差得离谱 ⇒ 遥测位置不可用）。能否采信由 :func:`run_extrinsics` 的残差
-    判据决定——``t_a`` 是真是假都解得出一个 ``t_x``，光看数字大小分辨不出来。
+    与它对比（差得离谱 ⇒ 遥测位置不可用）。能否采信由 :func:`run_extrinsics` 的**两条**判据
+    决定：平移方程残差自洽，且 :func:`telemetry_span_ok`（遥测位置真的动过、与画面同量级）
+    ——``t_a`` 是真是假都解得出一个 ``t_x``，光看数字大小分辨不出来；而"遥测位置恒零/几乎
+    不动"这类假数据，残差**也可能一位都不变**（见 :data:`BODY_SPAN_FLOOR_M`）。
+
+    ⚠ **平移必须"堆叠"成 (3n×3) 最小二乘，不能把各对方程逐行相加**：逐行相加 ≈ 把各对的
+    右端项做**等权平均**，而每对的信息量正比于 ``R_a − I``——旋转角小的对几乎不提供信息、
+    却把噪声全额带进平均（实测同一批数据上杆臂误差中位大 1.4–3.5 倍）。cv2 官方
+    ``calibrateHandEye`` 的 PARK 方法就是堆叠最小二乘：**同一个旋转解下两者逐位相同**
+    （实测差 3.4e-16 m）。回归用例
+    ``test_translation_branch_is_stacked_least_squares`` 把它钉住。
 
     返回 ``(R_x, t_x | None, 相对奇异值, 旋转轴张角(度))``。
     相对奇异值 ``s[-1]/s[0]`` 越接近 0 说明运动激励越充分（绝对值随量纲变化，只有相对量可比）。
@@ -820,12 +947,17 @@ def solve_hand_eye(
 
     translation: np.ndarray | None = None
     if use_translation:
-        d_matrix = np.zeros((3, 3))
-        d_vector = np.zeros(3)
-        for a_matrix, b_matrix in zip(a_list, b_list, strict=True):
-            d_matrix += a_matrix[:3, :3] - np.eye(3)
-            d_vector += rotation @ b_matrix[:3, 3] - a_matrix[:3, 3]
-        translation, *_ = np.linalg.lstsq(d_matrix, d_vector, rcond=None)
+        # 堆叠成 (3n×3) 最小二乘（= 法方程 AᵀA t = Aᵀb）。
+        # ⚠ 别改回"逐行相加再解 3×3"：那样等于给每对**等权**，旋转角小的对没有信息却带进噪声；
+        # 实测杆臂误差中位大 1.4–3.5 倍，且与 cv2 的 PARK 方法（就是本法）不再逐位一致。
+        d_rows = np.vstack([a_matrix[:3, :3] - np.eye(3) for a_matrix in a_list])
+        d_rhs = np.concatenate(
+            [
+                rotation @ b_matrix[:3, 3] - a_matrix[:3, 3]
+                for a_matrix, b_matrix in zip(a_list, b_list, strict=True)
+            ]
+        )
+        translation, *_ = np.linalg.lstsq(d_rows, d_rhs, rcond=None)
     return rotation, translation, relative, _axis_spread_deg(axes)
 
 
@@ -862,16 +994,47 @@ def _axis_spread_deg(axes: Sequence[np.ndarray]) -> float:
     return float(np.degrees(np.arccos(np.clip(gram[upper], -1.0, 1.0))).max())
 
 
-def _translation_span(poses: Sequence[np.ndarray]) -> float:
+def _translation_span(poses: Sequence[np.ndarray] | np.ndarray) -> float:
     """一组位姿的位置跨度（米）：三轴极差组成的包围盒对角线。
 
     用来把"遥测说机体动了多少"和"PnP 说相机动了多少"并排看——两者本该同量级
     （只差一个杆臂随姿态转动带来的小量），差一个数量级就是遥测位置不可用的铁证。
+
+    ⚠ 空值判断用 ``poses is None or len(poses) == 0``，**不要写 ``if not poses``**：
+    传进来 ndarray 时后者是"多元素真值判断"歧义，会抛
+    ``ValueError: The truth value of an array with more than one element is ambiguous``。
     """
-    if not poses:
+    if poses is None or len(poses) == 0:
         return 0.0
     points = np.asarray([pose[:3, 3] for pose in poses], dtype=np.float64)
     return float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
+
+
+def telemetry_span_ok(body_span_m: float, camera_span_m: float) -> bool:
+    """遥测位置"真的动过、且与画面同量级"吗——杆臂**估计值**的第二道门。
+
+    为什么残差判据不够（实测，见 docs/calibration_opencv.md）
+    --------------------------------------------------------
+    平移方程残差 = 右端项 ``b`` 在 ``A = stack(R_a − I)`` 列空间**正交补**上的投影。
+    "遥测位置恒零/几乎不动"带来的右端扰动 ``Δt_a`` 可以整体落在列空间里（实测垂直分量
+    1.5e-16 m），于是最小二乘把它**整体吸收进** ``t_x``：残差一位不变却解偏 |v|
+    （实测 0.664 m，``t_bc_reliable`` 照样是 True）。所以必须再加一道**与方程无关**的
+    量纲检查：
+
+    * 遥测位置跨度 ≥ :data:`BODY_SPAN_FLOOR_M`（机体得真的动起来）；
+    * 遥测跨度 / 画面跨度落在 [:data:`BODY_SPAN_RATIO_MIN`, :data:`BODY_SPAN_RATIO_MAX`]
+      （两边本该同量级）。
+
+    ⚠ 它是**勤勉性检查，不是证明**：只能抓住"遥测位置恒零/几乎不动"与"两边差一个数量级"
+    这两类，无法验证"遥测位置偏了一半"这种部分造假的中间态。采不到可信位置时的正确做法
+    始终是**重新采集**，或者干脆只用手眼旋转解（``t_bc`` 以尺量为准）。
+    """
+    if not math.isfinite(body_span_m) or not math.isfinite(camera_span_m):
+        return False
+    if body_span_m < BODY_SPAN_FLOOR_M or camera_span_m <= 0.0:
+        return False
+    ratio = body_span_m / camera_span_m
+    return BODY_SPAN_RATIO_MIN <= ratio <= BODY_SPAN_RATIO_MAX
 
 
 def _translation_residual(
@@ -882,9 +1045,13 @@ def _translation_residual(
 ) -> float:
     """平移方程 ``(R_a − I)t_x + t_a − R_x t_b`` 的最大残差（米）。
 
-    这是判"遥测位置能不能用"的关键量。``t_a`` 是真是假都解得出一个 ``t_x``
-    （最小二乘照样给你一个数），但假 ``t_a`` 会让方程**本身不自洽**：残差涨到与真实
-    位移同量级。所以别只看 ``t_x`` 的大小，要看这个残差。
+    这是判"遥测位置能不能用"的**两条**判据之一（另一条是 :func:`telemetry_span_ok`）。
+    ``t_a`` 是真是假都解得出一个 ``t_x``（最小二乘照样给你一个数），但假 ``t_a`` 往往会让
+    方程**本身不自洽**：残差涨到与真实位移同量级。所以别只看 ``t_x`` 的大小，要看这个残差。
+
+    ⚠ 但残差**不是充分判据**：它是右端项在 ``A`` 列空间正交补上的投影，而"遥测位置恒零/
+    几乎不动"带来的扰动可以整体落在列空间里——实测残差一位不变（差 2e-17 m）而解偏 0.664 m。
+    那也是 :func:`telemetry_span_ok` 存在的理由（详见 docs/calibration_opencv.md）。
     """
     if translation is None:
         return float("nan")
@@ -1059,7 +1226,7 @@ def align_body_poses(
 def run_extrinsics(
     *,
     board_poses: Sequence[tuple[float, np.ndarray, np.ndarray]],
-    body_poses: Sequence[np.ndarray],
+    body_poses: Sequence[np.ndarray] | np.ndarray,  # ndarray（逐帧堆叠）也收
     min_pair_rotation_deg: float = MIN_PAIR_ROTATION_DEG,
     min_axis_spread_deg: float = MIN_AXIS_SPREAD_DEG,
     estimate_body_translation: bool = True,
@@ -1081,10 +1248,16 @@ def run_extrinsics(
     ----------------------------------
     ``estimate_body_translation=True``（默认）会连 ``t_bc`` 一起解出来——它需要遥测位置
     ``t_a``，室内手持无 GPS 时不可信，所以这个估计值**不进标定文件**，只用于和尺量值
-    对表。可采信与否交给残差判据：``t_bc_reliable`` 要求平移方程残差
-    ≤ ``max(LEVER_ARM_RESIDUAL_FLOOR_M, LEVER_ARM_RESIDUAL_RATIO × 画面平移跨度)``。
-    理由是``t_a`` 是真是假**都**解得出一个 ``t_x``（最小二乘照样给数），假 ``t_a``
-    表现在方程不自洽、残差涨到与真实位移同量级，所以判据必须落在残差上。
+    对表。可采信与否交给**两条**判据：
+
+    1. **残差**：``t_bc_reliable`` 要求平移方程残差
+       ≤ ``max(LEVER_ARM_RESIDUAL_FLOOR_M, LEVER_ARM_RESIDUAL_RATIO × 画面平移跨度)``。
+       理由是 ``t_a`` 是真是假**都**解得出一个 ``t_x``（最小二乘照样给数），假 ``t_a``
+       表现在方程不自洽、残差涨到与真实位移同量级；
+    2. **量纲**：:func:`telemetry_span_ok` 要求遥测位置跨度真的动过、且与画面跨度同量级。
+       ⚠ 光靠残差**不够**：残差是右端项在 ``A`` 列空间正交补上的投影，"遥测位置恒零/
+       几乎不动"带来的扰动可以整体落在列空间里——残差一位不变却解偏几十厘米
+       （实测 0.664 m；见 :func:`telemetry_span_ok` 与 docs/calibration_opencv.md）。
     """
     if len(board_poses) != len(body_poses):
         raise ValueError(
@@ -1141,16 +1314,18 @@ def run_extrinsics(
     camera_span = _translation_span(camera_pose)
     translation_residual = _translation_residual(a_list, b_list, rotation, translation)
     tolerance = lever_arm_tolerance(camera_span)
+    span_ok = telemetry_span_ok(body_span, camera_span)
     return ExtrinsicsResult(
         r_bc=rotation,
         t_bc=translation,
         pairs=len(a_list),
         residual_rotation_deg=mean_residual,
         axis_spread_deg=axis_spread,
-        t_bc_reliable=translation is not None and translation_residual <= tolerance,
+        t_bc_reliable=(translation is not None and translation_residual <= tolerance and span_ok),
         residual_translation_m=translation_residual,
         body_span_m=body_span,
         camera_span_m=camera_span,
+        body_span_ok=span_ok,
         methods={"horaud": mean_residual, "relative_singular": relative_sv},
     )
 
@@ -1190,9 +1365,12 @@ def lever_arm_report(
         "residual_tolerance_m": None,
         "body_span_m": None,
         "camera_span_m": None,
+        "span_ratio": None,
+        "body_span_ok": False,
         "note": (
             "t_bc 以尺量为准（手持采集时遥测位置不可信）；"
-            "estimated 仅供对比校验，估计值与尺量值差得离谱即说明遥测位置不可用"
+            "estimated 仅供对比校验，判据有两条：平移方程残差自洽 + 遥测位置真的动过"
+            "且与画面跨度同量级（body_span_ok）。差得离谱即说明遥测位置不可用"
         ),
     }
     if result is None or result.t_bc is None:
@@ -1208,6 +1386,10 @@ def lever_arm_report(
         residual_tolerance_m=lever_arm_tolerance(result.camera_span_m),
         body_span_m=float(result.body_span_m),
         camera_span_m=float(result.camera_span_m),
+        span_ratio=(
+            float(result.body_span_m / result.camera_span_m) if result.camera_span_m > 0 else None
+        ),
+        body_span_ok=bool(result.body_span_ok),
     )
     return report
 
@@ -1232,25 +1414,76 @@ def _pose_matrix_from_rotation(rotation: np.ndarray, translation: Sequence[float
 # ----------------------------------------------------------------------
 # 飞行目录读取
 # ----------------------------------------------------------------------
-def load_flight_index(flight_dir: Path, limit: int | None = None) -> list[tuple[float, str]]:
-    """读帧索引，返回 ``[(capture_timestamp, 相对文件名), ...]``。"""
+def _stamp_value(stamp: FrameStamp, time_base: str) -> float:
+    """按时间轴取一个时刻；非法取值显式报错（不猜）。"""
+    if time_base == TIME_BASE_RECEIVED:
+        return stamp.received_timestamp
+    if time_base == TIME_BASE_CAPTURE:
+        return stamp.capture_timestamp
+    raise ValueError(
+        f"未知的 time_base: {time_base!r}（可选 {TIME_BASE_RECEIVED!r} / {TIME_BASE_CAPTURE!r}）"
+    )
+
+
+def _read_flight_index(flight_dir: Path, limit: int | None) -> list[tuple[FrameStamp, str]]:
+    """一次遍历读出 ``(时间记录, 相对文件名)``；缺 ``received_timestamp`` 显式报错。"""
     index_path = flight_dir / "frames_index.jsonl"
     if not index_path.is_file():
         raise FileNotFoundError(f"缺少帧索引: {index_path}")
-    entries: list[tuple[float, str]] = []
+    entries: list[tuple[FrameStamp, str]] = []
     for line in index_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
         record = json.loads(line)
-        entries.append((float(record["capture_timestamp"]), str(record["filename"])))
+        if "received_timestamp" not in record:
+            raise ValueError(
+                f"帧索引缺少 received_timestamp（{index_path} 第 {len(entries) + 1} 行）："
+                "标定第 2/3 步要用**收到时刻**这个原始量测时间差，不能拿录制时按配置假设出来的 "
+                "capture_timestamp 顶替（那测出来的是配置的残差）。老素材请重新采集，"
+                "或显式用 load_flight_index(..., time_base='capture') 只做诊断。"
+            )
+        entries.append(
+            (
+                FrameStamp(
+                    received_timestamp=float(record["received_timestamp"]),
+                    capture_timestamp=float(record["capture_timestamp"]),
+                    lag_s=float(record.get("lag", 0.0)),
+                ),
+                str(record["filename"]),
+            )
+        )
         if limit is not None and len(entries) >= limit:
             break
     return entries
 
 
-def load_flight_frames_paired(flight_dir: Path, limit: int = 200) -> list[tuple[float, np.ndarray]]:
-    """读帧，**连同它自己的拍摄时刻**一起返回。
+def load_flight_stamps(flight_dir: Path, limit: int | None = None) -> list[FrameStamp]:
+    '读帧索引的**原始**时间信息 ``(received_timestamp, capture_timestamp, lag)``。\n\n    索引里缺 ``received_timestamp``（老素材）时**显式报错**，不静默退回 capture 轴。\n    '
+    return [stamp for stamp, _ in _read_flight_index(flight_dir, limit)]
+
+
+def load_flight_index(
+    flight_dir: Path,
+    limit: int | None = None,
+    *,
+    time_base: str = TIME_BASE_RECEIVED,
+) -> list[tuple[float, str]]:
+    """读帧索引，返回 ``[(时刻, 相对文件名), ...]``。
+
+    默认给**收到时刻**（标定用的那条轴，见 :func:`load_flight_stamps`）；
+    ``time_base="capture"`` 给录制时假设的拍摄时刻，仅供诊断/复核。
+    """
+    return [
+        (_stamp_value(stamp, time_base), name)
+        for stamp, name in _read_flight_index(flight_dir, limit)
+    ]
+
+
+def load_flight_frames_paired(
+    flight_dir: Path, limit: int = 200
+) -> list[tuple[FrameStamp, np.ndarray]]:
+    """读帧，**连同它自己那条索引记录**一起返回（两条时间轴与当时的 lag 都在里面）。
 
     ⚠ 必须成对读。原来这里有两个各自独立的函数（``load_flight_frames`` 按
     "成功解码数"计数并跳过坏帧，``load_flight_timestamps`` 按"索引行数"计数），
@@ -1259,13 +1492,17 @@ def load_flight_frames_paired(flight_dir: Path, limit: int = 200) -> list[tuple[
     的时间错位，Δt 与手眼外参全建立在错配上，产出一份"看起来正常、其实错误"
     的 ``camera_calib.json``，且没有任何告警。现在一次遍历、时刻与图像取自
     同一条索引记录，结构上不可能错位；解不出的帧连同它的时刻一起跳过。
+
+    返回的是 :class:`FrameStamp` 而不是裸浮点：调用方要哪条时间轴就自己挑
+    （标定用 ``received_timestamp``，见 :func:`load_flight_stamps`），
+    免得"默认给哪条轴"这种隐藏约定又埋一个坑。
     """
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
 
     frames_dir = flight_dir / "frames"
-    paired: list[tuple[float, np.ndarray]] = []
+    paired: list[tuple[FrameStamp, np.ndarray]] = []
     skipped = 0
-    for stamp, name in load_flight_index(flight_dir):
+    for stamp, name in _read_flight_index(flight_dir, None):
         path = frames_dir / name
         if not path.is_file():
             skipped += 1
@@ -1292,15 +1529,63 @@ def load_flight_telemetry(flight_dir: Path) -> list[TelemetrySnapshot]:
     return list(FlightLog.open(flight_dir).iter_telemetry())
 
 
-def load_flight_timestamps(flight_dir: Path, limit: int = 200) -> list[float]:
-    """读帧索引里的拍摄时刻（与 :func:`load_flight_frames_paired` 配对使用时，
+def load_flight_timestamps(
+    flight_dir: Path,
+    limit: int = 200,
+    *,
+    time_base: str = TIME_BASE_RECEIVED,
+) -> list[float]:
+    """读帧索引里的时刻（默认**收到时刻**；与 :func:`load_flight_frames_paired` 配对使用时，
     优先用后者——它保证时刻与图像来自同一条索引记录）。"""
-    return [stamp for stamp, _ in load_flight_index(flight_dir, limit)]
+    return [stamp for stamp, _ in load_flight_index(flight_dir, limit, time_base=time_base)]
 
 
 # ----------------------------------------------------------------------
 # 主流程
 # ----------------------------------------------------------------------
+def _log_lever_arm(arm: dict[str, Any]) -> None:
+    """把杆臂对表结果写进日志；不合格时说清是**哪一条**判据不合格。
+
+    两条判据（残差自洽 / 遥测位置跨度合格）的由来见 :func:`run_extrinsics`。
+    """
+    if arm["estimated"] is None:
+        LOGGER.info("  杆臂按尺量: t_bc=%s（未估）", list(MEASURED_T_BC))
+        return
+    LOGGER.info(
+        "  杆臂：尺量 %s，标定估计 %s，差 %.3f m",
+        [round(value, 4) for value in arm["authoritative"]],
+        [round(value, 4) for value in arm["estimated"]],
+        arm["delta_m"],
+    )
+    if arm["estimated_reliable"]:
+        LOGGER.info(
+            "  估计值可采信（平移残差 %.4f m 在 %.4f m 以内；遥测位置跨度 %.2f m vs 画面 %.2f m）",
+            arm["residual_translation_m"],
+            arm["residual_tolerance_m"],
+            arm["body_span_m"],
+            arm["camera_span_m"],
+        )
+        return
+    reasons = []
+    if arm["residual_translation_m"] > arm["residual_tolerance_m"]:
+        reasons.append(
+            f"平移残差 {arm['residual_translation_m']:.4f} m 超出 "
+            f"{arm['residual_tolerance_m']:.4f} m"
+        )
+    if not arm["body_span_ok"]:
+        reasons.append(
+            f"遥测位置跨度 {arm['body_span_m']:.3f} m 不合格（画面 {arm['camera_span_m']:.3f} m，"
+            f"下限 {BODY_SPAN_FLOOR_M} m、比值需在 [{BODY_SPAN_RATIO_MIN}, {BODY_SPAN_RATIO_MAX}] 内）"
+        )
+    LOGGER.warning(
+        "  估计值**不可信**（%s）——室内手持无 GPS 时遥测位置不可用，以尺量值 %s 为准；"
+        "两者差得离谱正是这个原因。注意：遥测位置几乎不动时**残差也可能是干净的**，"
+        "所以判据不止残差一条",
+        "；".join(reasons) or "未知原因",
+        list(MEASURED_T_BC),
+    )
+
+
 def calibrate(
     flight_dir: Path,
     *,
@@ -1317,10 +1602,24 @@ def calibrate(
     paired = load_flight_frames_paired(flight_dir, max_frames)
     if not paired:
         raise ValueError(f"{flight_dir} 里没有可用帧")
-    # 帧与拍摄时刻来自同一条索引记录，**结构上不可能错位**
-    timestamps = [stamp for stamp, _ in paired]
+    # 帧与时间记录来自同一条索引记录，**结构上不可能错位**。
+    # ⚠ 第 2/3 步一律用 received（原始"收到帧"时刻）：capture 是录制时按配置的 lag 假设出来的
+    # 拍摄时刻，拿它测时间差只会测出"假设的残差"（见 load_flight_stamps 与
+    # measure_frame_telemetry_lag 的说明）。capture 轴只用于互核。
+    baselines = [stamp.lag_s for stamp, _ in paired]
     frames = [image for _, image in paired]
-    LOGGER.info("共 %d 帧", len(frames))
+    lag_baseline = baselines[0]
+    if max(baselines) - min(baselines) > 1e-6:
+        LOGGER.warning(
+            "  素材里各帧记录的 lag 不一致（%.4f ~ %.4f）：互核基准取第一帧",
+            min(baselines),
+            max(baselines),
+        )
+    LOGGER.info(
+        "共 %d 帧（时间轴 = received 收到时刻；录制时的 lag 基准 %.4f s）",
+        len(frames),
+        lag_baseline,
+    )
 
     # ---- 步骤一 ----
     LOGGER.info("步骤一：内参标定")
@@ -1338,13 +1637,14 @@ def calibrate(
     board_points = board_object_points(pattern_size, square_size)
     board_rotations: list[np.ndarray] = []
     pose_times: list[float] = []
+    pose_times_capture: list[float] = []
     board_poses: list[tuple[float, np.ndarray, np.ndarray]] = []
     rejected = 0
     # 用 solve_board_poses（含相邻帧连续性定支）而不是裸 solvePnP：
     # 检测器的角点顺序可能与我们枚举的对象点相反，单帧无法分辨（见其 docstring），
     # 而**混用两种标签**会让第三步残差飙到几十度。
     for stamp, pose in zip(
-        timestamps,
+        [record for record, _ in paired],
         solve_board_poses(
             frames,
             board_points,
@@ -1361,35 +1661,54 @@ def calibrate(
         rvec, tvec = pose
         rotation, _ = cv2.Rodrigues(rvec)
         board_rotations.append(rotation)
-        pose_times.append(stamp)
-        board_poses.append((stamp, rvec, tvec))
+        pose_times.append(stamp.received_timestamp)  # 第 3 步配对也用 received 轴
+        pose_times_capture.append(stamp.capture_timestamp)
+        board_poses.append((stamp.received_timestamp, rvec, tvec))
     if rejected:
         LOGGER.warning("  丢弃 %d 帧（角点检不出）", rejected)
 
     snapshots = [
         item for item in load_flight_telemetry(flight_dir) if _quaternion_of(item) is not None
     ]
-    lag = LagResult(lag_s=0.0, peak=float("nan"), samples=0)
+    measurement = LagMeasurement(
+        absolute=LagResult(lag_s=0.0, peak=float("nan"), samples=0),
+        residual=None,
+        baseline_s=lag_baseline,
+        cross_check_ok=False,
+    )
     if len(board_rotations) >= 3 and len(snapshots) >= 3:
-        cam_t, cam_w = angular_speed_from_poses(pose_times, board_rotations)
-        body_rotations = [
-            quaternion_to_matrix_local(quaternion)
-            for item in snapshots
-            if (quaternion := _quaternion_of(item)) is not None
-        ]
-        body_t, body_w = angular_speed_from_poses(
-            [item.timestamp for item in snapshots], body_rotations
-        )
-        lag = estimate_lag_by_correlation(
-            cam_t,
-            cam_w,
-            body_t,
-            body_w,
+        measurement = measure_frame_telemetry_lag(
+            pose_times,
+            pose_times_capture,
+            board_rotations,
+            snapshots,
+            baseline_s=lag_baseline,
             search_s=lag_search_s,
             step_s=lag_step_s,
         )
-        LOGGER.info("  Δt = %.4f s（相关系数 %.3f，样本 %d）", lag.lag_s, lag.peak, lag.samples)
+        lag = measurement.absolute
+        LOGGER.info(
+            "  Δt = %.4f s（received 轴 = **绝对对齐量**；相关系数 %.3f，样本 %d）",
+            lag.lag_s,
+            lag.peak,
+            lag.samples,
+        )
+        if measurement.residual is not None:
+            LOGGER.info(
+                "    互核：capture 轴残差 %.4f s + 录制基准 %.4f s = %.4f s%s",
+                measurement.residual.lag_s,
+                lag_baseline,
+                lag_baseline + measurement.residual.lag_s,
+                "" if measurement.cross_check_ok else "  ⚠ 与绝对量对不上，见下",
+            )
+            if not measurement.cross_check_ok:
+                LOGGER.warning(
+                    "    两条时间轴互核不通过（|基准 + 残差 − 绝对量| > %.3f s）："
+                    "素材索引里的 lag 与录制配置可能不一致；结果仍以 received 轴为准",
+                    LAG_CROSS_CHECK_TOL_S,
+                )
     else:
+        lag = measurement.absolute
         LOGGER.warning("  棋盘格位姿或四元数不足，跳过时间差估计")
 
     # ---- 步骤三 ----
@@ -1413,36 +1732,7 @@ def calibrate(
                 extrinsics.axis_spread_deg,
             )
             # 杆臂：**尺量为准**（写进标定文件的是它），标定估计值只用来对表
-            arm = lever_arm_report(extrinsics)
-            if arm["estimated"] is None:
-                LOGGER.info("  杆臂按尺量: t_bc=%s（未估）", list(MEASURED_T_BC))
-            else:
-                LOGGER.info(
-                    "  杆臂：尺量 %s，标定估计 %s，差 %.3f m",
-                    [round(value, 4) for value in arm["authoritative"]],
-                    [round(value, 4) for value in arm["estimated"]],
-                    arm["delta_m"],
-                )
-                if arm["estimated_reliable"]:
-                    LOGGER.info(
-                        "  估计值可采信（平移残差 %.4f m 在 %.4f m 以内；"
-                        "遥测位置跨度 %.2f m vs 画面 %.2f m）",
-                        arm["residual_translation_m"],
-                        arm["residual_tolerance_m"],
-                        arm["body_span_m"],
-                        arm["camera_span_m"],
-                    )
-                else:
-                    LOGGER.warning(
-                        "  估计值**不可信**（平移残差 %.4f m 超出 %.4f m；遥测位置跨度 "
-                        "%.2f m vs 画面 %.2f m）——室内手持无 GPS 时遥测位置不可用，"
-                        "以尺量值 %s 为准；两者差得离谱正是这个原因",
-                        arm["residual_translation_m"],
-                        arm["residual_tolerance_m"],
-                        arm["body_span_m"],
-                        arm["camera_span_m"],
-                        list(MEASURED_T_BC),
-                    )
+            _log_lever_arm(lever_arm_report(extrinsics))
         except ValueError as exc:
             LOGGER.warning("  手眼标定失败: %s", exc)
     else:
@@ -1470,6 +1760,21 @@ def calibrate(
                 "search_s": lag_search_s,
                 "step_s": lag_step_s,
                 "curve": lag.curve if lag.ok else [],
+                # 时间轴与互核：lag_s 是 **received 轴**的绝对对齐量（可直接回填 VideoConfig）
+                "time_base": measurement.time_base,
+                "lag_baseline_s": measurement.baseline_s,
+                "lag_residual_on_capture_axis_s": (
+                    float(measurement.residual.lag_s)
+                    if measurement.residual is not None and measurement.residual.ok
+                    else None
+                ),
+                "cross_check_ok": bool(measurement.cross_check_ok),
+                "cross_check_tolerance_s": LAG_CROSS_CHECK_TOL_S,
+                "note": (
+                    "Δt 用**收到帧的时刻**（received_timestamp）测量，是绝对对齐量"
+                    "（视频链路延时 − 遥测链路延时），可直接回填 VideoConfig.telemetry_lag；"
+                    "capture 轴残差 + 录制基准 = 该绝对量（互核）"
+                ),
             },
             "extrinsics": (
                 {

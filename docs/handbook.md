@@ -457,8 +457,8 @@ AlignmentWriter(buffer, aligner)      # 可调用对象：__call__(frame)
 | `AlignmentWriter.stats()` | `(written, skipped)`：`skipped` 只因"该时刻取不到遥测"增加 |
 | `BufferStats` | `storage` / `capacity` / `max_bytes` / `frames` / `put` / `evicted` / `bytes` / `last_index` |
 
-默认 `storage="jpeg"`：720p 约 0.1~0.2 MB/帧，满载（`capacity_for(30, 180)` = 5400 帧）约
-0.6~1 GiB；`storage="raw"` 无损但 5400 帧约 13.9 GiB。满了从**最旧**一端驱逐。
+默认 `storage="jpeg"`：720p 约 0.1–0.2 MB/帧，满载（`capacity_for(30, 180)` = 5400 帧）约
+0.6–1 GiB；`storage="raw"` 无损但 5400 帧约 13.9 GiB。满了从**最旧**一端驱逐。
 `capacity_for(fps=30.0, seconds=180.0)` 做换算；`raw_frame_bytes(width, height, channels=3)`
 算未压缩一帧的字节数。
 
@@ -734,7 +734,11 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 
 #### 3.4.4 `OcrEngine` 与 `OcrEngineConfig`
 
-`OcrEngine(config: OcrEngineConfig | None = None)`，方法：`ensure()`（惰性建 RapidOCR 实例）、`cls_providers()`（当前可用的方向分类后端）、`classify_orientation(image)`（返回 `OcrOrientation(label, score)`）、`warmup(size=320)`、`read_text(image)`（返回 `list[OcrText]`，每项 `box`/`text`/`score`）。
+`OcrEngine(config: OcrEngineConfig | None = None)`，方法：`ensure()`（惰性建 RapidOCR 实例）、`cls_providers()`（当前可用的方向分类后端）、`classify_orientation(image)`（返回 `OcrOrientation(label, score)`；**诊断/调试入口**，正式流程不调用，要求 `cls_engine != 'off'`）、`warmup(size=320)`、`read_text(image)`（返回 `list[OcrText]`，每项 `box`/`text`/`score`）。
+
+> **方向分类（Cls）的定位**：只用于**检查/调试**（几何转正的交叉验证与排故）。正式链路
+> 的方向由几何转正决定（平行边法 + 顶角 `60°±15°` 门限），所以 `cls_autorotate` 默认 `False`，
+> 逐帧不再跑分类；`cls_engine` 保留默认 `'onnx'` 仅为诊断时最快（要连会话都不建就设 `'off'`）。
 
 `OcrEngineConfig` 默认值（走 `airdrop.perception.cropproc`）：
 
@@ -744,12 +748,12 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 | `det_model` | `'PP-OCRv6_det_medium.pth'` | 检测权重 |
 | `rec_model` | `'PP-OCRv6_rec_medium.pth'` | 识别权重 |
 | `rec_keys` | `'ppocrv6_dict.txt'` | 字符集字典（在 git 里） |
-| `cls_engine` | `'onnx'` | 方向分类后端（实测最快） |
+| `cls_engine` | `'onnx'` | 方向分类后端（实测最快）；**只在启用方向分类时生效**（默认不参与识别，见下） |
 | `cls_onnx_model` | `'ch_ppocr_mobile_v2.0_cls_mobile.onnx'` | ONNX 版分类权重 |
 | `cls_torch_model` | `'ch_ptocr_mobile_v2.0_cls_mobile.pth'` | TORCH 版分类权重（**注意这个错拼**） |
 | `cls_use_cuda` | `True` | 分类是否用 CUDA |
 | `cls_thresh` | `0.9` | 方向判定阈值 |
-| `cls_autorotate` | `True` | 按判定把倒置文本行转正后再识别 |
+| `cls_autorotate` | `False` | **默认关**：方向分类只作诊断/交叉验证，不参与识别——正式流程的方向由几何转正（顶角 60°±15° 门限）保证。设为 `True` 才会按判定把倒置文本行转正再识别（2026-10 实测：开/关读号逐位相同，关掉每帧约省一成耗时） |
 | `use_cuda` | `True` | det/rec 是否用 CUDA |
 | `device_id` | `0` | GPU 序号 |
 | `text_score` | `0.1` | RapidOCR 的 `Global.text_score` |
@@ -792,7 +796,7 @@ PerceptionWorker(config: PerceptionConfigLike, *, buffer: AlignmentBuffer,
 
 其余行为约定：
 
-- **边长过滤**：`side_px` 不在 `min_side_px` 与 `max_side_px` 之间的检测被丢弃并计入 `invalid_side`（默认 10~400 px）。
+- **边长过滤**：`side_px` 不在 `min_side_px` 与 `max_side_px` 之间的检测被丢弃并计入 `invalid_side`（默认 10–400 px）。
 - **OCR 逐帧送检**：默认不启用跨帧去重，避免运动模糊导致唯一清晰帧被跳过；显式打开 `ocr_dedupe_s` / `ocr_dedupe_px` 时，才按时间和像素窗口合并相邻重复请求。**OCR 请求、OCR 结果、检测结果三条队列都无界、不丢弃**：积压只告警（OCR 侧按 `ocr_queue_size`，检测结果侧按 2000 条阈值），不会因为"队列满"丢掉任何请求或结果；积压长期不降时调 `perception.ocr_workers` 或降检测帧率。
 - **编号覆盖规则**：只有 `cls12` 的类别直出才写编号；OCR 结果回填时不会清掉已存在的编号（否则跨帧投票会被打乱）。
 - 单帧异常不终止循环：记日志并写进 `PerceptionStats.last_error`。
@@ -1041,7 +1045,7 @@ predict_impact(position_ned, velocity_ned, *, ground_z=0.0,
 
 模型要点：
 
-- 阻力按空气相对速度算，风作为空气速度参与；**密度基准是真实海拔**：`ground_altitude_m` 是地面平面的海拔（飞行时由 `MissionRunner` 传 GPS 原点/地面点海拔，反演时取投放记录的 `origin.alt_m − ground_z`）。关闭 `air_density_isa`（默认）时在**投放（初始）海拔**上算一次 ISA 密度、全弹道共用；打开后按 `ground_altitude_m + 离地高度` **逐级**求值（贵 26~30%，高海拔/大落差时更准）。不再有"地面=海平面"的假设；记录缺原点时退回 0，反演报告会告警。
+- 阻力按空气相对速度算，风作为空气速度参与；**密度基准是真实海拔**：`ground_altitude_m` 是地面平面的海拔（飞行时由 `MissionRunner` 传 GPS 原点/地面点海拔，反演时取投放记录的 `origin.alt_m − ground_z`）。关闭 `air_density_isa`（默认）时在**投放（初始）海拔**上算一次 ISA 密度、全弹道共用；打开后按 `ground_altitude_m + 离地高度` **逐级**求值（贵 26–30%，高海拔/大落差时更准）。不再有"地面=海平面"的假设；记录缺原点时退回 0，反演报告会告警。
 - 定步长 RK4（`rk_dt` 默认 0.005 s）；**落点用线性插值定在穿越地面的瞬间**，不是"第一个 z ≥ 地面的步"。
 - `wind_from_snapshot(snapshot, config)`：`wind_source='telemetry'` 时从快照取风；**取不到返回 `None`**，刻意与"风确实是 0"区分开；调用方按零风降级并只记一次日志。
 
@@ -1947,7 +1951,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `events.jsonl` | 各模块经 `recorder.events.emit(kind, **data)`（线程安全、写完即 flush） | `{timestamp, kind, ...}`，`kind` 目录见 §5.2 | 人、复盘脚本 | ⚠ 建议只读（这是任务时间线） |
 | `drops.jsonl` | `MissionRunner(on_drop=…)` → `recorder.drops.append(DropRecord)` | 投放瞬间**原始状态**：位置/速度/姿态（欧拉角+四元数）/风/离地高度/NED 原点/目标点/判据前推位置与预测落点（**数值不四舍五入**） | `tools/fit_ballistics.py`、人 | ⚠ 只读；实测落点写在 `impacts.jsonl`，别改这个文件 |
 | `frames/%06d.jpg` | recorder 的 frame writer 线程（**零重编码**：把缓冲里的 jpeg 字节直接写入磁盘） | 逐帧 JPEG，文件名 = 缓冲序号 | `record.replay.ReplayVideoSource` | ⚠ 删帧会让回放 `strict=True` 报错 |
-| `frames_index.jsonl` | 同上 | `index`、`filename`、`capture_timestamp`、`received_timestamp`、`lag`、`extrapolated`、`offset`、`bytes` | `record.replay.FlightLog` | ⚠ 只读（时间戳必须递增） |
+| `frames_index.jsonl` | 同上 | `index`、`filename`、`capture_timestamp`、`received_timestamp`、`lag`、`extrapolated`、`offset`、`bytes`（`capture = received − lag`；**标定第 2/3 步用 `received_timestamp`**，见 §5.3） | `record.replay.FlightLog`、`tools/calibrate.py` | ⚠ 只读（时间戳必须递增） |
 | `config_snapshot.json` | `start()` 时立刻写 | `asdict(Config)` 全量（含视频地址、标定文件路径） | 人、审查 | ⚠ 只读（"当时怎么配的"证据） |
 | `impacts.jsonl` / `impacts.csv` | **人**（现场量完落点后填） | `index` + 经纬度（`lat_deg`/`lon_deg`/`alt_m`）**或** NED（`north_m`/`east_m`/`down_m`） | `tools/fit_ballistics.py` | ✅ 本来就要手填（模板见 `write_impact_template`） |
 
@@ -1984,10 +1988,10 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `camera_matrix`（3×3）、`dist_coeffs` | 步骤一：棋盘格多视图 `calibrateCamera` | ✅（质量看 `meta.intrinsics.rms_px`） |
 | `image_size` | 同上 | ✅ 标定分辨率——换分辨率要用 `CameraModel.scaled()` 换算 |
 | `R_bc` | 步骤三：手眼标定 `A X = X B` | ✅ 旋转以标定为准 |
-| `t_bc` | **尺量常量**（`tools/calibrate.py` 顶部 `MEASURED_T_BC`） | ✅ 平移以尺量为准；标定估计值只在 `meta.extrinsics.lever_arm` 里供对比 |
-| `telemetry_lag` | 步骤二：画面角速度 × 飞控角速度互相关 | ✅ 标定后回填 `VideoConfig.telemetry_lag` |
+| `t_bc` | **尺量常量**（`tools/calibrate.py` 顶部 `MEASURED_T_BC`） | ✅ 平移以尺量为准；标定估计值只在 `meta.extrinsics.lever_arm` 里供对比（可采信与否看残差 **+** 遥测/画面位置跨度两条判据，见 `telemetry_span_ok`） |
+| `telemetry_lag` | 步骤二：画面角速度 × 飞控角速度互相关（用**收到帧的时刻** `received_timestamp` 测） | ✅ 标定后回填 `VideoConfig.telemetry_lag`；它是**绝对对齐量** = 视频链路延时 − 遥测链路延时，与录制时配置的 lag 无关 |
 | `meta.intrinsics` | `rms_px`、`views`、`per_view_errors`、`pattern_size`、`square_size_m` | 诊断 |
-| `meta.time_offset` | `lag_s`、`peak_correlation`、`samples`、`search_s`、`step_s`、`curve` | 诊断（相关系数低 → 激励不足，重采） |
+| `meta.time_offset` | `lag_s`（= 绝对对齐量，同 `telemetry_lag`）、`peak_correlation`、`samples`、`search_s`、`step_s`、`curve`；另加时间轴与互核：`time_base`（恒 `received`）、`lag_baseline_s`（录制时配置的 lag）、`lag_residual_on_capture_axis_s`、`cross_check_ok`、`cross_check_tolerance_s`、`note` | 诊断（相关系数低 → 激励不足，重采；`cross_check_ok=False` → 素材索引里的 lag 与录制配置不一致，只告警，结果仍以 received 轴为准） |
 | `meta.extrinsics` | `pairs`、`residual_rotation_deg`、`axis_spread_deg`、`t_bc_source`、`lever_arm`、`methods`、`note` | 诊断 |
 | `meta.source_dir` | 用了哪个飞行目录 | 追溯 |
 
@@ -2127,7 +2131,7 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | `--out-dir DIR` | make-world | 世界与资产写到哪个目录（默认 `sim/worlds/cuadc`） |
 | `--well-arrows` | make-world | 画"天井箭头"（规则文本有、规则图 2/4 没有；默认不画） |
 | `--sun AZ,EL` | make-world | 太阳位置（方位角,仰角 度；换阴影环境用，如 `90,12` = 东侧长阴影） |
-| `--sun-random` | make-world | 太阳由 seed + 轮次随机（方位全向、仰角 15~80°；换 seed 换光照） |
+| `--sun-random` | make-world | 太阳由 seed + 轮次随机（方位全向、仰角 15–80°；换 seed 换光照） |
 | `--aerial-patches N` | make-world | 比赛区域外铺几块航拍干扰底图（0 = 不铺；默认 12） |
 | `--size N` | make-backdrops / fetch-aerial | 底图贴图边长（像素，默认 512） |
 | `--seed N` | make-backdrops | 底图随机种子（`ground_*` / 程序化 `aerial_*` 长什么样） |
@@ -2169,6 +2173,44 @@ HOLD_PROCESS → OVERFLY（飞掠 + 投放）→ LAND → DONE
 
 ⚠ 关掉的自检项**不算通过**：每项都会落一条 `preflight` 事件（`ok=null`），
 正式任务起飞前请核对该事件；`preflight_skipped` 则表示根本没注入预检对象。
+
+**现场执行顺序（正式任务照这个次序走）**
+
+1. **链路先就绪，再启动程序**：飞控/数传/图传上电、MAVSDK 地址可达之后才
+   `python -m airdrop.run full-mission`。`thread.connect()` 是**阻塞**调用（连不上就抛异常，
+   退出码 1）；`INIT` 的等待上限 `init_max_s`（默认 30s）在状态机装配时就起算——链路没就绪
+   时程序不会替你等，超时直接 `ABORT(init_no_telemetry)` / `init_no_origin`（见 §4.13）。
+2. **确认连接与原点**：日志出现 `飞控已连接：…`，事件出现 `origin`（经纬度 + 海拔）
+   → 遥测位置与 NED 原点都就绪，`INIT` 放行到 `PREFLIGHT`。
+3. **等起飞前自检跑完再起飞**：`PREFLIGHT` 载入 detector / ocr / camera 并做视频自检，
+   逐项落 `preflight` 事件。自检不过会**在地面就** `ABORT(preflight_failed:<check>)` 并下
+   `abort_action`；此时若飞机已经起飞，就变成"刚起飞就判失败、飞机在空中盘旋"。所以
+   **建议自检通过之后再上传航线、再起飞**（自检与上传之间没有强制先后，只是这样更稳）。
+4. **操作手在 QGC 上传侦查航线并 Start Mission**：`recon_upload="operator"`（默认）时本包
+   **不 arm、不 takeoff、也不上传侦查航线**——"自动起飞"只能来自操作手启动的那条含起飞项
+   （`NAV_TAKEOFF`）的任务。上传在程序启动之前或之后都行，唯一要求是**在侦查段飞完之前**
+   让本包看到它；操作手可以自己画，也可以把 `RoutesConfig.recon_plan` 那份 `.plan` 导入 QGC
+   再上传（**那条配置只对 `"auto"` 档生效**，operator 档本包不读它）。
+5. **程序自动进侦查**：检测到在空中（`in_air` 为主，取不到时相对高度 ≥ `airborne_alt_m`，
+   默认 5m）→ 记 `airborne` → 进 `RECON` 并记 `recon_waiting_operator` → 确认飞控真的在
+   `MISSION`（`mission_confirmed`）→ 开始监视任务进度。
+6. **这个窗口要盯住**：进 `RECON` 后 `recon_max_s`（默认 600s）内必须确认到 `MISSION`，
+   否则 `ABORT(mission_not_started)` → 默认 `abort_action="hold"`（固定翼盘旋）。
+   **手动起飞但没启动任务 = 同样会等到超时**：侦查航线必须在飞控里真的跑起来。
+7. **侦查飞完之后的动作由本包接手**：`HOLD_PROCESS` 下 `hold`（盘旋）等目标统计（上限
+   `hold_process_max_s`，默认 10s）→ 本包**唯一一次上传**（飞掠段 + 降落段合成一条任务，
+   会覆盖飞控里当时存的那条）→ `OVERFLY` 投放 → `LAND` → `DONE`。
+8. **收尾**：落地后看 `flights/<时间戳>/`（`events.jsonl` 里逐条状态与原因，见 §5.2）；
+   Ctrl-C 会让程序按 `ABORT` 处理并下安全动作（退出码 130），不是直接退出。
+
+⚠ 现场最容易跑错的三条：
+
+* **侦查段已经飞完才启动程序**：`MissionMonitor` 要求"先见到一次未完成"才认"已飞完"
+  （防飞控侧的陈旧读数），已经飞完的任务不会被采信 → 一直空等到 `recon_max_s` 超时才
+  `ABORT`（超时原因看飞控当时的模式：仍是任务模式则 `recon_timeout`，已切出任务模式则
+  `mission_not_started`）。程序要在侦查段结束前就在跑。
+* **手动起飞之后不切任务模式**：见第 6 条——600s 后 `ABORT(mission_not_started)`。
+* **把"关掉自检"当成"自检通过"**：`--no-preflight` 只是跳过（事件里 `ok=null`）。
 
 **SITL 用哪个世界**：`examples/sitl_mission.py` 的航线与合成目标已对准
 `sim/worlds/cuadc/cuadc_recon_strike_r2.sdf`（CUADC 赛区：跑道 + A/B 两个 60x60m 目标区
@@ -2238,7 +2280,8 @@ config = Config(
 ### 6.6 一次真实任务的推荐顺序
 
 1. **标定**：`examples/calibration_capture.py` 录素材 → `tools/calibrate.py` 出 `camera_calib.json`
-   → 把 `telemetry_lag` 回填 `VideoConfig`（一步同时解决相机外参与时间差）。
+   → 把 `telemetry_lag` 回填 `VideoConfig`（标定用**收到帧的时刻**测量，输出就是可直接回填的
+   绝对对齐量；一步同时解决相机外参与时间差）。
 2. **配置**：`RECON_ROUTE`/`BACKUP_POINT` + 降落段——**要么**用操作手在 QGC 里画好的
    `routes/land.plan`（推荐，降落剖面由 QGC 保证），**要么**写 `LANDING_ROUTE` 航点
    （WGS84，高度是**相对起飞点**，且必须满足 §7 第 32 条的降落几何）；再配 `OVERFLY_HEADING_DEG`；
@@ -2246,7 +2289,9 @@ config = Config(
 3. **拆桨/演练**：`DRY_RUN=True` 跑 `examples.full_mission.py`，或先在 SITL 跑 `examples/sitl_mission.py`。
 4. **投放试验**：飞几次投放 → 量落点填 `impacts.jsonl` → `tools/fit_ballistics.py` →
    只把 `reliable=True` 的那组参数回填 `BallisticsConfig`。
-5. **装弹实飞**：`DRY_RUN=False`，确认 PX4 侧 gripper 输出与 `abort_action` 符合空域要求。
+5. **装弹实飞**：`DRY_RUN=False`，确认 PX4 侧 gripper 输出与 `abort_action` 符合空域要求；
+   起飞当天的现场次序照 §6.3 的"现场执行顺序"走（链路先就绪 → 连接/原点 → 自检通过 →
+   操作手 QGC 上传并启动侦查航线 → 程序自动进 `RECON`）。
 
 ## 7. 代码审查速查
 
@@ -2353,7 +2398,7 @@ config = Config(
 - [ ] 新增参数有没有进 `Config.validated()` 的取值域检查？
 - [ ] 失败路径是否**显式**（抛错 / `ok=False` / `None` 三选一，并在 docstring 写明）？
 - [ ] 是否碰了 §7.1 里 43 条不变量中的任何一条？改了哪条就要同步 `AGENTS.md` 与对应专题笔记。
-- [ ] 碰了任务项 / 航线来源 / 启动与完成判定（§7 第 31~35 条）时，除了离线用例，**跑一次 SITL 演练**（`examples/sitl_mission.py`）——这四条都是"离线测不出来、真飞控才暴露"的。
+- [ ] 碰了任务项 / 航线来源 / 启动与完成判定（§7 第 31–35 条）时，除了离线用例，**跑一次 SITL 演练**（`examples/sitl_mission.py`）——这四条都是"离线测不出来、真飞控才暴露"的。
 - [ ] 回归用例加了吗（`tests/` 是回归落点）？跑过 `pytest -m "not realdata and not sitl and not stream"` 吗？
 - [ ] 三份文档是否同步：`README.md`（怎么用）、`AGENTS.md`（约定与易错点）、本手册（目录/参数/产物）？
 
