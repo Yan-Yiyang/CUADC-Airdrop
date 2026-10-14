@@ -9,7 +9,7 @@
   Cd/m/A 的退化）、**测量文件的各种写法**（经纬度 / NED / CSV / 模板）、
   以及 ``tools/fit_ballistics.py`` 这条现场流程真能跑通。
 
-全部离线、不用硬件；临时目录放在工作区内（不用 ``tmp_path``，见 AGENTS.md）。
+全部离线、不用硬件；临时目录放在工作区内（沿用本文件的 fixture）。
 """
 
 from __future__ import annotations

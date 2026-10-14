@@ -1152,7 +1152,6 @@ def _index_telemetry(
     ``record.telemetry_hz=10`` 落盘约 1800 条，200 个位姿就是 **36 万次**
     ``quaternion_to_matrix`` + 36 万次 ``np.eye(4)``，几秒纯浪费。
 
-    这也直接违反本项目自订的规矩（AGENTS.md 易错点 2：「禁止重建整张时间列表」）。
     现在由 :func:`align_body_poses` 建一次并传下来。
     """
     usable: list[TelemetrySnapshot] = []

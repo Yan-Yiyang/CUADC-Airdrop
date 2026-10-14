@@ -287,7 +287,6 @@ def test_stop_takes_the_supervisor_lock_that_connect_holds() -> None:
       A 接着把 _stop_requested 清掉（抹掉 B 的停止意图）并装入新的 _serve
         → System() → mavsdk_server 子进程占死固定的 gRPC 50051，
         而 _thread/_loop 引用已被 B 清成 None ⇒ 之后没人能停它。
-    （AGENTS.md 易错点 1 / 14 描述的正是这类事故。）
 
     竞态本身难确定性复现，这里钉住它的必要条件：stop() 也要进这把锁。
     """

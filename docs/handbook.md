@@ -24,13 +24,13 @@
 | --- | --- | --- |
 | `README.md` | 怎么用：安装、四条入口、配置速览、安全提示 | 使用口径 |
 | **本文档** `docs/handbook.md` | 全景手册：目录、数据流、逐模块调用方法、参数总表、输入输出、流程、审查清单、排障 | 使用 + 审查口径 |
-| `AGENTS.md` | 给 AI 智能体的工作手册：环境约定、架构要点、关键易错点索引、验证方式 | 约定口径 |
+| `AGENTS.md` | 面向 AI 智能体的执行约束、代码入口与按需阅读索引 | 智能体工作指南 |
 | `docs/calibration_opencv.md` | 三步标定与 OpenCV 5.0 问题与易错点全记录（实测表、方程、判据） | **实测口径** |
 | `docs/video_hm30_ffmpeg.md` | 图传链路为什么只有 ffmpeg 一个后端 + 逐项实测 | **实测口径** |
 | `docs/perception_ocr.md` | 检测/OCR 细节：转正形态门限、Cls 权重命名、onnxruntime 前提 | **实测口径** |
 | `docs/ballistics_fit.md` | P12 投放记录与反演：可辨识性判据、σ、留一验证 | **实测口径** |
 
-**冲突时的优先级**：代码与 `docs/` 下的实测记录 > 本文档 > `AGENTS.md`/`README.md` 的概述性描述。
+**冲突时的优先级**：当前代码、配置与测试 > 相关专题文档 > 本手册 > `AGENTS.md`/`README.md` 的概述性描述。
 本文档刻意**不复制**专题笔记里的长篇实测结论，只给一行指针——要动那条链路前先读笔记。
 
 ### 0.3 一分钟了解这个项目
@@ -114,6 +114,25 @@
 
 `flights/` 曾长期未被 ignore（`git status` 会列出整个飞行目录），现在已进 `.gitignore`；
 `routes/` 相反是**要入库**的：`.plan` 是飞行输入，审查时要能看到"这次飞的是哪条航线"。
+
+### 1.4 `models/` 目录与模型文件（文件是否可用以实际安装为准）
+
+| 文件 | 大小 | 进 git | 用途 |
+| --- | --- | --- | --- |
+| `models/.gitkeep` | 0 | 是 | 占位 |
+| `models/best2.pt` | 5.95 MB | 否 | **唯一可用的 YOLO 权重**（单类 `target`）；`best.pt` / `best1.pt` 已废弃（零检出） |
+| `models/ppocr/PP-OCRv6_det_medium.pth` | 60.6 MB | 否 | OCR 检测模型（默认） |
+| `models/ppocr/PP-OCRv6_rec_medium.pth` | 73.4 MB | 否 | OCR 识别模型（默认） |
+| `models/ppocr/PP-OCRv6_{det,rec}_{small,tiny}.pth` | 1.9–20 MB | 否 | 备选尺度（`OcrEngineConfig` 可切） |
+| `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 0.56 MB | 否 | 方向分类 TORCH 版（**文件名不许规范化**，见笔记） |
+| `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 0.56 MB | 否 | 方向分类 ONNX 版（**启用方向分类时**默认用它，最快；默认 `cls_autorotate=False` 不参与识别） |
+| `models/ppocr/ppocrv6_dict.txt` | 70 KB | **是** | rec 字符集字典（固定识别字符集） |
+| `models/ppocr/ppocrv6_tiny_dict.txt` | 30 KB | **是** | tiny 模型字典 |
+
+取权重：`python -m airdrop.run fetch-models`（**只复制、不联网**；源路径是文件内常量，可由 `--source-dir` 覆盖）。
+> Cls 权重命名与 onnxruntime 的 CUDA 前提见 [docs/perception_ocr.md](perception_ocr.md)。
+
+---
 
 ## 2. 数据流与模块依赖
 
@@ -365,9 +384,8 @@ DryRunController(inner: MissionController, *, on_event=None)
 委托给 `inner`。用途：SITL 与"不装弹"演练能走完整状态机（SITL 里没有 gripper 硬件，
 投放被拒会让状态机按失败进 ABORT）。**真机装弹时绝不能使用。**
 
-> 线程/重连细节、`_release_drone()` 的必要性、可选流为什么不影响会话、以及"为什么任务项一律走
-> `mission_raw`"（MAVSDK 的 `vehicle_action=LAND` 会把一项拆成两项、被 PX4 固定翼整条拒掉）→
-> `AGENTS.md` 的"架构要点 / 关键约定"。
+> 遥测会话与释放实现见 `airdrop/telemetry/mavsdk_thread.py`；任务项上传与查询实现见
+> `airdrop/telemetry/controller.py`。
 
 ### 3.2 `airdrop.video` —— 图传接收、对齐与缓冲
 
@@ -1004,7 +1022,7 @@ cluster_points(points, config) -> (clusters, noise, rejected)
 select_cluster(clusters, config) -> Cluster | None
 ```
 
-流程与取舍（完整实测结论记在 `AGENTS.md` 的 P7 段与 `cluster.py` 模块 docstring 里）：
+流程与取舍见 `airdrop/targeting/cluster.py` 的模块说明及对应测试：
 
 1. **先排序**：输入按 `(capture_timestamp, frame_index)` 排序后再聚类——DBSCAN 的标签号依赖到达顺序，不排序结果不可复现。
 2. **先剔病态点**：坐标非有限（georef 病态给出 `inf`/`nan`）的点进 `rejected` 并计数，不参与聚类。
@@ -1076,7 +1094,7 @@ reset()
 判定逻辑：
 
 1. 每拍用当前快照预测落点，**水平误差 ≤ `radius_m` 即投**（`reason='predict'`）；
-2. **本次飞掠里先从目标前方接近过**（`approached=True`）且已越过目标、`force_after_pass=True` 时，执行强制投放（`reason='fallback'`）。⚠ "越过"只看沿航向的投影符号，没有 `approached` 前提的话，进入飞掠时飞机投影已在目标后方（例如刚结束盘旋、还在飞往入场点）会在第一拍假触发（实测 r2 世界架次 <架次>：113 m 误差）；
+2. **本次飞掠里先从目标前方接近过**（`approached=True`）且已越过目标、`force_after_pass=True` 时，执行强制投放（`reason='fallback'`）。⚠ "越过"只看沿航向的投影符号，没有 `approached` 前提的话，进入飞掠时飞机投影已在目标后方（例如刚结束盘旋、还在飞往入场点）会在第一拍假触发；
 3. **一次投放即锁存**：投过之后不再触发，`reset()` 才能重新武装（`approached` 也一并清零，每次飞掠各自重新计）；
 4. `delay_s` 的状态前推是一阶近似（位置 += 速度 × 延迟），不做加速度二次项；
 5. 摘要按 `SUMMARY_HZ`（5 Hz）落事件日志，触发瞬间写完整预测（落点/飞行时间/水平误差/前推后位置）。`on_event` 签名 `(kind, data)`，接 recorder 的标准写法是 `lambda kind, data: recorder.events.emit(kind, **data)`；事件写盘失败**不影响判据**。
@@ -2262,9 +2280,9 @@ config = Config(
 ### 6.5 测试怎么跑
 
 ```bash
-./.venv/Scripts/python.exe -m pytest                     # 全部（附覆盖率，当前 ≈85%；默认已排除 realdata/sitl）
+./.venv/Scripts/python.exe -m pytest                     # 全部（附覆盖率；默认已排除 realdata/sitl）
 ./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"  # 再跳过要起 ffmpeg 的用例
-./.venv/Scripts/python.exe -m pytest -m realdata         # GPU + 旧版 实战素材（分钟级）
+./.venv/Scripts/python.exe -m pytest -m realdata         # GPU + 外部真实素材（需另行提供）
 ./.venv/Scripts/python.exe -m pytest -m sitl             # WSL 里已起 PX4 SITL + 图传（分钟级）
 ./.venv/Scripts/python.exe -m pytest -k mission -v       # 只跑某个主题
 ```
@@ -2284,7 +2302,7 @@ config = Config(
 | `tests/test_perception.py` | pipeline 逻辑（假 detector / 假 OCR 池）、去重、编号不被覆盖 | 否 |
 | `tests/test_camera_pipeline.py` | 原图与 remap 视线一致性、尺寸不匹配拦截、显式缩放模型与旧记录兼容 | 否 |
 | `tests/test_capture_entry.py` | 标定采集入口正常/中断/视频未就绪/零帧的返回码、摘要、文件与资源清理 | 否 |
-| `tests/test_perception_realdata.py` | 真 YOLO + 真 OCR 在 旧版 素材上读对编号（56/56/56） | ✅ GPU + 素材绝对路径 |
+| `tests/test_perception_realdata.py` | 真 YOLO + 真 OCR 的外部素材回归（素材不随仓库提供） | ✅ GPU + 素材绝对路径 |
 | `tests/test_georef.py` | 相机模型加载/回退、像素→NED、边长法交叉验证（**沙箱里挂 `tmp_path`**） | 否 |
 | `tests/test_calibrate.py` | 标定三步合成链路（含整个 `calibrate()` 的输出契约） | 否 |
 | `tests/test_targeting.py` | DBSCAN 语义（eps 闭区间、样本权重是绝对权重）、众数、median/max | 否 |
@@ -2420,10 +2438,10 @@ config = Config(
 - [ ] 有没有在业务代码里硬编码数值（应进 `config.py`）？
 - [ ] 新增参数有没有进 `Config.validated()` 的取值域检查？
 - [ ] 失败路径是否**显式**（抛错 / `ok=False` / `None` 三选一，并在 docstring 写明）？
-- [ ] 是否碰了 §7.1 里 43 条不变量中的任何一条？改了哪条就要同步 `AGENTS.md` 与对应专题笔记。
+- [ ] 是否碰了 §7.1 中的行为约束？若有变化，更新对应源码说明、测试与相关专题文档。
 - [ ] 碰了任务项 / 航线来源 / 启动与完成判定（§7 第 31–35 条）时，除了离线用例，**跑一次 SITL 演练**（`examples/sitl_mission.py`）——这四条都是"离线测不出来、真飞控才暴露"的。
 - [ ] 回归用例加了吗（`tests/` 是回归落点）？跑过 `pytest -m "not realdata and not sitl and not stream"` 吗？
-- [ ] 三份文档是否同步：`README.md`（怎么用）、`AGENTS.md`（约定与易错点）、本手册（目录/参数/产物）？
+- [ ] 相关文档是否同步：`README.md`（怎么用）、本手册（目录/参数/产物）及任务涉及的专题文档？
 
 ---
 
@@ -2466,6 +2484,21 @@ config = Config(
 
 ### 9.1 已知边界与未验证项（别当成已完成）
 
+| 项 | 现状 |
+| --- | --- |
+| 弹道参数 | 质量 0.365 kg 是**称重占位值**（要实测填入）；`drag_coefficient=0.6`、`cross_area_m2=0.004` 是 350ml 水瓶估计；**反演工具就绪但尚无真实投放数据验证** |
+| 飞掠段长/高度/航向 | `leg_length_m=200`、`altitude_m=20` 待实验验证 |
+| 相机标定 | 只在合成链路上验证过；真实素材复测与 `telemetry_lag` 实测值待一次真实采集 |
+| SITL 演练 | 旧演练使用合成目标，未覆盖真实感知或实机投放精度；历史单次结果不代表当前完整链路已验收 |
+| `.plan` 航线 | 解析与复杂项展开在 `tests/test_plan.py`（现场造的样例）+ 入库的 `routes/land.plan` 上验证过；真实任务航线由运营方在 QGC 里提供，**只支持 `fwLandingPattern`**（VTOL 降落、测绘/结构航线显式报错） |
+| 生成航点的接受半径 | `DEFAULT_WAYPOINT_ACCEPTANCE_M = 3.0` 对固定翼偏紧——SITL 里出现过飞机绕着末航点转、迟迟不"到点"（进度停在 `current=2/total=3`）；QGC `.plan` 的航点自带 `param2`，不受这条影响。真机前建议按机型确认 `NAV_ACC_RAD` 与此值 |
+| `cls12` 模式 | 无 12 类权重（`best2.pt` 单类）→ 编号恒为 1，代码路径可跑但无实际意义 |
+| 方向分类交叉验证（**诊断用，默认关**，不参与识别） | 旧样本出现过误报，不能据此保证其他素材上的判定可靠性 |
+| PX4 侧配置 | gripper 输出、起飞项航点动作、任务结束后是否 RTL 都不在本包范围内 |
+| 仿真世界 | `sim/worlds/cuadc/` 的两个赛区世界已按规则（2026 版第 19–25 页）搭好并做离屏渲染核对（几何/尺寸/贴图方向，见 [`simulation_world.md`](simulation_world.md)）；天井位置与朝向按规则随机（`--seed` 复现，入库 = seed 0）；**未验证**：把 Gazebo 相机接进感知闭环、真机与世界的差异 |
+| 工程设施 | 无 CI（pytest/ruff/pyright 在本地运行）；覆盖率以当前测试报告为准；沙箱权限问题须与代码失败分别核实 |
+| 声明但尚未接入的参数 | 见 §4.18 的表（`save_crops`/`crop_dir`/`max_crops`/`lag_warn_frames`/相机 `undistort`/`flat`+经纬度/记录 `video`/`event_eval_hz`） |
+
 ### 9.2 数据与结果的可复现性
 
 - **权重不进 git**：拿权重后配 `config_snapshot.json` 才知道当时用的是什么；`models/ppocr/*.txt` 字典入库，
@@ -2489,4 +2522,4 @@ config = Config(
 ```
 
 改动代码后：① 跑 `tools.check_docs`；② 参数变了同步 §4；③ 新增产物/字段同步 §5；
-④ 不变量变了同步 §7 与 `AGENTS.md`；⑤ 边界变了同步 §9.1 与 `README.md` 的"已知边界与风险"。
+④ 行为约束变了同步 §7 与相关源码说明；⑤ 边界变了同步 §9.1 与 `README.md` 的"已知边界与风险"。

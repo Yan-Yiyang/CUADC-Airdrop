@@ -195,7 +195,6 @@ class MavsdkThread:
         #   A 接着把 _stop_requested 清掉（抹掉 B 的停止意图）并装入新的 _serve
         #     → System() → mavsdk_server 子进程起来占死固定的 gRPC 50051，
         #     而 _thread/_loop 引用已被 B 清成 None ⇒ 之后没人能停它。
-        # 参见 AGENTS.md 易错点 1 / 14。
         with self._supervisor_lock:
             self._stop_requested.set()
             supervisor, self._supervisor = self._supervisor, None
@@ -207,8 +206,7 @@ class MavsdkThread:
 
         # 绑局部变量：self._loop 会被循环线程在 _run_loop 的 finally 里置 None，
         # 三次独立读之间可能插进来（200/201 行），AttributeError 会让下面
-        # _release_drone / _ready.clear 全部不执行——那恰恰是 AGENTS.md 易错点 1
-        # 反复强调的头号事故（mavsdk_server 残留占死 50051）。
+        # _release_drone / _ready.clear 全部不执行，留下 mavsdk_server 占用 50051。
         loop = self._loop
         if loop is not None and not loop.is_closed() and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
@@ -575,7 +573,7 @@ class MavsdkThread:
             await stream
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - 可选流失败不是会话失败（见 AGENTS.md 第 3 条）
+        except Exception as exc:  # noqa: BLE001 - 可选流失败不是会话失败
             LOGGER.info("可选遥测流 %s 不可用（%s），相关功能降级", name, exc)
             return
         LOGGER.info("可选遥测流 %s 已结束，相关功能降级", name)

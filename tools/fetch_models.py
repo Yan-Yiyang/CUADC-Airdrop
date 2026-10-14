@@ -80,8 +80,7 @@ def copy_missing(source: Path, target: Path, names: tuple[str, ...]) -> tuple[in
     ⚠ ``missing`` 是为了让 :func:`main` 能区分"都已在位"与"**源目录写错了**"。
     原来只返回 copied，``--source-dir`` 打错一个字时会对 13 个文件逐个打印
     ``[跳过] 源缺失``，然后 ``total == 0`` ⇒ 打印"（都已在位，无需复制）"并
-    **返回 0** —— "取权重失败"被静默转成成功。AGENTS.md 描述的流程是"起飞前逐条
-    核对"，这个 0 会让它看起来像成功。
+    **返回 0** —— "取权重失败"被静默转成成功。这个 0 会让调用方误以为成功。
     """
     copied = 0
     missing = 0

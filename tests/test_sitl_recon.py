@@ -52,7 +52,7 @@ def _sitl_is_up(timeout: float = 8.0) -> bool:
 
     刻意不用 ``MavsdkThread.connect()`` 探活：那要拉起 mavsdk_server 与 gRPC 通道，而
     "连不上再收尾"这条路径实测会卡死整个进程（gRPC poller 线程报
-    ``Event loop is closed``，见 AGENTS.md 易错点 1）——探活只需要知道
+    ``Event loop is closed``）——探活只需要知道
     "14540 上有没有人在发心跳"。
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

@@ -151,6 +151,11 @@ sim/                                 # 仿真模块（世界 + 机型 + airframe
 | `ground_asphalt…ground_gravel.png`（512×512，6 张） | 目标区"底色"：6 种常见路面/地面色（沥青/旧水泥/混凝土/土面/砖面/砂石），**纯色 + 少量同色系纹理**（污渍/颗粒/淡裂纹） | `python -m airdrop.run make-backdrops`（程序化，可复现；`--seed` 换一批） |
 | `aerial_1…aerial_6.png`（512×512，6 张） | 比赛区域外的"随机航拍干扰底图"：农田/商区/住宅/工业/林地/湿地 | 默认同上（程序化）；也可 `python -m airdrop.run fetch-aerial` 换成真实航拍影像——**USDA NAIP via USGS National Map，公有领域**（160m/张、约 0.3m/像素），入库请保留这句来源说明 |
 
+图片靶素材只用于本地仿真迭代；要对外再分发请自行确认附件素材的授权。
+`ground_*` / `aerial_*` 两张底图集合是**同一组文件名**由两个命令写：`make-backdrops`
+（离线、程序化）与 `fetch-aerial`（联网、真实影像）；谁后跑谁生效，想让程序化生成
+也覆盖不到真实航拍图就用 `make-backdrops --parts ground`。
+
 ## 5. 起 SITL（WSL / Linux）
 
 世界文件必须出现在 PX4 的 worlds 目录里（`px4-rc.gzsim` 按
@@ -176,7 +181,7 @@ PX4 树里不再存手工副本；装机细节、可选补丁与还原办法见 
 
 机型默认用 **`gz_rc_cessna_down_cam`**：机身下挂 1280×720@30Hz、水平视场 1.74 rad 的
 相机（merge PX4 模型库里的基础 `rc_cessna` + 本仓库的 `camera_720p` 子模型）。
-相机话题由 Gazebo 按作用域命名，特定环境测量（r2 世界）：
+相机话题由 Gazebo 按作用域命名，旧 r2 世界样例（实例名以实际运行时为准）：
 
 ```text
 /world/cuadc_recon_strike_r2/model/rc_cessna_down_cam_0/link/camera_link/sensor/imager/image
@@ -195,15 +200,14 @@ PX4 树里不再存手工副本；装机细节、可选补丁与还原办法见 
 ### 5.1 视频流：PX4 自带的 GstCameraSystem（官方机制，无需自己搭）
 
 PX4 的 `gz_bridge/server.config` 给**每个世界**自动加载一个 GStreamer 相机系统插件
-（`src/modules/simulation/gz_plugins/gstreamer/`；特定环境测量 gz server 进程里已加载
-`libGstCameraSystem.so`）。按官方源码与插件 README：
+（`src/modules/simulation/gz_plugins/gstreamer/`）。按官方源码与插件 README：
 
 * 插件**自动发现世界里的第一台相机**（本项目 = `rc_cessna_down_cam` 的下视相机），
   用 GStreamer 编码成 **RTP/H.264 推到 `127.0.0.1:5600`**（默认值）；
 * **QGC 侧**：Application Settings → Video → Video Source = `UDP h.264 Video Stream`、
   UDP Port = `5600` 即可看画面（WSL 里的 QGC 开箱即用——它是官方的默认接收端配置）。
   ⚠ 别把 Video Source 选成 TCP 类的源（`TCP-MPEG2 Video Stream`）再填 `0.0.0.0:5600`：
-  特定环境测量 QGC 会**启动即闪退**；真闪退了就改回 ini（Windows：
+  旧环境中曾出现 QGC **启动即闪退**；真闪退了就改回 ini（Windows：
   `%APPDATA%\QGroundControl\QGroundControl.ini`）里的 `videoSource=UDP h.264 Video Stream`
   + `udpUrl=0.0.0.0:5600` 即可恢复（TCP 那条 `tcpUrl` 删掉，它的默认值是空）；
 * **想让 Windows 的 QGC 收**：起仿真前设 `PX4_VIDEO_HOST_IP=<主机的局域网 IP>`（例如
@@ -280,7 +284,7 @@ python -m airdrop.run preview-world
 * 目标区底色与比赛区域外的航拍底图是**抗扰用的随机项**，不在规则里：入库的是
   程序化生成的底图（离线可复现）；换成 `fetch-aerial` 抓的真实影像（USGS/NAIP，
   公有领域）后请按 §4 保留来源说明。真实影像只是"背景素材"，不参与任何几何/规则约束。
-* 感知只在离线回放（旧版 素材）与真实相机链路上验证过；**把 Gazebo 相机接进
+* 感知只在离线回放（外部素材）与真实相机链路上验证过；**把 Gazebo 相机接进
   `airdrop.perception` 还没做**——世界这边已就位：默认机型 `gz_rc_cessna_down_cam`
   在出图（1280×720@30Hz，朝向正确；贴地时相机穿模看到背景色，空中正常），
   且 **PX4 自带的 GstCameraSystem 会把第一台相机自动推到 UDP 5600 的 RTP/H.264**

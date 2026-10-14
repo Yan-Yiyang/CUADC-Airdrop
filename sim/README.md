@@ -171,17 +171,15 @@ ffmpeg 直接收（mirrored 网络共享端口；**不必用 HM30，也不用 QG
 * **`FW_LND_USETER=0` 也在仿真机型里永久置 0**：SITL 机型没有测距传感器，而 FW 自动
   降落默认要用地形估计（1），拿不到估计时会按 `FW_LND_ABORT`（默认 3 含地形位）
   在进入降落段 10 s 后 abort 降落、在落点上方 30 m（`MIS_LND_ABRT_ALT`）无限盘旋——任务永远不结束
-  （实测架次 <架次>：`Holding at 30 m above landing waypoint.`，
+  （旧日志示例：`Holding at 30 m above landing waypoint.`，
   最后靠状态机 `land_timeout` 收场）。置 0 = 不要求地形估计，flare/下滑用航点高度；
 * 有 QGC 连着更好（真机流程本来就有地面站；它能满足预检的数据链检查）；
 * **跑精度测试一律用无头模式**（`HEADLESS=1 bash sim/run_sitl.sh r2`）：带 GUI 时
-  `gz sim -g` 会和感知抢同一块 GPU，实测把仿真拖到 ~0.5x 实时（ulog 里"侦查飞完"
-  =53.6 模拟秒、遥测同一事件=101.6 实时秒）⇒ 检测只有 8~22 fps、感知落后 ~1900 帧，
-  `HOLD_PROCESS` 看不到目标（架次 <架次> 实测）。`px4-rc.gzsim` 里
+  `gz sim -g` 会与感知共享 GPU 资源；旧样本的运行耗时不作为其他环境的性能保证。`px4-rc.gzsim` 里
   `if [ -z "${HEADLESS}" ]` 才起 GUI，所以置 1 即可；
 * 测试期间会临时置 0 的飞控参数有两条（跑完都还原）：`NAV_DLL_ACT`（无数据链 failsafe）
   与 `NAV_RCL_ACT`——SITL **没有遥控**（ulog `manual_control_signal_lost` 恒 true），
-  默认的 RC-loss 动作（Return）会在飞几十秒后把飞机拉回场（架次 <架次> 实测）。
+  默认的 RC-loss 动作（Return）会在飞几十秒后把飞机拉回场。
 * **"任务上传成功、飞机却原地盘旋"这类问题的第一手证据在 PX4 的 ulog 里**：
   `~/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<日期>/*.ulg`，用 pyulog 读
   `logged_messages`（看 `mission_feasibility_checker` / `navigator` 的原话）与

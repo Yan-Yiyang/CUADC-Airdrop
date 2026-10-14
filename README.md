@@ -28,9 +28,9 @@
 
 > **第一次上手先看 [`docs/handbook.md`](docs/handbook.md)**（项目手册：目录总览、各模块调用方法与
 > 最小示例、参数总表、输入输出字段、使用流程、代码审查速查、排障表）。
-> 设计决策与"遇到过的问题/实测结论"在 **[`AGENTS.md`](AGENTS.md)**（本仓库的工作手册），
+> AI 智能体的执行约束与按需阅读索引见 **[`AGENTS.md`](AGENTS.md)**；用户使用说明见项目手册与专题文档。
 > 长专题（标定/OpenCV、图传/ffmpeg、感知/OCR、投放反演）在 **[`docs/`](docs/)** 下的专题笔记，
-> 两者**同等权威**。README 只说明使用方法。
+> 按任务需要查阅。README 说明项目使用方法。
 
 ## 目录结构
 
@@ -193,11 +193,13 @@ python -m airdrop.run calibrate --flight flights/<那份目录>   # 常量仍是
 3. **手眼外参**：`AX=XB` 求 `R_bc`；**`t_bc` 以尺量为准**，标定估计值写进报告供对比校验
    （室内手持没有 GPS，平移不可信）。
 
+> 目前仅有**合成链路**验证；真实素材复测与 `lag_s` 现场值尚未验证。
+
 ## 记录与回放
 
 一次飞行 = 一个 `flights/<时间戳>/` 目录：`flight.log`、`telemetry.jsonl`、
 `detections.jsonl`、`drops.jsonl`、`events.jsonl`、`frames/*.jpg` + `frames_index.jsonl`、
-`config_snapshot.json`。帧**零重编码**（直接写缓冲里的 jpeg），磁盘 ≈4.5MB/s @720p30。
+`config_snapshot.json`。帧**零重编码**（直接写缓冲里的 jpeg）。
 
 回放按**原时间轴**重放帧与遥测，于是对齐/解算/统计**均无需改动**：
 `ReplayVideoSource` 与 `Hm30VideoSource` 是同一套接口，遥测由 `TelemetryPacer`
@@ -250,19 +252,15 @@ ffmpeg 的错误原样抛出来（`stats.last_error`）；手动核对一条命�
 ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f null -
 ```
 
-图传**只有 ffmpeg 一个后端**，不要再引入 `cv2.VideoCapture`。真实理由是：(1) 管道反压让
-接收侧保持浅流水（实测 0 帧积压，而 cv2 后端有 17 帧 ≈0.57s 的内部排队）；(2) `read()`
-是 C 层不可中断调用，卡住只能杀进程；(3) 断流超时靠 ffmpeg 的 `-timeout`（微秒）。
-⚠ 早期文档里"OpenCV 5.0 移除了 `OPENCV_FFMPEG_CAPTURE_OPTIONS`"的说法**是错的**
-（那个字符串在插件 DLL 里，grep 错了文件）——完整复盘与逐项实测表见
-[`docs/video_hm30_ffmpeg.md`](docs/video_hm30_ffmpeg.md)。
+图传**只有 ffmpeg 一个后端**，不要再引入 `cv2.VideoCapture`：采集由独立进程负责，断流超时
+通过 ffmpeg 的 `-timeout`（微秒）控制。完整链路说明见 [`docs/video_hm30_ffmpeg.md`](docs/video_hm30_ffmpeg.md)。
 
 ## 测试与代码规范
 
 ```bash
-./.venv/Scripts/python.exe -m pytest                 # 全部（附覆盖率，当前 ≈85%；默认已排除 realdata/sitl）
+./.venv/Scripts/python.exe -m pytest                 # 全部（默认已排除 realdata/sitl）
 ./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"  # 再跳过要起 ffmpeg 的用例
-./.venv/Scripts/python.exe -m pytest -m realdata     # GPU + 旧版 实战素材（分钟级）
+./.venv/Scripts/python.exe -m pytest -m realdata     # 真实素材用例（需要相应本地素材与 GPU）
 ./.venv/Scripts/python.exe -m pytest -m sitl         # WSL 里已起 PX4 SITL + 图传（分钟级）
 ./.venv/Scripts/python.exe -m pytest -k mission -v   # 只跑某个主题
 
@@ -286,6 +284,17 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
   （`tests/test_fit.py` 因此自带工作区内的 `workdir` fixture）。
 
 ## 已知边界与风险（不应视为已完成）
+
+- **弹道参数**：**质量按称重实测填入**（默认值仅为占位）；
+  `drag_coefficient` 仍是占位值（0.6），反演工具与流程已就绪（`tools/fit_ballistics.py`），
+  但工具尚未通过真实投放数据验证——首次采集后按工具输出判断（可能因为"分不开"而要求
+  你改变投放剖面）。飞掠段长/航向同样**待实验验证**。
+- **标定的真实素材复测未做**；`t_bc` 以尺量为准，`telemetry_lag` 的实测值需一次真实采集。
+- SITL 演练使用合成目标，不能验证真实感知或实机投放精度；完整任务在侦查前要求确认飞机已离地。
+- **CUADC 赛区世界已入库**（`sim/worlds/cuadc/`：起降区 + A/B 两个 60×60m 目标区（分列起飞线两端，各距起降区约 200m）+ 8 座五边形天井（**位置与朝向按规则随机**，`--seed` 复现，默认 seed 0 = 入库布局；规则里只是示意的 4m/6m 打击圈与"天井箭头"默认不画；太阳位置可换 `--sun 方位,仰角`，或 `--sun-random` 由 seed 随机；目标区底色按种子取常见路面色、比赛区域外随机铺航拍干扰底图 `--aerial-patches`，都可以重新生成以模拟不同光照/背景），r1 图片靶标 / r2 数字靶标；`python -m airdrop.run make-world` 重生成）。世界的几何与贴图方向做过离屏渲染核对，演练航线（`examples/sitl_mission.py`，对准入库布局的中位数天井）与降落航线（`routes/land.plan`）已对准它；SITL 默认机型是带下视相机的 `gz_rc_cessna_down_cam`。**未验证**：把 Gazebo 相机接进感知闭环、世界与真机场地的差异。启动步骤见 `docs/simulation_world.md`。
+- PX4 侧需要自己配置：gripper 输出、起飞项的航点动作、任务结束后的行为。
+- `cls12` 的 12 类权重目前不存在（`best2.pt` 是单类），该模式当前只能跑出编号 1。
+- **无 CI**：pytest / ruff / pyright 都只在本地跑。
 
 ## 安全提示
 

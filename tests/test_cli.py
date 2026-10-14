@@ -384,7 +384,7 @@ def test_fetch_models_reports_a_wrong_source_dir_as_failure(tmp_path: Path) -> N
 
     原来 ``copy_missing`` 只返回 copied，源缺失时逐个打印 ``[跳过] 源缺失`` 后
     ``total == 0`` ⇒ 打印"（都已在位，无需复制）"并返回 0——"取权重失败"被静默
-    转成成功。AGENTS.md 描述的流程是"起飞前逐条核对"，这个 0 会让它看起来像成功。
+    转成成功。这个 0 会让调用方误以为成功。
     """
     from tools import fetch_models
 
