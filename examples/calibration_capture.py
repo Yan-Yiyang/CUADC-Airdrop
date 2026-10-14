@@ -108,7 +108,13 @@ def main(
     )
     thread = MavsdkThread.from_config(config.telemetry, broker=broker)
     source = Hm30VideoSource(config.video)
-    aligner = FrameTelemetryAligner(broker, max_wait=config.align.max_wait, mode=config.align.mode)
+    aligner = FrameTelemetryAligner(
+        broker,
+        max_wait=config.align.max_wait,
+        mode=config.align.mode,
+        on_timeout=config.align.on_timeout,
+        max_extrapolation=config.align.max_extrapolation,
+    )
     buffer = AlignmentBuffer(capacity_for(30.0, buffer_seconds), storage="jpeg")
     writer = AlignmentWriter(buffer, aligner)
     recorder = FlightRecorder(config)
@@ -121,11 +127,12 @@ def main(
         source.start()
         if not source.wait_ready(timeout=30.0):
             LOGGER.error("图传没有出帧：%s", source.stats.last_error or "未知原因")
-            return 1
-        deadline = time.monotonic() + max_seconds
-        while source.running and time.monotonic() < deadline:
-            time.sleep(0.2)
-        LOGGER.info("采集结束（%.0fs）", max_seconds)
+            exit_code = 1
+        else:
+            deadline = time.monotonic() + max_seconds
+            while source.running and time.monotonic() < deadline:
+                time.sleep(0.2)
+            LOGGER.info("采集结束（%.0fs）", max_seconds)
     except KeyboardInterrupt:
         LOGGER.info("用户中断，正常收尾")
     finally:
@@ -136,9 +143,9 @@ def main(
     written, skipped = writer.stats()
     stats = source.stats
     LOGGER.info(
-        "投递 %d 帧、跳过 %d 帧；对齐入库 %d 帧（取不到遥测跳过 %d 帧）",
+        "收到 %d 帧；实时读取跳过 %d 帧；对齐入库 %d 帧（取不到遥测跳过 %d 帧）",
         stats.frames,
-        stats.skipped,
+        stats.dropped,
         written,
         skipped,
     )

@@ -594,6 +594,7 @@ def test_tracker_skips_points_without_attitude_and_without_position() -> None:
         "no_fix": 1,
         "attitude_missing": 1,
         "side_mismatch": 0,
+        "image_size_mismatch": 0,
     }
 
 
@@ -648,6 +649,9 @@ def test_target_source_busy_follows_perception_backlog() -> None:
             self.results = results
 
     class _Worker:
+        processing = False
+        queued_results = 0
+
         def __init__(self, lag: int, submitted: int, results: int) -> None:
             self._lag = lag
             self._stats = _Stats(submitted, results)

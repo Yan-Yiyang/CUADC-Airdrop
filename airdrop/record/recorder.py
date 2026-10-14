@@ -139,7 +139,7 @@ class _JsonlWriter:
         try:
             self._file.write(line + "\n")
             self._file.flush()
-        except OSError:
+        except OSError, UnicodeError:
             LOGGER.exception("JSONL 写入失败: %s", self._path)
             return False
         self._count += 1
@@ -356,7 +356,9 @@ class FlightRecorder:
         self._frame_thread: threading.Thread | None = None
         self._telemetry_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._started_lock = threading.Lock()
+        self._started_lock = threading.RLock()
+        self._started = False
+        self._stop_cutoff: int | None = None
 
         # 运行统计
         self._frames_written = 0
@@ -376,7 +378,10 @@ class FlightRecorder:
     # ------------------------------------------------------------------
     @property
     def is_running(self) -> bool:
-        return self._flight_dir is not None and not self._stop_event.is_set()
+        return (self._started and not self._stop_event.is_set()) or any(
+            thread is not None and thread.is_alive()
+            for thread in (self._frame_thread, self._telemetry_thread)
+        )
 
     @property
     def flight_dir(self) -> Path | None:
@@ -427,7 +432,7 @@ class FlightRecorder:
         不会改依赖绑定——这是有意为之，避免跑一半换 broker 把数据写错位置）。
         """
         with self._started_lock:
-            if self.is_running:
+            if self._started and not self._stop_event.is_set():
                 LOGGER.debug("FlightRecorder 已在运行，跳过 start: %s", self._flight_dir)
                 return self
             if self._flight_dir is not None:
@@ -437,57 +442,70 @@ class FlightRecorder:
                     "请新建一个 FlightRecorder 实例再录新一次"
                 )
 
-            self._broker = broker
-            self._buffer = buffer
-            self._flight_dir = self._make_flight_dir()
-            self._frames_dir = self._flight_dir / FRAMES_DIR
-            self._frames_dir.mkdir(parents=False, exist_ok=False)
+            try:
+                self._broker = broker
+                self._buffer = buffer
+                self._flight_dir = self._make_flight_dir()
+                self._frames_dir = self._flight_dir / FRAMES_DIR
+                self._frames_dir.mkdir(parents=False, exist_ok=False)
 
-            self._dump_config_snapshot()
-            self._open_files()
-            self._install_log_handler()
+                self._dump_config_snapshot()
+                self._open_files()
+                self._install_log_handler()
 
-            self._stop_event.clear()
-            self._frame_thread = threading.Thread(
-                target=self._frame_writer_loop,
-                name="recorder-frames",
-                daemon=True,
-            )
-            self._telemetry_thread = threading.Thread(
-                target=self._telemetry_writer_loop,
-                name="recorder-telemetry",
-                daemon=True,
-            )
-            self._frame_thread.start()
-            self._telemetry_thread.start()
+                self._stop_event.clear()
+                self._frame_thread = threading.Thread(
+                    target=self._frame_writer_loop,
+                    name="recorder-frames",
+                    daemon=True,
+                )
+                self._telemetry_thread = threading.Thread(
+                    target=self._telemetry_writer_loop,
+                    name="recorder-telemetry",
+                    daemon=True,
+                )
+                self._frame_thread.start()
+                self._telemetry_thread.start()
+                self._started = True
 
-            self.events.emit(
-                "recorder_started",
-                flight_dir=str(self._flight_dir),
-                telemetry_hz=self._telemetry_hz,
-                buffer_storage=buffer.storage,
-                buffer_capacity=buffer.capacity,
-            )
-            LOGGER.info(
-                "FlightRecorder 已启动：%s（帧 %s，遥测 %.1fHz）",
-                self._flight_dir,
-                buffer.storage,
-                self._telemetry_hz,
-            )
-            # 显式 flush：让 flight.log 立刻可见，便于调试
-            if self._log_handler is not None:
-                self._log_handler.flush()
+                self.events.emit(
+                    "recorder_started",
+                    flight_dir=str(self._flight_dir),
+                    telemetry_hz=self._telemetry_hz,
+                    buffer_storage=buffer.storage,
+                    buffer_capacity=buffer.capacity,
+                )
+                LOGGER.info(
+                    "FlightRecorder 已启动：%s（帧 %s，遥测 %.1fHz）",
+                    self._flight_dir,
+                    buffer.storage,
+                    self._telemetry_hz,
+                )
+                # 显式 flush：让 flight.log 立刻可见，便于调试
+                if self._log_handler is not None:
+                    self._log_handler.flush()
+            except BaseException:
+                self._stop_event.set()
+                self.stop()
+                raise
         return self
 
     def stop(self, timeout: float = 5.0) -> None:
-        """停掉后台线程、关闭所有文件（幂等）。"""
+        """固定尾帧并排空；超时保留线程与句柄，可再次调用完成收尾。"""
+        with self._started_lock:
+            self._stop_locked(timeout)
+
+    def _stop_locked(self, timeout: float) -> None:
         if self._flight_dir is None and not self._stop_event.is_set():
             return  # 从未启动过
+        if self._stop_cutoff is None:
+            self._stop_cutoff = self._buffer.latest_index() if self._buffer is not None else 0
         self._stop_event.set()
+        deadline = time.monotonic() + max(timeout, 0.0)
         alive = False
         for thread in (self._frame_thread, self._telemetry_thread):
             if thread is not None and thread.is_alive():
-                thread.join(timeout)
+                thread.join(max(deadline - time.monotonic(), 0.0))
                 if thread.is_alive():
                     alive = True
                     LOGGER.warning("recorder 线程未在 %.1fs 内退出: %s", timeout, thread.name)
@@ -503,6 +521,7 @@ class FlightRecorder:
                 self._events.emit(
                     "recorder_stopped",
                     frames_written=self._frames_written,
+                    frames_skipped=self._frames_skipped,
                     telemetry_written=self._telemetry_written,
                     events=self._events.count,
                     detections=self._detections.count if self._detections else 0,
@@ -550,8 +569,16 @@ class FlightRecorder:
         index_file = self._frames_index_file
         assert index_file is not None
         cursor = 0
-        while not self._stop_event.is_set():
-            frame = buffer.wait_new(after_index=cursor, timeout=1.0)
+        while True:
+            cutoff = self._stop_cutoff
+            if cutoff is not None and cursor >= cutoff:
+                break
+            frame = buffer.wait_new(after_index=cursor, timeout=0.1)
+            cutoff = self._stop_cutoff
+            if cutoff is not None and (frame is None or frame.index > cutoff):
+                # 截止范围内已无可读记录（驱逐、清空或解码失败），缺失必须计数。
+                self._frames_skipped += max(cutoff - cursor, 0)
+                break
             if frame is None:
                 continue
             if frame.index > cursor + 1:
@@ -569,6 +596,7 @@ class FlightRecorder:
             try:
                 self._write_one_frame(frame, frames_dir, index_file)
             except Exception:
+                self._frames_skipped += 1
                 LOGGER.exception("录制帧 #%d 失败", frame.index)
 
     def _write_one_frame(
@@ -587,8 +615,7 @@ class FlightRecorder:
                 [int(cv2.IMWRITE_JPEG_QUALITY), _REENCODE_JPEG_QUALITY],
             )
             if not ok:
-                LOGGER.warning("raw 缓冲帧 #%d 编码失败，跳过", frame.index)
-                return
+                raise RuntimeError(f"raw 缓冲帧 #{frame.index} 编码失败")
             jpeg = encoded.tobytes()
             self._raw_reencoded += 1
 

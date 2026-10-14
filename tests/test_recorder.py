@@ -98,6 +98,113 @@ def _wait_until(predicate, timeout: float = 4.0, interval: float = 0.05) -> bool
 # ----------------------------------------------------------------------
 # 核心场景
 # ----------------------------------------------------------------------
+def test_recorder_rolls_back_partial_start(tmp_path: Path, broker, monkeypatch) -> None:
+    """打开部分文件后失败，不能伪装为运行中或泄漏句柄。"""
+    recorder = FlightRecorder(Config().validated(), base_dir=tmp_path)
+    handles = []
+
+    def fail():
+        recorder._events = EventLog(tmp_path / "partial.jsonl")
+        handles.append(recorder._events._file)
+        raise OSError("模拟打开失败")
+
+    monkeypatch.setattr(recorder, "_open_files", fail)
+    with pytest.raises(OSError, match="模拟打开失败"):
+        recorder.start(broker=broker, buffer=AlignmentBuffer(capacity=4))
+    try:
+        assert not recorder.is_running
+        assert handles[0].closed
+    finally:
+        recorder.stop()
+
+
+def test_recorder_stop_drains_tail_and_retains_resources_on_timeout(
+    tmp_path: Path, broker, monkeypatch
+) -> None:
+    """磁盘写入被阻塞时保留资源，解除阻塞后再 stop 必须录完截止尾帧。"""
+    buffer = AlignmentBuffer(capacity=8)
+    for index in range(1, 5):
+        buffer.put(_make_sample(index))
+    recorder = FlightRecorder(Config().validated(), base_dir=tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    original = recorder._write_one_frame
+
+    def write(frame, frames_dir, index_file):
+        entered.set()
+        assert release.wait(5)
+        original(frame, frames_dir, index_file)
+
+    monkeypatch.setattr(recorder, "_write_one_frame", write)
+    recorder.start(broker=broker, buffer=buffer)
+    try:
+        assert entered.wait(2)
+        recorder.stop(timeout=0.01)
+        assert recorder._frame_thread is not None
+        assert not recorder._frames_index_file.closed
+        assert recorder.is_running
+    finally:
+        release.set()
+        recorder.stop()
+    assert recorder.stats().frames_written == 4
+    assert not recorder.is_running
+
+
+def test_jsonl_encoding_failure_does_not_escape_or_poison_next_record(tmp_path: Path) -> None:
+    """非法 Unicode 记录失败返回 False，下一条有效记录仍能正常写盘。"""
+    writer = DetectionWriter(tmp_path / "encoding.jsonl")
+    try:
+        assert writer.append({"text": "\ud800"}) is False
+        assert writer.append({"text": "物资"}) is True
+        assert writer.count == 1
+    finally:
+        writer.close()
+    assert json.loads(writer.path.read_text(encoding="utf-8")) == {"text": "物资"}
+
+
+def test_recorder_rolls_back_second_thread_start_failure(
+    tmp_path: Path, broker, monkeypatch
+) -> None:
+    """第一条线程已启动、第二条启动失败，线程和 root handler 都须回收。"""
+    recorder = FlightRecorder(Config().validated(), base_dir=tmp_path)
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    original = threading.Thread.start
+
+    def start(thread):
+        if thread.name == "recorder-telemetry":
+            raise RuntimeError("模拟第二线程失败")
+        original(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    with pytest.raises(RuntimeError, match="第二线程失败"):
+        recorder.start(broker=broker, buffer=AlignmentBuffer(capacity=4))
+    assert not recorder.is_running
+    assert recorder._frame_thread is None
+    assert recorder._events is None
+    assert root.handlers == handlers and root.level == level
+
+
+def test_recorder_counts_failed_frame_writes(tmp_path: Path, broker, monkeypatch) -> None:
+    """编码失败与写盘失败都记入缺帧统计，不影响后续帧。"""
+    buffer = AlignmentBuffer(capacity=4, storage="raw")
+    for index in range(1, 4):
+        buffer.put(_make_sample(index))
+    recorder = FlightRecorder(Config().validated(), base_dir=tmp_path)
+    original = recorder._write_one_frame
+
+    def write(frame, frames_dir, index_file):
+        if frame.index == 1:
+            raise OSError("模拟磁盘失败")
+        original(frame, frames_dir, index_file)
+
+    monkeypatch.setattr(recorder, "_write_one_frame", write)
+    recorder.start(broker=broker, buffer=buffer)
+    recorder.stop()
+    stats = recorder.stats()
+    assert stats is not None
+    assert stats.frames_written == 2 and stats.frames_skipped == 1
+
+
 def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: TelemetryBroker) -> None:
     """完整生命周期：start → 传入帧/遥测/事件/检测 → stop → 五个记录文件齐全。"""
     buffer = AlignmentBuffer(capacity=32, storage="jpeg")

@@ -9,7 +9,7 @@
 * 有 ``main()``（``examples`` 的约定：``main(**kwargs)`` + 顶部常量 = 默认值）；
 * 模块级常量区块存在，且 ``build_config(**覆盖)`` 真的覆盖得动。
 
-不执行 ``main()``：那几个示例要飞控、图传或真实素材，跑起来就不是单测了。
+完整任务入口用离线替身执行 ``main()``，验证装配与收尾，不连接硬件。
 """
 
 from __future__ import annotations
@@ -151,6 +151,84 @@ def test_full_mission_default_route_passes_landing_precheck() -> None:
     assert commands[:2] == [16, 16], "飞掠段是 [entry, exit] 两个 NAV_WAYPOINT"
     assert 21 in commands, "降落段末尾必须有 NAV_LAND"
     assert plan.source == "target" and plan.landing_count >= 2
+
+
+@pytest.mark.parametrize("mode", ["ocr", "cls12"])
+@pytest.mark.parametrize("load_ocr", [False, True])
+@pytest.mark.parametrize("startup_fails", [False, True])
+def test_full_mission_starts_perception_independently_of_preflight(
+    monkeypatch: pytest.MonkeyPatch, mode: str, load_ocr: bool, startup_fails: bool
+) -> None:
+    """真入口与真自检：检查开关不能关闭感知，启动失败必须完整收尾。"""
+    from dataclasses import replace
+    from unittest.mock import MagicMock
+
+    import airdrop
+    from examples import full_mission
+
+    config = full_mission.build_config()
+    config = replace(
+        config,
+        perception=replace(config.perception, mode=mode),
+        preflight=replace(config.preflight, load_ocr=load_ocr, check_video=False),
+        align=replace(config.align, max_wait=0.25, max_extrapolation=0.125, mode="nearest"),
+    )
+    monkeypatch.setattr(full_mission, "build_config", lambda **kwargs: config)
+    lifecycle = []
+    worker = MagicMock(running=False)
+
+    def start_worker():
+        if startup_fails:
+            raise RuntimeError("模拟感知初始化失败")
+        if not worker.running:
+            lifecycle.append("perception")
+            worker.running = True
+        return worker
+
+    worker.start.side_effect = start_worker
+    thread = MagicMock()
+    source = MagicMock()
+    source.start.side_effect = lambda: lifecycle.append("video")
+    recorder = MagicMock()
+    runner = MagicMock(drops=[])
+    runner_factory = MagicMock(return_value=runner)
+    aligner_factory = MagicMock(wraps=airdrop.FrameTelemetryAligner)
+    monkeypatch.setattr(airdrop, "FrameTelemetryAligner", aligner_factory)
+    monkeypatch.setattr(
+        airdrop, "MavsdkThread", MagicMock(from_config=MagicMock(return_value=thread))
+    )
+    monkeypatch.setattr(airdrop, "DroneController", MagicMock())
+    monkeypatch.setattr(airdrop, "Hm30VideoSource", MagicMock(return_value=source))
+    monkeypatch.setattr(airdrop, "PerceptionWorker", MagicMock(return_value=worker))
+    monkeypatch.setattr(airdrop, "FlightRecorder", MagicMock(return_value=recorder))
+    monkeypatch.setattr(airdrop, "MissionRunner", runner_factory)
+
+    def run():
+        checks = runner_factory.call_args.kwargs["preflight"].run()
+        assert next(check for check in checks if check.name == "ocr").ok is (
+            True if load_ocr else None
+        )
+        assert worker.running, "关闭 OCR 自检不能让感知停止"
+        return airdrop.MissionState.DONE
+
+    runner.run.side_effect = run
+    assert full_mission.main(record=True, dry_run=False) == (1 if startup_fails else 0)
+    if startup_fails:
+        runner.run.assert_not_called()
+        source.start.assert_not_called()
+        runner.stop.assert_called_once_with("exception")
+    else:
+        assert lifecycle == ["perception", "video"]
+    assert aligner_factory.call_args.kwargs == {
+        "max_wait": 0.25,
+        "mode": "nearest",
+        "on_timeout": "drop",
+        "max_extrapolation": 0.125,
+    }
+    source.stop.assert_called_once()
+    worker.stop.assert_called_once()
+    recorder.stop.assert_called_once()
+    thread.stop.assert_called_once()
 
 
 def test_calibration_capture_builds_a_valid_config() -> None:

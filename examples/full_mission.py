@@ -226,7 +226,11 @@ def main(
         camera = config.camera.load_model()
         source = Hm30VideoSource(config.video)
         aligner = FrameTelemetryAligner(
-            broker, max_wait=config.align.max_wait, mode=config.align.mode
+            broker,
+            max_wait=config.align.max_wait,
+            mode=config.align.mode,
+            on_timeout=config.align.on_timeout,
+            max_extrapolation=config.align.max_extrapolation,
         )
         writer = AlignmentWriter(buffer, aligner)
 
@@ -260,8 +264,8 @@ def main(
     # config.preflight（默认四项全开；关掉的项记一条 preflight 事件、ok=null——
     # 关掉 ≠ 通过，正式任务起飞前请核对那几条事件）：
     #   ① detector：载入 YOLO 权重（就是感知线程要用的那个 Detector 实例）；
-    #   ② ocr：起感知工作线程 + OCR 进程池（OCR 权重在子进程里载入）；
-    #      ⚠ 关掉 load_ocr 等于不启动感知（正式任务别关）；
+    #   ② ocr：确认感知工作线程 + OCR 进程池已启动（start 幂等）；
+    #      感知在接收视频前独立启动，关闭 load_ocr 只跳过本项自检；
     #   ③ camera：载入相机标定（camera 那份，与 TargetTracker 用的是同一个文件）；
     #   ④ video：在 video_probe_s 窗口内等够 video_min_frames 帧，并用已载入的标定
     #      核对最新帧分辨率一致。
@@ -301,6 +305,8 @@ def main(
         broker,
         target_result=None if targets is None else targets.result,
         target_busy=None if targets is None else targets.busy,
+        health_check=None if worker is None else worker.raise_if_failed,
+        finish_recon=None if worker is None else worker.finish_input,
         release_judge=judge,
         on_event=on_event,
         on_drop=on_drop,
@@ -313,6 +319,8 @@ def main(
         LOGGER.info("飞控已连接；起飞前自检 → 等在空中 → 侦查（航线由操作手上传）")
         if recorder is not None:
             recorder.start(broker=broker, buffer=buffer)
+        if worker is not None:
+            worker.start()
         if source is not None and writer is not None:
             source.add_sink(writer)
             source.start()

@@ -18,6 +18,10 @@ LOGGER = logging.getLogger(__name__)
 __all__ = ["DetectionBatch", "Detector", "DetectorConfig"]
 
 
+class FrameSizeMismatchError(ValueError):
+    """输入尺寸与相机模型不匹配，必须修正配置后重新启动。"""
+
+
 @dataclass(frozen=True, slots=True)
 class DetectorConfig:
     """YOLO 检测参数。"""
@@ -159,8 +163,8 @@ class Detector:
                 self._calib_size_rejected_logged = True
                 LOGGER.warning(
                     "帧尺寸 %dx%d 与标定分辨率 %s 不符，拒绝建立去畸变映射表"
-                    "（内参只对标定分辨率有效，硬套会把画面扭坏）；本架次不去畸变。"
-                    "要按新分辨率去畸变，请先重新标定或显式清掉 calib_size",
+                    "（内参只对标定分辨率有效，硬套会把画面扭坏）；本帧不去畸变。"
+                    "请配置与新分辨率匹配的内参和 calib_size",
                     size[0],
                     size[1],
                     tuple(config.calib_size),
@@ -182,12 +186,9 @@ class Detector:
             if config.dist_coeffs is None
             else np.asarray(config.dist_coeffs, dtype=np.float64).reshape(-1)
         )
-        new_matrix, _ = cv2.getOptimalNewCameraMatrix(
-            matrix, dist, size, alpha=0.0, newImgSize=size
-        )
-        map_x, map_y = cv2.initUndistortRectifyMap(
-            matrix, dist, None, new_matrix, size, cv2.CV_16SC2
-        )
+        # 保留标定 K：下游 georef 用同一 K 反投影，不能只在这里改变焦距/主点。
+        # 映射仍只构建一次，逐帧复用定点查表；不额外裁剪或缩放纠正后的画面。
+        map_x, map_y = cv2.initUndistortRectifyMap(matrix, dist, None, matrix, size, cv2.CV_16SC2)
         self._remap = (map_x, map_y)
         self._remap_shape = size
         self._undistort_skipped_logged = False
@@ -235,13 +236,20 @@ class Detector:
 
         ``mode`` 只作为标签写进结果（``"ocr"`` / ``"cls12"``），detector 不关心
         编号怎么来的——``ocr`` 模式下编号由裁剪图 OCR 补上，``cls12`` 模式下
-        直接取类别。
+        直接取类别。已知相机尺寸与输入不符时抛 FrameSizeMismatchError，不加载或运行模型。
         """
+        config = self._config
+        height, width = image.shape[:2]
+        expected_size = config.calib_size or self._remap_shape
+        if expected_size is not None and (width, height) != tuple(expected_size):
+            raise FrameSizeMismatchError(
+                f"帧尺寸 {width}x{height} 与相机模型尺寸 {tuple(expected_size)} 不符，"
+                "停止运行；请配置匹配的相机标定后重新启动"
+            )
         self.load()
         assert self._model is not None  # load() 已保证
 
-        do_undistort = self._config.undistort if undistort is None else undistort
-        config = self._config
+        do_undistort = config.undistort if undistort is None else undistort
         if do_undistort and config.camera_matrix is not None:
             picture, rectified = self.undistort(image)
         else:
@@ -287,6 +295,7 @@ class Detector:
                             extra={
                                 "class_name": self._names.get(int(cls), ""),
                                 "undistorted": bool(rectified),
+                                "image_size": (width, height),
                             },
                         )
                     )
@@ -314,4 +323,6 @@ class Detector:
         self._model = None
         self._remap = None
         self._remap_shape = None
+        self._undistort_skipped_logged = False
+        self._calib_size_rejected_logged = False
         return self

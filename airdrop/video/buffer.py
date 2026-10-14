@@ -289,6 +289,29 @@ class AlignmentBuffer:
             self._bytes = 0
             self._condition.notify_all()
 
+    def freeze(self, *, after_index: int = 0) -> "AlignmentBuffer":
+        """固定当前未读范围，供侦查收尾使用；原缓冲继续接收录像帧。
+
+        仅复制记录引用，不复制或重新编码图像。返回值不接写入器，后续原缓冲
+        驱逐不会影响这份待处理范围；若未读帧已被驱逐，明确失败。
+        """
+        with self._lock:
+            first = self._records[0].index if self._records else self._next_index + 1
+            if after_index < first - 1:
+                raise RuntimeError("侦查未读帧已被缓冲驱逐，无法完整处理")
+            start = bisect.bisect_right(self._records, after_index, key=_index)
+            frozen = AlignmentBuffer(
+                self._capacity,
+                storage=self._storage,
+                jpeg_quality=self._jpeg_quality,
+                max_bytes=self._max_bytes,
+            )
+            frozen._records = self._records[start:]
+            frozen._bytes = sum(record.nbytes for record in frozen._records)
+            frozen._next_index = self._next_index
+            frozen._put = len(frozen._records)
+            return frozen
+
     # ------------------------------------------------------------------
     # 读取接口
     # ------------------------------------------------------------------

@@ -56,6 +56,24 @@ def make_sample(
 # ----------------------------------------------------------------------
 # 写入与驱逐
 # ----------------------------------------------------------------------
+@pytest.mark.parametrize("storage", ["jpeg", "raw"])
+def test_freeze_retains_unread_frames_without_copying_images(storage) -> None:
+    source = AlignmentBuffer(capacity=3, storage=storage)
+    for index in range(3):
+        source.put(make_sample(1000 + index), materialize=False)
+    frozen = source.freeze(after_index=1)
+    assert frozen.latest_index() == 3
+    assert frozen._records[0] is source._records[1]
+    assert frozen._records[0].payload is source._records[1].payload
+    for index in range(3, 8):
+        source.put(make_sample(1000 + index), materialize=False)
+    assert source.latest_index() == 8
+    assert frozen.latest_index() == 3
+    assert [frame.index for frame in frozen.iter_between()] == [2, 3]
+    with pytest.raises(RuntimeError, match="驱逐"):
+        source.freeze(after_index=1)
+
+
 def test_put_and_read() -> None:
     buffer = AlignmentBuffer(capacity=10)
     for i in range(3):

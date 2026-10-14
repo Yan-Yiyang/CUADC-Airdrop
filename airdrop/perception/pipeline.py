@@ -31,6 +31,7 @@ OCR 逐帧送检
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 import time
@@ -42,7 +43,7 @@ import numpy as np
 
 from ..video.buffer import AlignmentBuffer, BufferedFrame
 from .cropproc import OcrEngineConfig
-from .detector import Detector, DetectorConfig
+from .detector import Detector, DetectorConfig, FrameSizeMismatchError
 from .models import Detection
 from .ocr_worker import OcrResult, OcrWorkerPool
 
@@ -170,8 +171,16 @@ class PerceptionWorker:
         self._stats = PerceptionStats()
         self._stats_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._drained = threading.Event()
+        self._drain_to: int | None = None
+        self._drain_ok = False
+        self._fatal_error: str | None = None
+        self._run_finished = False
         self._thread: threading.Thread | None = None
         self._cursor = self._start_index
+        self._input_lock = threading.Lock()
+        self._completed_index = self._start_index
+        self._cutoff: int | None = None
         # 去重缓存：[(capture_timestamp, u, v)]；**只在启用去重时记录**，
         # 否则它会被每帧的检测结果喂大（见 _process_frame 的说明）。
         self._recent: list[tuple[float, float, float]] = []
@@ -214,6 +223,27 @@ class PerceptionWorker:
         """注册检测结果回调（在工作线程里被调用，必须快）。"""
         self._on_detection = callback
 
+    @property
+    def processing(self) -> bool:
+        """检测游标已取走、但整帧处理还未完成。"""
+        with self._input_lock:
+            return self._completed_index < self._cursor
+
+    def finish_input(self) -> int:
+        """固定侦查截止帧（幂等）；新图传仍写原缓冲，感知只排空固定范围。"""
+        with self._input_lock:
+            if self._cutoff is None:
+                self._buffer = self._buffer.freeze(after_index=self._cursor)
+                self._cutoff = self._buffer.latest_index()
+            return self._cutoff
+
+    def raise_if_failed(self) -> None:
+        """将后台尺寸配置错误交给主线程，避免感知已停而任务继续。"""
+        with self._stats_lock:
+            error = self._fatal_error
+        if error is not None:
+            raise FrameSizeMismatchError(error)
+
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
@@ -221,6 +251,7 @@ class PerceptionWorker:
         """起工作线程；OCR 模式下同时拉起 OCR 进程池。"""
         if self.running:
             return self
+        self.raise_if_failed()
         if self._config.mode == "ocr":
             if self._pool is None:
                 self._pool = OcrWorkerPool(
@@ -248,6 +279,10 @@ class PerceptionWorker:
             self._detector.load()
 
         self._stop_event.clear()
+        self._run_finished = False
+        self._drained.clear()
+        self._drain_to = None
+        self._drain_ok = False
         self._thread = threading.Thread(target=self._run, name="perception", daemon=True)
         self._thread.start()
         LOGGER.info(
@@ -266,13 +301,42 @@ class PerceptionWorker:
                 thread.join(timeout)
             if thread.is_alive():
                 # 线程没停就别清引用（否则 running 会撒谎、start() 会起第二个）；
-                # 池照常停：线程在下一拍看到 stop_event 就会退出。
+                # 线程仍可能提交或收取 OCR，不能由调用方同时操作池。
                 LOGGER.warning("感知线程未在 %.1fs 内退出，保留引用（可再调 stop()）", timeout)
+                return
             else:
                 self._thread = None
         if self._owns_pool and self._pool is not None:
             self._pool.stop()
         self._collect_remaining(timeout=0.5)
+
+    def drain(self, timeout: float = 120.0) -> bool:
+        """先停止生产者，再等待既有帧与 OCR 完成；失败或超时返回 False。
+
+        由工作线程在完整处理一帧之后确认，不能用已经提前推进的游标判断在途帧。
+        本方法不消费结果队列，调用方仍须抽取结果；生命周期操作应由单一调用方串行执行。
+        """
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("排空超时必须是非负有限秒数")
+        with self._stats_lock:
+            self._drained.clear()
+            self._drain_ok = False
+            self._drain_to = self._buffer.latest_index()
+            if not self.running or self._run_finished:
+                return False
+        if not self._drained.wait(timeout):
+            return False
+        with self._stats_lock:
+            return self._drain_ok
+
+    def _check_drained(self) -> None:
+        """仅工作线程在帧处理与结果回填之后确认排空。"""
+        if self._drain_to is None:
+            return
+        with self._stats_lock:
+            if self._cursor >= self._drain_to and not self._pending:
+                self._drain_ok = self._stats.last_error is None
+                self._drained.set()
 
     def __enter__(self) -> "PerceptionWorker":
         return self.start()
@@ -328,25 +392,47 @@ class PerceptionWorker:
     def _run(self) -> None:
         try:
             while not self._stop_event.is_set():
-                frame = self._buffer.wait_new(after_index=self._cursor, timeout=0.5)
+                source_buffer = self._buffer
+                frame = source_buffer.wait_new(after_index=self._cursor, timeout=0.5)
                 if frame is None:
                     # 缓冲里暂时没有新帧：先把 OCR 结果收回来，保持结果流不断
                     self._collect_remaining(timeout=0.0)
                     self._check_pool_health()
+                    self._check_drained()
                     continue
-                self._cursor = frame.index
+                with self._input_lock:
+                    # 截止可能发生在等待或解码期间；改从固定快照重新取，不能送检新帧。
+                    if source_buffer is not self._buffer:
+                        continue
+                    self._cursor = frame.index
                 try:
                     self._process_frame(frame)
+                except FrameSizeMismatchError as exc:
+                    with self._stats_lock:
+                        self._fatal_error = self._stats.last_error = str(exc)
+                    LOGGER.error("%s", exc)
+                    return
                 except Exception as exc:
                     LOGGER.exception("处理帧 #%d 失败", frame.index)
                     with self._stats_lock:
                         self._stats.last_error = f"{type(exc).__name__}: {exc}"
                 self._collect_remaining(timeout=0.0)
+                with self._input_lock:
+                    self._completed_index = frame.index
+                    if self._cutoff is not None and frame.index == self._cutoff:
+                        # 尾帧已送检，OCR 持有独立裁剪；释放固定快照中的整帧引用。
+                        self._buffer.clear()
                 self._check_pool_health()
+                self._check_drained()
         except Exception as exc:
             LOGGER.exception("感知线程异常退出")
             with self._stats_lock:
                 self._stats.last_error = f"{type(exc).__name__}: {exc}"
+
+        finally:
+            with self._stats_lock:
+                self._run_finished = True
+                self._drained.set()
 
     def _check_pool_health(self) -> None:
         """巡检 OCR 进程池存活数（有 worker 掉了会打一条节流的 ERROR）。

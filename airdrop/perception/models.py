@@ -85,6 +85,7 @@ class Detection:
     raw_text: str = ""
     ocr_confidence: float = 0.0
     mode: str = ""
+    #: 检测器提供 undistorted 和 image_size（宽、高），供下游核对像素模型。
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property

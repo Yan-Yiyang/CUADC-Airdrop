@@ -174,6 +174,10 @@ class MissionRunner:
         结束等待，而不是硬等满 10s。
     release_judge:
         投放判据；``None`` 表示不自动投放（演练/手动投），OVERFLY 会直接进 LAND。
+    health_check:
+        每拍检查输入链路的致命错误；异常立即 ABORT，不降级为“没有目标”。
+    finish_recon:
+        进入 HOLD_PROCESS 时固定感知截止帧并返回帧索引；失败则 ABORT。
     on_drop:
         投放记录回调——指令被飞控接受之后调一次，拿到的是
         :class:`~airdrop.ballistics.drops.DropRecord`（投放瞬间的位置/速度/姿态/风、
@@ -194,6 +198,8 @@ class MissionRunner:
         *,
         target_result: TargetResultReader | None = None,
         target_busy: Callable[[], bool] | None = None,
+        health_check: Callable[[], None] | None = None,
+        finish_recon: Callable[[], int] | None = None,
         release_judge: ReleaseJudgeLike | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         on_drop: Callable[[DropRecord], None] | None = None,
@@ -206,6 +212,8 @@ class MissionRunner:
         self._broker = broker
         self._target_result = target_result
         self._target_busy = target_busy
+        self._health_check = health_check
+        self._finish_recon = finish_recon
         self._judge = release_judge
         self._on_event = on_event
         self._on_drop = on_drop
@@ -315,6 +323,15 @@ class MissionRunner:
         stamp = float(self._clock()) if now is None else float(now)
         self._stats.ticks += 1
         for _ in range(3):
+            if not self._machine.is_terminal and self._health_check is not None:
+                try:
+                    self._health_check()
+                except Exception as exc:
+                    self._stats.errors += 1
+                    LOGGER.exception("任务输入异常，终止运行：%s", exc)
+                    self._emit("error", {"where": "health_check", "message": str(exc)})
+                    self.abort("input_failed")
+                    break
             state = self._machine.state
             if state is MissionState.INIT:
                 self._tick_init(stamp)
@@ -515,13 +532,14 @@ class MissionRunner:
             return
         result = self._read_result()
         elapsed = now - self._entered_at
-        if result is not None and result.ok:
+        busy = self._busy()
+        if result is not None and result.ok and not busy:
             self._finish_hold(now, result, "result")
             return
         if elapsed >= self._config.mission.hold_process_max_s:
             self._finish_hold(now, result, "timeout")
             return
-        if elapsed >= self._config.mission.hold_process_min_s and not self._busy():
+        if elapsed >= self._config.mission.hold_process_min_s and not busy:
             self._finish_hold(now, result, "no_target")
 
     def _tick_overfly(self, now: float) -> None:
@@ -680,6 +698,13 @@ class MissionRunner:
     # ------------------------------------------------------------------
     def _on_enter(self, state: MissionState, now: float) -> None:
         if state is MissionState.HOLD_PROCESS:
+            if self._finish_recon is not None:
+                try:
+                    cutoff = self._finish_recon()
+                    self._emit("recon_input_closed", {"last_frame_index": cutoff})
+                except Exception as exc:  # noqa: BLE001 - 截止失败必须中止任务，不能继续用部分数据
+                    self._fail("finish_recon", exc)
+                    return
             # 等待上限按"进入本状态的时刻"算（见 _tick_hold 的 elapsed）
             self._command(self._controller.hold, "hold")
         elif state is MissionState.OVERFLY:

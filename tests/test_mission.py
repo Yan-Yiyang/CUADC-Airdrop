@@ -297,6 +297,8 @@ def _runner(
     judge: FakeJudge | None = None,
     target_result: Any = None,
     target_busy: Any = None,
+    health_check: Callable[[], None] | None = None,
+    finish_recon: Callable[[], int] | None = None,
     events: list[tuple[str, dict[str, Any]]] | None = None,
     on_drop: Any = None,
     preflight: PreflightLike | None = None,
@@ -310,6 +312,8 @@ def _runner(
         FakeBroker(clock) if broker is None else broker,
         target_result=target_result,
         target_busy=target_busy,
+        health_check=health_check,
+        finish_recon=finish_recon,
         release_judge=judge,
         on_event=None if events is None else (lambda kind, data: events.append((kind, data))),
         on_drop=on_drop,
@@ -446,6 +450,24 @@ def test_emit_event_swallows_callback_failures() -> None:
     assert machine.state is MissionState.RECON
 
 
+def test_runner_aborts_on_input_failure_before_any_upload() -> None:
+    """后台感知配置错误由主循环处理，不能继续上传、启动或投放。"""
+    from airdrop.perception.detector import FrameSizeMismatchError
+
+    def failed() -> None:
+        raise FrameSizeMismatchError("帧尺寸不匹配，停止运行")
+
+    clock = FakeClock()
+    controller = FakeController()
+    runner = _runner(clock, controller, health_check=failed)
+    assert runner.run(max_ticks=2) is MissionState.ABORT
+    assert runner.stats.uploads == runner.stats.releases == 0
+    assert runner.stats.errors == 1
+    assert controller.count("hold") == 1
+    runner.update()
+    assert controller.count("hold") == 1
+
+
 def test_runner_confirms_the_mission_actually_started() -> None:
     """正常路径：RECON 第一拍就确认进了 MISSION，并记一条 ``mission_confirmed`` 事件。"""
     clock = FakeClock()
@@ -528,18 +550,65 @@ class FakePreflight:
         return (PreflightCheck("detector", True, "fake"),)
 
 
+@pytest.mark.parametrize(
+    "fault", ["stalled", "stale", "future", "missing", "size", "camera", "error"]
+)
+def test_preflight_rejects_unverifiable_or_stale_video(fault: str) -> None:
+    """历史累计帧、旧画面和无法核对尺寸均不能冒充当前视频健康。"""
+    clock = FakeClock(start=1000)
+    source = SimpleNamespace(stats=SimpleNamespace(frames=100))
+    frame = SimpleNamespace(width=1280, height=720, timestamp=1000.0)
+
+    def latest():
+        if fault == "error":
+            raise RuntimeError("取帧失败")
+        return None if fault == "missing" else frame
+
+    source.latest = latest
+
+    def sleep(seconds: float) -> None:
+        clock.sleep(seconds)
+        if fault != "stalled":
+            source.stats.frames += 1
+        frame.timestamp = 999.0 if fault == "stale" else clock()
+        if fault == "future":
+            frame.timestamp += 100
+        if fault == "size":
+            frame.width = None
+
+    events = []
+    preflight = Preflight(
+        PreflightConfig(
+            load_detector=False,
+            load_ocr=False,
+            load_camera=False,
+            video_probe_s=0.5,
+            video_min_frames=2,
+        ),
+        video_source=source,
+        camera_model=_camera_model(None if fault == "camera" else (1280, 720)),
+        clock=clock,
+        sleep=sleep,
+        on_event=lambda kind, data: events.append((kind, data)),
+    )
+    with pytest.raises(PreflightError, match="video:"):
+        preflight.run()
+    assert _events_of(events, "preflight")[-1]["ok"] is False
+
+
 class FakeVideoSource:
     """假图传源：只提供预检会读的两样东西（``stats.frames`` 与 ``latest()``）。"""
 
     def __init__(self, *, frames: int = 12, size: tuple[int, int] | None = (1280, 720)) -> None:
         self.stats = SimpleNamespace(frames=frames)
         self._size = size
+        self.timestamp = time.time()
 
     def latest(self):
         if self._size is None:
             return None
         width, height = self._size
-        return SimpleNamespace(width=width, height=height)
+        return SimpleNamespace(width=width, height=height, timestamp=self.timestamp)
 
 
 def _preflight(
@@ -554,14 +623,21 @@ def _preflight(
 ) -> Preflight:
     """按正式入口的接法装配一个真 :class:`~airdrop.Preflight`（时钟/节拍可注入）。"""
     clock = clock or FakeClock()
+
+    def produce(seconds: float) -> None:
+        clock.sleep(seconds)
+        if source is not None:
+            source.stats.frames += 1
+            source.timestamp = clock()
+
     return Preflight(
         config,
         model_loaders=loaders,
         video_source=source,
-        camera_model=camera_model,
+        camera_model=_camera_model() if camera_model is None else camera_model,
         on_event=None if events is None else (lambda kind, data: events.append((kind, data))),
         clock=clock,
-        sleep=clock.sleep if sleep is None else sleep,
+        sleep=produce if sleep is None else sleep,
     )
 
 
@@ -635,8 +711,9 @@ def test_real_preflight_video_check_needs_enough_frames() -> None:
     )
     source = FakeVideoSource(frames=3)
 
-    with pytest.raises(PreflightError, match="只收到 3 帧"):
-        _preflight(config, source=source).run()
+    clock = FakeClock()
+    with pytest.raises(PreflightError, match="只收到 0 帧"):
+        _preflight(config, source=source, clock=clock, sleep=clock.sleep).run()
 
     # 帧数是"等一等就够"的：窗口内涨到 10 帧就通过
     growing = FakeVideoSource(frames=3)
@@ -645,6 +722,7 @@ def test_real_preflight_video_check_needs_enough_frames() -> None:
     def sleep(seconds: float) -> None:
         clock.sleep(seconds)
         growing.stats.frames += 10  # 这一觉睡来了 10 帧
+        growing.timestamp = clock()
 
     checks = _preflight(config, source=growing, clock=clock, sleep=sleep).run()
     assert checks[-1].name == "video" and checks[-1].ok is True
@@ -705,8 +783,8 @@ def test_real_preflight_video_check_passes_when_resolution_matches() -> None:
     assert video.ok is True
 
 
-def test_real_preflight_skips_resolution_check_without_calib_size() -> None:
-    """相机模型没有 image_size（粗估默认模型）⇒ 跳过分辨率核对，不误判失败。"""
+def test_real_preflight_rejects_missing_calib_size() -> None:
+    """相机没有标定尺寸，就没有足够依据确认几何链路可用。"""
     config = PreflightConfig(
         load_detector=False,
         load_ocr=False,
@@ -721,8 +799,8 @@ def test_real_preflight_skips_resolution_check_without_calib_size() -> None:
         camera_model=_camera_model(None),
     )
 
-    checks = preflight.run()
-    assert next(c for c in checks if c.name == "video").ok is True
+    with pytest.raises(PreflightError, match="标定尺寸"):
+        preflight.run()
 
 
 def test_preflight_passes_then_waits_for_airborne_and_enters_recon() -> None:
@@ -1663,6 +1741,53 @@ def test_runner_waits_full_timeout_while_processing_is_busy() -> None:
     assert runner.plan is not None and runner.plan.source == "backup"
 
 
+def test_runner_closes_recon_once_and_waits_for_tail_even_with_a_target() -> None:
+    """已有候选目标不等于完整结果，截止后的在途任务必须排空。"""
+    clock, controller = FakeClock(), FakeController()
+    closures = []
+    events = []
+    busy = {"value": True}
+
+    def finish():
+        closures.append(1)
+        return 17
+
+    runner = _runner(
+        clock,
+        controller,
+        judge=FakeJudge([]),
+        target_result=_labeled_points,
+        target_busy=lambda: busy["value"],
+        finish_recon=finish,
+        events=events,
+    )
+    _drive(runner, clock, ticks=2)
+    controller.finish_mission()
+    _drive_until(runner, clock, MissionState.HOLD_PROCESS)
+    _drive(runner, clock, ticks=3)
+    assert runner.state is MissionState.HOLD_PROCESS
+    assert closures == [1]
+    assert _events_of(events, "recon_input_closed") == [{"last_frame_index": 17}]
+    busy["value"] = False
+    runner.update()
+    assert runner.state is MissionState.OVERFLY
+    assert _events_of(events, "targeting")[0]["reason"] == "result"
+
+
+def test_runner_aborts_when_recon_cutoff_fails() -> None:
+    """无法保全侦查尾帧时，不应把部分统计当作完整侦查。"""
+    clock, controller = FakeClock(), FakeController()
+
+    def finish() -> int:
+        raise RuntimeError("未读帧已被驱逐")
+
+    runner = _runner(clock, controller, finish_recon=finish)
+    _drive(runner, clock, ticks=2)
+    controller.finish_mission()
+    _drive_until(runner, clock, MissionState.ABORT)
+    assert runner.state is MissionState.ABORT
+
+
 def test_runner_keeps_waiting_for_a_result_up_to_the_limit() -> None:
     """先没结果、后面才出结果：应当在出结果那一拍就走，而不是等到超时。"""
     clock = FakeClock()
@@ -1676,7 +1801,7 @@ def test_runner_keeps_waiting_for_a_result_up_to_the_limit() -> None:
         controller,
         judge=FakeJudge([ReleaseDecision(True, "predict")]),
         target_result=lambda: good if ready["value"] else empty,
-        target_busy=lambda: True,  # 不给"处理完了"的信号 → 只能等结果或超时
+        target_busy=lambda: not ready["value"],
         events=events,
     )
 

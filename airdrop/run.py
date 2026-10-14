@@ -275,6 +275,13 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 source="STRICT",
             ),
             Option(
+                ("--drain-timeout",),
+                "drain_timeout_s",
+                "停止生产后等待尾帧与 OCR 完成的最长秒数",
+                kind="float",
+                source="DRAIN_TIMEOUT_S",
+            ),
+            Option(
                 ("--buffer-seconds",),
                 "buffer_seconds",
                 "环形缓冲保留时长（秒）",

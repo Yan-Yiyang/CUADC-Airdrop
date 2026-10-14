@@ -9,7 +9,10 @@ pipeline 的 detector / pool 都是构造注入的，这里正是为了可测性
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
+import queue
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import replace
@@ -35,7 +38,7 @@ from airdrop.perception import (
     PixelBox,
     correct_ocr_number,
 )
-from airdrop.perception.detector import Detector
+from airdrop.perception.detector import Detector, FrameSizeMismatchError
 from airdrop.telemetry.models import TelemetrySnapshot
 from airdrop.video.buffer import AlignedSample, AlignmentBuffer
 from airdrop.video.source import VideoFrame
@@ -872,6 +875,278 @@ def _buffer_with(frames: int = 3, *, storage: str = "jpeg") -> AlignmentBuffer:
     return buffer
 
 
+def test_drain_waits_for_inflight_frame_and_late_ocr() -> None:
+    """游标已推进但检测未结束，以及尾部 OCR 未返回，都不能算排空。"""
+    entered = threading.Event()
+    release = threading.Event()
+    ocr_ready = threading.Event()
+
+    class Detector(_FakeDetector):
+        def detect(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return super().detect(*args, **kwargs)
+
+    class Pool(_FakePool):
+        def poll(self, timeout=0.0):
+            return super().poll(timeout) if ocr_ready.is_set() else None
+
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr"),
+        buffer=_buffer_with(1),
+        detector=Detector(),
+        pool=Pool(numbers=[42]),
+    )
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert worker.lag_frames == 0
+        assert not worker.drain(timeout=0.01)
+        release.set()
+        assert not worker.drain(timeout=0.01)
+        ocr_ready.set()
+        assert worker.drain(timeout=5)
+        assert worker.stats.frames == worker.stats.submitted == worker.stats.results == 1
+        assert [item.code for item in worker.drain_results()] == [42]
+    finally:
+        release.set()
+        ocr_ready.set()
+        worker.stop()
+
+
+def test_drain_empty_and_failed_worker() -> None:
+    """空输入可排空；未启动或处理失败不能假报成功。"""
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=_buffer_with(0),
+        detector=_FakeDetector(),
+    )
+    assert not worker.drain(timeout=0)
+    with worker:
+        assert worker.drain(timeout=5)
+
+    class BrokenDetector(_FakeDetector):
+        def detect(self, *args, **kwargs):
+            raise RuntimeError("检测失败")
+
+    with PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=_buffer_with(2),
+        detector=BrokenDetector(),
+    ) as failed:
+        assert not failed.drain(timeout=5)
+        assert "检测失败" in (failed.stats.last_error or "")
+
+
+def test_recon_cutoff_drains_only_accepted_frames_and_late_ocr() -> None:
+    """侦查截止时仍有在途检测；之后录像缓冲继续追加，不能扩大 OCR 任务。"""
+    entered, release, ocr_ready = threading.Event(), threading.Event(), threading.Event()
+
+    class Detector(_FakeDetector):
+        def detect(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return super().detect(*args, **kwargs)
+
+    class Pool(_FakePool):
+        def poll(self, timeout=0.0):
+            return super().poll(timeout) if ocr_ready.is_set() else None
+
+    original = _buffer_with(3)
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr"),
+        buffer=original,
+        detector=Detector(),
+        pool=Pool(numbers=[42] * 3),
+    )
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert worker.processing
+        assert worker.finish_input() == 3
+        assert worker.finish_input() == 3
+        for i in range(4, 70):
+            original.put(
+                AlignedSample(
+                    frame=VideoFrame(
+                        index=i, image=np.zeros((64, 64, 3), np.uint8), timestamp=1000 + i
+                    ),
+                    snapshot=TelemetrySnapshot(timestamp=1000 + i),
+                    timestamp=1000 + i,
+                    lag=0,
+                    mode="interpolate",
+                ),
+                materialize=False,
+            )
+        assert original.latest_index() == 69
+        release.set()
+        assert not worker.drain(timeout=0.05)
+        ocr_ready.set()
+        assert worker.drain(timeout=5)
+        assert worker.stats.frames == worker.stats.results == 3
+        assert [item.frame_index for item in worker.drain_results()] == [1, 2, 3]
+        assert not worker.processing
+    finally:
+        release.set()
+        ocr_ready.set()
+        worker.stop()
+
+
+def test_size_mismatch_stops_worker_without_processing_later_frames() -> None:
+    """尺寸错误必须终止整次处理，不能被普通逐帧异常处理吞掉。"""
+
+    class WrongSize(_FakeDetector):
+        def detect(self, *args, **kwargs):
+            self.calls.append(kwargs["frame_index"])
+            raise FrameSizeMismatchError("帧尺寸 64x64 与标定 128x128 不符，停止运行")
+
+    detector = WrongSize()
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=_buffer_with(3),
+        detector=detector,
+    )
+    worker.start()
+    try:
+        assert not worker.drain(timeout=5)
+        with pytest.raises(FrameSizeMismatchError, match="停止运行"):
+            worker.raise_if_failed()
+        assert detector.calls == [1]
+        assert worker.stats.frames == 0
+    finally:
+        worker.stop()
+    with pytest.raises(FrameSizeMismatchError):
+        worker.start()
+
+
+@pytest.mark.parametrize("mode", ["ocr", "cls12"])
+@pytest.mark.parametrize(
+    ("missing", "strict", "expected", "fatal"),
+    [
+        (False, True, 0, False),
+        (True, True, 1, False),
+        (True, False, 0, False),
+        (False, True, 1, True),
+    ],
+)
+def test_replay_entry_drains_tail_and_preserves_failure(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    mode,
+    missing,
+    strict,
+    expected,
+    fatal,
+) -> None:
+    """真实回放入口在播放完成后才放行检测，确定性复现尾帧积压。"""
+    import cv2
+
+    import airdrop
+    from airdrop.perception.detector import Detector as RealDetector
+    from airdrop.record.replay import ReplayVideoSource
+    from examples import replay_flight
+
+    release = threading.Event()
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    ok, jpeg = cv2.imencode(".jpg", np.zeros((64, 64, 3), np.uint8))
+    assert ok
+    rows = []
+    snapshots = []
+    for index in range(1, 6):
+        stamp = 1000 + index * 0.1
+        name = f"{index:06d}.jpg"
+        if not (missing and index == 5):
+            (frames / name).write_bytes(jpeg.tobytes())
+        rows.append(
+            json.dumps(
+                dict(
+                    index=index,
+                    filename=name,
+                    capture_timestamp=stamp,
+                    received_timestamp=stamp + 0.15,
+                    lag=0.15,
+                    extrapolated=False,
+                    offset=0.0,
+                    bytes=len(jpeg),
+                )
+            )
+        )
+        snapshots.append(
+            json.dumps(
+                TelemetrySnapshot(
+                    timestamp=stamp,
+                    north_m=10,
+                    east_m=20,
+                    down_m=-50,
+                    roll_deg=0,
+                    pitch_deg=0,
+                    yaw_deg=0,
+                ).as_dict()
+            )
+        )
+    (tmp_path / "frames_index.jsonl").write_text("\n".join(rows), encoding="utf-8")
+    (tmp_path / "telemetry.jsonl").write_text("\n".join(snapshots), encoding="utf-8")
+
+    class Source(ReplayVideoSource):
+        def stop(self, timeout=5.0):
+            super().stop(timeout)
+            release.set()
+
+    class Detector(_FakeDetector):
+        def detect(self, *args, **kwargs):
+            if fatal:
+                return RealDetector(DetectorConfig(calib_size=(128, 128))).detect(args[0])
+            assert release.wait(10)
+            return super().detect(*args, **kwargs)
+
+    accepted = 4 if missing else 5
+
+    class Pool(_FakePool):
+        def poll(self, timeout=0.0):
+            # 全部送检后才一起返回，避免同步假池掩盖尾部 OCR 丢失。
+            return super().poll(timeout) if len(self.submitted) == accepted else None
+
+    workers = []
+
+    def create_worker(config, *, buffer):
+        worker = PerceptionWorker(
+            config,
+            buffer=buffer,
+            detector=Detector(),
+            pool=Pool(numbers=[42] * accepted) if mode == "ocr" else None,
+        )
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(airdrop, "ReplayVideoSource", Source)
+    monkeypatch.setattr(airdrop, "PerceptionWorker", create_worker)
+    caplog.set_level(logging.INFO)
+    assert (
+        replay_flight.main(
+            flight_dir=tmp_path,
+            perception_mode=mode,
+            strict=strict,
+            plan_drop_mission=False,
+            speed=0.1 if fatal else 0,
+        )
+        == expected
+    )
+    worker = workers[0]
+    assert not worker.running
+    if fatal:
+        assert worker.stats.frames == 0
+        assert "帧尺寸 64x64" in caplog.text
+        assert "回放终止" in caplog.text
+        return
+    assert worker.stats.frames == accepted
+    assert worker.queued_results == 0
+    if mode == "ocr":
+        assert worker.stats.submitted == worker.stats.results == accepted
+    assert f"回放结束：状态={'error' if missing and strict else 'finished'}" in caplog.text
+
+
 def test_pipeline_ocr_mode_emits_detections_with_codes() -> None:
     buffer = _buffer_with(3)
     pool = _FakePool(numbers=[42, 56, 95])
@@ -1414,10 +1689,213 @@ def test_detection_as_dict_includes_telemetry() -> None:
 # ----------------------------------------------------------------------
 def _close_pool_queues(pool) -> None:
     """关掉测试里手工打开的进程池队列，别让 feeder 线程挂到进程退出。"""
-    for bounded in (pool._request_q, pool._result_q):
+    for bounded in (pool._request_q, pool._result_q, pool._status_q):
         with contextlib.suppress(Exception):
             bounded.close()
             bounded.join_thread()
+
+
+class _StartupQueue(queue.Queue):
+    """初始化协议测试用队列，保留关闭接口。"""
+
+    def close(self):
+        pass
+
+    def join_thread(self):
+        pass
+
+
+class _StartupContext:
+    """只替换进程启动边界，父进程的等待、错误和回滚逻辑照常执行。"""
+
+    Queue = _StartupQueue
+
+    def __init__(self, actions):
+        self.actions = actions
+        self.processes = []
+        self.spawned = threading.Event()
+
+    def Process(self, *, target, args, name, daemon):
+        context = self
+        index = len(self.processes)
+
+        class Process:
+            alive = False
+            terminated = False
+
+            def __init__(self):
+                self.name = name
+
+            def start(self):
+                action = context.actions[index]
+                if action == "spawn_error":
+                    raise OSError("无法创建进程")
+                self.alive = action != "exit"
+                status = args[-1]
+                if action == "ready":
+                    status.put((index, None))
+                elif action == "error":
+                    status.put((index, "权重缺失"))
+                elif action == "duplicate":
+                    status.put((0, None))
+                if index == len(context.actions) - 1:
+                    context.spawned.set()
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.terminated = True
+                self.alive = False
+
+            def join(self, timeout):
+                self.alive = False
+
+        process = Process()
+        self.processes.append(process)
+        return process
+
+
+def _startup_pool(actions):
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    pool: Any = OcrWorkerPool(workers=len(actions))
+    _close_pool_queues(pool)
+    context = _StartupContext(actions)
+    pool._context = context
+    pool._request_q = context.Queue()
+    pool._result_q = context.Queue()
+    pool._status_q = context.Queue()
+    return pool, context
+
+
+def test_ocr_start_requires_every_worker_ready() -> None:
+    """第一个就绪不能代表整池就绪，等待阶段不接受送检。"""
+    pool, context = _startup_pool(["ready", "silent"])
+    finished = threading.Event()
+    errors = []
+
+    def start():
+        try:
+            pool.start(timeout=5)
+        except Exception as exc:  # noqa: BLE001 - 将测试线程异常交回主线程断言
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=start)
+    thread.start()
+    try:
+        assert context.spawned.wait(2)
+        assert not finished.is_set()
+        assert not pool.started
+        assert pool.submit(np.zeros((2, 2, 3)), frame_index=1, capture_timestamp=0) is None
+        pool._status_q.put((1, None))
+        assert finished.wait(2)
+        assert not errors
+        assert pool.started and pool.alive == 2
+        assert pool.poll() is None, "初始化消息不能混入识别结果"
+    finally:
+        pool._status_q.put((1, None))
+        thread.join(5)
+        pool.stop()
+
+
+@pytest.mark.parametrize(
+    ("action", "error", "message"),
+    [
+        ("error", RuntimeError, "权重缺失"),
+        ("exit", RuntimeError, "退出"),
+        ("silent", TimeoutError, "超时"),
+        ("duplicate", TimeoutError, "超时"),
+        ("spawn_error", OSError, "创建进程"),
+    ],
+)
+def test_ocr_start_failure_rolls_back_all_children(action, error, message) -> None:
+    pool, context = _startup_pool(["ready", action])
+    with pytest.raises(error, match=message):
+        pool.start(timeout=0.2)
+    assert not pool.started
+    assert pool.alive == 0
+    assert not pool._processes
+    assert context.processes[0].terminated
+
+
+@pytest.mark.parametrize("outcome", [True, False, "raise"])
+def test_ocr_child_reports_warmup_outcome(monkeypatch, outcome) -> None:
+    """子进程入口必须检查 warmup 的布尔结果，失败不消费识别请求。"""
+    from airdrop.perception import ocr_worker
+
+    class Post:
+        color = "blue"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def warmup(self):
+            if outcome == "raise":
+                raise RuntimeError("初始化异常")
+            return outcome
+
+    monkeypatch.setattr(ocr_worker, "OpenCvPostProcess", Post)
+    requests, results, status = queue.Queue(), queue.Queue(), queue.Queue()
+    requests.put(None)
+    ocr_worker.ocr_worker_main(requests, results, {}, 3, status)
+    worker_id, error = status.get_nowait()
+    assert worker_id == 3
+    assert (error is None) == (outcome is True)
+    assert requests.empty() == (outcome is True)
+    assert results.empty()
+
+
+def test_ocr_spawn_reports_initialization_error() -> None:
+    """真实 Windows spawn 验证错误可跨进程返回，不加载模型或 GPU。"""
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    pool = OcrWorkerPool(workers=1, config={"engine": {"invalid_option": True}})
+    try:
+        with pytest.raises(RuntimeError, match="初始化"):
+            pool.start(timeout=20)
+        assert not pool.started and pool.alive == 0
+    finally:
+        pool.stop()
+        _close_pool_queues(pool)
+
+
+def test_ocr_initialization_failure_cannot_pass_preflight() -> None:
+    """真实自检经真实感知启动收到错误，不能把 Process.start 当作成功。"""
+    from airdrop.config import PreflightConfig
+    from airdrop.preflight import Preflight, PreflightError
+
+    pool, _ = _startup_pool(["error"])
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr"),
+        buffer=_buffer_with(0),
+        pool=pool,
+        detector=_FakeDetector(),
+    )
+    preflight = Preflight(
+        PreflightConfig(load_detector=False, load_camera=False, check_video=False),
+        model_loaders={"ocr": worker.start},
+    )
+    with pytest.raises(PreflightError, match="权重缺失"):
+        preflight.run()
+    assert not worker.running and not pool.started
+
+
+def test_ocr_restart_uses_fresh_queues() -> None:
+    """失败启动和正常关闭都不能把旧就绪消息或退出哨兵留给下一轮。"""
+    pool, _ = _startup_pool(["error"])
+    with pytest.raises(RuntimeError):
+        pool.start()
+    for _ in range(2):
+        previous = pool._request_q
+        pool._context = _StartupContext(["ready"])
+        pool.start()
+        assert pool.started
+        assert pool._request_q is not previous
+        assert pool._request_q.empty()
+        pool.stop()
 
 
 def test_ocr_pool_submit_never_drops() -> None:

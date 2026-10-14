@@ -13,7 +13,7 @@
 * ``model_loaders``：``{"detector": 载入函数, "ocr": ..., "camera": ...}``——键就是
   :class:`~airdrop.config.PreflightConfig` 里的开关名；关掉的项记一条 ``preflight``
   事件（``ok=None``）后跳过；
-* ``video_source``：任何有 ``stats.frames``（以及可选 ``latest()``）的对象
+* ``video_source``：提供 ``stats.frames`` 与 ``latest()``（含尺寸和接收时间戳）的对象
   （:class:`~airdrop.video.Hm30VideoSource` / 回放源都行）；
 * ``camera_model``：已载入的相机标定（用来核对画面分辨率是否与标定一致）。
 
@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -85,7 +86,7 @@ class Preflight:
     video_source:
         图传源；读 ``stats.frames`` 计帧、``latest()`` 取最新帧核对分辨率。
     camera_model:
-        已载入的相机标定（有 ``width``/``height`` 时核对画面尺寸）。
+        已载入的相机标定（必须有有效 ``image_size`` 才能通过视频检查）。
     """
 
     def __init__(
@@ -145,31 +146,44 @@ class Preflight:
     def _check_video(self) -> PreflightCheck:
         if not self._config.check_video:
             return self._report(PreflightCheck("video", None, "配置里关掉了（未检查）"))
-        source = self._video_source
-        if source is None:
-            self._report(PreflightCheck("video", False, "没有接入视频源"))
-            raise PreflightError("video: 没有接入视频源")
+        try:
+            detail = self._probe_video()
+        except Exception as exc:
+            self._report(PreflightCheck("video", False, str(exc)))
+            raise PreflightError(f"video: {exc}") from exc
+        return self._report(PreflightCheck("video", True, detail))
+
+    def _probe_video(self) -> str:
+        """只核验本次窗口内的新帧，缺少核验依据即失败。"""
+        if self._video_source is None:
+            raise ValueError("没有接入视频源")
+        size = self._expected_size()
+        if size is None:
+            raise ValueError("缺少有效标定尺寸，无法核对画面")
 
         want = int(self._config.video_min_frames)
         window = float(self._config.video_probe_s)
-        deadline = self._clock() + window
-        frames = self._frames()
+        started = self._clock()
+        deadline = started + window
+        baseline = self._frames()
+        frames = 0
         while frames < want and self._clock() < deadline:
-            self._sleep(0.1)
-            frames = self._frames()
+            self._sleep(min(0.1, deadline - self._clock()))
+            frames = self._frames() - baseline
+            if frames < 0:
+                raise ValueError("视频帧计数回退，无法核验新增帧")
         if frames < want:
-            detail = f"{window:.1f}s 内只收到 {frames} 帧（要求 ≥ {want}）"
-            self._report(PreflightCheck("video", False, detail))
-            raise PreflightError(f"video: {detail}")
-
-        size = self._expected_size()
-        if size is not None:
-            actual = self._frame_size()
-            if actual is not None and actual != size:
-                detail = f"画面 {actual[0]}x{actual[1]} 与标定 {size[0]}x{size[1]} 不一致"
-                self._report(PreflightCheck("video", False, detail))
-                raise PreflightError(f"video: {detail}")
-        return self._report(PreflightCheck("video", True, f"{frames} 帧"))
+            raise ValueError(f"{window:.1f}s 内只收到 {frames} 帧（要求新增 ≥ {want}）")
+        frame = self._video_source.latest()
+        if frame is None:
+            raise ValueError("无法取得最新画面")
+        stamp = float(frame.timestamp)
+        if not math.isfinite(stamp) or not started <= stamp <= self._clock():
+            raise ValueError("最新画面时间不在本次自检窗口内")
+        actual = (int(frame.width), int(frame.height))
+        if actual != size:
+            raise ValueError(f"画面 {actual[0]}x{actual[1]} 与标定 {size[0]}x{size[1]} 不一致")
+        return f"窗口内新增 {frames} 帧，最新画面尺寸与标定一致"
 
     # ------------------------------------------------------------------
     def _frames(self) -> int:
@@ -180,7 +194,7 @@ class Preflight:
             return 0
 
     def _expected_size(self) -> tuple[int, int] | None:
-        """标定时的图像尺寸 ``(width, height)``；没有标定尺寸就返回 None（跳过核对）。
+        """标定时的图像尺寸 ``(width, height)``；缺失返回 None，由自检报告失败。
 
         ⚠ 字段名必须对上 :class:`~airdrop.georef.CameraModel` 的 ``image_size``——
         这里曾经读的是并不存在的 ``width``/``height``，``getattr`` 恒返回 None，
@@ -201,23 +215,6 @@ class Preflight:
         if width <= 0 or height <= 0:
             return None
         return (width, height)
-
-    def _frame_size(self) -> tuple[int, int] | None:
-        latest = getattr(self._video_source, "latest", None)
-        if latest is None:
-            return None
-        try:
-            frame = latest()
-        except Exception:
-            LOGGER.exception("取最新帧失败（跳过分辨率核对）")
-            return None
-        if frame is None:
-            return None
-        width = getattr(frame, "width", None)
-        height = getattr(frame, "height", None)
-        if width and height:
-            return (int(width), int(height))
-        return None
 
     def _report(self, check: PreflightCheck) -> PreflightCheck:
         LOGGER.info("起飞前自检 %s：%s", check.name, check.detail or "通过")

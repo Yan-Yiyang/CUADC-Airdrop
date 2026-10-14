@@ -1915,7 +1915,13 @@ def main(
     )
     writer = AlignmentWriter(
         buffer,
-        FrameTelemetryAligner(broker, max_wait=config.align.max_wait, mode=config.align.mode),
+        FrameTelemetryAligner(
+            broker,
+            max_wait=config.align.max_wait,
+            mode=config.align.mode,
+            on_timeout=config.align.on_timeout,
+            max_extrapolation=config.align.max_extrapolation,
+        ),
     )
     source.add_sink(writer)
 
@@ -1953,6 +1959,8 @@ def main(
         broker,
         target_result=perception.source.result,
         target_busy=perception.source.busy,
+        health_check=perception.worker.raise_if_failed,
+        finish_recon=perception.worker.finish_input,
         release_judge=judge,
         on_event=on_event,
         on_drop=on_drop,
@@ -2000,6 +2008,7 @@ def main(
                 " abort、在落点上方 30 m 无限盘旋（查 sim/airframes/4007_gz_rc_cessna_down_cam）"
             )
 
+        perception.worker.start()
         source.start()
         if not source.wait_ready(video_wait_s):
             LOGGER.error(

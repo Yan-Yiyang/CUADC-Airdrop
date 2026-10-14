@@ -486,6 +486,12 @@ flight_dir  -> Path | None
 `logger.info` 都自动进 `flight.log`）→ 起 2 个写盘线程。**幂等**：重复 `start` 直接返回；
 `stop` 后再 `start` 会报错（要新建实例）。
 
+启动失败会回滚已打开文件、日志处理器和已启动线程，保留失败目录供排查。
+停止时固定尾帧索引，排空截止前的可读帧；应先停止视频生产，再调用 `stop`。
+`timeout` 是两条线程共同的等待预算。超时仍保留线程与文件，`is_running` 在后台线程
+存活时仍为真，稍后再次 `stop` 完成收尾。`frames_skipped` 包含驱逐、解码缺失、
+编码及写盘失败，最终事件也记录该计数。JSONL 编码失败返回 `False`，后续有效记录仍可写入。
+
 **最小的"录一次 + 回放"示例**（真跑通；用工作区内的临时目录，避免污染 `flights/`）：
 
 ```python
@@ -637,7 +643,7 @@ FlightLog.iter_telemetry() -> Iterator[TelemetrySnapshot]
 | `raw_text` | `''` | OCR 原始串（纠错前） |
 | `ocr_confidence` | `0.0` | OCR 置信度 |
 | `mode` | `''` | 产生它的模式（`ocr` / `cls12`） |
-| `extra` | 空字典 | 附加信息，检测器会写 `undistorted`（像素是否已在纠正后的图上） |
+| `extra` | 空字典 | 检测器写入 `undistorted`（是否已纠正）和 `image_size`（像素所在画面的宽、高；JSON 中为二元素列表） |
 
 属性 `has_code`（`code is not None`）与 `as_dict()`（键：`frame_index`、`capture_timestamp`、`pixel`、`box`、`confidence`、`code`、`side_px`、`raw_text`、`ocr_confidence`、`mode`、`telemetry`、`extra`；`telemetry` 内嵌 `timestamp`、`latitude_deg`、`longitude_deg`、`absolute_altitude_m`、`north_m`、`east_m`、`down_m`、`roll_deg`、`pitch_deg`、`yaw_deg`，`extra` 为空时不出现）。`detections.jsonl` 与回放素材里写的就是这个字典。
 
@@ -648,7 +654,7 @@ Detector(config: DetectorConfig | None = None)
 DetectorConfig(model_path='models/best2.pt', device='0', conf_threshold=0.25,
                iou_threshold=0.45, imgsz=1280, max_detections=300,
                crop_expand_ratio=0.2, camera_matrix=None, dist_coeffs=None,
-               undistort=True)
+               undistort=True, calib_size=None)
 ```
 
 方法：
@@ -659,11 +665,15 @@ DetectorConfig(model_path='models/best2.pt', device='0', conf_threshold=0.25,
 | `warmup(width, height)` | 用一张空图跑一次，避免首帧卡顿；返回是否成功 |
 | `prepare_undistort(width, height, *, force=False)` | 预计算 remap 映射表；**映射表锁定在标定分辨率上**，尺寸不符直接返回 `False` 并告警 |
 | `undistort(image)` | 返回 `(纠正后图像, 是否真的纠正了)` |
-| `detect(image, *, frame_index=0, capture_timestamp=0.0, telemetry=None, mode='', undistort=None)` | 返回 `DetectionBatch(image, detections, undistorted)` |
+| `detect(image, *, frame_index=0, capture_timestamp=0.0, telemetry=None, mode='', undistort=None)` | 返回 `DetectionBatch(image, detections, undistorted)`；已知尺寸不符时抛 `FrameSizeMismatchError`，提示输入与标定尺寸并终止本次运行，不加载或运行模型 |
 | `crop(batch, detection)` | 按 `crop_expand_ratio` 外扩取目标裁剪图（交给后处理） |
 | `replace_config(**changes)` | 派生一个新检测器（改 `conf_threshold` 等做 A/B） |
 
 三个必须知道的行为：
+
+- **`device` 显式指定**（默认 `'0'`），确保运行设备由配置决定。
+- **去畸变用预计算 remap**，复用映射表以避免逐帧建表。`detect` 在推理前检查 `calib_size`（缺失时使用已建映射表的尺寸），不匹配就抛异常终止处理；关闭去畸变也不能绕过。感知线程锁存错误，`raise_if_failed()` 交给主线程：回放停止生产并返回 1；完整任务和 SITL 侦查通过 `MissionRunner(health_check=...)` 每拍检查，进入 ABORT 并执行配置的收尾动作。修正标定后重新启动，不逐帧跳过等尺寸恢复。单独调用底层 `undistort` 仍保留返回原图和 `False` 的行为，不代表尺寸已核对通过。
+- `detect` 写入 `Detection.extra["undistorted"]` 和 `image_size`，供解算端核对。改变分辨率时，需把显式缩放/重新标定的同一相机模型交给检测器和 `TargetTracker`；`force=True` 仅重建映射表，不负责换算内参。
 
 #### 3.4.3 `OpenCvPostProcess` —— 裁剪图后处理
 
@@ -766,12 +776,13 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 
 ```python
 OcrWorkerPool(workers=2, *, queue_size=500, config: dict | None = None)
-# start() / stop(timeout=5.0) / submit(crop, *, frame_index, capture_timestamp, payload=None)
+# start(timeout=120.0) / stop(timeout=5.0) / submit(crop, *, frame_index, capture_timestamp, payload=None)
 # poll(timeout=0.0) / drain()
 ```
 
 - `submit` 返回任务号；请求/结果队列都**无界、不丢弃**（目标可能只清晰一瞬，漏一个请求就可能漏目标）。`queue_size` 不再是容量，而是**积压告警阈值**：未完成数（`submitted - results`）达到它时打一条 WARNING（跨阈值一次；回落到一半以下后再次涨上来会重新告警），提示降帧率或加 OCR worker。`PerceptionStats.ocr_dropped` 同步池侧的 `dropped` 计数——不丢弃策略下它恒为 0，保留作监控。
 - OCR 放独立进程的理由：RapidOCR 单帧几十到几百毫秒，放主循环里会直接拖垮逐帧检测。进程参数经 `config`（字典）传给 `ocr_worker_main`。
+- `start` 并行启动所有进程，等待每个进程完成模型预热并确认就绪才返回；120 秒是整池初始化总时限。预热返回 `False`、初始化异常、进程提前退出或超时均失败，并回收本轮已启动进程。`PerceptionWorker.start()` 将错误传给自检，不能仅凭进程已创建就报告通过。初始化消息使用独立队列，不混入识别结果，也不增加逐帧消息。重启使用新队列并重置队列统计，防止旧退出哨兵或结果进入新一轮。
 - Windows 是 spawn 语义：**入口脚本必须放在 `if __name__ == "__main__":` 之下**，否则子进程会重复导入主模块。受限沙箱里命名管道不可用，进程池会起不来（见 §8）。
 
 #### 3.4.6 `PerceptionWorker` —— 逐帧主循环
@@ -779,12 +790,13 @@ OcrWorkerPool(workers=2, *, queue_size=500, config: dict | None = None)
 ```python
 PerceptionWorker(config: PerceptionConfigLike, *, buffer: AlignmentBuffer,
                  detector=None, pool=None, start_index=0)
-# start() / stop(timeout=10.0) / poll_result(timeout=0.0) / drain_results()
+# start() / drain(timeout=120.0) / stop(timeout=10.0) / poll_result(timeout=0.0) / drain_results()
 # iter_results(timeout=0.5) / set_result_callback(callback)
 ```
 
 - `buffer` 必须是 `AlignmentBuffer`（不是别的可迭代对象）：worker 用 `wait_new` 逐帧跟随，**一帧不落**。`start_index` 决定从哪一帧开始（断点续跑用）。
 - `detector` / `pool` 可注入：传假对象即可离线测整条流水线（`tests/test_perception.py` 正是这么做的），这也是它们存在的理由。
+- 收尾先停止生产者，再调用 `drain(timeout=120.0)` 等待既有帧和 OCR 回填；它不消费结果队列，成功后仍需抽取结果再 `stop()`。超时、未启动或处理失败返回 `False`。`stop()` 超时会保留工作线程和池，避免并发操作正在使用的池。
 - `PerceptionConfigLike` 只要求这些字段：`mode`、`model_path`、`device`、`conf_threshold`、`imgsz`、`target_color`、`ocr_conf_threshold`、`ocr_workers`、`ocr_queue_size`、`ocr_dedupe_s`、`ocr_dedupe_px`、`min_side_px`、`max_side_px`、`engine`（默认 `None`）。真实的参数类是 `PerceptionConfig`，字段更多（见 §4）。
 
 两种模式：
@@ -938,7 +950,7 @@ CameraModel(camera_matrix, dist_coeffs=<全零>, r_bc=<DEFAULT_R_BC>, t_bc=<零�
 - `quaternion_to_matrix(w, x, y, z, *, normalize_input=True)`、`euler_to_matrix(roll_deg, pitch_deg, yaw_deg)`、`rotation_x/y/z(angle_deg)`、`normalize(vector)`。约定：欧拉角是**机体到 NED** 的旋转，顺序 roll → pitch → yaw。
 - `LLARef(lon_deg, lat_deg, alt_m)`（注意字段顺序是**经度在前**）、`wgs84_to_ned(lon, lat, alt, ref)`、`ned_to_wgs84(ned, ref)`、`ned_distance(a, b)`。经纬度换算走 `pyproj`，`ref` 既可以是 `LLARef` 也可以是 `(lon, lat, alt)` 三元组。
 
-**去畸变只做一次**（这条最容易出错）：检测器若已经 remap（检测器内参 `camera_matrix` 非空），像素就在纠正后的图上，坐标解算不能再来一次。`Detector.detect` 会把这件事写进 `Detection.extra["undistorted"]`，`TargetTracker(undistort=None)` 默认据此自动判断；手动调用 `pixel_to_ned` 时由 `undistort=` 显式控制。
+**像素与内参保持一致，去畸变只做一次**：检测器 remap 的输出保留标定矩阵 K，不另改焦距/主点或裁剪画面；下游使用同一相机模型反投影。若以后更换输出矩阵，必须同步传递对应模型。映射表按分辨率缓存，逐帧复用。纠正后的图像可能包含无源像素对应的黑边，不能通过隐式裁剪消除。`Detector.detect` 在 `Detection.extra["undistorted"]` 中记录是否已纠正，`TargetTracker(undistort=None)` 据此避免重复去畸变；手动调用 `pixel_to_ned` 时由 `undistort=` 显式控制。
 
 ```python
 """坐标解算：水平朝下看 + 主点像素 ⇒ 目标就在飞机正下方。"""
@@ -1337,6 +1349,7 @@ PerceptionTargetSource(worker, tracker)
 行为约定：
 
 - **缺姿态或位置的点不猜**：分别计入 `attitude_missing` / `no_fix` 后跳过（计数可从 tracker 的统计读到）。
+- **画面尺寸必须与相机模型一致**：`Detection.extra["image_size"]` 与 `CameraModel.image_size` 不符或格式错误时拒绝解算，计入 `image_size_mismatch` 并记录同名事件；`reset()` 清零。旧记录未携带尺寸，或模型未声明尺寸时保留原行为，这不代表已经通过尺寸核对。
 - **边长交叉验证默认只当诊断**：超门限记 `side_check` 事件与计数，**不剔点**（默认 `reject_on_side_mismatch=False`；误判一个真实观测比多一个野点的代价大）。`DEFAULT_SIDE_TOLERANCE=0.25` 与 `cross_check_by_side` 的默认一致。
 - `undistort=None` 时按 `Detection.extra["undistorted"]` 自动判断要不要去畸变（见 3.5.4）。
 - `ground_z(snapshot)` 只依赖配置里的地面点参数；给不出时返回 0（原点高度面），由调用方决定记不记警告。
@@ -1345,13 +1358,18 @@ PerceptionTargetSource(worker, tracker)
 
 ```python
 MissionRunner(config, controller, broker, *, target_result=None, target_busy=None,
-              release_judge=None, on_event=None, on_drop=None, preflight=None,
+              health_check=None, finish_recon=None, release_judge=None, on_event=None, on_drop=None, preflight=None,
               clock=time.time, sleep=time.sleep)
   .run(*, max_ticks=None) -> MissionState     # 按 tick_hz 推进，直到终态/stop/拍数上限
   .update(now=None) -> MissionState           # 单拍
   .stop(reason='stopped')                     # 请求退出；未结束按 ABORT 处理
   .abort(reason)                              # 外部故障也可直接调
 ```
+
+完整任务与 SITL 侦查将 `finish_recon` 接到 `PerceptionWorker.finish_input()`：侦查结束时
+固定未读帧快照，图传与全程录制仍使用原缓冲。快照共享图像存储，不重新编码；原缓冲
+后续驱逐不会丢失这些尾帧，最后一帧送检后释放快照引用。积压排空期间可能额外保留
+截止前未读图像所占的内存。`targeting.reason` 区分 `result`、`no_target` 与 `timeout`。
 
 `preflight` 是 :class:`~airdrop.preflight.PreflightLike`（默认 `None` = 记一条 `preflight_skipped`
 后放过，**正式入口必须注入**）。`update()` 对 `PREFLIGHT`/`WAIT_AIRBORNE` 这两个**瞬时状态**
@@ -1367,7 +1385,7 @@ MissionRunner(config, controller, broker, *, target_result=None, target_busy=Non
 | `PREFLIGHT` | - | 跑一次预检 `self._preflight.run()`：载入 detector/ocr/camera → 视频自检 | 全部通过 → `WAIT_AIRBORNE`（`preflight_ok`）；任一项失败 → `ABORT`（`preflight_failed:<check>`）；超 `preflight.max_s` → `preflight_timeout`；**没注入预检**（离线测试）→ 记 `preflight_skipped` 后放过 |
 | `WAIT_AIRBORNE` | - | 什么都不下发；`in_air` 为主，取不到时用 `relative_altitude_m >= airborne_alt_m` 兜底 | 判定在空中 → 记 `airborne` 事件（带 `source`）→ `RECON`；`airborne_timeout_s`（默认 1800s）超时 → `ABORT`（`airborne_timeout`） |
 | `RECON` | `recon_upload="auto"` 时上传并启动侦查航线；`"operator"`（默认，正式任务）**不上传**，记一条 `recon_waiting_operator` 后等操作手在 QGC 启动 | **先确认任务真在跑**（`_confirm_started`，见下）→ 链路看门狗 + 查询任务是否飞完 | 飞完 → `HOLD_PROCESS`（`recon_finished`）；`recon_max_s` 超时 → `ABORT`（`recon_timeout`） |
-| `HOLD_PROCESS` | 下 `hold` | 读目标统计：有结果（`result.ok`）或到 `hold_process_max_s`，或已过 `hold_process_min_s` 且 `target_busy()` 为假 | 结束等待 → 建投放航线（无目标就用备用点）→ 上传启动 → `OVERFLY`；`PlanningError` → `ABORT` |
+| `HOLD_PROCESS` | 调 `finish_recon` 固定识别截止帧，记 `recon_input_closed`，再下 `hold` | 等截止前帧、在途检测、OCR 与结果队列排空：有结果即可结束，无结果还须经过 `hold_process_min_s`；超过 `hold_process_max_s` 则记超时 | 结束等待 → 建投放航线（无目标就用备用点）→ 上传启动 → `OVERFLY`；`PlanningError` → `ABORT` |
 | `OVERFLY` | 记兜底上限 `land_max_s`；`judge.reset()` | **先确认任务真在跑** → 再跑投放判据：`should_release` 就投放 | 投放成功 → `LAND`；任务飞完却没投出去 → `ABORT`（`overfly_finished_without_release`，这是**失败**不是完成）；超时 → `overfly_timeout` |
 | `LAND` | - | 查询任务是否飞完 | 飞完 → `DONE`；超时 → `land_timeout` |
 | `ABORT` | 计数 + 下安全动作（`abort_action`） | - | 终态 |
@@ -1607,7 +1625,7 @@ preflight = Preflight(
         "camera": lambda: config.camera.load_model(),  # CameraConfig.load_model()
     },
     video_source=source,  # 任何有 stats.frames（以及可选 latest()）的对象
-    camera_model=camera,  # 有 width/height 时核对画面分辨率与标定一致
+    camera_model=camera,  # 必须有 image_size，核对画面分辨率与标定一致
     on_event=lambda kind, data: recorder.events.emit(kind, **data),
 )
 checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightError
@@ -1624,8 +1642,9 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 
 - **开着却没注入回调 = 装配错误**：那一项直接判失败并抛 `PreflightError`（绝不静默当成通过）；
 - **关掉的项**记一条 `preflight` 事件（`detail='配置里关掉了（未检查）'`、`ok=null`）后跳过；
-- 视频自检 = 在 `video_probe_s` 窗口内等够 `video_min_frames` 帧；若给了 `camera_model`，
-  再核对最新帧尺寸与标定一致（`Hm30VideoSource` 与回放源都满足 `stats.frames` / `latest()`）；
+- 视频自检 = 在 `video_probe_s` 窗口内新增至少 `video_min_frames` 帧，历史累计帧不计入。
+  最新帧接收时间须在本次窗口内，尺寸必须与有效 `camera_model.image_size` 一致；
+  无标定尺寸、取帧失败、缺少时间戳或尺寸均失败，不把无法核对当成通过。
 - **每一项都发一条 `preflight` 事件**，正式任务起飞前逐项核对即可知道哪几项没有把关。
 
 ⚠ 复盘口径：**"关掉"与"通过"必须分得开**——`ok=None` 是"没把关"，`ok=True` 才是"查过且合格"。
@@ -1843,11 +1862,11 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `load_detector` | bool | `True` | 载入 YOLO 权重（`model_loaders["detector"]`） |
-| `load_ocr` | bool | `True` | 载入 OCR 权重与字典（`model_loaders["ocr"]`） |
+| `load_ocr` | bool | `True` | 检查 OCR 初始化（`model_loaders["ocr"]`）；完整任务与 SITL 在接收视频前独立启动感知，关闭此检查不会关闭识别 |
 | `load_camera` | bool | `True` | 载入相机标定（`model_loaders["camera"]`） |
-| `check_video` | bool | `True` | 视频自检：窗口内帧数（+ 有标定时核对分辨率） |
+| `check_video` | bool | `True` | 视频自检：窗口新增帧数、最新帧新鲜度与标定尺寸核对 |
 | `video_probe_s` | float | `5.0` | 视频探测窗口（秒） |
-| `video_min_frames` | int | `10` | 窗口内要求的最少帧数（至少 1） |
+| `video_min_frames` | int | `10` | 窗口内要求新增的最少帧数（至少 1） |
 | `max_s` | float | `120.0` | 整个预检的总上限；超时 → `ABORT('preflight_timeout')` |
 
 ⚠ **关掉 ≠ 通过**：被关掉的项记一条 `preflight` 事件（`ok=null`），正式任务起飞前请核对那一条。
@@ -1979,6 +1998,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `recon_waiting_operator` | `MissionRunner` | `note`：`recon_upload='operator'`，本包**不上传**侦查航线，等操作手在 QGC 上传并启动 |
 | `drop_dry_run` | `DryRunController` | `count`：演练模式下第几次"投放只记日志" |
 | `side_check` | `TargetTracker` | 边长法交叉验证超门限的诊断（**默认不剔点**） |
+| `image_size_mismatch` | `TargetTracker` | 检测画面尺寸与相机不符：含帧号、拍摄时刻、实际及预期尺寸；该条不解算 |
 | `recorder_started` / `recorder_stopped` | `FlightRecorder` | 目录、频率、缓冲容量 / 各类计数 |
 
 ### 5.3 `camera_calib.json`（`tools/calibrate.py` 产出）
@@ -2086,7 +2106,7 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | `python -m airdrop.run full-mission` | `examples/full_mission.py` | 飞控 + 图传 + `camera_calib.json` + 航线配置；`--dry-run` 可不装弹。**这是正式任务档**：`INIT→PREFLIGHT`（载入模型 + 视频自检）→`WAIT_AIRBORNE`→`RECON`（侦查航线由操作手在 QGC 上传并启动，`recon_upload="operator"`） | `flights/<ts>/` 一整套；终端打印任务与统计 | 0 成功 / 2 未到 DONE / 130 中断 / 1 异常 |
 | `python -m airdrop.run sitl` | `examples/sitl_mission.py` | PX4 SITL 在 `udpin://0.0.0.0:14540`；`--land-plan` 指向的 `routes/land.plan` 要在（不给则用内置 `LANDING_ROUTE`）。**这是自动测试档**：自检全关、`recon_upload="auto"`（本包上传侦查航线）、**不等起飞**（`require_airborne=False`，见 §4.13） | 终端"演练记录"：状态轨迹 / 上传与投放次数 / 判据评估次数 / 飞掠计划；`flights/<ts>/` 记录 | 0 成功 / 2 未到 DONE / 130 中断 / 1 异常 |
 | `python -m airdrop.run sitl-recon` | `tools/sitl_recon.py` | WSL 里起 SITL（`bash sim/run_sitl.sh r2`）+ Gazebo 自带的 RTP/H.264 图传（**不必用 HM30**）。**完全标准流程**：本脚本只扮演操作手（上传/启动「起飞任务」与「侦查航线」），其余交给 `MissionRunner` 状态机 + 真 `Preflight` + `PerceptionWorker`（OCR 进程池）+ `DryRunController`：监视侦查 → 空中出目标 → 飞掠投放 → 降落（**没有任何 offboard 设定点**）。测试期间临时把 `NAV_DLL_ACT` 置 0（跑完还原成 2）；`MIS_TKO_LAND_REQ` 已在仿真机型里永久置 0（理由见 `sim/airframes/4007_gz_rc_cessna_down_cam` 的注释——只飞侦查段，投弹航线要空中出结果才能生成） | 终端精度报告 + `.sitl-recon-tmp/report.json`（任务结果与分井误差、延时敏感性、反向诊断）+ `flights/<ts>/` 记录 | 0 成功 / 2 没遥测 / 3 没画面 / 4 没解锁 / 5 没进任务模式 / 6 没起飞 / 7 没飞完（仍出报告） / 1 异常 |
-| `python -m airdrop.run replay` | `examples/replay_flight.py` | 一份飞行目录（`--flight`，不给则取 `flights/` 最新） | 终端：帧统计、目标点、聚类结果、飞掠航线（**不上传**） | 0（没结果也是 0，只是走备用点分支） |
+| `python -m airdrop.run replay` | `examples/replay_flight.py` | 一份飞行目录（`--flight`，不给则取 `flights/` 最新） | 终端：播放终态、帧统计、目标点、聚类结果、飞掠航线（**不上传**） | 0 完成（没目标也为 0）；1 播放失败、排空超时或处理不完整 |
 | `python -m airdrop.run calibration-capture` | `examples/calibration_capture.py` | 图传（不给 `--rtsp-url` 用默认 HM30 地址）+ 飞控遥测 | 一个标定用飞行目录（姿态 50Hz、位置 20Hz、缓冲 300s） | 0；一帧没收到 = 1 |
 | `python -m airdrop.run calibrate` | `tools/calibrate.py` | 上面那份标定目录（`--flight`） | `camera_calib.json`；终端打印每步残差/相关系数 | 0；`--strict` 且外参/时间差没标出来 = 2 |
 | `python -m airdrop.run fit-ballistics` | `tools/fit_ballistics.py` | 投放试验的飞行目录 + `--impacts`（实测落点） | `ballistics_fit.json` + 终端对照表 + 可粘回的 `BallisticsConfig(...)` | 0 可信 / 2 不可信 / 3 缺测量 / 1 出错（§5.4） |
@@ -2119,6 +2139,7 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | `--side-check TOL` | replay | 边长互校门限（**默认关**；回放优化时才给，如 0.25——诊断用，不剔点） |
 | `--speed` | replay | 回放速度（0 = 全速） |
 | `--strict` | replay / calibrate | 回放异常即失败 / 标定降级（外参或时间差没标出来）即返回 2 |
+| `--drain-timeout` | replay | 停止生产后等待尾帧与 OCR 完成的最长秒数，默认 120；超时明确失败，不把部分结果当成完整回放 |
 | `--lag S` | sitl-recon | 图传链路延时估计（秒；报告里还会给 lag 扫描与反向诊断） |
 | `--recon-timeout S` | sitl-recon | RECON 段的上限（秒，状态机在这一段等侦查航线飞完） |
 | `--video-wait S` | sitl-recon | 等第一帧画面的上限（秒；SITL 刚启动时可以给大一点） |
@@ -2150,7 +2171,7 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 INIT           等遥测 + NED 原点（不上传任何任务）
   ↓
 PREFLIGHT      起飞前自检：载入 detector / ocr / camera → 视频自检
-               （窗口 video_probe_s 内至少 video_min_frames 帧；有标定时核对分辨率）
+               （窗口 video_probe_s 内新增至少 video_min_frames 帧；核对最新帧时间与标定尺寸）
   ↓            任一项失败 → ABORT("preflight_failed:<check>")；超 max_s → preflight_timeout
 WAIT_AIRBORNE  什么都不下发，等"飞机真的在空中"
                （in_air 为主，取不到时 relative_altitude_m >= airborne_alt_m 兜底）
@@ -2261,6 +2282,8 @@ config = Config(
 | `tests/test_recorder.py` | 飞行目录七个文件齐全、帧零重编码、事件/检测/投放写入、幂等启停 | 否（**沙箱里挂 `tmp_path`**） |
 | `tests/test_replay.py` | 回放对齐结果与"直接从日志查询"的参考 broker 完全一致 | 否 |
 | `tests/test_perception.py` | pipeline 逻辑（假 detector / 假 OCR 池）、去重、编号不被覆盖 | 否 |
+| `tests/test_camera_pipeline.py` | 原图与 remap 视线一致性、尺寸不匹配拦截、显式缩放模型与旧记录兼容 | 否 |
+| `tests/test_capture_entry.py` | 标定采集入口正常/中断/视频未就绪/零帧的返回码、摘要、文件与资源清理 | 否 |
 | `tests/test_perception_realdata.py` | 真 YOLO + 真 OCR 在 旧版 素材上读对编号（56/56/56） | ✅ GPU + 素材绝对路径 |
 | `tests/test_georef.py` | 相机模型加载/回退、像素→NED、边长法交叉验证（**沙箱里挂 `tmp_path`**） | 否 |
 | `tests/test_calibrate.py` | 标定三步合成链路（含整个 `calibrate()` 的输出契约） | 否 |

@@ -199,7 +199,14 @@ def main(
     if broker.wait_next_snapshot(timeout=15.0, predicate=lambda s: s.is_valid()) is None:
         LOGGER.warning("15 秒内没收到遥测：拉流不受影响，但对齐取不到遥测的帧会被计为 skipped")
 
-    aligner = FrameTelemetryAligner(broker, lag=config.video.telemetry_lag)
+    aligner = FrameTelemetryAligner(
+        broker,
+        lag=config.video.telemetry_lag,
+        max_wait=config.align.max_wait,
+        mode=config.align.mode,
+        on_timeout=config.align.on_timeout,
+        max_extrapolation=config.align.max_extrapolation,
+    )
 
     buffer = AlignmentBuffer(
         capacity_for(buffer_fps, buffer_seconds),

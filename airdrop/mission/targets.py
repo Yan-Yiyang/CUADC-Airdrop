@@ -80,6 +80,7 @@ class TargetTracker:
     _undistort_warned: bool = field(default=False, init=False)
     _ground_warned: bool = field(default=False, init=False)
     _attitude_missing: int = field(default=0, init=False)
+    _image_size_mismatch: int = field(default=0, init=False)
     #: ``(点数, 结果)`` 缓存——点数没变说明输入没变（_points 只增不减），
     #: analyze 是纯函数，所以结果必然相同。见 :meth:`result`。
     _result_cache: tuple[int, TargetingResult] | None = field(default=None, init=False)
@@ -89,6 +90,8 @@ class TargetTracker:
     # ------------------------------------------------------------------
     def add(self, detection: Detection) -> TargetPoint | None:
         """一条检测 → 一个目标点；解算不出来时返回 None（并计数）。"""
+        if not self._image_size_matches(detection):
+            return None
         snapshot = detection.telemetry
         position = _position_of(snapshot)
         if position is None:
@@ -180,6 +183,7 @@ class TargetTracker:
             "no_fix": self._no_fix,
             "attitude_missing": self._attitude_missing,
             "side_mismatch": self._side_mismatch,
+            "image_size_mismatch": self._image_size_mismatch,
         }
 
     def reset(self) -> None:
@@ -189,10 +193,33 @@ class TargetTracker:
         self._no_fix = 0
         self._side_mismatch = 0
         self._attitude_missing = 0
+        self._image_size_mismatch = 0
 
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
+    def _image_size_matches(self, detection: Detection) -> bool:
+        """已知尺寸必须匹配；旧记录没有尺寸字段时保留原有读取行为。"""
+        size = detection.extra.get("image_size")
+        expected = self.camera.image_size
+        if size is None or expected is None:
+            return True
+        if isinstance(size, (tuple, list)) and tuple(size) == expected:
+            return True
+        self._image_size_mismatch += 1
+        if self._image_size_mismatch == 1:
+            LOGGER.warning("检测画面尺寸 %s 与相机模型 %s 不符，拒绝解算", size, expected)
+        self._emit(
+            "image_size_mismatch",
+            {
+                "frame_index": detection.frame_index,
+                "capture_timestamp": detection.capture_timestamp,
+                "image_size": size,
+                "expected_size": expected,
+            },
+        )
+        return False
+
     def ground_z(self, snapshot: Any) -> float:
         """地面在 NED 下的 z；地面点参数不全时按 0（原点高度面）并只警告一次。"""
         ground = self.config.ground.ground_z(snapshot.origin_altitude_m)
@@ -304,11 +331,16 @@ class PerceptionTargetSource:
 
         判据：缓冲里还有帧没处理（``lag_frames``）或送出去的 OCR 还没回来
         （``submitted > results``——请求/结果都不丢弃，这个差值就是真正的未完成数）。
-        刻意不包含"结果还在队列里没抽干"——那由 :meth:`pump` 负责，
-        而 :meth:`result` 每次都会先抽一遍。
+        同时包含正在检测的帧与尚未抽取的结果，避免结果查询后后台刚好产出
+        尾帧结果时，主循环误把上一份统计当成完整结果。
         """
         stats = self.worker.stats
-        return self.worker.lag_frames > 0 or stats.submitted > stats.results
+        return (
+            self.worker.lag_frames > 0
+            or self.worker.processing
+            or stats.submitted > stats.results
+            or self.worker.queued_results > 0
+        )
 
 
 def _position_of(snapshot: Any) -> tuple[float, float, float] | None:

@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -51,6 +52,7 @@ BUFFER_SECONDS = 180.0
 BUFFER_FPS = 30.0
 PLAN_DROP_MISSION = True  # 出了结果就生成飞掠+降落航线（不上传，只打印）
 STRICT = True  # 回放异常（缺帧/sink 抛异常）就让本次以 error 结束
+DRAIN_TIMEOUT_S = 120.0  # 停止生产后等待尾帧与 OCR 的最大秒数
 PERCEPTION_MODE: str | None = None  # None = 用 Config 默认（ocr）
 SELECTION_RULE: str | None = None  # None = 用 Config 默认（median）
 #: 相机标定文件；None = 用 Config 默认（仓库根的 ``camera_calib.json``，通常不存在，
@@ -116,10 +118,13 @@ def main(
     buffer_fps: float = BUFFER_FPS,
     plan_drop_mission: bool = PLAN_DROP_MISSION,
     strict: bool = STRICT,
+    drain_timeout_s: float = DRAIN_TIMEOUT_S,
     side_check_tolerance: float | None = SIDE_CHECK_TOLERANCE,
     **config_overrides,
 ) -> int:
     """回放一次；``config_overrides`` 原样交给 :func:`build_config`。"""
+    if not math.isfinite(drain_timeout_s) or drain_timeout_s < 0:
+        raise ValueError("排空超时必须是非负有限秒数")
     # 重依赖在使用时才导入：`python -m airdrop.run replay --help` 不加载它们
     from airdrop import (
         DEFAULT_SIDE_TOLERANCE,
@@ -137,6 +142,7 @@ def main(
         load_broker_from_log,
         ned_to_wgs84,
     )
+    from airdrop.perception.detector import FrameSizeMismatchError
 
     logging.basicConfig(
         level=logging.INFO,
@@ -160,7 +166,13 @@ def main(
     )
 
     # 3) 与实飞一致：对齐 → 环形缓冲 → 感知 → 坐标解算 → 目标统计
-    aligner = FrameTelemetryAligner(broker, max_wait=config.align.max_wait, mode=config.align.mode)
+    aligner = FrameTelemetryAligner(
+        broker,
+        max_wait=config.align.max_wait,
+        mode=config.align.mode,
+        on_timeout=config.align.on_timeout,
+        max_extrapolation=config.align.max_extrapolation,
+    )
     buffer = AlignmentBuffer(capacity_for(buffer_fps, buffer_seconds), storage="jpeg")
     writer = AlignmentWriter(buffer, aligner)
     camera = config.camera.load_model()
@@ -175,23 +187,35 @@ def main(
     )
     targets = PerceptionTargetSource(worker=worker, tracker=tracker)
 
-    worker.start()
+    drained = False
+    ready = False
     try:
+        worker.start()
         source.add_sink(writer)
         source.start()
-        if not source.wait_ready(timeout=30.0):
+        ready = source.wait_ready(timeout=30.0)
+        if not ready:
             LOGGER.error("回放没有出帧：%s", source.stats.last_error or "未知原因")
-            return 1
         # 示例里只等播放线程结束；直接碰私有属性是刻意的（没有公开的 join 接口）
         thread = source._thread  # noqa: SLF001
-        if thread is not None:
-            thread.join()
+        if ready and thread is not None:
+            while thread.is_alive():
+                worker.raise_if_failed()
+                thread.join(timeout=0.1)
+            worker.raise_if_failed()
+    except FrameSizeMismatchError as exc:
+        LOGGER.error("回放终止：%s", exc)
+        return 1
     finally:
-        source.stop()
-        worker.stop()
+        stats = source.stats  # stop() 会改写状态，保留播放终态用于摘要和返回码。
+        try:
+            source.stop()
+            if not source.running:
+                drained = worker.drain(timeout=drain_timeout_s)
+        finally:
+            worker.stop()
 
     written, skipped = writer.stats()
-    stats = source.stats
     LOGGER.info(
         "回放结束：状态=%s 投递 %d/%d 帧、跳过 %d 帧（对齐入库 %d、因取不到遥测跳过 %d）",
         stats.state,
@@ -209,6 +233,16 @@ def main(
     LOGGER.info(
         "目标点 %d 个（本次抽干 %d 条），统计：%s", len(tracker.points), added, tracker.stats
     )
+    if not ready or stats.state != "finished" or not drained or worker.stats.frames != written:
+        LOGGER.error(
+            "回放未完整完成：播放=%s 排空=%s 处理=%d/%d，错误=%s",
+            stats.state,
+            drained,
+            worker.stats.frames,
+            written,
+            stats.last_error or worker.stats.last_error,
+        )
+        return 1
     if not result.ok:
         LOGGER.warning("没有可用结果（没看到目标 / 没有带编号的类）——实飞时走备用点分支")
         return 0

@@ -311,12 +311,23 @@ def test_replay_options_override_the_config() -> None:
     from examples import replay_flight
 
     kwargs = run.resolve_kwargs(
-        "replay", ["--flight", "flights/x", "--speed", "2.5", "--perception-mode", "cls12"]
+        "replay",
+        [
+            "--flight",
+            "flights/x",
+            "--speed",
+            "2.5",
+            "--perception-mode",
+            "cls12",
+            "--drain-timeout",
+            "12",
+        ],
     )
     config = replay_flight.build_config(**_config_kwargs("examples.replay_flight", kwargs))
 
     assert kwargs["flight_dir"] == Path("flights/x")
     assert kwargs["speed"] == pytest.approx(2.5)
+    assert kwargs["drain_timeout_s"] == 12
     assert config.perception.mode == "cls12"
 
 

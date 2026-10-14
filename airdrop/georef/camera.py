@@ -92,7 +92,7 @@ class CameraModel:
     r_bc: np.ndarray = field(default_factory=lambda: DEFAULT_R_BC.copy())  # noqa: PLW0108
     #: 相机光心在机体系中的位置（杆臂），米
     t_bc: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
-    #: 标定时的图像尺寸 (width, height)；用于"帧尺寸不符就跳过去畸变"
+    #: 标定时的图像尺寸 (width, height)；检测与解算据此拒绝不匹配画面
     image_size: tuple[int, int] | None = None
     #: 标定链路延时（秒），供 VideoConfig.telemetry_lag 覆盖
     telemetry_lag: float | None = None

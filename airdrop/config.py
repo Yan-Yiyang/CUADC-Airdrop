@@ -414,8 +414,8 @@ class PreflightConfig:
 
     * ``load_detector`` / ``load_ocr`` / ``load_camera``：分别载入 YOLO 权重、
       OCR 权重与字典、相机标定；
-    * ``check_video``：视频自检（``video_probe_s`` 窗口内至少 ``video_min_frames`` 帧；
-      已载入标定时还要核对画面分辨率与标定一致）；
+    * ``check_video``：视频自检（``video_probe_s`` 窗口内新增至少 ``video_min_frames`` 帧；
+      最新帧接收时间须在窗口内，画面分辨率须与有效标定尺寸一致）；
     * ``max_s``：整个预检的总上限。
 
     ⚠ **关掉 ≠ 通过**：被关掉的检查会记一条 ``preflight`` 事件（``ok=None``），

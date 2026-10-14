@@ -22,6 +22,7 @@ worker"的判断交给操作手；``stats()`` 里的 ``pending`` 也一直可见
 from __future__ import annotations
 
 import logging
+import math
 import multiprocessing as mp
 import queue
 import time
@@ -85,6 +86,7 @@ def ocr_worker_main(
     result_q: Any,
     config_dict: dict[str, Any],
     worker_id: int = 0,
+    status_q: Any = None,
 ) -> None:  # pragma: no cover - 子进程入口，由集成测试覆盖
     """OCR 工作进程入口（``multiprocessing`` target，必须是模块级函数）。
 
@@ -96,14 +98,23 @@ def ocr_worker_main(
         format=f"%(asctime)s %(levelname)-7s ocr{worker_id} %(message)s",
     )
     log = logging.getLogger(f"ocr{worker_id}")
-    engine_config = OcrEngineConfig(**config_dict.get("engine", {}))
-    post = OpenCvPostProcess(
-        color=config_dict.get("color", "blue"),
-        ocr_conf_threshold=config_dict.get("ocr_conf_threshold", 0.6),
-        engine_config=engine_config,
-    )
-    log.info("OCR 工作进程 %d 启动（color=%s）", worker_id, post.color)
-    post.warmup()
+    try:
+        engine_config = OcrEngineConfig(**config_dict.get("engine", {}))
+        post = OpenCvPostProcess(
+            color=config_dict.get("color", "blue"),
+            ocr_conf_threshold=config_dict.get("ocr_conf_threshold", 0.6),
+            engine_config=engine_config,
+        )
+        if not post.warmup():
+            raise RuntimeError("OCR 模型预热失败，请检查权重、引擎及设备配置")
+    except Exception as exc:
+        log.exception("OCR 工作进程 %d 初始化失败", worker_id)
+        if status_q is not None:
+            status_q.put((worker_id, f"{type(exc).__name__}: {exc}"))
+        return
+    if status_q is not None:
+        status_q.put((worker_id, None))
+    log.info("OCR 工作进程 %d 初始化完成（color=%s）", worker_id, post.color)
 
     while True:
         try:
@@ -173,6 +184,8 @@ class OcrWorkerPool:
         # maxsize=0 → 无界：put_nowait 永远不会 Full，请求/结果都不丢
         self._request_q: Any = self._context.Queue()
         self._result_q: Any = self._context.Queue()
+        self._status_q: Any = self._context.Queue()
+        self._used = False
         # spawn 上下文的 Process 是 SpawnProcess（`mp.Process` 只是基类名），
         # 按实际类型标注才不会被类型检查判成"装不进去"
         self._processes: list[SpawnProcess] = []
@@ -241,22 +254,71 @@ class OcrWorkerPool:
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
-    def start(self) -> "OcrWorkerPool":
-        """拉起工作进程（幂等）。"""
+    def start(self, timeout: float = 120.0) -> "OcrWorkerPool":
+        """并行初始化全部工作进程，收到预热成功确认后返回；失败回滚。
+
+        timeout 是整池初始化的总时限。状态走独立队列，不混入识别结果。
+        """
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("OCR 初始化超时必须是非负有限秒数")
         if self._started:
             return self
-        for index in range(self._workers):
-            process = self._context.Process(
-                target=ocr_worker_main,
-                args=(self._request_q, self._result_q, self._config, index),
-                name=f"ocr-worker-{index}",
-                daemon=True,
-            )
-            process.start()
-            self._processes.append(process)
+        if self._processes:
+            raise RuntimeError("上次 OCR 进程尚未退出，不能重新启动")
+        if self._used:
+            # 不把上次关闭的哨兵或失败启动的消息交给新进程。
+            for channel in (self._request_q, self._result_q, self._status_q):
+                channel.close()
+            self._request_q = self._context.Queue()
+            self._result_q = self._context.Queue()
+            self._status_q = self._context.Queue()
+            self._submitted = self._results = self._dropped = 0
+            self._backlog_warned = False
+        self._used = True
+        deadline = time.monotonic() + timeout
+        try:
+            for index in range(self._workers):
+                process = self._context.Process(
+                    target=ocr_worker_main,
+                    args=(self._request_q, self._result_q, self._config, index, self._status_q),
+                    name=f"ocr-worker-{index}",
+                    daemon=True,
+                )
+                process.start()
+                self._processes.append(process)
+            self._wait_ready(deadline)
+        except BaseException:
+            # 覆盖部分 Process.start 失败、初始化失败、超时及操作手中断。
+            for process in self._processes:
+                if process.is_alive():
+                    process.terminate()
+                process.join(1.0)
+            self._processes = [p for p in self._processes if p.is_alive()]
+            raise
         self._started = True
-        LOGGER.info("OCR 工作进程池已启动：%d 个", self._workers)
+        LOGGER.info("OCR 工作进程池已就绪：%d 个", self._workers)
         return self
+
+    def _wait_ready(self, deadline: float) -> None:
+        """等待所有不同进程的预热确认，并检测初始化期退出。"""
+        ready: set[int] = set()
+        while len(ready) < self._workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"OCR 初始化超时：{len(ready)}/{self._workers} 就绪")
+            try:
+                worker_id, error = self._status_q.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                if self.alive != self._workers:
+                    raise RuntimeError("OCR 初始化期间工作进程退出，未全部就绪") from None
+                continue
+            if error is not None:
+                raise RuntimeError(f"OCR 工作进程 {worker_id} 初始化失败：{error}")
+            if worker_id not in range(self._workers):
+                raise RuntimeError(f"OCR 初始化收到无效进程编号：{worker_id}")
+            ready.add(worker_id)
+        if self.alive != self._workers:
+            raise RuntimeError("OCR 工作进程在初始化确认后退出")
 
     def stop(self, timeout: float = 5.0) -> None:
         """发退出指令并等进程结束（幂等）。
@@ -265,7 +327,7 @@ class OcrWorkerPool:
         等不完的（``timeout`` 内没退）会被强制终止，这也是"关闭时不再保证
         处理完积压"的唯一场合。
         """
-        if not self._started:
+        if not self._started and not self._processes:
             return
         for _ in self._processes:
             self._request_q.put_nowait(None)
@@ -275,7 +337,7 @@ class OcrWorkerPool:
                 LOGGER.warning("OCR 工作进程 %s 未在 %.1fs 内退出，强制终止", process.name, timeout)
                 process.terminate()
                 process.join(1.0)
-        self._processes.clear()
+        self._processes = [p for p in self._processes if p.is_alive()]
         self._started = False
         self._dead_reported = None
 
