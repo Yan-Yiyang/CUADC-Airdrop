@@ -13,7 +13,8 @@ params/位置），**上传一律走 ``mission_raw``**——``mission`` 插件�
 
 失败语义（刻意统一，状态机只需要处理一种异常）
 --------------------------------------------
-命令**没做成**一律抛 :class:`ControllerError`；``None`` / ``False`` 只表示
+命令失败或执行结果未知时抛 :class:`ControllerError`；超时不证明飞控未执行。
+``None`` / ``False`` 只表示
 "读到了、但确实还没有"（原点尚未就绪、任务尚未完成）。调用方据此区分
 "链路/飞控出问题"（→ ABORT）与"下一拍再查"。
 
@@ -24,14 +25,15 @@ params/位置），**上传一律走 ``mission_raw``**——``mission`` 插件�
 
 from __future__ import annotations
 
-import concurrent.futures
+import contextlib
 import logging
-import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
 
 from mavsdk.mission_raw import MissionItem as RawMissionItem
+
+from ._operations import get_operation_gate
 
 if TYPE_CHECKING:  # 仅类型标注：见模块 docstring 的导入顺序说明
     from ..config import Config, GripperConfig
@@ -137,7 +139,7 @@ class DroneController:
         来自 :class:`~airdrop.config.GripperConfig`；``enabled=False`` 时
         :meth:`gripper_release` 只记日志并返回 False（**不假装投了**）。
     timeout:
-        单条指令的等待上限（秒）。
+        一次调用的等待预算（秒），包含排队、旧协程收尾及成组 RPC。
     on_event:
         ``(kind, data)`` 事件回调，接 recorder 上是
         ``lambda kind, data: recorder.events.emit(kind, **data)``；抛异常不影响控制流。
@@ -163,8 +165,8 @@ class DroneController:
         self._timeout = float(timeout)
         self._on_event = on_event
         self._sleep = sleep
-        # 上传/启动/hold 之间不能交错（协程在 await 点上会互相穿插）
-        self._lock = threading.RLock()
+        # 同一 MAVSDK 线程上的所有控制器及 send_command 共用门控。
+        self._gate = get_operation_gate(thread)
 
     @classmethod
     def from_config(
@@ -203,7 +205,7 @@ class DroneController:
         specs = tuple(items)
         if not specs:
             raise ControllerError("任务项为空，拒绝上传")
-        with self._lock:
+        with self._sequence("上传任务"):
             self._run(lambda: self._upload(specs), "上传任务")
             self._verify_upload(specs)
         self._emit(
@@ -232,7 +234,7 @@ class DroneController:
         """回读飞控上的任务，逐项比对命令与位置；不一致抛 :class:`ControllerError`。"""
         from ..mission.items import command_name  # 惰性导入：避免 telemetry ↔ mission 成环
 
-        stored = self._run(self._download, "回读任务")
+        stored = self._run(self._download, "回读任务", mutating=False)
         if len(stored) != len(specs):
             raise ControllerError(
                 f"上传后回读：飞控上有 {len(stored)} 项，我们发了 {len(specs)} 项"
@@ -282,7 +284,7 @@ class DroneController:
         所以每次都先复位再启动——实测复位那一路 100% 进 ``MISSION``。
         启动后是否**真的**进了任务模式由状态机用 :meth:`in_mission_mode` 确认。
         """
-        with self._lock:
+        with self._sequence("启动任务"):
             self._run(self._rewind, "复位任务项")
             self._run(self._start, "启动任务")
         self._emit("mission_start", {})
@@ -333,8 +335,7 @@ class DroneController:
     # ------------------------------------------------------------------
     def hold(self) -> None:
         """原地盘旋（固定翼 = LOITER），用于 HOLD_PROCESS 与 ABORT。"""
-        with self._lock:
-            self._run(self._hold, "hold")
+        self._run(self._hold, "hold", recovery=True)
         self._emit("hold", {})
 
     async def _hold(self) -> None:
@@ -343,8 +344,7 @@ class DroneController:
 
     def rtl(self) -> None:
         """返航（``abort_action="rtl"`` 时用）。"""
-        with self._lock:
-            self._run(self._rtl, "返航")
+        self._run(self._rtl, "返航", recovery=True)
         self._emit("rtl", {})
 
     async def _rtl(self) -> None:
@@ -360,8 +360,7 @@ class DroneController:
             LOGGER.warning("gripper 未启用（GripperConfig.enabled=False），本次不投放")
             self._emit("gripper_skipped", {"reason": "disabled"})
             return False
-        with self._lock:
-            self._run(self._release, "投放（gripper.release）")
+        self._run(self._release, "投放（gripper.release）")
         self._emit("gripper_release", {"instance": self._gripper_instance})
         LOGGER.warning("已发出投放指令（gripper instance=%d）", self._gripper_instance)
         if self._release_settle_s > 0:
@@ -383,7 +382,7 @@ class DroneController:
         （两者同源）。状态机用本方法做就绪判断，坐标换算用同一原点。
         """
         try:
-            origin = self._run(self._query_origin, "查询 NED 原点")
+            origin = self._run(self._query_origin, "查询 NED 原点", mutating=False)
         except ControllerError as exc:
             LOGGER.info("NED 原点尚不可用：%s", exc)
             return None
@@ -400,16 +399,35 @@ class DroneController:
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
-    def _run(self, factory: Callable[[], Any], what: str) -> Any:
-        """把协程投到 MAVSDK 线程并等结果；任何失败翻译成 :class:`ControllerError`。"""
+    @contextlib.contextmanager
+    def _sequence(self, what: str) -> Iterator[None]:
+        """上传/回读、复位/启动共用一次等待预算，且不能被其他控制器穿插。"""
         try:
-            future = self._thread.submit(factory())
+            with self._gate.transaction(self._timeout, what):
+                yield
+        except ControllerError:
+            raise
         except Exception as exc:
-            raise ControllerError(f"{what}：无法提交到 MAVSDK 线程（{exc}）") from exc
+            raise ControllerError(f"{what}：{exc}") from exc
+
+    def _run(
+        self,
+        factory: Callable[[], Coroutine[Any, Any, Any]],
+        what: str,
+        *,
+        mutating: bool = True,
+        recovery: bool = False,
+    ) -> Any:
+        """等待与取消分开；本地收尾完成也不代表远端变更已撤销。"""
         try:
-            return future.result(timeout=self._timeout)
-        except concurrent.futures.TimeoutError as exc:
-            raise ControllerError(f"{what}：{self._timeout:.0f}s 内没有结果") from exc
+            return self._gate.run(
+                self._thread.submit,
+                factory,
+                timeout=self._timeout,
+                label=what,
+                mutating=mutating,
+                recovery=recovery,
+            )
         except Exception as exc:
             raise ControllerError(f"{what}：{exc}") from exc
 

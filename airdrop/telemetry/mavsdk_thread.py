@@ -24,6 +24,7 @@ from mavsdk import System
 from mavsdk.action import ActionError
 from mavsdk.telemetry import GpsGlobalOrigin, TelemetryError
 
+from ._operations import OperationGate
 from .broker import SUPPORTED_QUERY_MODES, TelemetryBroker
 from .models import Command, CommandResult, TelemetrySnapshot
 
@@ -137,6 +138,7 @@ class MavsdkThread:
         self._started = threading.Event()
         self._ready = threading.Event()
         self._stop_requested = threading.Event()
+        self._operation_gate = OperationGate()
 
     # ------------------------------------------------------------------
     # 配置入口
@@ -281,14 +283,20 @@ class MavsdkThread:
 
     def get_gps_global_origin(self, timeout: float = 10.0) -> GpsGlobalOrigin:
         """实时查询本地 NED 坐标系原点（GPS_GLOBAL_ORIGIN）并写入快照。"""
-        return self.submit(self._query_origin()).result(timeout=timeout)
+        return self._operation_gate.run(
+            self.submit,
+            self._query_origin,
+            timeout=timeout,
+            label="查询 NED 原点",
+            mutating=False,
+        )
 
     def send_command(
         self,
         command: Command | dict[str, Any],
         timeout: float = 30.0,
     ) -> CommandResult:
-        """向 MAVSDK 线程发送一条指令并等待结果。"""
+        """串行发送指令；超时请求本地取消，结果未知不等于远端撤销。"""
         if isinstance(command, dict):
             command = Command.from_dict(command)
 
@@ -300,15 +308,14 @@ class MavsdkThread:
                 error=f"不支持的指令: {command.name}",
             )
 
-        future = self.submit(self._execute_command(command))
         try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            return CommandResult(
-                id=command.id,
-                name=command.name,
-                success=False,
-                error=f"指令在 {timeout}s 内超时",
+            return self._operation_gate.run(
+                self.submit,
+                lambda: self._execute_command(command),
+                timeout=timeout,
+                label=command.name,
+                mutating=command.name not in {"get_snapshot_at", "get_gps_global_origin"},
+                recovery=command.name in {"hold", "rtl", "return_to_launch"},
             )
         except Exception as exc:  # noqa: BLE001 - MAVSDK 异常统一成 CommandResult 失败
             return CommandResult(
@@ -316,14 +323,20 @@ class MavsdkThread:
                 name=command.name,
                 success=False,
                 error=f"{type(exc).__name__}: {exc}",
+                data={
+                    "result_unknown": self._operation_gate.state_unknown,
+                    "result": _error_code(exc.__cause__ or exc),
+                },
             )
 
     def submit(self, coro: Coroutine[Any, Any, Any]) -> concurrent.futures.Future[Any]:
         """把协程调度到 MAVSDK 事件循环上执行。
 
-        调用方可以用 ``future.result(timeout=...)`` 同步等待结果。
+        调用方可以用 ``future.result(timeout=...)`` 同步等待结果，但它不提供命令
+        超时门控；业务命令应使用控制器或 send_command。
         """
-        self.start()
+        self.start(timeout=self._operation_gate.remaining_timeout(5.0))
+        self._operation_gate.remaining_timeout(5.0)
         if self._loop is None:
             raise RuntimeError("MAVSDK 事件循环不可用")
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -675,6 +688,9 @@ class MavsdkThread:
                 data=data,
             )
         except (ActionError, TelemetryError) as exc:
+            if _error_code(exc) == "TIMEOUT":
+                # 插件自己的超时也无法证明命令未执行，交给共享门控锁存。
+                raise
             LOGGER.warning("指令 %s 被拒绝：%s", command.name, exc)
             return CommandResult(
                 id=command.id,
@@ -683,6 +699,8 @@ class MavsdkThread:
                 error=str(exc),
                 data={"result": _error_code(exc)},
             )
+        except TimeoutError:
+            raise
         except Exception as exc:
             LOGGER.exception("指令 %s 执行失败", command.name)
             return CommandResult(
