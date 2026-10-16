@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
 
 from mavsdk.mission_raw import MissionItem as RawMissionItem
 
+from ._mission_sync import mission_raw_transfer_lock
 from ._operations import get_operation_gate
 
 if TYPE_CHECKING:  # 仅类型标注：见模块 docstring 的导入顺序说明
@@ -222,13 +223,15 @@ class DroneController:
         drone = self._thread.require_drone()
         # mission_raw：原样投递。走 mission 插件会被它把 vehicle_action=LAND
         # 拆成两项，PX4 固定翼随即拒掉整条任务（见 to_raw_item 的说明）。
-        await drone.mission_raw.upload_mission(
-            [to_raw_item(item, index) for index, item in enumerate(specs)]
-        )
+        async with mission_raw_transfer_lock(drone):
+            await drone.mission_raw.upload_mission(
+                [to_raw_item(item, index) for index, item in enumerate(specs)]
+            )
 
     async def _download(self) -> list[RawMissionItem]:
         drone = self._thread.require_drone()
-        return list(await drone.mission_raw.download_mission())
+        async with mission_raw_transfer_lock(drone):
+            return list(await drone.mission_raw.download_mission())
 
     def _verify_upload(self, specs: tuple[MissionItem, ...]) -> None:
         """回读飞控上的任务，逐项比对命令与位置；不一致抛 :class:`ControllerError`。"""

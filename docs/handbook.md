@@ -337,10 +337,22 @@ MavsdkThread(broker=None, system_address="udpin://0.0.0.0:14540", *,
 
 **6 条核心流**：position / home / position_velocity_ned / attitude_euler /
 attitude_quaternion / gps_global_origin，用 `asyncio.TaskGroup` 并行采集，**任一核心流结束即视为
-断连**，交给 supervisor 重连。**两条"可选流"**（`mission_raw.mission_progress()` 任务进度、
-`telemetry.flight_mode()` 飞行模式）：结束或报错只记日志、不影响会话——它们分别送入快照的
-`mission_current`/`mission_total` 与 `flight_mode`，状态机靠这二者判断"任务是否飞完""是否真在任务模式"。
-风估计也是可选流（没有它时投放判据按零风降级并记一次日志），但它是 MAVSDK `telemetry.wind()`。
+断连**，交给 supervisor 重连。`mission_raw` 的任务进度和变化通知由独立同步器管理；
+`telemetry.flight_mode()` 飞行模式仍是可选流，结束或报错只记日志、不影响会话，写入
+`flight_mode`，供状态机确认"真的进了任务模式"。风估计也是可选流（没有它时投放判据按零风
+降级并记一次日志），但它是 MAVSDK `telemetry.wind()`。
+
+任务同步器在每条连接会话启动时只读下载一次任务；收到 `mission_changed() == True` 后清空
+快照中的任务进度并合并触发后续下载。下载成功后，`mission_total` 表示回读确认的任务项数，
+`mission_current` 保持未知，直到本次回读之后建立的进度订阅先观察到非终态进度，才接受完成
+状态。任务项为空或 SDK 明确返回 `NO_MISSION_AVAILABLE` 时计数为 0；BUSY、TIMEOUT 和其它 RPC
+错误保持未知并退避重试，不会折算为空。后台下载与控制器上传及上传后回读共用连接内传输锁。
+该路径只读，不调用 `upload_mission()` 或清空飞控任务；`recon_upload="operator"` 时由操作手在
+QGC 上传的任务仍由操作手管理。
+
+MAVSDK 提供的变化通知与进度没有任务 ID，因此程序无法证明订阅重建后收到的 SDK 缓存进度属于
+哪一条任务。新回读后的首条完成进度会保守保持未知，直到观察到非终态进度；这能挡住常见的旧
+完成状态残留，但不能识别所有同长度任务切换后的缓存序列。
 
 #### 3.1.3 `DroneController`（任务级控制）
 
@@ -2389,7 +2401,7 @@ config = Config(
 | 31 | 任务项一律走 **`mission_raw`**，不用 MAVSDK 的 `vehicle_action` 翻译 | `mission/items.py`、`telemetry/controller.py` 的 `to_raw_item`/`_upload` | `vehicle_action=LAND` 被拆成"同坐标航点 + `NAV_LAND`"⇒ PX4 固定翼拒**整条任务**，而 `start_mission()` 仍回成功 |
 | 32 | 降落段必须过 `check_fixed_wing_landing`：紧前一项**严格高于**落点，且下滑角 ≤ `tan(FW_LND_ANG+0.1°)` | `mission/plan_file.py`、`mission/planner.py` | 上传后被飞控整条拒掉（`No valid mission available, loitering`），飞机原地盘旋 |
 | 33 | 上传启动后**必须确认**飞控真进了 `MISSION`（`mission_start_timeout_s`） | `mission/runner.py` 的 `_confirm_started`、`telemetry/controller.py` 的 `in_mission_mode` | "命令回成功"当成"在飞"⇒ 空等到状态超时（实测 15 分钟） |
-| 34 | 完成判定读快照 `mission_current == mission_total`（`mission_raw` 进度流） | `telemetry/controller.py` 的 `mission_finished`、`mavsdk_thread.py` 的 `_stream_mission_progress` | 用 MAVSDK `mission.is_mission_finished()`：raw 上传下**永远回 False**，状态机卡在 RECON |
+| 34 | 完成判定读快照 `mission_current == mission_total`（`mission_raw` 进度流） | `telemetry/controller.py` 的 `mission_finished`、`telemetry/_mission_sync.py` 的 `MissionSync` | 用 MAVSDK `mission.is_mission_finished()`：raw 上传下**永远回 False**，状态机卡在 RECON |
 | 35 | 上传前**先 `set_current_mission_item(0)`** 再启动 | `telemetry/controller.py` 的 `start_mission` | 同 CRC 的任务再启动时飞控不清"已飞完"锁存 ⇒ 停在 `HOLD` |
 | 36 | 每条腿的航线来源**二选一**（waypoint 配置 / QGC `.plan`），同时给两个直接报错 | `config.py` 的 `validated`、`mission/planner.py` | 飞的可能不是你以为的那条航线 |
 | 37 | `.plan` 复杂项按 QGC 的展开逻辑在本地展开；不支持的复杂项**显式报错** | `mission/plan_file.py` | 猜着展开 ⇒ 上传一条 QGC 里根本没画过的航线 |

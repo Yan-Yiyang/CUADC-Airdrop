@@ -131,6 +131,16 @@ class TelemetrySnapshot:
         self.mission_current = int(current)
         self.mission_total = int(total)
 
+    def clear_mission_progress(self) -> None:
+        """使当前任务进度失效，避免新任务沿用旧任务状态。"""
+        self.mission_current = None
+        self.mission_total = None
+
+    def update_mission_count(self, total: int) -> None:
+        """发布已从飞控回读确认的任务项数，进度仍保持未知。"""
+        self.mission_current = None
+        self.mission_total = int(total)
+
     def update_flight_mode(self, mode: Any) -> None:
         """飞行模式（MAVSDK ``FlightMode`` 枚举）→ 字符串名字。
 

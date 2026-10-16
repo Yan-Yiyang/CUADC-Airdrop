@@ -302,6 +302,14 @@ class TelemetryBroker:
         """发布一次任务进度更新（可选流；状态机靠它判断"任务是否飞完"）。"""
         return self._update(lambda s: s.update_mission_progress(current, total))
 
+    def clear_mission_progress(self) -> TelemetrySnapshot:
+        """清除任务进度字段，不影响其它遥测快照。"""
+        return self._update(lambda s: s.clear_mission_progress())
+
+    def update_mission_count(self, total: int) -> TelemetrySnapshot:
+        """发布已回读确认的任务项数，并使任务进度保持未知。"""
+        return self._update(lambda s: s.update_mission_count(total))
+
     def update_flight_mode(self, mode: Any) -> TelemetrySnapshot:
         """发布一次飞行模式更新（可选流；状态机靠它确认"真的进了任务模式"）。"""
         return self._update(lambda s: s.update_flight_mode(mode))
