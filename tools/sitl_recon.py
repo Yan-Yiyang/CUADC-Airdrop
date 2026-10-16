@@ -91,8 +91,10 @@ from pathlib import Path
 from typing import Any
 
 from airdrop import Config, TelemetryBroker, Waypoint
+from airdrop.telemetry._operations import get_operation_gate
 
 LOGGER = logging.getLogger("sitl_recon")
+PARAM_RPC_TIMEOUT_S = 15.0
 
 #: MAVSDK 连 SITL 的地址（与其它 SITL 入口一致）
 SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
@@ -415,18 +417,20 @@ def build_config(
     ).validated()
 
 
-def _write_param(thread: Any, name: str, value: int) -> None:
+def _write_param(thread: Any, name: str, value: int, *, recovery: bool = False) -> None:
     """在 MAVSDK 线程上写一条飞控参数（同步等待结果）。"""
 
     async def _write() -> None:
         await thread.require_drone().param.set_param_int(name, value)
 
-    thread.submit(_write()).result(timeout=15.0)
-
-
-#: 数据链丢失时飞控的动作（airframe 的 ``NAV_DLL_ACT``）：测试里临时置 0，
-#: 收尾还原成机型标准值 2（Return）。真机保持机型/参数的配置，不在测试里动。
-NAV_DLL_ACT_DEFAULT = 2
+    get_operation_gate(thread).run(
+        thread.submit,
+        _write,
+        timeout=PARAM_RPC_TIMEOUT_S,
+        label=f"写飞控参数 {name}",
+        mutating=True,
+        recovery=recovery,
+    )
 
 
 def read_param(thread: Any, name: str) -> int:
@@ -435,11 +439,20 @@ def read_param(thread: Any, name: str) -> int:
     async def _read() -> int:
         return await thread.require_drone().param.get_param_int(name)
 
-    return thread.submit(_read()).result(timeout=15.0)
+    return get_operation_gate(thread).run(
+        thread.submit,
+        _read,
+        timeout=PARAM_RPC_TIMEOUT_S,
+        label=f"读飞控参数 {name}",
+        mutating=False,
+    )
 
 
 def zero_test_params(
-    thread: Any, names: tuple[str, ...] = ("NAV_DLL_ACT", "NAV_RCL_ACT")
+    thread: Any,
+    names: tuple[str, ...] = ("NAV_DLL_ACT", "NAV_RCL_ACT"),
+    *,
+    ledger: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """把 SITL 测试要临时关掉的飞控参数置 0，返回原值（``main`` 收尾时还原）。
 
@@ -453,23 +466,23 @@ def zero_test_params(
     它已经在仿真机型里永久置 0（``sim/airframes/4007_gz_rc_cessna_down_cam``，附了原因）
     ——投弹航线要空中出结果才能生成、降落段没法预先和侦查段拼成一条任务。
     """
-    originals: dict[str, int] = {}
+    if ledger is None:
+        ledger = {}
     for name in names:
-        originals[name] = read_param(thread, name)
+        value = read_param(thread, name)
+        ledger.setdefault(name, value)
         _write_param(thread, name, 0)
-    return originals
+    return ledger
 
 
 def restore_params(thread: Any, values: dict[str, int]) -> None:
     """还原测试期间改过的飞控参数（尽力而为：失败只告警）。"""
     for name, value in values.items():
-        # 当年被测试改过的参数恢复成机型标准值（持久化在 SITL 的参数库里）
-        target = NAV_DLL_ACT_DEFAULT if name == "NAV_DLL_ACT" else value
         try:
-            _write_param(thread, name, target)
-            LOGGER.info("飞控参数 %s 已还原为 %s", name, target)
+            _write_param(thread, name, value, recovery=True)
+            LOGGER.info("飞控参数 %s 已还原为 %s", name, value)
         except Exception:  # noqa: BLE001 - 还原失败不影响报告
-            LOGGER.warning("还原飞控参数 %s 失败（不影响报告）", name)
+            LOGGER.warning("还原飞控参数 %s 失败，原值 %s 仍在账本中（不影响报告）", name, value)
 
 
 def start_status_text_logger(thread: Any) -> None:
@@ -1995,7 +2008,7 @@ def main(
             return 2
 
         # 测试期间把数据链 failsafe 关掉（SITL 没有操作手盯链路），收尾还原
-        original_params.update(zero_test_params(thread))
+        zero_test_params(thread, ledger=original_params)
         LOGGER.info("SITL 测试参数已置 0（原值 %s；跑完还原）", original_params)
         if read_param(thread, "MIS_TKO_LAND_REQ") != 0:
             LOGGER.warning(

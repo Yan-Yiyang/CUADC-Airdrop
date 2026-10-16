@@ -27,10 +27,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import contextlib
 import json
 import math
 import shutil
 import socket
+import threading
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -100,6 +104,201 @@ def test_sitl_recon_accuracy() -> None:
     calibration = report.get("lag_calibration") or {}
     holdout = calibration.get("holdout_error_m")
     assert holdout is None or holdout < 2.0, f"留一验证超 2 m：{calibration}"
+
+
+def test_zero_test_params_keeps_original_value_when_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """置零失败时，账本也必须保留已经读到的参数原值。"""
+    from tools import sitl_recon
+
+    ledger: dict[str, int] = {}
+    monkeypatch.setattr(sitl_recon, "read_param", lambda _thread, _name: 7)
+
+    def fail_write(_thread: Any, _name: str, _value: int) -> None:
+        raise TimeoutError("写入结果未知")
+
+    monkeypatch.setattr(sitl_recon, "_write_param", fail_write)
+    with pytest.raises(TimeoutError, match="未知"):
+        sitl_recon.zero_test_params(object(), ("NAV_DLL_ACT",), ledger=ledger)
+
+    assert ledger == {"NAV_DLL_ACT": 7}
+
+
+def test_zero_test_params_returns_original_values_for_legacy_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不传账本时保留原有的 dict 返回接口；传入时返回完整账本。"""
+    from tools import sitl_recon
+
+    monkeypatch.setattr(sitl_recon, "read_param", lambda _thread, name: 2 if name == "A" else 5)
+    monkeypatch.setattr(sitl_recon, "_write_param", lambda *_args, **_kwargs: None)
+
+    assert sitl_recon.zero_test_params(object(), ("A", "B")) == {"A": 2, "B": 5}
+    ledger = {"A": 8}
+    assert sitl_recon.zero_test_params(object(), ("A", "B"), ledger=ledger) is ledger
+    assert ledger == {"A": 8, "B": 5}
+
+
+def test_zero_test_params_read_failure_does_not_record_or_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """读取失败时没有可恢复的原值，因此不能写参数或污染账本。"""
+    from tools import sitl_recon
+
+    ledger: dict[str, int] = {}
+    writes: list[tuple[str, int]] = []
+
+    def fail_read(_thread: Any, name: str) -> int:
+        if name == "NAV_RCL_ACT":
+            raise RuntimeError("参数读取失败")
+        return 4
+
+    monkeypatch.setattr(sitl_recon, "read_param", fail_read)
+    monkeypatch.setattr(
+        sitl_recon, "_write_param", lambda _thread, name, value: writes.append((name, value))
+    )
+    with pytest.raises(RuntimeError, match="读取失败"):
+        sitl_recon.zero_test_params(object(), ("NAV_DLL_ACT", "NAV_RCL_ACT"), ledger=ledger)
+
+    assert ledger == {"NAV_DLL_ACT": 4}
+    assert writes == [("NAV_DLL_ACT", 0)]
+
+
+def test_restore_params_uses_exact_values_and_continues_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """恢复写失败应继续其它参数，NAV_DLL_ACT 也按账本原值恢复。"""
+    from tools import sitl_recon
+
+    calls: list[tuple[str, int, bool]] = []
+
+    def write(_thread: Any, name: str, value: int, *, recovery: bool = False) -> None:
+        calls.append((name, value, recovery))
+        if name == "BROKEN":
+            raise RuntimeError("模拟恢复失败")
+
+    monkeypatch.setattr(sitl_recon, "_write_param", write)
+    sitl_recon.restore_params(object(), {"NAV_DLL_ACT": 5, "BROKEN": 9, "NAV_RCL_ACT": 3})
+
+    assert calls == [
+        ("NAV_DLL_ACT", 5, True),
+        ("BROKEN", 9, True),
+        ("NAV_RCL_ACT", 3, True),
+    ]
+
+
+def test_timed_out_parameter_write_finishes_before_recovery_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """写超时后恢复等待协程收尾，不能让迟到的置零覆盖恢复值。"""
+    from airdrop.telemetry._operations import OperationGate
+    from tools import sitl_recon
+
+    class LoopThread:
+        def __init__(self) -> None:
+            self.loop = asyncio.new_event_loop()
+            self.errors: list[dict[str, Any]] = []
+            self.loop.set_exception_handler(lambda _loop, context: self.errors.append(context))
+            self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+            self.thread.start()
+
+        def submit(self, coro: Any) -> concurrent.futures.Future[Any]:
+            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            future.add_done_callback(self._consume)
+            return future
+
+        @staticmethod
+        def _consume(future: concurrent.futures.Future[Any]) -> None:
+            with contextlib.suppress(Exception):
+                future.result()
+
+        def close(self) -> None:
+            async def cancel_pending() -> None:
+                current = asyncio.current_task()
+                tasks = [
+                    task
+                    for task in asyncio.all_tasks(self.loop)
+                    if task is not current and not task.done()
+                ]
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            asyncio.run_coroutine_threadsafe(cancel_pending(), self.loop).result(timeout=1)
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.thread.join(timeout=1)
+            assert not self.thread.is_alive(), "测试事件循环未能退出"
+            self.loop.close()
+            assert not self.errors, f"事件循环出现未处理异常：{self.errors!r}"
+
+    class Param:
+        def __init__(self) -> None:
+            self.value = 6
+            self.entered = threading.Event()
+            self.finish_cancelled_write = asyncio.Event()
+            self.cancelled_write_finished = threading.Event()
+            self.writes: list[int] = []
+
+        async def get_param_int(self, _name: str) -> int:
+            return self.value
+
+        async def set_param_int(self, _name: str, value: int) -> None:
+            self.writes.append(value)
+            if value == 0:
+                self.entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await self.finish_cancelled_write.wait()
+                    self.value = value
+                    self.cancelled_write_finished.set()
+                    raise
+            self.value = value
+
+    class Thread(LoopThread):
+        def __init__(self) -> None:
+            super().__init__()
+            self._gate = OperationGate()
+            self.param = Param()
+            self.drone = type("Drone", (), {"param": self.param})()
+
+        def require_drone(self) -> Any:
+            return self.drone
+
+    thread = Thread()
+    monkeypatch.setattr(sitl_recon, "PARAM_RPC_TIMEOUT_S", 0.05)
+    outcome: concurrent.futures.Future[BaseException | None] = concurrent.futures.Future()
+
+    def zero() -> None:
+        try:
+            sitl_recon._write_param(thread, "NAV_DLL_ACT", 0)
+        except BaseException as exc:  # noqa: BLE001 - 记录预期的超时结果。
+            outcome.set_result(exc)
+        else:
+            outcome.set_result(None)
+
+    caller = threading.Thread(target=zero)
+    caller.start()
+    try:
+        assert thread.param.entered.wait(1)
+        error = outcome.result(timeout=1)
+        assert isinstance(error, TimeoutError)
+
+        sitl_recon.restore_params(thread, {"NAV_DLL_ACT": 6})
+        assert thread.param.writes == [0], "前序写入未收尾时不能提交恢复写"
+
+        thread.loop.call_soon_threadsafe(thread.param.finish_cancelled_write.set)
+        assert thread.param.cancelled_write_finished.wait(1)
+        sitl_recon.restore_params(thread, {"NAV_DLL_ACT": 6})
+        assert thread.param.writes == [0, 6]
+        assert thread.param.value == 6
+    finally:
+        thread.loop.call_soon_threadsafe(thread.param.finish_cancelled_write.set)
+        caller.join(timeout=1)
+        assert not caller.is_alive(), "参数写入调用线程未退出"
+        thread.close()
 
 
 # ----------------------------------------------------------------------
