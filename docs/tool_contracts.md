@@ -2,7 +2,7 @@
 
 标定计算位于独立包 `airdrop_calibration`，仿真配置和生成位于独立包 `airdrop_sim`。
 两者通过文件与运行包交换数据，不导入 `airdrop`；
-`tools/sitl_recon.py` 是主仓的集成协调器，允许使用运行包并消费工具产物。
+`airdrop/runtime/` 中的 SITL 适配 是主仓的集成协调器，允许使用运行包并消费工具产物。
 主仓通过 `vendor/airdrop-sim` 和 `vendor/airdrop-calibration` 的 submodule 固定提交。
 初始化、独立运行和升级见 [工具仓库](tool_repositories.md)。
 
@@ -64,7 +64,7 @@ python -m airdrop.run make-vehicle --width 800 --height 600 --hfov 1.2 --out-dir
 
 ## 主仓演练消费
 
-`sitl-recon --manifest PATH` 固定本次相机配置、原点与真值，随后报告和延时扫描使用同一份场景，
+`mission --mode sitl --manifest PATH` 固定本次相机配置、原点与真值，随后报告和延时扫描使用同一份场景，
 不修改其它演练的全局参数。省略 manifest 时仍使用 r2/seed 0。省略 `--lag` 时使用相机配置中的延时；
 显式 `--lag` 覆盖本次延时。图片靶标 manifest 不用于数字识别精度报告。
 

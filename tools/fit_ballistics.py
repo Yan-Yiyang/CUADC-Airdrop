@@ -456,7 +456,7 @@ def main(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[报告] {target}")
-    print("[回填] 把下面这段抄进配置（airdrop/config.py 的默认值或 examples 里的装配处）：")
+    print("[回填] 把下面这段抄进配置（airdrop/config.py 的默认值或 runtime 里的装配处）：")
     print(config_snippet(result))
     if not result.ok:
         return 2

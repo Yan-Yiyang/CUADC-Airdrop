@@ -1043,9 +1043,10 @@ def test_replay_entry_drains_tail_and_preserves_failure(
     import cv2
 
     import airdrop
+    from airdrop.perception import pipeline as perception_pipeline
     from airdrop.perception.detector import Detector as RealDetector
     from airdrop.record.replay import ReplayVideoSource
-    from examples import replay_flight
+    from airdrop.runtime import replay as replay_flight
 
     release = threading.Event()
     frames = tmp_path / "frames"
@@ -1121,7 +1122,7 @@ def test_replay_entry_drains_tail_and_preserves_failure(
         return worker
 
     monkeypatch.setattr(airdrop, "ReplayVideoSource", Source)
-    monkeypatch.setattr(airdrop, "PerceptionWorker", create_worker)
+    monkeypatch.setattr(perception_pipeline, "PerceptionWorker", create_worker)
     caplog.set_level(logging.INFO)
     assert (
         replay_flight.main(

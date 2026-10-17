@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture
 def core_checkout(tmp_path: Path) -> Path:
     """复制主仓源码而不带 vendor，避免修改当前子模块状态。"""
-    for name in ("airdrop", "tools", "examples"):
+    for name in ("airdrop", "tools"):
         shutil.copytree(ROOT / name, tmp_path / name, ignore=shutil.ignore_patterns("__pycache__"))
     return tmp_path
 
@@ -33,7 +33,7 @@ class RejectTools(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, RejectTools())
 import airdrop
 from airdrop.run import main
-for arguments in (['--help'], ['full-mission', '--help'], ['replay', '--help']):
+for arguments in (['--help'], ['mission', '--help'], ['replay', '--help']):
     try:
         main(arguments)
     except SystemExit as exc:
@@ -53,7 +53,7 @@ assert not any(n.startswith(('airdrop_sim', 'airdrop_calibration')) for n in sys
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("command", ["make-world", "calibrate", "sitl-recon"])
+@pytest.mark.parametrize("command", ["make-world", "calibrate"])
 def test_missing_tool_has_actionable_error(core_checkout: Path, command: str) -> None:
     result = subprocess.run(
         [sys.executable, "-X", "utf8", "-m", "airdrop.run", command, "--help"],

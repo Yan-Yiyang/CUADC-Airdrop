@@ -59,7 +59,7 @@
 | `airdrop/` | 唯一的运行时代码包（9 个子包，见 §3） | `__init__.py`（171 个公开名）、`config.py`（全部参数） | 是 |
 | `airdrop/config.py` | **全部参数的唯一集中处**（frozen dataclass + 取值域校验） | `Config`、`Config.validated` | 是 |
 | `tools/` | 一次性离线工具（**纯库模块**：文件内常量 = 默认值，暴露 `build_config(**覆盖)` / `main(**kwargs)`；命令行解析归 §6.2 的 `airdrop/run.py`） | `fetch_models.py`、`calibrate.py`、`fit_ballistics.py`、`make_world.py`、`dump_api.py`、`check_docs.py` | 是 |
-| `examples/` | 七个入口示例（同样是纯库模块：常量 = 默认值；重依赖只在函数体内导入，所以 `import` 它们**不加载** cv2/mavsdk/torch） | `full_mission.py`、`replay_flight.py`、`sitl_mission.py` | 是 |
+| `airdrop/runtime/` | real/SITL 在线任务、运行参数、共享组件与生命周期；离线回放复用感知组件 | `options.py`、`components.py`、`session.py` | 是 |
 | `airdrop/run.py` | **主仓命令行入口**：argparse 子命令 → 关键字覆盖到各入口的 `build_config`/`main`（见 §6.2） | `run.py`、`airdrop/_lazy.py`（PEP 562 惰性导出） | 是 |
 | `tests/` | pytest 套件（21 个测试文件，全部离线；`realdata` 标记默认跳过） | `conftest.py`、`test_e2e.py`、`test_fit.py`、`test_plan.py`、`test_world.py`、`test_sim_scripts.py` | 是 |
 | `docs/` | 专题笔记（5 篇实测记录）+ 本手册 | `handbook.md`、`simulation_world.md`、`calibration_opencv.md`、`video_hm30_ffmpeg.md`、`perception_ocr.md`、`ballistics_fit.md` | 是 |
@@ -199,22 +199,22 @@
 | --- | --- | --- |
 | `airdrop.config` | `airdrop.video.source`（仅取 `VideoConfig` 与 HM30 默认地址）、`airdrop.perception`/`airdrop.georef`（惰性导入，避免导入环） | 几乎所有模块 |
 | `airdrop.telemetry.models` | 无（纯 dataclass + `time`/`uuid`） | telemetry / video / perception / record / mission |
-| `airdrop.telemetry.broker` | `models` | video.align / record（recorder + replay）/ examples / tests |
-| `airdrop.telemetry.mavsdk_thread` | `models`、`broker`、mavsdk | examples；`controller` 通过它下发指令 |
+| `airdrop.telemetry.broker` | `models` | video.align / record（recorder + replay）/ runtime / tests |
+| `airdrop.telemetry.mavsdk_thread` | `models`、`broker`、mavsdk | runtime；`controller` 通过它下发指令 |
 | `airdrop.telemetry.controller` | `models`、`mavsdk_thread`（经 `submit`）、`mavsdk` 的 `mission_raw`/`mission`/`gripper`/`action` | `mission.runner`（按 `MissionController` 协议） |
-| `airdrop.video.source` | `VideoConfig`（本模块定义）、ffmpeg 子进程 | `record.replay`（同接口）、examples |
+| `airdrop.video.source` | `VideoConfig`（本模块定义）、ffmpeg 子进程 | `record.replay`（同接口）、runtime |
 | `airdrop.video.align` | `broker`、`VideoFrame`、`AlignConfig` 语义 | `video.buffer.AlignmentWriter`、`record.replay` |
 | `airdrop.video.buffer` | `align.AlignedSample`、cv2/numpy | `perception.pipeline`、`record.recorder` |
-| `airdrop.record.recorder` | `broker`、`buffer`、`ballistics.drops.DropRecord` | examples（`on_event`/`on_drop`/`detections`） |
-| `airdrop.record.replay` | `broker`、`buffer`（可选）、`video.source` 的接口形状 | examples.replay_flight、tests.test_replay |
+| `airdrop.record.recorder` | `broker`、`buffer`、`ballistics.drops.DropRecord` | runtime（`on_event`/`on_drop`/`detections`） |
+| `airdrop.record.replay` | `broker`、`buffer`（可选）、`video.source` 的接口形状 | 离线回放入口、tests.test_replay |
 | `airdrop.perception.detector` | ultralytics（**惰性导入**）、`georef` 相机矩阵（可选去畸变） | `perception.pipeline` |
 | `airdrop.perception.cropproc` | rapidocr（惰性）、cv2 | `perception.pipeline`（OCR 进程内调用） |
 | `airdrop.perception.ocr_worker` | `multiprocessing`、`cropproc` | `perception.pipeline`（`OcrWorkerPool`） |
 | `airdrop.perception.pipeline` | `buffer`、`detector`、`ocr_worker` | `mission.targets.PerceptionTargetSource` |
-| `airdrop.georef.camera` | numpy、cv2（去畸变）、标定 JSON | `georef.project`、`mission.targets`、examples |
+| `airdrop.georef.camera` | numpy、cv2（去畸变）、标定 JSON | `georef.project`、`mission.targets`、runtime |
 | `airdrop.georef.project` | `camera`、numpy | `mission.targets`、`georef.__init__` |
-| `airdrop.georef.geo` | pyproj（模块级建 transformer） | `mission.planner`、`ballistics.drops`、examples |
-| `airdrop.targeting.cluster` | scikit-learn（DBSCAN） | `mission.targets`、examples |
+| `airdrop.georef.geo` | pyproj（模块级建 transformer） | `mission.planner`、`ballistics.drops`、runtime |
+| `airdrop.targeting.cluster` | scikit-learn（DBSCAN） | `mission.targets`、runtime |
 | `airdrop.ballistics.model` | numpy 无关（纯 math）、`config.BallisticsConfig` | `ballistics.release`、`ballistics.drops`、`ballistics.fit` |
 | `airdrop.ballistics.release` | `model`、`config.DropConfig`、`telemetry.models` | `mission.runner`（按 `ReleaseJudgeLike` 协议） |
 | `airdrop.ballistics.drops` | `config`、`georef`（原点换算/姿态）、`model` | `ballistics.fit`、`record.recorder`、`mission.runner` |
@@ -223,10 +223,10 @@
 | `airdrop.mission.items` | 无（纯标准库；**不导入 telemetry**，避免成环） | `mission.planner`、`mission.plan_file`、`telemetry.controller`（仅类型标注 + 惰性导入 `command_name`）、`airdrop/__init__` |
 | `airdrop.mission.plan_file` | `mission.items`（纯 JSON，不碰 MAVSDK/网络） | `mission.planner`、`tests/test_plan.py` |
 | `airdrop.mission.planner` | `config`、`georef.geo`、`mission.items`、`mission.plan_file` | `mission.runner` |
-| `airdrop.mission.targets` | `perception`（协议）、`georef`、`targeting` | `mission.runner`、examples |
-| `airdrop.mission.runner` | `states`、`planner`、`broker`、`controller` 协议、`judge` 协议 | examples、`tools`（无） |
+| `airdrop.mission.targets` | `perception`（协议）、`georef`、`targeting` | `mission.runner`、runtime |
+| `airdrop.mission.runner` | `states`、`planner`、`broker`、`controller` 协议、`judge` 协议 | runtime、`tools`（无） |
 
-依赖方向是**单向**的：`config → telemetry/video/georef/targeting/ballistics → perception/record → mission → examples/tools`。
+依赖方向是**单向**的：`config → telemetry/video/georef/targeting/ballistics → perception/record → mission → runtime/tools`。
 三个刻意的"反向"依赖都用**惰性导入**绕开：`config.PerceptionConfig.ocr_engine_config` /
 `to_pipeline_config` 在函数内部导入 perception；`config.CameraConfig.load_model` 在函数内导入 georef；
 `telemetry.controller` 只在**类型标注**下导入 `mission.items.MissionItem`，运行时在 `_verify_upload`
@@ -364,7 +364,7 @@ DroneController(thread, *, gripper_instance=0, gripper_enabled=True,
 
 | 方法 | 返回 | 说明 |
 | --- | --- | --- |
-| `upload_mission(items, /)` | `int` | 上传任务（覆盖飞控上的旧任务），返回任务项数；**走 `mission_raw`** 并**回读校验**（命令+位置逐项比对，不一致抛错） |
+| `upload_mission(items, /)` | `int` | 上传任务（覆盖飞控上的旧任务），返回任务项数；**走 `mission_raw`** 并**回读校验**（数量、命令、坐标系、位置、继续标志及参数逐项比对，浮点量化容差与 NaN 对等处理；不一致抛错） |
 | `start_mission()` | None | 启动任务：**先 `set_current_mission_item(0)` 复位再启动**（否则同 CRC 的旧任务可能停在 `HOLD`） |
 | `in_mission_mode()` | `bool` | 飞控**是否真的**在任务模式（读快照 `flight_mode`）；流未就绪 → 抛 `ControllerError` |
 | `mission_finished()` | `bool` | 是否飞完（读快照 `mission_current == mission_total`）；进度流未就绪 → 抛 `ControllerError` |
@@ -1250,7 +1250,8 @@ print(
 | `airdrop.mission.states` | `MissionState`、`TRANSITIONS`、`TERMINAL_STATES`、`MissionStateMachine`、`MissionTransition`、`InvalidTransition`、`emit_event` |
 | `airdrop.mission.planner` | 纯函数：侦查航线、飞掠 entry/exit、飞掠+降落合并任务、WGS84↔NED |
 | `airdrop.mission.targets` | `TargetTracker`（检测 → 目标点 → 统计）、`PerceptionTargetSource`（包成主循环要的两个回调） |
-| `airdrop.mission.runner` | `MissionRunner`（主循环）、`MissionStats`、`MissionMonitor`、两个协议 |
+| `airdrop.mission.runner` | `MissionRunner`（状态推进）、`MissionStats`、`MissionMonitor` 与注入协议 |
+| `airdrop.mission.transfer` | 上传、回读、激活的后台顺序执行、协作取消与真实收尾 |
 
 #### 3.8.1 `states` —— 状态与合法转移
 
@@ -1264,8 +1265,8 @@ print(
 | `PREFLIGHT` | `WAIT_AIRBORNE`、`ABORT` |
 | `WAIT_AIRBORNE` | `RECON`、`ABORT` |
 | `RECON` | `HOLD_PROCESS`、`ABORT` |
-| `HOLD_PROCESS` | `OVERFLY`、`ABORT` |
-| `OVERFLY` | `LAND`、`ABORT` |
+| `HOLD_PROCESS` | `OVERFLY`、`DONE`、`ABORT` |
+| `OVERFLY` | `LAND`、`DONE`、`ABORT` |
 | `LAND` | `DONE`、`ABORT` |
 | `DONE` / `ABORT` | 无（`TERMINAL_STATES`） |
 
@@ -1439,15 +1440,13 @@ MissionRunner(config, controller, broker, *, target_result=None, target_busy=Non
 **启动确认（`_confirm_started`）**：`upload_mission` + `start_mission` 之后，状态机在**有限时间**
 （`MissionConfig.mission_start_timeout_s`，默认 20s）内要求 `in_mission_mode()` 为真；确认成功记一条
 `mission_confirmed` 事件，超时则 `ABORT("mission_not_started")`。**"命令回成功"不等于"飞控进了任务模式"**
-——飞控可能拒绝模式切换却仍然回 ACK，飞机继续盘旋（2026-09 SITL 里因此空等 15 分钟）。模式流不可用时
-（`in_mission_mode()` 抛 `ControllerError`）**退化为不做确认**并只记一次日志：宁可退回旧行为，也不要
-因为读不到模式就把任务判失败。
+——飞控可能拒绝模式切换却仍然回 ACK。模式流不可用或查询异常时仍保持未确认，等待模式进入 MISSION 或截止后显式失败；未知不等于成功。
 
-失败语义分五类（这条是审查重点）：
+失败语义（审查重点）：
 
 1. **命令失败**（上传/启动/hold/rtl/投放）→ 直接进 `ABORT`，原因写事件日志（`_fail` → `abort("<where>_failed")`）。
 2. **查询失败**（`mission_finished`、`in_mission_mode`、`request_origin`）→ 只报**一次**日志与事件，然后照常继续，由状态超时兜底（20 Hz 每拍都报会掩盖真正原因）。
-3. **启动未确认**（模式在 `mission_start_timeout_s` 内没进 `MISSION`）→ `ABORT`（`mission_not_started`）；模式流不可用时**不做这项判断**（只记一次告警）。
+3. **启动未确认**（模式在 `mission_start_timeout_s` 内没进 `MISSION`）→ `ABORT`（`mission_not_started`）；模式流不可用时保持等待，截止后同样失败。
 4. **链路异常**（遥测无效，或陈旧超过 `telemetry_stale_s`）→ `ABORT`（`telemetry_lost`）。
 5. **投放记录失败不影响状态**：投放已经发生，记录写不进去只记日志与 `error` 事件（见 `_record_drop`）。
 6. **自检失败**（模型/标定载入抛异常、视频自检窗口内帧数不够或分辨率与标定不一致）→ `ABORT`（`preflight_failed:<check>`）；预检整体超 `preflight.max_s` → `preflight_timeout`。**检查被关掉不算失败**，但会记一条 `preflight` 事件（`ok=null`）；**没注入预检对象**只记 `preflight_skipped` 并告警（正式入口必须注入）。
@@ -1457,10 +1456,10 @@ MissionRunner(config, controller, broker, *, target_result=None, target_busy=Non
 
 - `release_judge=None` 时不自动投放：记 `drop_skipped`（`reason='no_judge'`）直接转 `LAND`——只飞航线。
 - 投放成功时把**判据看到的那份快照**一起写进 `DropRecord`（不是重新取一份），免得记录与决策之间插进一拍遥测导致残差归因错位；记录经 `on_drop` 回调交给 recorder 写入磁盘（`on_drop=recorder.drops.append`）。
-- `MissionMonitor` 要求"**先见到一次 `False` 再认 `True`**"：任务进度是飞控侧的**状态**而不是"本次启动之后的事件"——新任务刚上传、还没启动时，它可能仍是上一条任务留下的"已飞完"（`current == total`）。
+- `MissionMonitor` 要求"**先见到一次真实 `False` 再认 `True`**"，未知/异常不武装完成判据：任务进度是飞控侧的**状态**而不是"本次启动之后的事件"——新任务刚上传、还没启动时，它可能仍是上一条任务留下的"已飞完"（`current == total`）。
 - 状态是**在某一拍结束时**进入的：测试里"进入新状态后要发生的事"需要再调一次 `update()`。
 - 事件类型（runner 产生）：`origin`、`targeting`、`drop_plan`、`mission_confirmed`、`drop`、`drop_record`、`drop_skipped`、`abort_action`、`error`、`preflight_skipped`、`airborne`、`recon_waiting_operator`，加上状态机自己的 `state`（逐项检查的 `preflight` 事件由 `Preflight` 自己发，见 §5.2）。
-- 主循环**不自己起线程**；`clock`/`sleep` 也是注入的，所以测试能把分钟级任务压成毫秒级确定性跑完。
+- 状态推进仍可单拍驱动；上传/回读/启动由独立任务传输器顺序执行，主循环轮询并持续监视链路。`clock`、`sleep` 与传输提交器可注入，测试控制完成时机。会话退出前通过 `close()` 等待传输、恢复动作及底层在途协程收尾。
 
 ```python
 """航线规划（纯函数）：侦查任务项 + 飞掠/降落合并任务。"""
@@ -1899,6 +1898,9 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 
 校验要求 `hold_process_min_s <= hold_process_max_s`，其余时长与频率为正。
 
+| `drop_stage` | bool | `True` | 侦查处理后是否执行飞掠投放阶段；False 盘旋结束，不规划备用点飞掠 |
+| `auto_land` | bool | `True` | 是否在投放任务中追加降落尾段；False 飞完出口后盘旋结束 |
+
 ### 4.14 `PreflightConfig` —— 起飞前自检（正式任务流程的第一步）
 
 正式流程：`INIT`（遥测 + NED 原点）→ `PREFLIGHT`（**载入模型 → 视频自检**）→
@@ -2135,165 +2137,45 @@ uv sync                                                # 依赖（清华镜像�
 
 ### 6.2 入口清单：`python -m airdrop.run <子命令>`
 
-**命令行解析集中在唯一一个运行模块** `airdrop/run.py`（标准库 argparse 子命令）。
-`examples/*.py` 与 `tools/*.py` 都是**纯库模块**：文件顶部常量 = 默认值，暴露
-`build_config(**覆盖)` 与 `main(**kwargs)`；命令行选项到配置走**关键字覆盖**
-（各模块内部 `dataclasses.replace` 派生），默认值直接取入口模块的常量——`run.py` 里
-**不重复写第二遍**。加子命令只需在 `airdrop/run.py` 的 `SUBCOMMANDS` 注册表里加一条。
+主仓命令行解析集中在 `airdrop/run.py`，任务参数和生命周期集中在 `airdrop/runtime/`；不再由多个示例分别装配。默认值取自对应入口模块。总帮助与参数帮助不加载 detector/OCR、视频后端或 MAVSDK；可选工具只在调用时加载。
 
-⚠ **帮助信息不加载重库**：`--help`（顶层与每个子命令）与 `check-docs` 都不会加载
-torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在 handler 真正跑起来时
-由各模块的**函数体**导入，`airdrop/__init__.py` 与各子包都是 PEP 562 惰性导出
-（`airdrop/_lazy.py`）。`tests/test_cli.py` 用干净子进程盯着这条不变量。
+| 命令 | 职责 |
+| --- | --- |
+| `python -m airdrop.run mission` | 唯一在线任务入口，`--mode real` 或 `--mode sitl`，同一套阶段参数和状态机 |
+| `python -m airdrop.run replay` | 离线回放、识别、定位及可选规划，不上传飞机任务 |
+| `python -m airdrop.run calibrate` | 转发独立标定工具，读取标准飞行目录并输出 `camera_calib.json` |
+| `python -m airdrop.run fit-ballistics` | 读取 `drops.jsonl` 与实测落点，输出 `ballistics_fit.json` |
+| `python -m airdrop.run fetch-models` | 获取识别模型 |
+| `python -m airdrop.run make-world` | 转发仿真世界生成工具 |
+| `python -m airdrop.run make-vehicle` | 转发机型/相机生成工具 |
+| `python -m airdrop.run make-backdrops` | 转发程序化底图工具 |
+| `python -m airdrop.run fetch-aerial` | 转发联网航拍底图工具 |
+| `python -m airdrop.run preview-world` | 转发世界预览工具 |
+| `python -m airdrop.run dump-api` | 自省生成主包接口参考 |
+| `python -m airdrop.run check-docs` | 检查手册与主包 API、配置、记录文件和 CLI 的一致性 |
 
-| 子命令 | 入口模块 | 前置条件 | 产物 / 输出 | 退出码 |
-| --- | --- | --- | --- | --- |
-| `python -m airdrop.run full-mission` | `examples/full_mission.py` | 飞控 + 图传 + `camera_calib.json` + 航线配置；`--dry-run` 可不装弹。**这是正式任务档**：`INIT→PREFLIGHT`（载入模型 + 视频自检）→`WAIT_AIRBORNE`→`RECON`（侦查航线由操作手在 QGC 上传并启动，`recon_upload="operator"`） | `flights/<ts>/` 一整套；终端打印任务与统计 | 0 成功 / 2 未到 DONE / 130 中断 / 1 异常 |
-| `python -m airdrop.run sitl` | `examples/sitl_mission.py` | PX4 SITL 在 `udpin://0.0.0.0:14540`；`--land-plan` 指向的 `routes/land.plan` 要在（不给则用内置 `LANDING_ROUTE`）。**这是自动测试档**：自检全关、`recon_upload="auto"`（本包上传侦查航线）、**不等起飞**（`require_airborne=False`，见 §4.13） | 终端"演练记录"：状态轨迹 / 上传与投放次数 / 判据评估次数 / 飞掠计划；`flights/<ts>/` 记录 | 0 成功 / 2 未到 DONE / 130 中断 / 1 异常 |
-| `python -m airdrop.run sitl-recon` | `tools/sitl_recon.py` | WSL 里起 SITL（`bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2`）+ Gazebo 自带的 RTP/H.264 图传（**不必用 HM30**）。**完全标准流程**：本脚本只扮演操作手（上传/启动「起飞任务」与「侦查航线」），其余交给 `MissionRunner` 状态机 + 真 `Preflight` + `PerceptionWorker`（OCR 进程池）+ `DryRunController`：监视侦查 → 空中出目标 → 飞掠投放 → 降落（**没有任何 offboard 设定点**）。测试期间临时把 `NAV_DLL_ACT` 置 0（跑完还原成 2）；`MIS_TKO_LAND_REQ` 已在仿真机型里永久置 0（理由见 `vendor/airdrop-sim/airdrop_sim/assets/airframes/4007_gz_rc_cessna_down_cam` 的注释——只飞侦查段，投弹航线要空中出结果才能生成） | 终端精度报告 + `.sitl-recon-tmp/report.json`（任务结果与分井误差、延时敏感性、反向诊断）+ `flights/<ts>/` 记录 | 0 成功 / 2 没遥测 / 3 没画面 / 4 没解锁 / 5 没进任务模式 / 6 没起飞 / 7 没飞完（仍出报告） / 1 异常 |
-| `python -m airdrop.run replay` | `examples/replay_flight.py` | 一份飞行目录（`--flight`，不给则取 `flights/` 最新） | 终端：播放终态、帧统计、目标点、聚类结果、飞掠航线（**不上传**） | 0 完成（没目标也为 0）；1 播放失败、排空超时或处理不完整 |
-| `python -m airdrop.run calibration-capture` | `examples/calibration_capture.py` | 图传（不给 `--rtsp-url` 用默认 HM30 地址）+ 飞控遥测 | 一个标定用飞行目录（姿态 50Hz、位置 20Hz、缓冲 300s） | 0；一帧没收到 = 1 |
-| `python -m airdrop.run calibrate` | `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` | 上面那份标定目录（`--flight`） | `camera_calib.json`；终端打印每步残差/相关系数 | 0；`--strict` 且外参/时间差没标出来 = 2 |
-| `python -m airdrop.run fit-ballistics` | `tools/fit_ballistics.py` | 投放试验的飞行目录 + `--impacts`（实测落点） | `ballistics_fit.json` + 终端对照表 + 可粘回的 `BallisticsConfig(...)` | 0 可信 / 2 不可信 / 3 缺测量 / 1 出错（§5.4） |
-| `python -m airdrop.run basic` | `examples/basic_usage.py` | 飞控（只看遥测部分则不必） | 订阅推送、按时间戳查询与指令演示 | 0；15s 收不到遥测 = 1 |
-| `python -m airdrop.run hm30-video` | `examples/hm30_video.py` | HM30 图传 | 链路统计；`--preview` 开窗、`--save-path` 存 mp4 | 0 |
-| `python -m airdrop.run video-sync` | `examples/video_telemetry_sync.py` | HM30 图传 + 飞控 | 对齐 + 逐帧入缓冲 + 读者线程演示 | 0；首帧超时/一帧没收到 = 1 |
-| `python -m airdrop.run fetch-models` | `tools/fetch_models.py` | 本地素材目录（`--source-dir`；**只复制、不联网**） | 权重复制进 `models/` | 0 |
-| `python -m airdrop.run make-world` | `vendor/airdrop-sim/airdrop_sim/make_world.py` | — | `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/` 里的两个 CUADC 赛区世界 + 网格/材质（`--out-dir` 会把贴图一起复制过去）；布局与 SITL 启动见 [`simulation_world.md`](simulation_world.md) | 0 成功 / 1 参数非法或缺资产 |
-| `python -m airdrop.run make-vehicle` | `vendor/airdrop-sim/airdrop_sim/make_vehicle.py` | — | 参数化相机机型、`camera_calib.json`、`simulation.manifest.json`；不修改 PX4 参考源码 | 0 成功 / 1 参数非法 |
-| `python -m airdrop.run make-backdrops` | `vendor/airdrop-sim/airdrop_sim/make_backdrops.py` | —（离线；要 Pillow） | `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/materials/textures/` 里的目标区地面纹理 `ground_*.png` + 程序化航拍底图 `aerial_*.png`；`--parts ground` 只写前者（不覆盖抓来的真实航拍图） | 0 / 1 参数非法 |
-| `python -m airdrop.run fetch-aerial` | `vendor/airdrop-sim/airdrop_sim/fetch_aerial.py` | **联网**（USGS NAIP 影像服务；公有领域） | 用真实航拍影像覆盖 `aerial_*.png`（比赛区域外那块干扰底图） | 0 / 1 联网或下载失败 |
-| `python -m airdrop.run preview-world` | `vendor/airdrop-sim/airdrop_sim/preview_world.py` | —（要 Pillow；只读世界文件，不重新生成） | 俯视预览图 `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/preview.png`（带中文标注：天井编号/两位数、航拍块编号、图例；**标注只在这张 PNG 里**） | 0 / 1 世界文件读不了 |
-| `python -m airdrop.run dump-api` | `tools/dump_api.py` | — | 把公开签名与默认值自省成 `docs/api_reference.md`（核对文档用） | 0 |
-| `python -m airdrop.run check-docs` | `tools/check_docs.py` | — | 核验 `docs/handbook.md` 与代码是否一致 | 0 一致 / 1 有缺口 |
+完整选项见各命令 `--help`。运行参数语义、相互约束和生命周期见 [统一运行说明](runtime.md)。工具仓初始化与升级见 [独立工具](tool_repositories.md)。
 
-常用选项（每个子命令的完整选项与默认值看 `--help`；默认值直接取自入口模块的常量）：
+### 6.3 任务环境与阶段
 
-| 选项 | 子命令 | 落到配置 |
-| --- | --- | --- |
-| `--system-address` | full-mission / sitl / basic / video-sync / calibration-capture | `TelemetryConfig.system_address` |
-| `--rtsp-url` | full-mission / hm30-video / video-sync / calibration-capture | `VideoConfig.url` |
-| `--telemetry-lag` | full-mission / video-sync / calibration-capture | `VideoConfig.telemetry_lag` |
-| `--land-plan` | full-mission / sitl / replay | `RoutesConfig.land_plan`（与配置航点**二选一**，同时给会报错；replay 只规划不上传） |
-| `--recon-upload {operator,auto}` | full-mission / sitl | `MissionConfig.recon_upload` |
-| `--no-video` | full-mission | 本架次不接图传：跳过图传/感知，自检四项也相应关掉 |
-| `--no-preflight` | full-mission | 把 `config.preflight` 各项全关掉（**关掉 ≠ 通过**：每项仍记 `ok=null` 事件） |
-| `--require-airborne` / `--no-require-airborne` | full-mission / sitl | `MissionConfig.require_airborne`（地面演练才关） |
-| `--target-offset N,E,D` | sitl | 合成目标相对盘旋点的 NED 偏移 |
-| `--flight DIR` | replay / calibrate | 飞行目录（回放素材 / 标定素材） |
-| `--calib FILE` | replay | `CameraConfig.calib_file`（**要用录该素材时同一份**；SITL 架次是 `.sitl-recon-tmp/camera_calib_sim.json`） |
-| `--side-check TOL` | replay | 边长互校门限（**默认关**；回放优化时才给，如 0.25——诊断用，不剔点） |
-| `--speed` | replay | 回放速度（0 = 全速） |
-| `--strict` | replay / calibrate | 回放异常即失败 / 标定降级（外参或时间差没标出来）即返回 2 |
-| `--drain-timeout` | replay | 停止生产后等待尾帧与 OCR 完成的最长秒数，默认 120；超时明确失败，不把部分结果当成完整回放 |
-| `--lag S` | sitl-recon | 图传链路延时估计（秒；报告里还会给 lag 扫描与反向诊断） |
-| `--recon-timeout S` | sitl-recon | RECON 段的上限（秒，状态机在这一段等侦查航线飞完） |
-| `--video-wait S` | sitl-recon | 等第一帧画面的上限（秒；SITL 刚启动时可以给大一点） |
-| `--work-dir DIR` | sitl-recon | 产物目录（模拟相机标定/SDP/检测明细/`report.json`） |
-| `--impacts FILE` | fit-ballistics | 实测落点文件 |
-| `--mass-kg` | fit-ballistics | `BallisticsConfig.mass_kg`（**实测值，不参与反演**） |
-| `--seed N` | make-world | 天井位置与朝向的随机种子（默认 0 = 入库布局） |
-| `--rounds {both,1,2}` | make-world | 生成哪几轮（第一轮图片靶标 / 第二轮数字靶标） |
-| `--wind E,N,U` | make-world | 世界的恒定风（东,北,天 m/s；默认静风） |
-| `--out-dir DIR` | make-world | 世界与资产写到哪个目录（默认 `simulation-output/worlds/cuadc`） |
-| `--origin-lat` / `--origin-lon` / `--origin-alt` | make-world / make-vehicle | WGS84 原点纬度、经度（度）与海拔（米）；写入世界及 manifest |
-| `--width` / `--height` / `--hfov` | make-vehicle | 相机尺寸（像素）与水平视场（弧度），同时用于 SDF 与相机内参 |
-| `--mount` / `--pitch` | make-vehicle | FRD 光心杆臂（米）与 SDF FLU 安装俯仰（弧度） |
-| `--manifest PATH` | sitl-recon | 使用本次世界原点、真值与相机参数；默认仍为 r2/seed 0 |
-| `--well-arrows` | make-world | 画"天井箭头"（规则文本有、规则图 2/4 没有；默认不画） |
-| `--sun AZ,EL` | make-world | 太阳位置（方位角,仰角 度；换阴影环境用，如 `90,12` = 东侧长阴影） |
-| `--sun-random` | make-world | 太阳由 seed + 轮次随机（方位全向、仰角 15–80°；换 seed 换光照） |
-| `--aerial-patches N` | make-world | 比赛区域外铺几块航拍干扰底图（0 = 不铺；默认 12） |
-| `--size N` | make-backdrops / fetch-aerial | 底图贴图边长（像素，默认 512） |
-| `--seed N` | make-backdrops | 底图随机种子（`ground_*` / 程序化 `aerial_*` 长什么样） |
-| `--parts {all,ground,aerial}` | make-backdrops | 只写哪一类底图（默认 all） |
-| `--tile-width-m M` | fetch-aerial | 每张真实航拍图覆盖的地面宽度（米，默认 160） |
-| `--world-dir DIR` | preview-world | 预览哪个世界目录（默认 `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc`） |
-| `--round {1,2}` | preview-world | 预览哪一轮（默认 2） |
-| `--out FILE` | preview-world | 输出 PNG 路径（默认 `simulation-output/worlds/cuadc/preview.png`，输入默认世界来自包内资产） |
+真实环境与 SITL 的差异只在连接、场景/相机参数和仿真操作手适配；图传、感知、记录器、投放判据与 `MissionRunner` 复用统一装配。
 
-参数不合法（未知子命令、未知选项、取值越界）一律由 argparse 以 **2** 退出。
+| 参数 | 行为 |
+| --- | --- |
+| `--mode real|sitl` | 选择真实运行或仿真环境 |
+| `--mission-control` / `--no-mission-control` | 是否控制任务；关闭后只运行所选采集/识别/记录组件，不上传、不解锁、不下发 hold/RTL/投弹 |
+| `--capture` / `--no-capture` | 是否接收视频；识别开启时必须接收 |
+| `--record` / `--no-record` | 是否保存标准飞行目录，与视频采集和识别独立 |
+| `--recognize` / `--no-recognize` | 是否运行检测、OCR 与坐标/目标统计；关闭时不加载对应模型或相机标定 |
+| `--drop-stage` / `--no-drop-stage` | 是否在侦查后规划飞掠投放；关闭时处理结束后盘旋完成，不走备用点飞掠 |
+| `--real-release` / `--no-real-release` | 是否执行真实挂架动作；默认关闭，仍可执行模拟投放判据与记录，SITL 拒绝实投 |
+| `--auto-recon` / `--no-auto-recon` | 是否由程序上传侦查；关闭后只观察操作手任务 |
+| `--auto-land` / `--no-auto-land` | 投放阶段后是否自动降落；关闭时规划不含降落项，投放后飞至出口并盘旋完成 |
+| `--max-seconds` | 被动采集或运行的时长上限；具体支持范围见入口帮助 |
 
+没有识别结果但启用投放阶段时保留备用点策略；需要只侦查/只采集时应显式关闭投放阶段或任务控制。真实运行不会自动 arm。`DONE` 表示本次程序阶段已完成，需结合事件的完成方式区分盘旋退出与降落任务完成；任务进度不是“飞机已落地”的独立证据。
 
-### 6.3 正式任务的启动顺序（与自动测试档的区别）
-
-```
-INIT           等遥测 + NED 原点（不上传任何任务）
-  ↓
-PREFLIGHT      起飞前自检：载入 detector / ocr / camera → 视频自检
-               （窗口 video_probe_s 内新增至少 video_min_frames 帧；核对最新帧时间与标定尺寸）
-  ↓            任一项失败 → ABORT("preflight_failed:<check>")；超 max_s → preflight_timeout
-WAIT_AIRBORNE  什么都不下发，等"飞机真的在空中"
-               （in_air 为主，取不到时 relative_altitude_m >= airborne_alt_m 兜底）
-  ↓            超 airborne_timeout_s → ABORT（airborne_timeout）
-RECON          正式任务：recon_upload="operator" —— **不上传**，等操作手在 QGC 启动侦查航线
-               （本包只等它开始，然后监视进度）；自动测试才用 "auto" 由本包上传
-  ↓
-HOLD_PROCESS → OVERFLY（飞掠 + 投放）→ LAND → DONE
-```
-
-| 档位 | `MissionConfig.recon_upload` | 自检（`PreflightConfig`） | 谁上传侦查航线 | 入口 |
-| --- | --- | --- | --- | --- |
-| **正式任务** | `'operator'`（默认） | 全开（载入模型 + 视频自检） | **操作手**（QGC） | `examples/full_mission.py` |
-| 自动测试 / SITL | `'auto'` | 全关或按需关（无相机、无模型、飞机不起飞） | 本包 | `examples/sitl_mission.py` |
-
-⚠ SITL/地面演练还会关掉"等起飞"的检查：`examples/sitl_mission.py` 的 `REQUIRE_AIRBORNE = False`
-（即 `MissionConfig.require_airborne=False`，见 §4.13）——飞机停在停机坪上也能把状态机整条跑完，
-不必等到 `airborne_timeout_s`（默认 1800s）才失败。放行**留痕**：一条 `airborne_skipped`
-事件 + 一条 WARNING；正式任务必须保持默认的 `True`。
-
-⚠ 关掉的自检项**不算通过**：每项都会落一条 `preflight` 事件（`ok=null`），
-正式任务起飞前请核对该事件；`preflight_skipped` 则表示根本没注入预检对象。
-
-**现场执行顺序（正式任务照这个次序走）**
-
-1. **链路先就绪，再启动程序**：飞控/数传/图传上电、MAVSDK 地址可达之后才
-   `python -m airdrop.run full-mission`。`thread.connect()` 是**阻塞**调用（连不上就抛异常，
-   退出码 1）；`INIT` 的等待上限 `init_max_s`（默认 30s）在状态机装配时就起算——链路没就绪
-   时程序不会替你等，超时直接 `ABORT(init_no_telemetry)` / `init_no_origin`（见 §4.13）。
-2. **确认连接与原点**：日志出现 `飞控已连接：…`，事件出现 `origin`（经纬度 + 海拔）
-   → 遥测位置与 NED 原点都就绪，`INIT` 放行到 `PREFLIGHT`。
-3. **等起飞前自检跑完再起飞**：`PREFLIGHT` 载入 detector / ocr / camera 并做视频自检，
-   逐项落 `preflight` 事件。自检不过会**在地面就** `ABORT(preflight_failed:<check>)` 并下
-   `abort_action`；此时若飞机已经起飞，就变成"刚起飞就判失败、飞机在空中盘旋"。所以
-   **建议自检通过之后再上传航线、再起飞**（自检与上传之间没有强制先后，只是这样更稳）。
-4. **操作手在 QGC 上传侦查航线并 Start Mission**：`recon_upload="operator"`（默认）时本包
-   **不 arm、不 takeoff、也不上传侦查航线**——"自动起飞"只能来自操作手启动的那条含起飞项
-   （`NAV_TAKEOFF`）的任务。上传在程序启动之前或之后都行，唯一要求是**在侦查段飞完之前**
-   让本包看到它；操作手可以自己画，也可以把 `RoutesConfig.recon_plan` 那份 `.plan` 导入 QGC
-   再上传（**那条配置只对 `"auto"` 档生效**，operator 档本包不读它）。
-5. **程序自动进侦查**：检测到在空中（`in_air` 为主，取不到时相对高度 ≥ `airborne_alt_m`，
-   默认 5m）→ 记 `airborne` → 进 `RECON` 并记 `recon_waiting_operator` → 确认飞控真的在
-   `MISSION`（`mission_confirmed`）→ 开始监视任务进度。
-6. **这个窗口要盯住**：进 `RECON` 后 `recon_max_s`（默认 600s）内必须确认到 `MISSION`，
-   否则 `ABORT(mission_not_started)` → 默认 `abort_action="hold"`（固定翼盘旋）。
-   **手动起飞但没启动任务 = 同样会等到超时**：侦查航线必须在飞控里真的跑起来。
-7. **侦查飞完之后的动作由本包接手**：`HOLD_PROCESS` 下 `hold`（盘旋）等目标统计（上限
-   `hold_process_max_s`，默认 10s）→ 本包**唯一一次上传**（飞掠段 + 降落段合成一条任务，
-   会覆盖飞控里当时存的那条）→ `OVERFLY` 投放 → `LAND` → `DONE`。
-8. **收尾**：落地后看 `flights/<时间戳>/`（`events.jsonl` 里逐条状态与原因，见 §5.2）；
-   Ctrl-C 会让程序按 `ABORT` 处理并下安全动作（退出码 130），不是直接退出。
-
-⚠ 现场最容易跑错的三条：
-
-* **侦查段已经飞完才启动程序**：`MissionMonitor` 要求"先见到一次未完成"才认"已飞完"
-  （防飞控侧的陈旧读数），已经飞完的任务不会被采信 → 一直空等到 `recon_max_s` 超时才
-  `ABORT`（超时原因看飞控当时的模式：仍是任务模式则 `recon_timeout`，已切出任务模式则
-  `mission_not_started`）。程序要在侦查段结束前就在跑。
-* **手动起飞之后不切任务模式**：见第 6 条——600s 后 `ABORT(mission_not_started)`。
-* **把"关掉自检"当成"自检通过"**：`--no-preflight` 只是跳过（事件里 `ok=null`）。
-
-**SITL 用哪个世界**：`examples/sitl_mission.py` 的航线与合成目标已对准
-`vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/cuadc_recon_strike_r2.sdf`（CUADC 赛区：跑道 + A/B 两个 60x60m 目标区
-分列起飞线两端、8 座天井在区内随机摆放，第二轮数字靶标；航线常量按 seed 0 手写，
-`vendor/airdrop-sim/tests/test_world.py` 会核验它对准 A 区中位数天井）。启动脚本在 PX4 树外准备独立运行目录并设置世界/资源路径；不修改 PX4 源码。已有构建、运行目录与环境前提见
-[`simulation_world.md`](simulation_world.md)；一键版本是 `bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2`
-（机型默认 `gz_rc_cessna_down_cam`：带 1280x720 下视相机，感知取图用的那个）。
-**视频流是 PX4 官方机制**：`gz_bridge/server.config` 自动加载 `GstCameraSystem`，把世界里的
-第一台相机编码成 RTP/H.264 推到 UDP 5600，QGC 设 “UDP h.264 / 5600” 就能看（详见世界文档 §5.1）。
-
-标定工具自有输入类型、相机文件和仿真 manifest 的字段、单位及独立调用方式见
-[`tool_contracts.md`](tool_contracts.md)。仿真配置和数学工具不导入主任务包；SITL 集成协调器保留在主仓。
+侦查截止后固定未读帧快照，等待截止前检测/OCR 排空；视频和记录仍可覆盖后续飞行。关闭识别不影响已选中的采集/记录。SITL 参数调整只发生在仿真任务控制路径，原值写前登记，收尾尽力恢复；纯被动模式不改飞控参数。
 
 ### 6.4 改配置的三种方式
 
@@ -2348,8 +2230,12 @@ config = Config(
 | `tests/test_plan.py` | QGC `.plan` 解析与复杂项展开、固定翼降落预检逐条判据、plan↔配置航点二选一 | 否 |
 | `tests/test_e2e.py` | 回放驱动全链路：帧 → 感知 → 坐标 → 统计 → 航线（另有 `realdata` 变体） | 否（变体需 GPU） |
 | `tests/test_fit.py` | 投放记录读写、反演真值回收、退化/不可辨识必拒、工具现场流程 | 否 |
-| `tests/test_examples.py` | 示例与工具不脱节（导入即校验 + **导入不加载重库** + 真跑装配函数） | 否 |
-| `tests/test_sitl_recon.py` | **SITL 侦查精度（可选，标 `sitl`；默认被 `-m "not realdata and not sitl"` 排除，显式 `-m sitl` 才跑）**：驱动 `tools/sitl_recon.py` 跑完整标准流程，断言状态机 `DONE`、三个编号全识别、任务选中 56、误差与留一验证都 < 2 m；探活用**裸 UDP 听 14540 心跳**（不建 MAVSDK 会话），没在跑就 skip | 否（要 WSL 里已起 PX4 SITL） |
+| `tests/test_examples.py` | 统一运行参数与共享装配的导入、轻量帮助及阶段组合回归 | 否 |
+| `tests/test_runtime_factory.py` | real/SITL 入口的真实组件装配、状态机、自检、投放开关与阶段组合 | 否 |
+| `tests/test_runtime_session.py` | 组件工厂、被动采集、阶段组合与失败时独立收尾 | 否 |
+| `tests/test_runtime_sitl.py` | SITL 真实协调入口的离线 I/O 替身、阶段参数、报告与参数恢复 | 否 |
+| `tests/test_mission_transfer.py` | 上传/激活的取消竞态、一次恢复及关闭等待 | 否 |
+| `tests/test_sitl_recon.py` | **SITL 侦查精度（可选，标 `sitl`；默认被 `-m "not realdata and not sitl"` 排除，显式 `-m sitl` 才跑）**：驱动 `airdrop/runtime/sitl.py` 跑完整标准流程，断言状态机 `DONE`、三个编号全识别、任务选中 56、误差与留一验证都 < 2 m；探活用**裸 UDP 听 14540 心跳**（不建 MAVSDK 会话），没在跑就 skip | 否（要 WSL 里已起 PX4 SITL） |
 | `tests/test_cli.py` | 集中式入口：子命令注册表（parser + handler）、`--help`/`check-docs` **不加载重库**（干净子进程实测）、参数不合法退出码 2、选项覆盖真的进了 `build_config()` | 否 |
 | `tests/test_handbook.py` | **本手册 §3 的 11 段示例逐条真跑**（文档里的代码必须能运行） | 否 |
 | `vendor/airdrop-sim/tests/test_world.py` | CUADC 赛区世界：**生成结果 == 入库文件**、目标区在起飞线两端（±200, 0）、天井区内随机摆放且间距 > 20m、五边形环壁（厚 5mm、高 400mm）、**规则里只是示意的东西不许出现**（4m/6m 打击圈、天井箭头）、同区天井同色、贴地标线不共面重叠（防 z-fighting）、两轮靶标摆位（第二轮中位数落在第 3 座）、演练航线对准中位数天井、目标区底色（常见路面色 + 少量纹理）、周边航拍底图（不压跑道/目标区、互不重叠）、底图生成器（可复现/离线校验）、俯视预览图（尺寸/可复现/参数校验）、资产逐级存在、数字板必须是**白底黑字** | 否 |
@@ -2357,14 +2243,14 @@ config = Config(
 
 ### 6.6 一次真实任务的推荐顺序
 
-1. **标定**：`examples/calibration_capture.py` 录素材 → `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 出 `camera_calib.json`
+1. **标定**：`mission --no-mission-control --no-recognize --record` 录素材 → `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 出 `camera_calib.json`
    → 把 `telemetry_lag` 回填 `VideoConfig`（标定用**收到帧的时刻**测量，输出就是可直接回填的
    绝对对齐量；一步同时解决相机外参与时间差）。
 2. **配置**：`RECON_ROUTE`/`BACKUP_POINT` + 降落段——**要么**用操作手在 QGC 里画好的
    `routes/land.plan`（推荐，降落剖面由 QGC 保证），**要么**写 `LANDING_ROUTE` 航点
    （WGS84，高度是**相对起飞点**，且必须满足 §7 第 32 条的降落几何）；再配 `OVERFLY_HEADING_DEG`；
    用 `Config().validated()` 过一遍。
-3. **拆桨/演练**：`DRY_RUN=True` 跑 `examples.full_mission.py`，或先在 SITL 跑 `examples/sitl_mission.py`。
+3. **拆桨/演练**：`--no-real-release` 跑 `mission --mode real`，或先在 SITL 跑 `mission --mode sitl`。
 4. **投放试验**：飞几次投放 → 量落点填 `impacts.jsonl` → `tools/fit_ballistics.py` →
    只把 `reliable=True` 的那组参数回填 `BallisticsConfig`。
 5. **装弹实飞**：`DRY_RUN=False`，确认 PX4 侧 gripper 输出与 `abort_action` 符合空域要求；
@@ -2431,7 +2317,7 @@ config = Config(
 | `DroneController.request_origin()` | `NedOrigin` | `None` = 原点**尚未就绪**（不是错误） |
 | `load_plan(path)` | `QgcPlan` | 抛 `PlanError`（读不了 / 不是 QGC plan / `SimpleItem` 之外的复杂项 / 参数不全） |
 | `build_drop_mission(...)` | `DropMissionPlan` | 抛 `PlanningError`（缺 NED 原点 / 降落段为空 / 降落几何不合格 / 目标与备用点都没有） |
-| `MissionRunner` 的启动确认 | 记 `mission_confirmed` | `ABORT('mission_not_started')`（模式迟迟不进 `MISSION`）；模式流不可用时只告警并退化 |
+| `MissionRunner` 的启动确认 | 记 `mission_confirmed` | `ABORT('mission_not_started')`（模式迟迟不进 `MISSION`）；模式流不可用时保持未确认，截止后失败 |
 | `BallisticsModel.predict_impact()` | `Impact(ok=True, ned=…)` | `ok=False` + `reason`（`below_ground`/`timeout`），`ned=None` |
 | `ReleaseJudge.update()` | `ReleaseDecision`（`should_release` 真/假） | 状态不足时 `reason="unknown_position"`；预测不出时 `no_prediction:*` |
 | `fit_ballistics()` | `FitResult(ok=True, …)` | `ok=False` + `reason`（无样本/退化/欠定/不可辨识/初值越界） |
@@ -2467,7 +2353,7 @@ config = Config(
 | 新增一个可拟合参数 | `ballistics/fit.py` 的 `FIT_PARAMETERS` + `bounds_for`/`initial_for`/`with_parameters` + `tools/fit_ballistics.py` 的开关与报告（**先想清楚它跟已有参数是否退化**） |
 | 换坐标解算（比如带高程图） | `georef/project.py`（`pixel_to_ned` 的 `ground_z` 来源）与 `GroundConfig` |
 | 新增一个离线工具 | 放 `tools/`，写成**纯库模块**：常量 = 默认值、`build_config(**覆盖)`、`main(**kwargs)` 返回退出码（**不要自己 import argparse**），再到 `airdrop/run.py` 的 `SUBCOMMANDS` 注册一个子命令（`--help` 不许加载重库，重依赖放函数体内）；`tests/test_cli.py` 会校验注册表与帮助信息 |
-| 新增一个示例 | 放 `examples/`，同样写成纯库模块：`build_config(**覆盖)` 暴露参数（文件内常量 = 默认值）、`main(**kwargs)` 返回退出码；`tests/test_examples.py` 会自动校验"不脱节 + 导入不加载重库" |
+| 新增运行能力 | 优先扩展 `airdrop/runtime/` 的阶段参数或组件工厂，保留真实入口生命周期测试，不新增并行任务脚本 |
 
 ### 7.5 审查清单（照抄即可用）
 
@@ -2476,7 +2362,7 @@ config = Config(
 - [ ] 新增参数有没有进 `Config.validated()` 的取值域检查？
 - [ ] 失败路径是否**显式**（抛错 / `ok=False` / `None` 三选一，并在 docstring 写明）？
 - [ ] 是否碰了 §7.1 中的行为约束？若有变化，更新对应源码说明、测试与相关专题文档。
-- [ ] 碰了任务项 / 航线来源 / 启动与完成判定（§7 第 31–35 条）时，除了离线用例，**跑一次 SITL 演练**（`examples/sitl_mission.py`）——这四条都是"离线测不出来、真飞控才暴露"的。
+- [ ] 碰了任务项 / 航线来源 / 启动与完成判定（§7 第 31–35 条）时，除了离线用例，**跑一次 SITL 演练**（`mission --mode sitl`）——这四条都是"离线测不出来、真飞控才暴露"的。
 - [ ] 回归用例加了吗（`tests/` 是回归落点）？跑过 `pytest -m "not realdata and not sitl and not stream"` 吗？
 - [ ] 相关文档是否同步：`README.md`（怎么用）、本手册（目录/参数/产物）及任务涉及的专题文档？
 
@@ -2507,7 +2393,7 @@ config = Config(
 | `mavsdk_server --version` 长时间不返回 | 那个二进制没有 `--version`，它会去起服务并阻塞 | 版本看日志首行 `mavsdk_server: MAVSDK version: vX.Y.Z`（与 Python 包版本一致） |
 | 目标坐标整体偏一段距离 | 没标定（默认外参）、或 `telemetry_lag` 是旧值 | 跑标定并把 `telemetry_lag` 回填；核对 `camera_calib.json` 的 `R_bc`/`t_bc` |
 | `models/best2.pt` 找不到 | 没取权重 | `python -m airdrop.run fetch-models`（`--source-dir` 可覆盖文件内常量） |
-| `examples.full_mission` 起不来 | 缺 `camera_calib.json`/航线为空/RTSP 地址不对 | 看 `flight.log`；`Config().validated()` 会提前挡掉取值域错误 |
+| `统一真实运行入口` 起不来 | 缺 `camera_calib.json`/航线为空/RTSP 地址不对 | 看 `flight.log`；`Config().validated()` 会提前挡掉取值域错误 |
 | 状态机停在 `INIT` | 没等到遥测位置或 NED 原点（`INIT` 本身不上传任何任务） | 看 `flight.log`；`init_max_s` 超时会 `ABORT(init_no_telemetry` / `init_no_origin)` |
 | 状态机停在 `PREFLIGHT` | 模型载入无响应/抛异常，或视频自检没等到足够的帧 | 看 `preflight` 事件与 `flight.log`：任一项失败 → `ABORT(preflight_failed:<check>)`；超 `preflight.max_s` → `preflight_timeout`；没有相机就把 `PreflightConfig.check_video` 关掉 |
 | 状态机停在 `WAIT_AIRBORNE` | 飞控没报 `in_air`，相对高度也没超过 `airborne_alt_m` | 这是**正常**的等起飞；`airborne_timeout_s`（默认 1800s）超时会 `ABORT(airborne_timeout)`；核对 `in_air` 可选流是否就绪 |
@@ -2541,7 +2427,7 @@ config = Config(
 - **权重不进 git**：拿权重后配 `config_snapshot.json` 才知道当时用的是什么；`models/ppocr/*.txt` 字典入库，
   正是为了让 rec 的字符集固定。
 - **一次飞行的全部输入都在飞行目录里**：`config_snapshot.json` + `telemetry.jsonl` + `frames/`，
-  配合 `ReplayVideoSource` 可离线重跑同一条链路；改动算法后**先跑 `examples/replay_flight.py` 对比**
+  配合 `ReplayVideoSource` 可离线重跑同一条链路；改动算法后**先跑 `python -m airdrop.run replay` 对比**
   再考虑实飞。
 - **投放试验的结论是可追溯的**：`ballistics_fit.json` 里同时留着原始 `record` 与 `impact_ned`、
   以及用了哪次实测（`impact_source`）。

@@ -115,6 +115,8 @@ def test_preflight_and_airborne_defaults_match_the_new_flow() -> None:
 
     mission = MissionConfig()
     assert mission.recon_upload == "operator", "默认必须等操作手在 QGC 上传并启动"
+    assert mission.drop_stage is True
+    assert mission.auto_land is True
     assert mission.airborne_alt_m > 0.0, "收不到 in_air 时的兜底判据要有非零门限"
     assert mission.airborne_timeout_s > 0.0
     assert frozenset({"operator", "auto"}) == RECON_UPLOAD_MODES

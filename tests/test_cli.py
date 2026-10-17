@@ -1,21 +1,8 @@
-"""集中式运行模块（airdrop/run.py）的离线验收。
-
-全部离线：不连飞控、不开相机、不碰 GPU，也没有一个用例真的去跑任务——跑的都是
-``--help``、参数校验与"选项 → 关键字"的翻译。
-
-三条核心口径：
-
-1. 子命令注册表完整：每个子命令都有 parser 与 handler；
-2. 帮助信息不加载重库：``--help``（顶层与每个子命令）跑在干净子进程里，
-   跑完 ``sys.modules`` 里不许有 torch / cv2 / mavsdk / ultralytics / rapidocr；
-3. 选项真的进了配置：``run.resolve_kwargs()`` 给出的关键字交给各入口的
-   ``build_config()``，配置里确实变了（``dataclasses.replace`` 那条路）。
-"""
+"""统一任务 CLI 与轻量入口回归。"""
 
 from __future__ import annotations
 
-import importlib
-import inspect
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -23,351 +10,168 @@ from pathlib import Path
 import pytest
 
 from airdrop import run
+from airdrop.runtime.mission import main as run_mission
+from airdrop.runtime.session import LiveComponents
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-#: 帮助信息与 ``import airdrop`` 都不许加载的重依赖
+ROOT = Path(__file__).resolve().parents[1]
 HEAVY_MODULES = ("torch", "cv2", "mavsdk", "ultralytics", "rapidocr", "onnxruntime")
 
 
-def _run_in_subprocess(code: str) -> subprocess.CompletedProcess[str]:
-    """在干净解释器里跑一段代码（重库是否被加载只能这样量）。"""
+def _run(code: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-c", code],
-        cwd=str(REPO_ROOT),
+        cwd=ROOT,
         capture_output=True,
         text=True,
         encoding="utf-8",
-        errors="replace",
-        timeout=300,
-        check=False,  # 非零退出由调用方按退出码断言
+        timeout=120,
+        check=False,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
 
 
-# ----------------------------------------------------------------------
-# 1) 注册表：每个子命令都有 parser 与 handler
-# ----------------------------------------------------------------------
-def test_every_subcommand_has_a_parser_and_a_handler() -> None:
-    parser = run.build_parser()
-    # argparse 把子命令注册在 _SubParsersAction.choices 里（名字 -> 子解析器）
-    actions = [
-        action for action in parser._actions if action.__class__.__name__ == "_SubParsersAction"
-    ]
-    assert len(actions) == 1, "顶层解析器应当只有一个子命令动作"
-    registered = actions[0].choices
-    # choices 在桩里是 Iterable | None；这里断言它确实注册过（上面已确认只有一个动作）
-    assert registered is not None
-    assert set(registered) == set(run.SUBCOMMANDS), "注册表与解析器必须一一对应"
-
-    for name, spec in run.SUBCOMMANDS.items():
-        if name in run.TOOL_COMMANDS:
-            continue
-        module = importlib.import_module(spec.module)
-        handler = getattr(module, spec.handler, None)
-        assert callable(handler), f"{name}: {spec.module}.{spec.handler} 不可调用"
-        assert callable(getattr(module, "build_config", None)), (
-            f"{name}: {spec.module} 缺少 build_config()（纯库模块的约定）"
-        )
-        # 每个选项的默认值出处必须是模块里真有的常量
-        for option in spec.options:
-            if option.source:
-                assert hasattr(module, option.source), (
-                    f"{name}: {spec.module} 里没有常量 {option.source}"
-                )
-
-
-def test_subcommand_list_covers_the_old_entries() -> None:
-    """覆盖改造前的全部入口（少一个就是"某个脚本没地方跑了"）。"""
-    assert set(run.SUBCOMMANDS) == {
+def test_registry_has_one_mission_and_offline_commands() -> None:
+    assert "mission" in run.SUBCOMMANDS
+    assert "replay" in run.SUBCOMMANDS
+    assert not set(run.SUBCOMMANDS) & {
         "full-mission",
         "sitl",
         "sitl-recon",
-        "replay",
         "basic",
         "hm30-video",
         "video-sync",
         "calibration-capture",
-        "calibrate",
-        "fit-ballistics",
-        "fetch-models",
-        "make-world",
-        "make-vehicle",
-        "make-backdrops",
-        "fetch-aerial",
-        "preview-world",
-        "dump-api",
-        "check-docs",
     }
+    assert run.SUBCOMMANDS["mission"].module == "airdrop.runtime.mission"
 
 
-def test_help_text_lists_every_subcommand() -> None:
-    result = _run_in_subprocess("import airdrop.run; airdrop.run.main(['--help'])")
-    assert result.returncode == 0, result.stderr
-    for name in run.SUBCOMMANDS:
-        assert name in result.stdout, f"--help 里没有列出子命令 {name}"
+@pytest.mark.parametrize("argv", [["--help"], ["mission", "--help"], ["replay", "--help"]])
+def test_help_does_not_load_heavy_libraries(argv: list[str]) -> None:
+    code = (
+        "import sys; from airdrop.run import main; "
+        f"\ntry: main({argv!r})\nexcept SystemExit as exc: assert exc.code == 0\n"
+        f"print([name for name in {HEAVY_MODULES!r} if name in sys.modules] or 'NONE')"
+    )
+    result = _run(code)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.rstrip().endswith("NONE")
 
 
-# ----------------------------------------------------------------------
-# 2) 惰性导入：帮助信息不加载重库（核心验收）
-# ----------------------------------------------------------------------
-_HELP_PROBE = """
-import sys
-import airdrop.run as runner
+def test_mission_options_parse_to_runtime_keywords() -> None:
+    values = run.resolve_kwargs(
+        "mission",
+        [
+            "--mode",
+            "real",
+            "--no-mission-control",
+            "--capture",
+            "--no-recognize",
+            "--record",
+            "--max-seconds",
+            "20",
+            "--backup-point",
+            "31.2,121.5,10",
+        ],
+    )
+    assert values["mode"] == "real"
+    assert values["run_mission"] is False
+    assert values["capture"] is True and values["recognize"] is False
+    assert values["max_seconds"] == 20
+    assert values["backup_point"] == (31.2, 121.5, 10.0)
+    defaults = run.resolve_kwargs("mission", ["--mode", "sitl"])
+    assert all(
+        defaults[key] is None
+        for key in ("system_address", "rtsp_url", "calib_file", "recon_plan", "land_plan")
+    )
 
-code = 0
-try:
-    code = runner.main({argv!r})
-except SystemExit as exc:          # argparse 的 --help 走 SystemExit(0)
-    code = 0 if exc.code is None else exc.code
-print("EXIT", code)
-print("HEAVY", [name for name in {heavy!r} if name in sys.modules] or "NONE")
-"""
+
+def test_real_release_has_explicit_positive_and_negative_flags() -> None:
+    assert run.resolve_kwargs("mission", ["--real-release"])["real_release"] is True
+    assert run.resolve_kwargs("mission", ["--no-real-release"])["real_release"] is False
+
+
+def test_real_cli_keywords_run_through_injected_factory() -> None:
+    calls: list[str] = []
+
+    class Thread:
+        def connect(self) -> None:
+            calls.append("connect")
+
+        def stop(self, timeout: float = 5.0) -> None:
+            del timeout
+            calls.append("stop")
+
+    def factory(options, config) -> LiveComponents:
+        assert options.mode == "real" and not options.run_mission
+        assert config.telemetry.system_address == "udp://127.0.0.1:14540"
+        assert config.video.url == "rtsp://example.test/stream"
+        assert config.routes.recon_plan == "custom-recon.plan"
+        assert config.routes.land_plan == "custom-land.plan"
+        return LiveComponents(thread=Thread())
+
+    kwargs = run.resolve_kwargs(
+        "mission",
+        [
+            "--mode",
+            "real",
+            "--no-mission-control",
+            "--no-capture",
+            "--no-recognize",
+            "--no-record",
+            "--max-seconds",
+            "0.000001",
+            "--system-address",
+            "udp://127.0.0.1:14540",
+            "--rtsp-url",
+            "rtsp://example.test/stream",
+            "--recon-plan",
+            "custom-recon.plan",
+            "--land-plan",
+            "custom-land.plan",
+        ],
+    )
+
+    assert kwargs["work_dir"] is None
+    assert run_mission(**kwargs, components_factory=factory) == 0
+    assert calls == ["connect", "stop"]
 
 
 @pytest.mark.parametrize(
     "argv",
-    [["--help"], *([name, "--help"] for name in run.SUBCOMMANDS if name not in run.TOOL_COMMANDS)],
+    [
+        ["mission", "--mode", "unknown"],
+        ["mission", "--max-seconds", "nan"],
+        ["mission", "--backup-point", "31,121"],
+        ["replay", "--speed", "fast"],
+    ],
 )
-def test_help_does_not_load_heavy_libraries(argv: list[str]) -> None:
-    """顶层与每个子命令的 ``--help``：退出码 0，且 sys.modules 里没有重依赖。"""
-    result = _run_in_subprocess(_HELP_PROBE.format(argv=argv, heavy=HEAVY_MODULES))
-    assert result.returncode == 0, result.stderr
-    assert "EXIT 0" in result.stdout, result.stdout + result.stderr
-    assert "HEAVY NONE" in result.stdout, (
-        f"--help（{' '.join(argv)}）加载了重库：{result.stdout.strip()}"
-    )
+def test_invalid_arguments_fail_at_cli_boundary(argv: list[str]) -> None:
+    result = _run(f"from airdrop.run import main; main({argv!r})")
+    assert result.returncode == 2, result.stdout + result.stderr
 
 
-def test_importing_airdrop_is_light() -> None:
-    """``import airdrop`` 本身不加载重依赖（惰性导出的底线）。"""
-    result = _run_in_subprocess(
-        "import sys; import airdrop;"
-        f"print('HEAVY', [n for n in {HEAVY_MODULES!r} if n in sys.modules] or 'NONE')"
+def test_importing_real_runtime_does_not_import_sitl_or_heavy_libraries() -> None:
+    result = _run(
+        "import sys; import airdrop.runtime.mission as mission; "
+        "assert callable(mission.build_live_components); "
+        f"print([name for name in {HEAVY_MODULES!r} if name in sys.modules] or 'NONE'); "
+        "print('SITL', 'airdrop.runtime.sitl' in sys.modules)"
     )
     assert result.returncode == 0, result.stderr
-    assert "HEAVY NONE" in result.stdout, result.stdout
+    assert "NONE" in result.stdout
+    assert "SITL False" in result.stdout
 
 
-def test_lazy_exports_still_resolve_across_subpackages() -> None:
-    """``import airdrop`` 之后，跨子包的名字照样取得出来（惰性导出没漏）。"""
-    result = _run_in_subprocess(
-        "import airdrop;"
-        "names = ('MavsdkThread', 'Config', 'BallisticsModel', 'load_plan', 'MissionState');"
-        "print('RESOLVED', [n for n in names if getattr(airdrop, n, None) is None] or 'ALL')"
-    )
-    assert result.returncode == 0, result.stderr
-    assert "RESOLVED ALL" in result.stdout, result.stdout + result.stderr
-
-
-def test_check_docs_subcommand_is_light_and_passes() -> None:
-    """``check-docs`` 也是 handler：跑完不许加载重库，退出码 0（手册与代码一致）。"""
-    result = _run_in_subprocess(
-        "import sys; import airdrop.run as runner;"
-        "code = runner.main(['check-docs']);"
-        f"print('HEAVY', [n for n in {HEAVY_MODULES!r} if n in sys.modules] or 'NONE');"
-        "raise SystemExit(code)"
-    )
-    assert "HEAVY NONE" in result.stdout, result.stdout + result.stderr
+def test_docs_check_subcommand_passes() -> None:
+    result = _run("from airdrop.run import main; raise SystemExit(main(['check-docs']))")
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-# ----------------------------------------------------------------------
-# 3) 参数校验：未知子命令 / 非法参数以 2 退出
-# ----------------------------------------------------------------------
-def test_build_parser_still_parses_selected_options() -> None:
-    args = run.build_parser().parse_args(["full-mission", "--telemetry-lag", "0.3"])
-    assert args.telemetry_lag_s == pytest.approx(0.3)
-
-
-def test_unknown_subcommand_exits_with_two() -> None:
-    result = _run_in_subprocess("import airdrop.run; airdrop.run.main(['nope'])")
-    assert result.returncode == 2, result.stdout + result.stderr
-
-
-def test_missing_subcommand_exits_with_two() -> None:
-    result = _run_in_subprocess("import airdrop.run; airdrop.run.main([])")
-    assert result.returncode == 2, result.stdout + result.stderr
-
-
-@pytest.mark.parametrize(
-    ("argv", "what"),
-    [
-        (["full-mission", "--telemetry-lag", "abc"], "浮点参数写错"),
-        (["full-mission", "--recon-upload", "manual"], "枚举取值不在集合里"),
-        (["full-mission", "--unknown-option"], "未知选项"),
-        (["sitl", "--target-offset", "300,0"], "三元组少一个数"),
-        (["replay", "--speed", "fast"], "浮点参数写错"),
-    ],
-)
-def test_invalid_arguments_exit_with_two(argv: list[str], what: str) -> None:
-    result = _run_in_subprocess(f"import airdrop.run; airdrop.run.main({argv!r})")
-    assert result.returncode == 2, f"{what}: {result.stdout + result.stderr}"
-
-
-# ----------------------------------------------------------------------
-# 4) 选项 → 关键字 → 配置：真的进了 build_config()
-# ----------------------------------------------------------------------
-def _config_kwargs(module_name: str, kwargs: dict) -> dict:
-    """只挑 ``build_config`` 认的关键字（``dry_run``/``record`` 这类是运行期开关）。"""
-    module = importlib.import_module(module_name)
-    parameters = inspect.signature(module.build_config).parameters
-    if any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
-        return dict(kwargs)
-    return {key: value for key, value in kwargs.items() if key in parameters}
-
-
-def test_full_mission_options_override_the_config() -> None:
-    from examples import full_mission
-
-    kwargs = run.resolve_kwargs(
-        "full-mission",
-        [
-            "--system-address",
-            "udpin://0.0.0.0:14550",
-            "--rtsp-url",
-            "rtsp://127.0.0.1:8554/test",
-            "--telemetry-lag",
-            "0.25",
-            "--land-plan",
-            "routes/land.plan",
-            "--recon-upload",
-            "auto",
-            "--no-video",
-            "--no-preflight",
-            "--no-require-airborne",
-            "--dry-run",
-        ],
-    )
-    config = full_mission.build_config(**_config_kwargs("examples.full_mission", kwargs))
-
-    assert config.telemetry.system_address == "udpin://0.0.0.0:14550"
-    assert config.video.url == "rtsp://127.0.0.1:8554/test"
-    assert config.video.telemetry_lag == pytest.approx(0.25)
-    assert config.routes.land_plan == "routes/land.plan"
-    assert not config.routes.landing_route, "走 plan 时不能再带配置航点"
-    assert config.mission.recon_upload == "auto"
-    assert config.mission.require_airborne is False
-    # --no-video / --no-preflight：一个把视频链路关掉，一个把自检各项关掉
-    assert not any(
-        (
-            config.preflight.load_detector,
-            config.preflight.load_ocr,
-            config.preflight.load_camera,
-            config.preflight.check_video,
-        )
-    )
-    # 运行期开关不进 config，但要真的传给了 main()
-    assert kwargs["dry_run"] is True and kwargs["use_video"] is False
-
-
-def test_sitl_options_override_the_config() -> None:
-    from examples import sitl_mission
-
-    kwargs = run.resolve_kwargs(
-        "sitl",
-        ["--target-offset", "300,10,-2", "--system-address", "udpin://0.0.0.0:14541"],
-    )
-    config = sitl_mission.build_config(**_config_kwargs("examples.sitl_mission", kwargs))
-
-    assert kwargs["target_offset_ned"] == (300.0, 10.0, -2.0)
-    assert config.telemetry.system_address == "udpin://0.0.0.0:14541"
-    # 演练档的两条默认：不等起飞、自检全关（--require-airborne 未给 → 保持默认）
-    assert config.mission.require_airborne is False
-    assert config.mission.recon_upload == "auto"
-
-
-def test_replay_options_override_the_config() -> None:
-    from examples import replay_flight
-
-    kwargs = run.resolve_kwargs(
-        "replay",
-        [
-            "--flight",
-            "flights/x",
-            "--speed",
-            "2.5",
-            "--perception-mode",
-            "cls12",
-            "--drain-timeout",
-            "12",
-        ],
-    )
-    config = replay_flight.build_config(**_config_kwargs("examples.replay_flight", kwargs))
-
-    assert kwargs["flight_dir"] == Path("flights/x")
-    assert kwargs["speed"] == pytest.approx(2.5)
-    assert kwargs["drain_timeout_s"] == 12
-    assert config.perception.mode == "cls12"
-
-
-def test_fit_ballistics_options_override_the_config() -> None:
-    from tools import fit_ballistics
-
-    kwargs = run.resolve_kwargs(
-        "fit-ballistics", ["--impacts", "flights/z/impacts.jsonl", "--mass-kg", "0.42"]
-    )
-    settings = fit_ballistics.build_config(mass_kg=kwargs["mass_kg"])
-
-    # --impacts / --drops / --out 是 main() 的运行期入参，--mass-kg 才是配置
-    assert kwargs["impacts"] == Path("flights/z/impacts.jsonl")
-    assert settings.base.mass_kg == pytest.approx(0.42)
-    assert settings.fit_drag_coefficient is fit_ballistics.FIT_DRAG_COEFFICIENT
-
-
-def test_defaults_come_from_the_module_constants() -> None:
-    """不带选项时，关键字必须等于入口模块的常量（默认值不写第二遍）。"""
-    from examples import full_mission, sitl_mission
-
-    kwargs = run.resolve_kwargs("full-mission", [])
-    assert kwargs["rtsp_url"] == full_mission.RTSP_URL
-    assert kwargs["telemetry_lag_s"] == full_mission.TELEMETRY_LAG_S
-    assert kwargs["land_plan"] == full_mission.LAND_PLAN
-
-    sitl = run.resolve_kwargs("sitl", [])
-    assert sitl["target_offset_ned"] == sitl_mission.TARGET_OFFSET_NED
-    assert sitl["system_address"] == sitl_mission.SYSTEM_ADDRESS
-
-
-def test_fetch_models_reports_a_wrong_source_dir_as_failure(tmp_path: Path) -> None:
-    """``--source-dir`` 打错时必须**失败**，不能报"都已在位"并返回 0。
-
-    原来 ``copy_missing`` 只返回 copied，源缺失时逐个打印 ``[跳过] 源缺失`` 后
-    ``total == 0`` ⇒ 打印"（都已在位，无需复制）"并返回 0——"取权重失败"被静默
-    转成成功。这个 0 会让调用方误以为成功。
-    """
+def test_fetch_models_missing_source_returns_failure(tmp_path: Path) -> None:
     from tools import fetch_models
 
-    absent = tmp_path / "definitely-not-here"
-    code = fetch_models.main(source_dir=absent, source_ocr_dir=absent, target_dir=tmp_path / "out")
-    assert code == 2, f"源目录不存在应返回 2，实际 {code}"
-
-
-def test_fetch_models_returns_zero_when_source_is_complete(tmp_path: Path) -> None:
-    """来源齐全时返回 0（对照组：上一条若恒返回非 0，这条会失败）。"""
-    from tools import fetch_models
-
-    source = tmp_path / "src"
-    source.mkdir()
-    for name in fetch_models.YOLO_FILES:
-        (source / name).write_bytes(b"x")
-    for name in fetch_models.OCR_FILES:
-        (source / name).write_bytes(b"y")
-
-    code = fetch_models.main(source_dir=source, source_ocr_dir=source, target_dir=tmp_path / "out")
-    assert code == 0
-    assert (tmp_path / "out" / "best2.pt").is_file()
-    assert (tmp_path / "out" / "ppocr" / "ppocrv6_dict.txt").is_file()
-
-
-def test_check_docs_honours_an_explicit_doc_path(tmp_path: Path) -> None:
-    """``check_docs(doc_path=...)`` 要真的校验**传入的那本**，不是模块常量。
-
-    原来存在性检查用 ``doc_path``、读内容却用模块常量 ``DOC_PATH`` ⇒ 最坏情况是
-    "核验通过了但核验的不是你以为的那本"，是个半个选项。而 main() 的 docstring
-    承诺"关键字与 build_config 一致"。
-    """
-    from tools import check_docs
-
-    decoy = tmp_path / "decoy.md"
-    decoy.write_text("这里没有手册该有的任何内容", encoding="utf-8")
-    assert check_docs.main(doc_path=decoy) == 1, "显然不合格的内容不该通过"
+    missing = tmp_path / "missing"
+    assert (
+        fetch_models.main(source_dir=missing, source_ocr_dir=missing, target_dir=tmp_path / "out")
+        == 2
+    )

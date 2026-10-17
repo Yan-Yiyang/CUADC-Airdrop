@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from tools.optional_tools import load_tool_module
+from .tool_loader import load_tool_module
 
 load_tool_module("airdrop_sim")
 

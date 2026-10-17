@@ -670,6 +670,27 @@ class ReplayVideoSource:
         """等到第一帧被投递（与实飞源同义）。"""
         return self.read(timeout=timeout) is not None
 
+    def wait_finished(self, timeout: float | None = None) -> bool:
+        """等待播放进入 finished/error/stopped 终态，超时返回 False。"""
+        if timeout is not None and timeout < 0:
+            raise ValueError("等待时限不能为负")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while self._stats.state not in {"finished", "error", "stopped"}:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def join(self, timeout: float | None = None) -> bool:
+        """等待播放线程退出并返回是否已退出。"""
+        thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
     # ------------------------------------------------------------------
     # 读取接口
     # ------------------------------------------------------------------

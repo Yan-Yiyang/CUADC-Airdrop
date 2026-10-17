@@ -84,9 +84,9 @@ def test_sitl_recon_accuracy() -> None:
     if not _sitl_is_up():
         pytest.skip("SITL 没在跑（先 bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2）")
 
-    from tools import sitl_recon
+    from airdrop.runtime import sitl
 
-    exit_code = sitl_recon.main()
+    exit_code = sitl.main()
     # 先断言退出码：否则退出码非 0 时下面读 report 会先抛 FileNotFoundError /
     # JSONDecodeError，把真正的失败原因盖掉
     assert exit_code in (0, 7), f"退出码 {exit_code}"
@@ -112,17 +112,17 @@ def test_zero_test_params_keeps_original_value_when_write_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """置零失败时，账本也必须保留已经读到的参数原值。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_operations
 
     ledger: dict[str, int] = {}
-    monkeypatch.setattr(sitl_recon, "read_param", lambda _thread, _name: 7)
+    monkeypatch.setattr(sitl_operations, "read_param", lambda _thread, _name: 7)
 
     def fail_write(_thread: Any, _name: str, _value: int) -> None:
         raise TimeoutError("写入结果未知")
 
-    monkeypatch.setattr(sitl_recon, "_write_param", fail_write)
+    monkeypatch.setattr(sitl_operations, "_write_param", fail_write)
     with pytest.raises(TimeoutError, match="未知"):
-        sitl_recon.zero_test_params(object(), ("NAV_DLL_ACT",), ledger=ledger)
+        sitl_operations.zero_test_params(object(), ("NAV_DLL_ACT",), ledger=ledger)
 
     assert ledger == {"NAV_DLL_ACT": 7}
 
@@ -131,14 +131,16 @@ def test_zero_test_params_returns_original_values_for_legacy_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """不传账本时保留原有的 dict 返回接口；传入时返回完整账本。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_operations
 
-    monkeypatch.setattr(sitl_recon, "read_param", lambda _thread, name: 2 if name == "A" else 5)
-    monkeypatch.setattr(sitl_recon, "_write_param", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        sitl_operations, "read_param", lambda _thread, name: 2 if name == "A" else 5
+    )
+    monkeypatch.setattr(sitl_operations, "_write_param", lambda *_args, **_kwargs: None)
 
-    assert sitl_recon.zero_test_params(object(), ("A", "B")) == {"A": 2, "B": 5}
+    assert sitl_operations.zero_test_params(object(), ("A", "B")) == {"A": 2, "B": 5}
     ledger = {"A": 8}
-    assert sitl_recon.zero_test_params(object(), ("A", "B"), ledger=ledger) is ledger
+    assert sitl_operations.zero_test_params(object(), ("A", "B"), ledger=ledger) is ledger
     assert ledger == {"A": 8, "B": 5}
 
 
@@ -146,7 +148,7 @@ def test_zero_test_params_read_failure_does_not_record_or_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """读取失败时没有可恢复的原值，因此不能写参数或污染账本。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_operations
 
     ledger: dict[str, int] = {}
     writes: list[tuple[str, int]] = []
@@ -156,12 +158,12 @@ def test_zero_test_params_read_failure_does_not_record_or_write(
             raise RuntimeError("参数读取失败")
         return 4
 
-    monkeypatch.setattr(sitl_recon, "read_param", fail_read)
+    monkeypatch.setattr(sitl_operations, "read_param", fail_read)
     monkeypatch.setattr(
-        sitl_recon, "_write_param", lambda _thread, name, value: writes.append((name, value))
+        sitl_operations, "_write_param", lambda _thread, name, value: writes.append((name, value))
     )
     with pytest.raises(RuntimeError, match="读取失败"):
-        sitl_recon.zero_test_params(object(), ("NAV_DLL_ACT", "NAV_RCL_ACT"), ledger=ledger)
+        sitl_operations.zero_test_params(object(), ("NAV_DLL_ACT", "NAV_RCL_ACT"), ledger=ledger)
 
     assert ledger == {"NAV_DLL_ACT": 4}
     assert writes == [("NAV_DLL_ACT", 0)]
@@ -171,7 +173,7 @@ def test_restore_params_uses_exact_values_and_continues_after_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """恢复写失败应继续其它参数，NAV_DLL_ACT 也按账本原值恢复。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_operations
 
     calls: list[tuple[str, int, bool]] = []
 
@@ -180,8 +182,9 @@ def test_restore_params_uses_exact_values_and_continues_after_failure(
         if name == "BROKEN":
             raise RuntimeError("模拟恢复失败")
 
-    monkeypatch.setattr(sitl_recon, "_write_param", write)
-    sitl_recon.restore_params(object(), {"NAV_DLL_ACT": 5, "BROKEN": 9, "NAV_RCL_ACT": 3})
+    monkeypatch.setattr(sitl_operations, "_write_param", write)
+    with pytest.raises(RuntimeError, match="BROKEN"):
+        sitl_operations.restore_params(object(), {"NAV_DLL_ACT": 5, "BROKEN": 9, "NAV_RCL_ACT": 3})
 
     assert calls == [
         ("NAV_DLL_ACT", 5, True),
@@ -194,8 +197,8 @@ def test_timed_out_parameter_write_finishes_before_recovery_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """写超时后恢复等待协程收尾，不能让迟到的置零覆盖恢复值。"""
+    from airdrop.runtime import sitl_operations
     from airdrop.telemetry._operations import OperationGate
-    from tools import sitl_recon
 
     class LoopThread:
         def __init__(self) -> None:
@@ -270,12 +273,12 @@ def test_timed_out_parameter_write_finishes_before_recovery_write(
             return self.drone
 
     thread = Thread()
-    monkeypatch.setattr(sitl_recon, "PARAM_RPC_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(sitl_operations, "PARAM_RPC_TIMEOUT_S", 0.05)
     outcome: concurrent.futures.Future[BaseException | None] = concurrent.futures.Future()
 
     def zero() -> None:
         try:
-            sitl_recon._write_param(thread, "NAV_DLL_ACT", 0)
+            sitl_operations._write_param(thread, "NAV_DLL_ACT", 0)
         except BaseException as exc:  # noqa: BLE001 - 记录预期的超时结果。
             outcome.set_result(exc)
         else:
@@ -288,12 +291,13 @@ def test_timed_out_parameter_write_finishes_before_recovery_write(
         error = outcome.result(timeout=1)
         assert isinstance(error, TimeoutError)
 
-        sitl_recon.restore_params(thread, {"NAV_DLL_ACT": 6})
+        with pytest.raises(RuntimeError, match="NAV_DLL_ACT"):
+            sitl_operations.restore_params(thread, {"NAV_DLL_ACT": 6})
         assert thread.param.writes == [0], "前序写入未收尾时不能提交恢复写"
 
         thread.loop.call_soon_threadsafe(thread.param.finish_cancelled_write.set)
         assert thread.param.cancelled_write_finished.wait(1)
-        sitl_recon.restore_params(thread, {"NAV_DLL_ACT": 6})
+        sitl_operations.restore_params(thread, {"NAV_DLL_ACT": 6})
         assert thread.param.writes == [0, 6]
         assert thread.param.value == 6
     finally:
@@ -387,7 +391,7 @@ def test_report_origin_survives_broker_reset(workdir: Path) -> None:
     所以原点必须从**飞行记录重建**的 broker 里取（与 ``lag_sweep`` 同一个来源），
     实在没有才退回 ``MissionRunner.origin``。
     """
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
     flight = workdir / "flight"
     _flight_with_origin(flight)
@@ -406,12 +410,12 @@ def test_report_origin_survives_broker_reset(workdir: Path) -> None:
     assert live.get_snapshot().origin_longitude_deg is None, "前提不成立：reset 没清空原点"
 
     outcome = _outcome_stub(flight_dir=flight, broker=live)
-    analysis = sitl_recon._analysis_broker(outcome)
-    origin_lla = sitl_recon._origin_lla(outcome, analysis)
+    analysis = sitl_analysis._analysis_broker(outcome)
+    origin_lla = sitl_analysis._origin_lla(outcome, analysis)
 
     assert origin_lla == pytest.approx((8.5461637, 47.3979710, 0.177))
     # 报告真正用到它的地方：把天井真值换算到本机 NED（原来就是在这里炸的）
-    north, east = sitl_recon._well_truth_ned(56, origin_lla)
+    north, east = sitl_analysis._well_truth_ned(56, origin_lla)
     assert abs(north) < 1e4 and abs(east) < 1e4
 
 
@@ -421,20 +425,20 @@ def test_report_origin_falls_back_to_runner_then_fails_loudly(workdir: Path) -> 
     退化到 runner 那份（``--no-record`` 或记录读不出来），再退化就该说人话，而不是
     让 ``None`` 一路传到 georef 深处变成看不懂的 ``TypeError``。
     """
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
     live = TelemetryBroker(history_interval=0.0)
     live.reset()
     runner_origin = (8.5, 47.4, 0.2)
 
     outcome = _outcome_stub(flight_dir=None, broker=live, origin=runner_origin)
-    assert sitl_recon._origin_lla(outcome, sitl_recon._analysis_broker(outcome)) == (
+    assert sitl_analysis._origin_lla(outcome, sitl_analysis._analysis_broker(outcome)) == (
         pytest.approx(runner_origin)
     )
 
     outcome = _outcome_stub(flight_dir=None, broker=live, origin=None)
     with pytest.raises(RuntimeError, match="原点"):
-        sitl_recon._origin_lla(outcome, sitl_recon._analysis_broker(outcome))
+        sitl_analysis._origin_lla(outcome, sitl_analysis._analysis_broker(outcome))
 
 
 # ----------------------------------------------------------------------
@@ -452,14 +456,14 @@ def _turn_deg(a: tuple[float, float], b: tuple[float, float], c: tuple[float, fl
 
 
 def _dense_route() -> tuple[tuple[float, float], ...]:
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_geometry
 
     flat: list[tuple[float, float]] = []
-    for start, end in sitl_recon.RECON_LEGS_ENU:
+    for start, end in sitl_geometry.RECON_LEGS_ENU:
         for point in (start, end):
             if not flat or flat[-1] != point:
                 flat.append(point)
-    return sitl_recon.round_corners(flat, sitl_recon.TURN_RADIUS_M)
+    return sitl_geometry.round_corners(flat, sitl_geometry.TURN_RADIUS_M)
 
 
 def test_turn_radius_follows_speed_and_bank() -> None:
@@ -467,15 +471,15 @@ def test_turn_radius_follows_speed_and_bank() -> None:
 
     这是航线设计的输入，所以公式本身要被钉住——改错了整条线的可行性判断就全错。
     """
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_geometry
 
-    base = sitl_recon.turn_radius_m(15.0, 45.0)
+    base = sitl_geometry.turn_radius_m(15.0, 45.0)
     assert base == pytest.approx(15.0**2 / 9.80665, rel=1e-3)
-    assert sitl_recon.turn_radius_m(30.0, 45.0) == pytest.approx(4 * base, rel=1e-6)
-    assert sitl_recon.turn_radius_m(15.0, 30.0) > base, "倾角变小 ⇒ 半径变大"
-    assert sitl_recon.turn_radius_m(15.0, 60.0) < base, "倾角变大 ⇒ 半径变小"
+    assert sitl_geometry.turn_radius_m(30.0, 45.0) == pytest.approx(4 * base, rel=1e-6)
+    assert sitl_geometry.turn_radius_m(15.0, 30.0) > base, "倾角变小 ⇒ 半径变大"
+    assert sitl_geometry.turn_radius_m(15.0, 60.0) < base, "倾角变大 ⇒ 半径变小"
     with pytest.raises(ValueError, match="倾角"):
-        sitl_recon.turn_radius_m(15.0, 0.0)
+        sitl_geometry.turn_radius_m(15.0, 0.0)
 
 
 def test_recon_route_has_no_in_place_reversal() -> None:
@@ -501,10 +505,10 @@ def test_recon_route_turns_lie_on_the_declared_radius() -> None:
     做法：取一段至少 3 个弧点的连续弯道，拟合外接圆，断言半径 ≈ 声明值。
     直线段与弧的衔接处不参与拟合（两侧长度不等，那个公式会失效）。
     """
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_geometry
 
     dense = _dense_route()
-    radius = sitl_recon.TURN_RADIUS_M
+    radius = sitl_geometry.TURN_RADIUS_M
 
     def circumradius(a, b, c) -> float | None:
         side_a, side_b, side_c = math.dist(b, c), math.dist(a, c), math.dist(a, b)
@@ -536,37 +540,37 @@ def test_reverse_diagnostic_refuses_mismatched_bearings() -> None:
 
     口径：这种输入下**不给数**，只给"两遍不同轴"和两个航迹角。
     """
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
     # 西南向对角线（227°）与东向扫掠线（90°）差 137°，不是反向 → 拦住
-    diagonal = sitl_recon._axis_check_note({"+east": 90.0, "-east": 227.0})
+    diagonal = sitl_analysis._axis_check_note({"+east": 90.0, "-east": 227.0})
     assert diagonal is not None and "同一条轴" in diagonal
 
     # 真正的同轴反向：正东 90° / 正西 270°（相差正好 180°）要放行
-    assert sitl_recon._axis_check_note({"+east": 90.0, "-east": 270.0}) is None
+    assert sitl_analysis._axis_check_note({"+east": 90.0, "-east": 270.0}) is None
     # 转弯中的短暂偏航在容差内
-    assert sitl_recon._axis_check_note({"+east": 100.0, "-east": 285.0}) is None
+    assert sitl_analysis._axis_check_note({"+east": 100.0, "-east": 285.0}) is None
     # 缺一组要显式说缺
-    assert "缺少" in (sitl_recon._axis_check_note({"+east": 90.0}) or "")
+    assert "缺少" in (sitl_analysis._axis_check_note({"+east": 90.0}) or "")
 
 
 def test_circular_mean_deg_does_not_flip_at_180() -> None:
     """角度的圆周均值：179°/181° 的均值是 180°，不是 0°。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
-    assert sitl_recon._circular_mean_deg([179.0, 181.0]) == pytest.approx(180.0, abs=0.1)
-    assert sitl_recon._circular_mean_deg([89.0, 91.0]) == pytest.approx(90.0, abs=0.1)
-    assert sitl_recon._circular_mean_deg([350.0, 10.0]) == pytest.approx(0.0, abs=0.1)
+    assert sitl_analysis._circular_mean_deg([179.0, 181.0]) == pytest.approx(180.0, abs=0.1)
+    assert sitl_analysis._circular_mean_deg([89.0, 91.0]) == pytest.approx(90.0, abs=0.1)
+    assert sitl_analysis._circular_mean_deg([350.0, 10.0]) == pytest.approx(0.0, abs=0.1)
 
 
 def test_reverse_diagnostic_on_a_recorded_flight() -> None:
     """真跑一遍：拿架次 20260930-151637 的记录验同轴校验真的会拦住那条误导输出。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis, sitl_geometry
 
     flight = Path("flights/20260930-151637")
     if not (flight / "telemetry.jsonl").is_file():
         pytest.skip(f"没有架次记录：{flight}")
-    detail = sitl_recon._load_detail(flight / "detections.jsonl")
+    detail = sitl_analysis._load_detail(flight / "detections.jsonl")
     if not detail:
         pytest.skip("该架次没有检测明细")
     broker, pacer = load_broker_from_log(flight, history_maxlen=0)
@@ -574,12 +578,12 @@ def test_reverse_diagnostic_on_a_recorded_flight() -> None:
 
     codes = {row.get("code") for row in detail if row.get("code") is not None}
     assert codes, "该架次没有读出任何编号，换一个架次再验"
-    result = sitl_recon._reverse_diagnostic(
+    result = sitl_analysis._reverse_diagnostic(
         detail,
         broker,
         calib_file=".sitl-recon-tmp/camera_calib_sim.json",
         code=min(code for code in codes if code is not None),
-        lag_s=sitl_recon.TELEMETRY_LAG_S,
+        lag_s=sitl_geometry.TELEMETRY_LAG_S,
     )
     if "implied_lag_s" in result:
         # 给了数就必须是通过同轴校验的：两个航迹角都得贴正东/正西
@@ -629,36 +633,36 @@ def _snap(
 
 def test_course_deg_needs_speed_and_both_components() -> None:
     """速度太小或缺字段时**不给**航迹角——停机坪上方向是纯噪声。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
-    assert sitl_recon._course_deg(_snap(yaw=90.0)) == pytest.approx(90.0)
-    assert sitl_recon._course_deg(_snap(yaw=0.0, speed=0.4)) is None, "速度 0.4 m/s 不该给方向"
-    assert sitl_recon._course_deg({"vx_m_s": 5.0}) is None, "缺 vy 就是缺一半方向"
-    assert sitl_recon._course_deg({}) is None
-    assert sitl_recon._course_deg(None) is None
+    assert sitl_analysis._course_deg(_snap(yaw=90.0)) == pytest.approx(90.0)
+    assert sitl_analysis._course_deg(_snap(yaw=0.0, speed=0.4)) is None, "速度 0.4 m/s 不该给方向"
+    assert sitl_analysis._course_deg({"vx_m_s": 5.0}) is None, "缺 vy 就是缺一半方向"
+    assert sitl_analysis._course_deg({}) is None
+    assert sitl_analysis._course_deg(None) is None
 
 
 def test_angle_diff_deg_folds_across_180() -> None:
     """角度差必须折叠到 0~180：正东 90° 与正西 270° 的差是 180° 而不是 −0°。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
-    assert sitl_recon._angle_diff_deg(90.0, 270.0) == pytest.approx(180.0)
-    assert sitl_recon._angle_diff_deg(270.0, 90.0) == pytest.approx(180.0)
-    assert sitl_recon._angle_diff_deg(350.0, 10.0) == pytest.approx(20.0)
-    assert sitl_recon._angle_diff_deg(-90.0, 90.0) == pytest.approx(180.0)
-    assert sitl_recon._angle_diff_deg(5.0, 5.0) == pytest.approx(0.0)
+    assert sitl_analysis._angle_diff_deg(90.0, 270.0) == pytest.approx(180.0)
+    assert sitl_analysis._angle_diff_deg(270.0, 90.0) == pytest.approx(180.0)
+    assert sitl_analysis._angle_diff_deg(350.0, 10.0) == pytest.approx(20.0)
+    assert sitl_analysis._angle_diff_deg(-90.0, 90.0) == pytest.approx(180.0)
+    assert sitl_analysis._angle_diff_deg(5.0, 5.0) == pytest.approx(0.0)
 
 
 def test_heading_consistency_flags_the_post_takeoff_transient() -> None:
     """yaw 偏 25~35° 的那批要被抓出来，且**不剔点**（n 仍等于总观测数）。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
     dets = [_det(_snap(yaw=112.0, course=90.0)) for _ in range(4)]  # 起飞后瞬态：偏 22°
     dets += [_det(_snap(yaw=95.0, course=90.0)) for _ in range(6)]  # 正常段：偏 5°
     dets += [_det(_snap(yaw=90.0, course=90.0, speed=0.5))]  # 太慢，不参与
     dets += [{"telemetry": {}}]  # 缺遥测，不能炸也不能计入
 
-    stats = sitl_recon._heading_consistency(dets)
+    stats = sitl_analysis._heading_consistency(dets)
     assert stats["n"] == 10, "只统计有速度且速度够的观测"
     assert stats["over_tolerance"] == 4
     assert stats["over_fraction"] == pytest.approx(0.4)
@@ -670,24 +674,24 @@ def test_heading_consistency_flags_the_post_takeoff_transient() -> None:
 
 def test_heading_consistency_is_empty_not_wrong_when_nothing_is_usable() -> None:
     """一条都算不出来时只报 n=0，不能拿 0 冒充"偏差 0°"。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
-    stats = sitl_recon._heading_consistency([{"telemetry": {}}, {"telemetry": None}])
+    stats = sitl_analysis._heading_consistency([{"telemetry": {}}, {"telemetry": None}])
     assert stats["n"] == 0
     assert "median_deg" not in stats, "没有样本就不该有中位数"
 
 
 def test_error_stats_reports_median_rms_p90_and_under_2m() -> None:
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
-    stats = sitl_recon._error_stats([0.5, 1.0, 1.5, 2.0, 13.0])
+    stats = sitl_analysis._error_stats([0.5, 1.0, 1.5, 2.0, 13.0])
     assert stats["n"] == 5
     assert stats["median_m"] == pytest.approx(1.5)
     assert stats["max_m"] == pytest.approx(13.0)
     assert stats["p90_m"] == pytest.approx(13.0)
     assert stats["under_2m_fraction"] == pytest.approx(0.6)
     assert stats["rms_m"] == pytest.approx(math.sqrt((0.25 + 1 + 2.25 + 4 + 169) / 5), abs=1e-3)
-    assert sitl_recon._error_stats([]) == {"n": 0}
+    assert sitl_analysis._error_stats([]) == {"n": 0}
 
 
 def test_observation_errors_split_by_heading_tolerance(workdir: Path) -> None:
@@ -701,12 +705,12 @@ def test_observation_errors_split_by_heading_tolerance(workdir: Path) -> None:
 
     from airdrop import load_camera_model
     from airdrop.georef.project import _attitude_matrix
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis, sitl_geometry
 
-    calib = sitl_recon.write_sim_calib(workdir / "calib.json", lag_s=0.49)
+    calib = sitl_geometry.write_sim_calib(workdir / "calib.json", lag_s=0.49)
     camera = load_camera_model(str(calib), fallback_size=(1280, 720))
-    origin = sitl_recon.WORLD_ORIGIN_LLA
-    truth = sitl_recon._well_truth_ned(56, origin)
+    origin = sitl_geometry.WORLD_ORIGIN_LLA
+    truth = sitl_analysis._well_truth_ned(56, origin)
     # 相机放在**目标西侧 15 m、高 20 m**：视线离天顶约 37°，求交条件良好。
     # ⚠ 别把相机放在世界原点——真值在 E≈200 m 外，那样视线近乎水平、求交病态，
     # 连"零误差"那一条都会算出 4 m 的假误差（实测踩过）。
@@ -726,7 +730,7 @@ def test_observation_errors_split_by_heading_tolerance(workdir: Path) -> None:
 
     good = _det(_snap(yaw=0.0, course=2.0, pose=pose), pixel=pixel, code=56)
     bad = _det(_snap(yaw=30.0, course=0.0, pose=pose), pixel=[pixel[0] + 300.0, pixel[1]], code=56)
-    stats = sitl_recon._observation_errors([good, bad], origin_lla=origin, calib_file=str(calib))
+    stats = sitl_analysis._observation_errors([good, bad], origin_lla=origin, calib_file=str(calib))
 
     assert stats["all"]["n"] == 2
     assert stats["heading_consistent"]["n"] == 1, "航向偏 30° 的那条不进子集"
@@ -743,7 +747,7 @@ def test_heading_diagnostic_reads_velocity_from_the_flight_record() -> None:
     少了它们，飞行记录重建出来的报告里这条诊断永远是 ``n=0``——离线复算不了。
     """
     from airdrop.perception.models import Detection, PixelBox
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
     def detection(vx: float, vy: float, yaw: float) -> dict[str, Any]:
         snapshot = TelemetrySnapshot(
@@ -771,12 +775,12 @@ def test_heading_diagnostic_reads_velocity_from_the_flight_record() -> None:
     eastbound = detection(0.5, 14.0, 90.0)
     assert eastbound["vx_m_s"] == pytest.approx(0.5)
     assert eastbound["vy_m_s"] == pytest.approx(14.0)
-    east_course = sitl_recon._course_deg(eastbound)
-    north_course = sitl_recon._course_deg(detection(14.0, 0.5, 90.0))
+    east_course = sitl_analysis._course_deg(eastbound)
+    north_course = sitl_analysis._course_deg(detection(14.0, 0.5, 90.0))
     assert east_course is not None and north_course is not None
     assert east_course == pytest.approx(87.95, abs=0.01)
-    assert sitl_recon._angle_diff_deg(east_course, 90.0) == pytest.approx(2.05, abs=0.01)
-    assert sitl_recon._angle_diff_deg(north_course, 90.0) == pytest.approx(87.95, abs=0.01)
+    assert sitl_analysis._angle_diff_deg(east_course, 90.0) == pytest.approx(2.05, abs=0.01)
+    assert sitl_analysis._angle_diff_deg(north_course, 90.0) == pytest.approx(87.95, abs=0.01)
 
 
 def test_eps_retry_widens_only_when_labeled_classes_are_few() -> None:
@@ -795,7 +799,7 @@ def test_eps_retry_widens_only_when_labeled_classes_are_few() -> None:
     from dataclasses import replace
 
     from airdrop import TargetPoint, analyze
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
     base = replace(Config().targeting, selection_rule="median")
     assert base.eps_m == pytest.approx(1.5), "默认 eps 应当是 1.5"
@@ -823,7 +827,7 @@ def test_eps_retry_widens_only_when_labeled_classes_are_few() -> None:
     # 56 的点散开 2.5 m（1.5 装不下、3.0 装得下）→ 应当放宽并多聚出一个类
     loose = tuple(well(n, e, 56) for n, e in ((-13.0, 200.0), (-10.5, 200.5), (-8.0, 201.0)))
     narrow = analyze(loose, base)
-    wide = analyze(loose, replace(base, eps_m=sitl_recon.RETRY_EPS_M))
+    wide = analyze(loose, replace(base, eps_m=sitl_analysis.RETRY_EPS_M))
     assert sum(1 for c in wide.clusters if c.code is not None) > sum(
         1 for c in narrow.clusters if c.code is not None
     ), "3.0 应当比 1.5 多聚出类，否则重试没意义"
@@ -835,70 +839,72 @@ def test_eps_retry_reports_the_radius_actually_used() -> None:
     否则"三个靶标误差都很小"会让人以为 1.5 m 就够了，而其实是放宽到 3.0 聚出来的——
     精度是被门限换来的，报告却看不出来。
     """
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis, sitl_geometry
 
-    assert sitl_recon.RETRY_EPS_M > 1.5, "重试半径应当比默认大"
+    assert sitl_analysis.RETRY_EPS_M > 1.5, "重试半径应当比默认大"
     # 靶标间距 20 m：3.0 仍有 6.7 倍余量，不会把相邻靶标并成一个
     min_gap = min(
         abs(a[0] - b[0]) + abs(a[1] - b[1])
-        for i, a in enumerate(sitl_recon.WELLS_A_ENU.values())
-        for b in list(sitl_recon.WELLS_A_ENU.values())[i + 1 :]
+        for i, a in enumerate(sitl_geometry.WELLS_A_ENU.values())
+        for b in list(sitl_geometry.WELLS_A_ENU.values())[i + 1 :]
     )
-    assert min_gap > sitl_recon.RETRY_EPS_M * 2, f"重试半径 {sitl_recon.RETRY_EPS_M} 会把靶标并起来"
+    assert min_gap > sitl_analysis.RETRY_EPS_M * 2, (
+        f"重试半径 {sitl_analysis.RETRY_EPS_M} 会把靶标并起来"
+    )
 
 
 def test_default_eps_covers_target_spacing() -> None:
     """默认 ``eps`` 相对靶标间距要有足够余量（同一靶标的观测散布远小于靶间距）。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_geometry
 
     base = Config().targeting
     min_gap = min(
         abs(a[0] - b[0]) + abs(a[1] - b[1])
-        for i, a in enumerate(sitl_recon.WELLS_A_ENU.values())
-        for b in list(sitl_recon.WELLS_A_ENU.values())[i + 1 :]
+        for i, a in enumerate(sitl_geometry.WELLS_A_ENU.values())
+        for b in list(sitl_geometry.WELLS_A_ENU.values())[i + 1 :]
     )
     assert min_gap > base.eps_m * 5, f"默认 eps={base.eps_m} 相对靶间距 {min_gap:.1f} m 余量不足"
 
 
 def test_round_corners_leaves_straight_legs_alone() -> None:
     """共线段不该被塞进弧点（否则直线被采样成一堆冗余航点）。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_geometry
 
     line = ((0.0, 0.0), (50.0, 0.0), (100.0, 0.0), (150.0, 0.0))
-    assert sitl_recon.round_corners(line, 20.0) == line
+    assert sitl_geometry.round_corners(line, 20.0) == line
 
 
 def test_round_corners_rejects_nonsense() -> None:
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_geometry
 
     with pytest.raises(ValueError, match="半径"):
-        sitl_recon.round_corners(((0.0, 0.0), (1.0, 1.0)), 0.0)
+        sitl_geometry.round_corners(((0.0, 0.0), (1.0, 1.0)), 0.0)
     with pytest.raises(ValueError, match="步进角"):
-        sitl_recon.round_corners(((0.0, 0.0), (1.0, 1.0)), 10.0, step_deg=120.0)
+        sitl_geometry.round_corners(((0.0, 0.0), (1.0, 1.0)), 10.0, step_deg=120.0)
 
 
 def test_recon_route_waypoints_are_built() -> None:
     """航线要真的能变成航点（首点带起飞高度，其余侦查高度）。"""
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_geometry
 
-    route = sitl_recon.recon_route()
+    route = sitl_geometry.recon_route()
     assert len(route) >= 4
-    assert route[0].alt_m == pytest.approx(sitl_recon.TAKEOFF_ALT_M)
-    assert all(wp.alt_m == pytest.approx(sitl_recon.RECON_ALT_M) for wp in route[1:])
+    assert route[0].alt_m == pytest.approx(sitl_geometry.TAKEOFF_ALT_M)
+    assert all(wp.alt_m == pytest.approx(sitl_geometry.RECON_ALT_M) for wp in route[1:])
 
 
 def test_lag_sweep_runs_off_a_recorded_flight(workdir: Path) -> None:
     'lag 扫描要能从记录里查出历史——它本来就是离线分析，不依赖会话还活着。'
-    from tools import sitl_recon
+    from airdrop.runtime import sitl_analysis
 
     flight = workdir / "flight"
     _flight_with_origin(flight, count=50)
     outcome = _outcome_stub(flight_dir=flight, broker=TelemetryBroker(history_interval=0.0))
-    analysis = sitl_recon._analysis_broker(outcome)
+    analysis = sitl_analysis._analysis_broker(outcome)
     pacer_broker, pacer = load_broker_from_log(flight, history_maxlen=0)
     pacer.publish_until(float("inf"))
 
     assert analysis is not pacer_broker  # 两个独立来源，只是恰好都从记录来
     assert pacer_broker.get_snapshot_at(1002.0, "interpolate") is not None, "历史没灌进去"
-    origin_lla = sitl_recon._origin_lla(outcome, analysis)
-    assert sitl_recon._well_truth_ned(56, origin_lla) == pytest.approx((-10.83, 200.29), abs=0.5)
+    origin_lla = sitl_analysis._origin_lla(outcome, analysis)
+    assert sitl_analysis._well_truth_ned(56, origin_lla) == pytest.approx((-10.83, 200.29), abs=0.5)

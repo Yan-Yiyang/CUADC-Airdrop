@@ -47,8 +47,8 @@ airdrop/
   ballistics/          # model（RK4 二次阻力）/ release（判据）/ drops（投放记录）/ fit（参数反演）
   mission/             # states（状态机）/ planner（航线）/ targets（坐标解算）/ runner（主循环）
   record/              # recorder（五个记录文件 + drops.jsonl）/ replay（回放源 + 遥测回填）
-tools/                 # 主仓工具：fetch_models / fit_ballistics / sitl_recon / dump_api / check_docs
-examples/              # 纯库模块：full_mission / replay_flight / calibration_capture / sitl_mission / 其余演示
+tools/                 # 主仓工具：fetch_models / fit_ballistics / dump_api / check_docs
+airdrop/runtime/       # 同一任务入口、参数化阶段、组件装配及 real/SITL 适配
 vendor/                # 固定版本的 airdrop-sim 与 airdrop-calibration 子模块
 tests/                 # 全部离线（GPU 与真实素材的用例标 realdata，默认跳过）
 ```
@@ -62,69 +62,31 @@ uv sync                 # 依赖见 pyproject.toml（索引走清华镜像）
 python -m airdrop.run fetch-models    # 把 YOLO / PP-OCR 权重取进 models/（不进 git）
 ```
 
-## 几个入口
+## 任务运行
 
-**主仓以 `airdrop/run.py` 为命令行入口**（argparse 子命令）：`examples/*.py` 与 `tools/*.py`
-都是纯库模块——文件顶部的常量就是默认值，`build_config(**覆盖)` / `main(**kwargs)`
-按需传值；选项到配置走关键字覆盖，默认值直接取自模块常量。
-`--help` 与 `check-docs` **不加载** torch / cv2 / mavsdk 这些重依赖（惰性导出 + 函数体内导入）。
+任务只有真实运行与 SITL 两种环境，使用同一个入口和状态机。接收视频、识别、保存记录、侦查后的投放阶段、真实挂架动作及自动降落分别控制。参数语义与组合约束见 [运行说明](docs/runtime.md)。
 
 ```bash
-python -m airdrop.run --help                 # 列出全部子命令
-python -m airdrop.run <子命令> --help         # 该子命令的选项与默认值来源
-
-# 1) 离线迭代识别与坐标：一份回放素材反复跑，不碰硬件
-python -m airdrop.run replay --flight flights/<架次> --speed 2
-
-# 2) 完整任务（需要飞控 + 图传 + 标定文件）
-python -m airdrop.run full-mission --land-plan routes/land.plan       # --dry-run 不装弹演练
-python -m airdrop.run full-mission --no-video --no-preflight          # 无图传/免自检的演练档
-
-# 3) SITL 演练：只走控制链路（合成目标 + 投放只记日志，默认不等起飞）
-python -m airdrop.run sitl --target-offset 0,-20,0      # 航线已对准 vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc 的赛区
-
-# 4) 标定采集：录一个标准飞行目录给 calibrate 用
-python -m airdrop.run calibration-capture
-python -m airdrop.run calibrate --flight flights/<那份目录> --strict
-
-# 5) 投放试验反演：量完实际落点后估计弹道参数（只读数据，不接硬件）
-python -m airdrop.run fit-ballistics --impacts flights/<那份目录>/impacts.jsonl --mass-kg 0.365
-
-# 6) 重建 CUADC 赛区的 Gazebo 世界（换天井布局与朝向/换轮次/加风/换光照与底图；SITL 启动见 docs/simulation_world.md）
-python -m airdrop.run make-world                       # 入库的两个世界（r1 图片靶 / r2 数字靶）
-python -m airdrop.run make-world --rounds 2 --seed 3 --wind 5,2,0
+python -m airdrop.run mission --help
+python -m airdrop.run mission --mode real
+python -m airdrop.run mission --mode sitl
+# 只采集，不控制飞机、不载入识别模型
+python -m airdrop.run mission --mode real --no-mission-control --capture --no-recognize --record
+# 侦查与识别完成后盘旋结束，不规划投放阶段
+python -m airdrop.run mission --mode real --no-drop-stage
+# 运行飞掠投放判据，飞出出口后盘旋，不上传降落段
+python -m airdrop.run mission --mode real --no-auto-land
 ```
 
-其余演示：`basic`（遥测/指令）、`hm30-video`（拉流与统计）、`video-sync`（对齐 + 入缓冲 + 读者线程）。
+真实环境默认由操作手上传并启动侦查任务；`--auto-recon` 才由程序上传。真实环境不会自动解锁。`--real-release` 显式启用真实挂架动作；默认模拟该动作，仍运行弹道判据并记录结果。SITL 不允许真实挂架动作。回放是离线分析工具，不构成第三种任务环境：
 
-## 正式任务现场顺序（`full-mission`）
+```bash
+python -m airdrop.run replay --flight flights/<架次>
+python -m airdrop.run calibrate --flight flights/<架次> --strict
+python -m airdrop.run fit-ballistics --help
+```
 
-正式档（`recon_upload="operator"`，默认）：**侦查航线由操作手在 QGC 上传并启动**——本包不 arm、
-不 takeoff、也不上传它，只等飞机真的在空中、然后监视这条航线的进度。现场照这个次序走
-（判据与超时的完整说明见 [`docs/handbook.md`](docs/handbook.md) §6.3）：
-
-1. **链路先就绪，再启动程序**：飞控/数传/图传上电、MAVSDK 地址可达之后才
-   `python -m airdrop.run full-mission --land-plan routes/land.plan`。`thread.connect()` 是阻塞调用
-   （连不上以异常退出，退出码 1）；`INIT` 的 30s 上限（`init_max_s`）在状态机装配时就起算，
-   链路没就绪时程序不会替你等。
-2. **看连接与原点**：日志 `飞控已连接：…` + 事件 `origin` → 遥测位置与 NED 原点就绪。
-3. **等起飞前自检通过再起飞**：`PREFLIGHT` 载入 detector/ocr/camera 并做视频自检，逐项落
-   `preflight` 事件（`--no-preflight` 只是跳过，`ok=null` ≠ 通过）。自检不过会在地面就 `ABORT`
-   并下安全动作；飞机已经在空中时失败 = 空中盘旋、本次任务提前结束。
-4. **操作手在 QGC 上传侦查航线（含起飞项）→ Start Mission**：飞机自动起飞并进 `MISSION`。
-   上传在程序启动前/后都行，但要在侦查段飞完之前让本包看到它。
-5. **程序自动接手**：检测到在空中（`in_air` 为主，取不到时相对高度 ≥ 5m）→ `airborne` →
-   `RECON`（`recon_waiting_operator`）→ 确认飞控在 `MISSION`（`mission_confirmed`）→ 监视进度。
-   ⚠ 进 `RECON` 后 **`recon_max_s`（默认 600s）内**必须确认到 `MISSION`，否则
-   `ABORT(mission_not_started)`（默认 `hold` = 固定翼盘旋）——**只手动起飞、不启动任务同样会超时**。
-6. **侦查飞完**：`hold` 盘旋等统计（上限 10s）→ 本包**唯一一次上传**（飞掠 + 降落合成一条任务，
-   会覆盖飞控里当时那条）→ 飞掠投放 → 降落 → `DONE`；全程写 `flights/<时间戳>/`。
-7. **别等侦查段飞完才启动程序**：完成判定要求"先见到一次未完成"（防陈旧读数），已经飞完的任务
-   不会被采信，程序会空等到 `recon_max_s` 超时才 `ABORT`（`recon_timeout` 或
-   `mission_not_started`，看飞控当时还在不在任务模式）。
-
-演练档：`--dry-run` 只拦投放指令（其余真下发）；`--no-video --no-preflight` 是无图传/免自检组合；
-`sitl` 子命令默认不等起飞（`require_airborne=False`，**只给地面演练**）。
+正式任务先按场地设置侦查航线、备用点、飞掠参数和降落航线，并使用对应相机标定。只采集模式不要求识别模型或相机标定；启用识别时必须接收视频。SITL 的世界、相机和真值来自可选仿真工具包，使用方法见 [仿真说明](docs/simulation_world.md)。
 
 ## 配置
 
@@ -160,14 +122,14 @@ python -m airdrop.run make-world --rounds 2 --seed 3 --wind 5,2,0
 ## 状态机
 
 `INIT → PREFLIGHT → WAIT_AIRBORNE → RECON → HOLD_PROCESS → OVERFLY → LAND → DONE`，
-任意环节异常 → `ABORT`。
+关闭投放阶段可从 `HOLD_PROCESS` 盘旋结束；关闭自动降落可从 `OVERFLY` 飞完出口、盘旋结束。任意环节异常 → `ABORT`。
 
 - `INIT`：等遥测位置 + NED 原点（**不上传任何任务**）；`init_max_s` 超时 → `ABORT`。
 - `PREFLIGHT`：起飞前自检（载入 detector/ocr/camera + 视频自检）；任一项失败 → `ABORT`。
 - `WAIT_AIRBORNE`：什么都不下发，等飞机真的在空中（`in_air` 为主，取不到时用相对高度
   ≥ `airborne_alt_m` 兜底）；`airborne_timeout_s` 超时 → `ABORT`。
 - `RECON`：正式档（`recon_upload="operator"`）**不上传**，等操作手在 QGC 启动侦查航线并监视
-  进度；`"auto"` 档才由本包上传并启动（首航点带**起飞项**，只用于自动测试）。完成判定读
+  进度；`"auto"` 档才由本包上传并启动（SITL 适配器先完成仿真起飞，再运行共同的侦查上传流程）。完成判定读
   飞控侧 `mission_raw` 进度（`current == total`）——新任务刚上传时的**陈旧 True** 不会被
   `MissionMonitor` 采信（要求先见到一次 `False`）。
 - `HOLD_PROCESS`：`hold()` 盘旋，等 targeting 出结果；处理完且无结果就提前结束，
@@ -178,13 +140,13 @@ python -m airdrop.run make-world --rounds 2 --seed 3 --wind 5,2,0
 - `ABORT`：只下**一条**安全动作（`abort_action`：`hold` 默认 / `rtl` / `none`）——
   链路断了这条指令也发不出去，那种情况交给飞控自己的 failsafe。
 
-完整链路的接法见 `examples/full_mission.py`；不装弹演练见 `examples/sitl_mission.py`
+完整链路的接法见 `mission --mode real`；不装弹演练见 `mission --mode sitl`
 （`DryRunController` 拦下投放指令，其余全部真实执行）。
 
 ## 标定（三步，离线）
 
 棋盘格**固定**、手持飞机在其上方**平移 + 旋转**，录一个标准飞行目录
-（`examples/calibration_capture.py`），然后：
+（`mission --mode real --no-mission-control --no-recognize --record`），然后：
 
 ```bash
 python -m airdrop.run calibrate --flight flights/<那份目录>   # 常量仍是默认值（--help 里能看到出处）
@@ -205,7 +167,7 @@ python -m airdrop.run calibrate --flight flights/<那份目录>   # 常量仍是
 
 回放按**原时间轴**重放帧与遥测，于是对齐/解算/统计**均无需改动**：
 `ReplayVideoSource` 与 `Hm30VideoSource` 是同一套接口，遥测由 `TelemetryPacer`
-按帧时刻推进（`load_broker_from_log`）。算法迭代使用 `examples/replay_flight.py`。
+按帧时刻推进（`load_broker_from_log`）。算法迭代使用 `python -m airdrop.run replay`。
 
 ## 投放记录与弹道参数反演
 
@@ -293,7 +255,7 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
   你改变投放剖面）。飞掠段长/航向同样**待实验验证**。
 - **标定的真实素材复测未做**；`t_bc` 以尺量为准，`telemetry_lag` 的实测值需一次真实采集。
 - SITL 演练使用合成目标，不能验证真实感知或实机投放精度；完整任务在侦查前要求确认飞机已离地。
-- **CUADC 赛区世界已入库**（`vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/`：起降区 + A/B 两个 60×60m 目标区（分列起飞线两端，各距起降区约 200m）+ 8 座五边形天井（**位置与朝向按规则随机**，`--seed` 复现，默认 seed 0 = 入库布局；规则里只是示意的 4m/6m 打击圈与"天井箭头"默认不画；太阳位置可换 `--sun 方位,仰角`，或 `--sun-random` 由 seed 随机；目标区底色按种子取常见路面色、比赛区域外随机铺航拍干扰底图 `--aerial-patches`，都可以重新生成以模拟不同光照/背景），r1 图片靶标 / r2 数字靶标；`python -m airdrop.run make-world` 重生成）。世界的几何与贴图方向做过离屏渲染核对，演练航线（`examples/sitl_mission.py`，对准入库布局的中位数天井）与降落航线（`routes/land.plan`）已对准它；SITL 默认机型是带下视相机的 `gz_rc_cessna_down_cam`。**未验证**：把 Gazebo 相机接进感知闭环、世界与真机场地的差异。启动步骤见 `docs/simulation_world.md`。
+- **CUADC 赛区世界已入库**（`vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/`：起降区 + A/B 两个 60×60m 目标区（分列起飞线两端，各距起降区约 200m）+ 8 座五边形天井（**位置与朝向按规则随机**，`--seed` 复现，默认 seed 0 = 入库布局；规则里只是示意的 4m/6m 打击圈与"天井箭头"默认不画；太阳位置可换 `--sun 方位,仰角`，或 `--sun-random` 由 seed 随机；目标区底色按种子取常见路面色、比赛区域外随机铺航拍干扰底图 `--aerial-patches`，都可以重新生成以模拟不同光照/背景），r1 图片靶标 / r2 数字靶标；`python -m airdrop.run make-world` 重生成）。世界的几何与贴图方向做过离屏渲染核对，演练航线（`mission --mode sitl`，对准入库布局的中位数天井）与降落航线（`routes/land.plan`）已对准它；SITL 默认机型是带下视相机的 `gz_rc_cessna_down_cam`。**未验证**：把 Gazebo 相机接进感知闭环、世界与真机场地的差异。启动步骤见 `docs/simulation_world.md`。
 - PX4 侧需要自己配置：gripper 输出、起飞项的航点动作、任务结束后的行为。
 - `cls12` 的 12 类权重目前不存在（`best2.pt` 是单类），该模式当前只能跑出编号 1。
 - **无 CI**：pytest / ruff / pyright 都只在本地跑。

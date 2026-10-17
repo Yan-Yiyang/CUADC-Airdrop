@@ -15,6 +15,7 @@ import concurrent.futures
 import math
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -303,9 +304,18 @@ def _runner(
     on_drop: Any = None,
     preflight: PreflightLike | None = None,
     sleep: Callable[[float], None] | None = None,
+    transfer_submit: Callable[[Callable[[], int]], concurrent.futures.Future[int]] | None = None,
 ) -> MissionRunner:
     # 默认用跟随假时钟的 broker：任务里假时间会推进几分钟，真实墙钟快照会被
     # 看门狗判成"陈旧"（那是另一组用例专门验证的行为）。
+    def submit_inline(operation: Callable[[], int], /) -> concurrent.futures.Future[int]:
+        future: concurrent.futures.Future[int] = concurrent.futures.Future()
+        try:
+            future.set_result(operation())
+        except BaseException as exc:  # noqa: BLE001 - 传递测试Future中的取消类异常
+            future.set_exception(exc)
+        return future
+
     return MissionRunner(
         config or _config(),
         controller,
@@ -320,6 +330,7 @@ def _runner(
         preflight=preflight,
         clock=clock,
         sleep=clock.sleep if sleep is None else sleep,
+        transfer_submit=submit_inline if transfer_submit is None else transfer_submit,
     )
 
 
@@ -509,8 +520,8 @@ def test_runner_aborts_when_the_mission_never_enters_mission_mode() -> None:
     assert _events_of(events, "mission_confirmed") == []
 
 
-def test_runner_without_a_flight_mode_stream_skips_the_confirmation() -> None:
-    """模式流不可用时退化为不确认（只告警），不能因为取不到模式就把任务判失败。"""
+def test_runner_without_a_flight_mode_stream_waits_then_aborts() -> None:
+    """模式未知时不假装启动成功，有限确认窗口结束后显式失败。"""
     clock = FakeClock()
     controller = FakeController()
     controller.fail_on = {"in_mission_mode"}
@@ -524,9 +535,204 @@ def test_runner_without_a_flight_mode_stream_skips_the_confirmation() -> None:
         clock.advance(1.0)
     assert runner.state is MissionState.RECON, "取不到模式就继续等（由状态超时兜底）"
 
+    for _ in range(20):
+        runner.update()
+        clock.advance(1.0)
+        if runner.state is MissionState.ABORT:
+            break
+    assert runner.state is MissionState.ABORT
+    assert runner.history[-1].reason == "mission_not_started"
+    assert _events_of(events, "error")[0]["where"] == "flight_mode"
+
+
+def test_transfer_pending_keeps_runner_live_and_cancel_skips_activation() -> None:
+    """主循环可继续巡检；停止后迟到的上传结果不能再启动任务。"""
+    clock = FakeClock()
+    controller = FakeController()
+    jobs: list[tuple[Callable[[], int], concurrent.futures.Future[int]]] = []
+
+    def submit(operation: Callable[[], int], /) -> concurrent.futures.Future[int]:
+        future: concurrent.futures.Future[int] = concurrent.futures.Future()
+        jobs.append((operation, future))
+        return future
+
+    checks: list[str] = []
+    runner = MissionRunner(
+        _config(),
+        controller,
+        FakeBroker(clock),
+        health_check=lambda: checks.append("health"),
+        clock=clock,
+        sleep=clock.sleep,
+        transfer_submit=submit,
+    )
+    _drive(runner, clock, ticks=1)
+    runner.update()
+    assert checks == ["health"] * 4
+    assert len(jobs) == 1 and controller.uploads == []
+
+    runner.stop("test_cancel")
+    assert runner.state is MissionState.ABORT
+    assert controller.count("hold") == 0, "停止主循环时不得同步等待传输门控"
+    operation, future = jobs.pop(0)
+    try:
+        future.set_result(operation())
+    except BaseException as exc:  # noqa: BLE001 - 传递测试Future中的取消类异常
+        future.set_exception(exc)
+    runner.close()
+    assert controller.count("start_mission") == 0
+    assert controller.count("hold") == 1, "取消后的恢复hold必须等上传调用实际返回后执行"
+
+
+def test_initial_transfer_submit_rejection_still_runs_abort_hold() -> None:
+    """首次后台提交拒绝时没有在途RPC，ABORT必须同步fallback到hold。"""
+    clock = FakeClock()
+    controller = FakeController()
+
+    def reject_submit(_operation: Callable[[], int], /) -> concurrent.futures.Future[int]:
+        raise RuntimeError("后台worker未接受任务")
+
+    runner = _runner(clock, controller, transfer_submit=reject_submit)
+    assert runner.update() is MissionState.ABORT
+    assert controller.count("upload_mission") == 0
+    assert controller.count("hold") == 1
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        runner.close()
+    assert any("后台worker未接受任务" in str(error) for error in caught.value.exceptions)
+
+
+def test_drop_stage_disabled_finishes_after_hold_without_planning_drop() -> None:
+    """关闭投放阶段时只排空侦查输入并成功保持，不读取备用点或降落航线。"""
+    clock = FakeClock()
+    controller = FakeController()
+    base = _config()
+    config = replace(
+        base,
+        routes=replace(base.routes, backup_point=None),
+        mission=MissionConfig(
+            tick_hz=20.0,
+            recon_upload="auto",
+            hold_process_min_s=0.0,
+            hold_process_max_s=0.0,
+            drop_stage=False,
+        ),
+    ).validated()
+    cutoffs: list[int] = []
+    runner = _runner(
+        clock,
+        controller,
+        config=config,
+        judge=FakeJudge(),
+        finish_recon=lambda: cutoffs.append(9) or 9,
+    )
+    _to_hold(runner, clock, controller)
+    runner.update()
+
+    assert runner.state is MissionState.DONE
+    assert runner.history[-1].reason == "holding"
+    assert cutoffs == [9]
+    assert len(controller.uploads) == 1, "只上传侦查航线"
+    assert controller.count("gripper_release") == 0
+
+
+def test_auto_land_disabled_releases_once_then_completes_exit_route() -> None:
+    """关闭自动降落时，投放后继续飞完出口任务才进入DONE。"""
+    clock = FakeClock()
+    controller = FakeController()
+    config = replace(
+        _config(),
+        mission=MissionConfig(
+            tick_hz=20.0,
+            recon_upload="auto",
+            hold_process_min_s=0.0,
+            hold_process_max_s=0.0,
+            auto_land=False,
+        ),
+    ).validated()
+    events: list[tuple[str, dict[str, Any]]] = []
+    runner = _runner(
+        clock,
+        controller,
+        config=config,
+        judge=FakeJudge([ReleaseDecision(True, "predict")]),
+        events=events,
+    )
+    _to_hold(runner, clock, controller)
+    runner.update()
+    assert runner.state is MissionState.OVERFLY
+    runner.update()  # 上传事务完成并触发一次投放
+    assert runner.state is MissionState.OVERFLY
+    assert runner.stats.releases == 1
+    assert runner.history[-1].to_state is MissionState.OVERFLY
+    assert all(item.command != MAV_CMD_NAV_LAND for item in controller.uploads[-1])
+
+    runner.update()  # 完成读数先武装monitor
     controller.finish_mission()
-    _drive_until(runner, clock, MissionState.HOLD_PROCESS)
-    assert runner.state is MissionState.HOLD_PROCESS
+    runner.update()
+    assert runner.state is MissionState.DONE
+    assert runner.history[-1].reason == "holding"
+    assert controller.count("hold") == 2, "侦查后与出口完成后都要确认hold成功"
+    assert _events_of(events, "completion") == [{"completion_mode": "holding"}]
+
+
+def test_auto_land_disabled_hold_failure_cannot_complete() -> None:
+    """出口飞完但安全盘旋失败时必须ABORT，不能标为DONE。"""
+    clock = FakeClock()
+    controller = FakeController()
+    config = replace(
+        _config(),
+        mission=MissionConfig(
+            tick_hz=20.0,
+            recon_upload="auto",
+            hold_process_min_s=0.0,
+            hold_process_max_s=0.0,
+            auto_land=False,
+        ),
+    ).validated()
+    runner = _runner(
+        clock,
+        controller,
+        config=config,
+        judge=FakeJudge([ReleaseDecision(True, "predict")]),
+    )
+    _to_hold(runner, clock, controller)
+    runner.update()
+    runner.update()
+    assert runner.stats.releases == 1
+    runner.update()
+    controller.finish_mission()
+    controller.fail_on.add("hold")
+    runner.update()
+
+    assert runner.state is MissionState.ABORT
+    assert runner.history[-1].reason == "hold_failed"
+    assert runner.stats.releases == 1
+
+
+def test_auto_land_disabled_without_release_aborts_after_exit_route() -> None:
+    """启用真实投放但判据未触发，飞完出口后必须失败，不能冒称成功。"""
+    clock = FakeClock()
+    controller = FakeController()
+    config = replace(
+        _config(),
+        mission=MissionConfig(
+            tick_hz=20.0,
+            recon_upload="auto",
+            hold_process_min_s=0.0,
+            hold_process_max_s=0.0,
+            auto_land=False,
+        ),
+    ).validated()
+    runner = _runner(clock, controller, config=config, judge=FakeJudge())
+    _to_hold(runner, clock, controller)
+    runner.update()
+    runner.update()
+    runner.update()
+    controller.finish_mission()
+    runner.update()
+    assert runner.state is MissionState.ABORT
+    assert runner.history[-1].reason == "overfly_finished_without_release"
 
 
 # ----------------------------------------------------------------------
@@ -2284,6 +2490,111 @@ def test_drone_controller_uploads_the_planned_mission() -> None:
     assert payload["count"] == 2
     assert payload["items"][0]["command"] == MAV_CMD_NAV_TAKEOFF
     assert _events_of(events, "mission_start") != []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("seq", 1),
+        ("frame", 0),
+        ("autocontinue", 0),
+        ("param1", -15.0),
+        ("param2", -15.0),
+        ("param3", -15.0),
+        ("param4", -15.0),
+        ("z", -15.0),
+        ("mission_type", 1),
+    ],
+)
+def test_drone_controller_rejects_mutated_raw_fields(
+    monkeypatch: pytest.MonkeyPatch, field_name: str, value: float | int
+) -> None:
+    controller, drone = _controller()
+    original_download = controller._download
+
+    async def changed_download() -> list[Any]:
+        items = await original_download()
+        first = items[0]
+        fields = {
+            name: getattr(first, name)
+            for name in (
+                "seq",
+                "frame",
+                "command",
+                "current",
+                "autocontinue",
+                "param1",
+                "param2",
+                "param3",
+                "param4",
+                "x",
+                "y",
+                "z",
+                "mission_type",
+            )
+        }
+        fields[field_name] = value
+        items[0] = SimpleNamespace(**fields)
+        return items
+
+    monkeypatch.setattr(controller, "_download", changed_download)
+    expected_error = "位置" if field_name == "z" else field_name
+    with pytest.raises(ControllerError, match=expected_error):
+        controller.upload_mission(build_recon_mission(_config(recon=1)))
+    assert drone.started == 0, "回读不完整时不得激活任务"
+
+
+def test_drone_controller_ignores_runtime_current_flag_on_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, _ = _controller()
+    original_download = controller._download
+
+    async def changed_download() -> list[Any]:
+        items = await original_download()
+        first = items[0]
+        fields = {
+            name: getattr(first, name)
+            for name in (
+                "seq",
+                "frame",
+                "command",
+                "current",
+                "autocontinue",
+                "param1",
+                "param2",
+                "param3",
+                "param4",
+                "x",
+                "y",
+                "z",
+                "mission_type",
+            )
+        }
+        fields["current"] = 1 - int(fields["current"])
+        items[0] = SimpleNamespace(**fields)
+        return items
+
+    monkeypatch.setattr(controller, "_download", changed_download)
+    assert controller.upload_mission(build_recon_mission(_config(recon=1))) == 1
+
+
+def test_drone_controller_accepts_float32_rounding_and_nan_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回读允许float32小误差，并将MAVLink未指定NaN视为相等。"""
+    controller, _ = _controller()
+    original_download = controller._download
+
+    async def rounded_download() -> list[Any]:
+        items = await original_download()
+        first = items[0]
+        first.param1 += 1e-6
+        items[0] = first
+        return items
+
+    monkeypatch.setattr(controller, "_download", rounded_download)
+    assert controller.upload_mission(build_recon_mission(_config(recon=1))) == 1
 
 
 def test_drone_controller_rejects_empty_mission() -> None:

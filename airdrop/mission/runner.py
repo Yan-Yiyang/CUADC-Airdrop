@@ -62,6 +62,7 @@ from .planner import (
     llaref_of,
 )
 from .states import MissionState, MissionStateMachine, MissionTransition, emit_event
+from .transfer import MissionSubmitter, MissionTransfer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ __all__ = [
     "MissionMonitor",
     "MissionRunner",
     "MissionStats",
+    "MissionTransfer",
     "PreflightLike",
     "ReleaseJudgeLike",
     "TargetResultReader",
@@ -206,6 +208,7 @@ class MissionRunner:
         preflight: PreflightLike | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        transfer_submit: MissionSubmitter | None = None,
     ) -> None:
         self._config = config
         self._controller = controller
@@ -218,6 +221,10 @@ class MissionRunner:
         self._on_event = on_event
         self._on_drop = on_drop
         self._preflight = preflight
+        self._transfer = MissionTransfer(controller, submitter=transfer_submit)
+        self._transfer_leg: str | None = None
+        self._released = False
+        self._closed = False
         self._clock = clock
         self._sleep = sleep
 
@@ -309,9 +316,41 @@ class MissionRunner:
         return self._machine.state
 
     def stop(self, reason: str = "stopped") -> None:
-        """请求退出主循环；任务未结束就按 ``ABORT`` 处理（含 ``abort_action``）。"""
+        """请求退出主循环；在途上传协作取消，恢复动作由worker收尾。"""
         self._stop.set()
         self.abort(reason)
+
+    def close(self, *, timeout: float | None = None) -> None:
+        """等待任务传输及恢复动作实际收尾；必须早于 MAVSDK 线程停止。"""
+        if self._closed:
+            return
+        if not self._machine.is_terminal:
+            self.stop("runner_closed")
+        errors: list[BaseException] = []
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        try:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            self._transfer.close(timeout=remaining)
+        except BaseException as exc:  # noqa: BLE001 - 收集全部清理错误后统一上报
+            errors.append(exc)
+            self._emit(
+                "error", {"module": "mission", "where": "transfer_close", "message": str(exc)}
+            )
+        wait_pending = getattr(self._controller, "wait_pending", None)
+        if wait_pending is not None:
+            try:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                wait_pending(timeout=remaining)
+            except BaseException as exc:  # noqa: BLE001 - 收集全部清理错误后统一上报
+                errors.append(exc)
+                self._emit(
+                    "error", {"module": "mission", "where": "command_drain", "message": str(exc)}
+                )
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("任务后台操作未能正常收尾", errors)
+        self._closed = True
 
     def update(self, now: float | None = None) -> MissionState:
         """推进一步（主循环里每拍调一次；测试里手动调）。
@@ -502,7 +541,7 @@ class MissionRunner:
             except PlanningError as exc:
                 self._fail("plan_recon", exc)
                 return
-            if not self._upload_and_start(items, "recon"):
+            if not self._start_transfer(items, "recon"):
                 return
         else:
             self._emit(
@@ -518,10 +557,12 @@ class MissionRunner:
     def _tick_recon(self, now: float) -> None:
         if not self._link_ok(now):
             return
+        if self._transfer_leg == "recon" and not self._poll_transfer(now):
+            return
         if not self._confirm_started(now):
             return
-        finished = self._query(self._controller.mission_finished, "mission_finished", default=False)
-        if self._monitor.update(bool(finished)):
+        finished = self._query(self._controller.mission_finished, "mission_finished", default=None)
+        if finished is not None and self._monitor.update(bool(finished)):
             self._transition(MissionState.HOLD_PROCESS, "recon_finished", now)
             return
         if self._timed_out(now, self._config.mission.recon_max_s):
@@ -545,9 +586,16 @@ class MissionRunner:
     def _tick_overfly(self, now: float) -> None:
         if not self._link_ok(now):
             return
+        if self._transfer_leg == "drop" and not self._poll_transfer(now):
+            return
         if not self._confirm_started(now):
             return
-        if self._judge is not None and self._plan is not None:
+        if (
+            not self._released
+            and self._judge is not None
+            and self._config.gripper.enabled
+            and self._plan is not None
+        ):
             snapshot = self._broker.get_snapshot()
             try:
                 decision = self._judge.update(
@@ -565,10 +613,18 @@ class MissionRunner:
                 # 免得记录与决策之间又插进一拍遥测（那会让残差归因错位）。
                 self._release(now, decision, snapshot)
                 return
-        finished = self._query(self._controller.mission_finished, "mission_finished", default=False)
-        if self._monitor.update(bool(finished)):
+        finished = self._query(self._controller.mission_finished, "mission_finished", default=None)
+        if finished is not None and self._monitor.update(bool(finished)):
             # 飞掠+降落整条任务都飞完了却没投出去 —— 这是失败，不是"顺利完成"
-            self.abort("overfly_finished_without_release")
+            if self._judge is not None and self._config.gripper.enabled and not self._released:
+                self.abort("overfly_finished_without_release")
+            elif not self._config.mission.auto_land:
+                self._command(self._controller.hold, "hold")
+                if self.state is MissionState.ABORT:
+                    return
+                self._transition(MissionState.DONE, "holding", now)
+            else:
+                self.abort("overfly_finished_without_release")
             return
         if self._deadline is not None and now >= self._deadline:
             self.abort("overfly_timeout")
@@ -576,8 +632,10 @@ class MissionRunner:
     def _tick_land(self, now: float) -> None:
         if not self._link_ok(now):
             return
-        finished = self._query(self._controller.mission_finished, "mission_finished", default=False)
-        if self._monitor.update(bool(finished)):
+        if not self._confirm_started(now):
+            return
+        finished = self._query(self._controller.mission_finished, "mission_finished", default=None)
+        if finished is not None and self._monitor.update(bool(finished)):
             self._transition(MissionState.DONE, "mission_finished", now)
             return
         if self._deadline is not None and now >= self._deadline:
@@ -595,16 +653,19 @@ class MissionRunner:
             "targeting": None if result is None else result.as_dict(),
         }
         self._emit("targeting", payload)
+        if not self._config.mission.drop_stage:
+            self._transition(MissionState.DONE, "holding", now)
+            return
         target_ned = result.ned if (result is not None and result.ok) else None
         try:
             plan = build_drop_mission(self._config, origin=self._origin, target_ned=target_ned)
         except PlanningError as exc:
             self._fail("plan_drop", exc)
             return
-        if not self._upload_and_start(plan.items, "drop"):
-            return
         self._plan = plan
         self._monitor = MissionMonitor()
+        if not self._start_transfer(plan.items, "drop"):
+            return
         self._emit("drop_plan", plan.as_dict())
         self._transition(MissionState.OVERFLY, f"drop_mission_{plan.source}", now)
 
@@ -633,13 +694,15 @@ class MissionRunner:
             )
             return
         self._stats.releases += 1
+        self._released = True
         # 投放已经发生了，从这里往后任何失败都只记日志：记录写不进去不能改变
         # 任务状态（真实世界里的弹已经出去了）。
         self._record_drop(
             decision,
             snapshot if snapshot is not None else self._broker.get_snapshot(),
         )
-        self._transition(MissionState.LAND, f"released_{decision.reason}", now)
+        if self._config.mission.auto_land:
+            self._transition(MissionState.LAND, f"released_{decision.reason}", now)
 
     def _record_drop(
         self,
@@ -708,11 +771,9 @@ class MissionRunner:
             # 等待上限按"进入本状态的时刻"算（见 _tick_hold 的 elapsed）
             self._command(self._controller.hold, "hold")
         elif state is MissionState.OVERFLY:
-            # 飞掠与降落同属一条上传的任务，共用这个兜底上限
-            self._deadline = now + float(self._config.mission.land_max_s)
             if self._judge is not None and self._config.gripper.enabled:
                 self._judge.reset()
-            else:
+            elif self._config.mission.auto_land:
                 # ⚠ 两条"本架次不投放"的路径要一起处理，否则语义不对称：
                 #   release_judge=None      → 干净地记 drop_skipped 并进 LAND；
                 #   gripper.enabled=False   → controller.gripper_release() 返回
@@ -724,12 +785,15 @@ class MissionRunner:
                     event_reason, why = "gripper_disabled", "GripperConfig.enabled=False"
                 else:
                     event_reason, why = "no_judge", "release_judge=None"
-                LOGGER.warning("本架次不自动投放（%s）：只飞航线，继续降落段", why)
+                LOGGER.warning("本架次不自动投放（%s）：只飞当前任务路线", why)
                 self._emit("drop_skipped", {"reason": event_reason})
-                self._transition(MissionState.LAND, event_reason, now)
         elif state is MissionState.ABORT:
             self._stats.aborts += 1
-            self._do_abort_action()
+            if self._transfer.future is not None:
+                self._transfer.cancel(self._abort_command)
+                self._emit("abort_action_pending", {"action": self._config.mission.abort_action})
+            else:
+                self._do_abort_action()
 
     def _do_abort_action(self) -> None:
         """ABORT 时下的安全动作（``MissionConfig.abort_action``）。"""
@@ -750,21 +814,56 @@ class MissionRunner:
             return
         self._emit("abort_action", {"action": action})
 
+    def _abort_command(self) -> None:
+        """在传输worker内完成恢复动作并留下实际结果。"""
+        action = self._config.mission.abort_action
+        if action == "none":
+            self._emit("abort_action", {"action": "none"})
+            return
+        call = self._controller.rtl if action == "rtl" else self._controller.hold
+        call()
+        self._emit("abort_action", {"action": action})
+
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
     def _transition(self, to_state: MissionState, reason: str, now: float) -> None:
         self._machine.transition(to_state, reason=reason, now=now)
         self._entered_at = now
+        if to_state is MissionState.DONE:
+            mode = "holding" if reason == "holding" else "mission_finished"
+            self._emit("completion", {"completion_mode": mode})
         self._on_enter(to_state, now)
 
-    def _upload_and_start(self, items: Sequence[MissionItem], leg: str) -> bool:
-        """上传并启动一条任务；失败返回 False（已进 ABORT）。"""
+    def _start_transfer(self, items: Sequence[MissionItem], leg: str) -> bool:
+        """提交上传、回读与启动事务；具体结果由状态拍轮询。"""
         try:
-            count = self._controller.upload_mission(items)
-            self._controller.start_mission()
-        except ControllerError as exc:
+            self._transfer.start(items, leg)
+        except Exception as exc:  # noqa: BLE001 - 后台RPC异常按状态机失败处理
             self._fail(f"{leg}_upload", exc)
+            return False
+        self._transfer_leg = leg
+        self._start_confirmed = False
+        self._start_deadline = float(self._clock()) + float(
+            self._config.mission.mission_start_timeout_s
+        )
+        return True
+
+    def _poll_transfer(self, now: float) -> bool:
+        """每拍检查事务；完成启动时设置确认窗口与任务超时。"""
+        leg = self._transfer_leg
+        if leg is None:
+            return True
+        try:
+            count = self._transfer.poll()
+        except Exception as exc:  # noqa: BLE001 - 后台RPC异常按状态机失败处理
+            self._transfer_leg = None
+            self._fail(f"{leg}_upload", exc)
+            return False
+        if count is None:
+            return False
+        self._transfer_leg = None
+        if self.state is MissionState.ABORT or self.stopped:
             return False
         self._stats.uploads += 1
         # 启动回成功 ≠ 飞控真的进了任务模式 —— 交给 _confirm_started 在有限时间内确认
@@ -772,6 +871,14 @@ class MissionRunner:
         self._start_deadline = float(self._clock()) + float(
             self._config.mission.mission_start_timeout_s
         )
+        if leg == "drop":
+            self._deadline = now + float(self._config.mission.land_max_s)
+            if (
+                self._judge is None or not self._config.gripper.enabled
+            ) and self._config.mission.auto_land:
+                self._transition(MissionState.LAND, "drop_skipped", now)
+                return False
+        self._monitor = MissionMonitor()
         LOGGER.info("%s 任务已上传并启动：%d 个任务项", leg, count)
         return True
 
@@ -782,8 +889,7 @@ class MissionRunner:
         ——飞控可能拒绝模式切换却仍然回 ACK，飞机继续盘旋。这里给它一个短的确认窗口
         （``MissionConfig.mission_start_timeout_s``），超时按显式失败处理。
 
-        模式流不可用时（``flight_mode`` 为 ``None``）退化为跳过确认并只记一次日志：
-        宁可跳过确认，也不要因为取不到模式就把任务判失败。
+        模式未知或查询失败时持续等待，直到有限确认窗口结束。
         """
         if self._start_confirmed:
             return True
@@ -792,10 +898,13 @@ class MissionRunner:
         except ControllerError as exc:
             if "flight_mode" not in self._query_reported:
                 self._query_reported.add("flight_mode")
-                LOGGER.warning("读不到飞行模式（%s），本次不确认任务是否真的启动", exc)
-            self._start_confirmed = True
-            self._start_deadline = None
-            return True
+                LOGGER.warning("读不到飞行模式（%s），继续等待启动确认", exc)
+                self._emit(
+                    "error", {"module": "mission", "where": "flight_mode", "message": str(exc)}
+                )
+            if self._start_deadline is not None and now >= self._start_deadline:
+                self.abort("mission_not_started")
+            return False
         if in_mission:
             self._start_confirmed = True
             self._start_deadline = None

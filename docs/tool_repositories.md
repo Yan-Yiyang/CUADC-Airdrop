@@ -22,7 +22,7 @@ git config submodule.vendor/airdrop-calibration.url <标定仓本地路径>
 git -c protocol.file.allow=always submodule update --init --recursive
 ```
 
-工具未初始化时，`import airdrop`、主 CLI 总帮助与 `full-mission --help` 可正常使用；工具命令报缺少包和初始化方法，不自动安装。`sitl-recon` 为跨仓演练，需要仿真工具。
+工具未初始化时，`import airdrop`、主 CLI 总帮助与 `mission --help` 可正常使用；工具命令报缺少包和初始化方法，不自动安装。`mission --mode sitl` 为跨仓演练，需要仿真工具。
 
 ## 独立运行与依赖
 

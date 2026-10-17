@@ -164,9 +164,8 @@ max-returns = 8
     "PLW2901",
     "SIM102",
 ]
-# 示例与工具：命令行程序，`print` 就是输出方式；参数多是因为把配置摊平成关键字；
+# 开发工具：`print` 是输出方式；参数多是因为把配置摊平成关键字；
 # 打表输出用 `%` 占位符是既有写法
-"examples/**" = ["T201", "PLR0913", "PLR0915", "PLR0917", "INP001", "UP031"]
 "tools/**" = ["T201", "PLR0913", "PLR0915", "PLR0917", "INP001", "UP031", "PLW2901"]
 # 惰性导出包：`__all__` 的"常量 → 类 → 函数"分组是本项目的既定契约
 # （tools/dump_api.py 与 tools/check_docs.py 依赖它），不改成字典序
@@ -174,7 +173,7 @@ max-returns = 8
 "airdrop/*/__init__.py" = ["RUF022", "F401"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["airdrop", "tools", "examples"]
+known-first-party = ["airdrop", "tools"]
 
 # 派生产物（docs/api_reference.md）不进检查范围
 [tool.ruff.format]
@@ -200,7 +199,7 @@ line-ending = "auto"
 # 跑法：./.venv/Scripts/pyright.exe（读本节配置；PKG 列表来自 include）
 [tool.pyright]
 extraPaths = ["vendor/airdrop-sim", "vendor/airdrop-calibration"]
-include = ["airdrop", "tests", "tools", "examples"]
+include = ["airdrop", "tests", "tools"]
 exclude = [
     "**/node_modules",
     "**/__pycache__",

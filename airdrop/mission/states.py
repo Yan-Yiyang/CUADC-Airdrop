@@ -70,8 +70,10 @@ TRANSITIONS: dict[MissionState, frozenset[MissionState]] = {
     MissionState.PREFLIGHT: frozenset({MissionState.WAIT_AIRBORNE, MissionState.ABORT}),
     MissionState.WAIT_AIRBORNE: frozenset({MissionState.RECON, MissionState.ABORT}),
     MissionState.RECON: frozenset({MissionState.HOLD_PROCESS, MissionState.ABORT}),
-    MissionState.HOLD_PROCESS: frozenset({MissionState.OVERFLY, MissionState.ABORT}),
-    MissionState.OVERFLY: frozenset({MissionState.LAND, MissionState.ABORT}),
+    MissionState.HOLD_PROCESS: frozenset(
+        {MissionState.OVERFLY, MissionState.DONE, MissionState.ABORT}
+    ),
+    MissionState.OVERFLY: frozenset({MissionState.LAND, MissionState.DONE, MissionState.ABORT}),
     MissionState.LAND: frozenset({MissionState.DONE, MissionState.ABORT}),
     MissionState.DONE: frozenset(),
     MissionState.ABORT: frozenset(),

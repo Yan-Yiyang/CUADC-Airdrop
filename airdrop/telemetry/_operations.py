@@ -89,6 +89,33 @@ class OperationGate:
             raise OperationTimeout("等待预算已耗尽，本次调用未提交")
         return min(default, remaining)
 
+    def wait_idle(self, timeout: float | None = None) -> None:
+        """等待包装协程真实执行完finally，不把桥接Future完成当作收尾证据。"""
+        if timeout is not None:
+            timeout = float(timeout)
+            if not math.isfinite(timeout) or not 0 <= timeout <= threading.TIMEOUT_MAX:
+                raise ValueError("timeout 必须是有限、非负且可等待的秒数")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            acquired = (
+                self.lock.acquire() if remaining is None else self.lock.acquire(timeout=remaining)
+            )
+            if not acquired:
+                raise OperationTimeout("等待任务命令锁收尾超时")
+            try:
+                active = self._active
+                if active is None:
+                    return
+                if active.finished.is_set():
+                    self._active = None
+                    continue
+            finally:
+                self.lock.release()
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not active.finished.wait(remaining):
+                raise OperationTimeout("等待任务包装协程实际收尾超时")
+
     @contextlib.contextmanager
     def transaction(self, timeout: float, label: str) -> Iterator[float]:
         """成组 RPC 共用可重入锁与截止时间；异步收尾绝不获取此锁。"""

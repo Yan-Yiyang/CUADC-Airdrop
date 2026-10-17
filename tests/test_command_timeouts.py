@@ -118,6 +118,19 @@ def test_timeout_cancels_task_and_queued_recovery_cannot_run_late() -> None:
         assert action.entered.wait(1), "hold 协程没有启动"
         assert action.cleanup_entered.wait(1), "超时后没有取消并进入 finally"
 
+        drain_started = threading.Event()
+        drained = threading.Event()
+
+        def drain_controller() -> None:
+            drain_started.set()
+            controller.wait_pending(timeout=1)
+            drained.set()
+
+        drainer = threading.Thread(target=drain_controller, daemon=True)
+        drainer.start()
+        assert drain_started.wait(1)
+        assert not drained.wait(0.02), "桥接调用超时不能冒充异步finally收尾"
+
         caller = threading.Thread(target=try_recover, daemon=True)
         caller.start()
         failure = recover_result.result(timeout=1)
@@ -128,6 +141,9 @@ def test_timeout_cancels_task_and_queued_recovery_cannot_run_late() -> None:
         # 即使前序 finally 随后结束，已超时的排队恢复也不得被延迟执行。
         thread.loop.call_soon_threadsafe(action.release_cleanup.set)
         assert action.cleanup_finished.wait(1), "异步 finally 未能完成"
+        assert drained.wait(1), "门控排空没有等待到包装协程真实结束"
+        drainer.join(timeout=1)
+        assert not drainer.is_alive()
         caller.join(timeout=1)
         assert not caller.is_alive()
         assert not action.rtl_entered.is_set(), "超时退出的恢复动作被迟到下发"

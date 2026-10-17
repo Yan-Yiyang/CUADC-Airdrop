@@ -68,13 +68,12 @@ class PlanningError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class DropMissionPlan:
-    """飞掠 + 降落段合并任务（Q13）。
+    """飞掠任务及按配置附加的降落段。
 
     ``source`` 是 ``"target"``（用了统计结果）或 ``"backup"``（用了备用点）——
     落进事件日志，复盘时一眼能看出这架次投的是哪一个。
 
-    ``tail_source`` 说明飞掠段后面那段是哪来的：``"plan:<文件>"``（操作手的
-    QGC 航线）或 ``"route"``（配置里的 ``RoutesConfig.landing_route`` 生成）。
+    ``tail_source`` 说明飞掠段后附加的降落航线来源；``"none"`` 表示只规划飞掠出口。
     """
 
     items: tuple[MissionItem, ...]
@@ -276,8 +275,8 @@ def build_drop_mission(
     * ``RoutesConfig.landing_route``：配置航点生成，``MissionConfig.land_last``
       时末项做成降落项。
 
-    ``target_ned=None`` 时用 ``RoutesConfig.backup_point``（无目标分支，Q11）；
-    两者都没有、或没有 NED 原点、或降落段为空 —— 全部抛 :class:`PlanningError`。
+    ``target_ned=None`` 时用 ``RoutesConfig.backup_point``（无目标分支，Q11）。
+    开启 ``MissionConfig.auto_land`` 时还需要降落段；关闭时完全不读取降落配置。
 
     ⚠ 降落段会先过一遍 :func:`~airdrop.mission.plan_file.check_fixed_wing_landing`
     的本地预检：PX4 固定翼对降落剖面有硬性几何要求，不满足就整条任务被拒，
@@ -289,22 +288,25 @@ def build_drop_mission(
     overfly = config.overfly
     routes = config.routes
 
-    plan_path = str(routes.land_plan or "")
-    if plan_path:
-        tail = _load_plan_items(plan_path, what="降落段（RoutesConfig.land_plan）")
-        tail_source = f"plan:{plan_path}"
-    else:
-        landing = tuple(routes.landing_route)
-        if not landing:
-            raise PlanningError(
-                "降落段为空（RoutesConfig.landing_route 与 land_plan 都没配）："
-                "拒绝上传只有飞掠段的任务"
-            )
-        tail = tuple(MissionItem.from_waypoint(waypoint) for waypoint in landing)
-        if config.mission.land_last:
-            last = landing[-1]
-            tail = (*tail[:-1], MissionItem.land(float(last.lat), float(last.lon)))
-        tail_source = "route"
+    tail: tuple[MissionItem, ...] = ()
+    tail_source = "none"
+    if config.mission.auto_land:
+        plan_path = str(routes.land_plan or "")
+        if plan_path:
+            tail = _load_plan_items(plan_path, what="降落段（RoutesConfig.land_plan）")
+            tail_source = f"plan:{plan_path}"
+        else:
+            landing = tuple(routes.landing_route)
+            if not landing:
+                raise PlanningError(
+                    "降落段为空（RoutesConfig.landing_route 与 land_plan 都没配）："
+                    "拒绝上传只有飞掠段的任务"
+                )
+            tail = tuple(MissionItem.from_waypoint(waypoint) for waypoint in landing)
+            if config.mission.land_last:
+                last = landing[-1]
+                tail = (*tail[:-1], MissionItem.land(float(last.lat), float(last.lon)))
+            tail_source = "route"
 
     if target_ned is not None:
         target = _check_target(target_ned)
@@ -330,13 +332,14 @@ def build_drop_mission(
     )
     # 降落段的紧前一项是飞掠段的 exit —— 判据要连这一项一起看（只检查降落段会
     # 把"降落项是段内第一项"误判成"任务以降落开头"）。
-    problems = check_fixed_wing_landing(
-        tail, preceding=head[-1], land_angle_deg=float(routes.fw_land_angle_deg)
-    )
-    if problems:
-        raise PlanningError(
-            f"降落段不合格（{tail_source}）——PX4 固定翼会拒整条任务：" + "；".join(problems)
+    if tail:
+        problems = check_fixed_wing_landing(
+            tail, preceding=head[-1], land_angle_deg=float(routes.fw_land_angle_deg)
         )
+        if problems:
+            raise PlanningError(
+                f"降落段不合格（{tail_source}）——PX4 固定翼会拒整条任务：" + "；".join(problems)
+            )
     items = (*head, *tail)
 
     plan = DropMissionPlan(
@@ -349,7 +352,7 @@ def build_drop_mission(
         tail_source=tail_source,
     )
     LOGGER.info(
-        "飞掠+降落任务：来源 %s，目标 NED (%.2f, %.2f)，航向 %.1f°，段长 %.0fm，"
+        "飞掠任务：来源 %s，目标 NED (%.2f, %.2f)，航向 %.1f°，段长 %.0fm，"
         "共 %d 个任务项（飞掠 2 + 降落 %d，降落段来自 %s）",
         source,
         target[0],

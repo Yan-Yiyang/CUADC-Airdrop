@@ -23,7 +23,7 @@
 from .._lazy import lazy_dir, lazy_exports
 
 __getattr__ = lazy_exports(
-    __name__, ("states", "items", "plan_file", "targets", "planner", "runner")
+    __name__, ("states", "items", "plan_file", "targets", "planner", "runner", "transfer")
 )
 __dir__ = lazy_dir(__name__)
 
@@ -58,6 +58,7 @@ __all__ = [
     "MissionStateMachine",
     "MissionStats",
     "MissionTransition",
+    "MissionTransfer",
     "PerceptionTargetSource",
     "PlanError",
     "PlanningError",

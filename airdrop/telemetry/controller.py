@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import time
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
@@ -102,6 +103,15 @@ def to_raw_item(item: MissionItem, index: int) -> RawMissionItem:
         z=float(item.alt_m),
         mission_type=MISSION_TYPE_MISSION,
     )
+
+
+def _same_float(expected: float, actual: float, *, tolerance: float = 1e-5) -> bool:
+    """比较protobuf float32回读值；未指定的NaN参数按NaN对等处理。"""
+    expected_value = float(expected)
+    actual_value = float(actual)
+    if math.isnan(expected_value) or math.isnan(actual_value):
+        return math.isnan(expected_value) and math.isnan(actual_value)
+    return math.isclose(expected_value, actual_value, rel_tol=tolerance, abs_tol=tolerance)
 
 
 @runtime_checkable
@@ -234,7 +244,7 @@ class DroneController:
             return list(await drone.mission_raw.download_mission())
 
     def _verify_upload(self, specs: tuple[MissionItem, ...]) -> None:
-        """回读飞控上的任务，逐项比对命令与位置；不一致抛 :class:`ControllerError`。"""
+        """回读飞控上的任务，逐项比对有效MAVLink字段；不一致抛错误。"""
         from ..mission.items import command_name  # 惰性导入：避免 telemetry ↔ mission 成环
 
         stored = self._run(self._download, "回读任务", mutating=False)
@@ -244,12 +254,33 @@ class DroneController:
             )
         problems: list[str] = []
         for index, (sent, got) in enumerate(zip(specs, stored, strict=True)):
+            if int(got.seq) != index:
+                problems.append(f"第 {index} 项seq不符：发 {index}、回读 {got.seq}")
             if int(got.command) != int(sent.command):
                 problems.append(
                     f"第 {index} 项命令 {sent.command}({command_name(sent.command)}) "
                     f"→ 飞控 {got.command}({command_name(got.command)})"
                 )
                 continue
+            if int(got.frame) != int(sent.frame):
+                problems.append(f"第 {index} 项frame不符：发 {sent.frame}、回读 {got.frame}")
+            if int(got.autocontinue) != (1 if sent.autocontinue else 0):
+                problems.append(
+                    f"第 {index} 项autocontinue不符：发 {int(sent.autocontinue)}、"
+                    f"回读 {got.autocontinue}"
+                )
+            if int(got.mission_type) != MISSION_TYPE_MISSION:
+                problems.append(
+                    f"第 {index} 项mission_type不符：发 {MISSION_TYPE_MISSION}、"
+                    f"回读 {got.mission_type}"
+                )
+            for field_name in ("param1", "param2", "param3", "param4"):
+                expected = float(getattr(sent, field_name))
+                actual = float(getattr(got, field_name))
+                if not _same_float(expected, actual):
+                    problems.append(
+                        f"第 {index} 项{field_name}不符：发 {expected!r}、回读 {actual!r}"
+                    )
             if not sent.is_positional:
                 continue
             lat, lon, alt = got.x / 1e7, got.y / 1e7, float(got.z)
@@ -312,6 +343,13 @@ class DroneController:
         if snapshot.flight_mode is None:
             raise ControllerError("还没有飞行模式（flight_mode 流未就绪）")
         return snapshot.flight_mode == "MISSION"
+
+    def wait_pending(self, *, timeout: float | None = None) -> None:
+        """等待本控制器共享命令门里的异步包装协程真正收尾。"""
+        try:
+            self._gate.wait_idle(timeout)
+        except Exception as exc:
+            raise ControllerError(f"等待命令收尾失败：{exc}") from exc
 
     def mission_finished(self) -> bool:
         """任务是否已飞完（最后一项已到达：``mission_current == mission_total``）。
@@ -473,6 +511,11 @@ class DryRunController:
 
     def in_mission_mode(self) -> bool:
         return self._inner.in_mission_mode()
+
+    def wait_pending(self, *, timeout: float | None = None) -> None:
+        wait_pending = getattr(self._inner, "wait_pending", None)
+        if wait_pending is not None:
+            wait_pending(timeout=timeout)
 
     def hold(self) -> None:
         self._inner.hold()

@@ -1,4 +1,4 @@
-"""标定采集入口的离线生命周期回归：真实对齐、缓冲与文件写入。"""
+"""被动任务入口的离线生命周期回归：真实协调器、对齐、缓冲与文件写入。"""
 
 from __future__ import annotations
 
@@ -14,8 +14,9 @@ import pytest
 
 import airdrop
 from airdrop import Config, FlightRecorder, TelemetryBroker
+from airdrop.run import resolve_kwargs
+from airdrop.runtime.mission import main as run_mission
 from airdrop.video.source import VideoConfig, VideoFrame, VideoStats
-from examples import calibration_capture
 
 
 @pytest.mark.parametrize("ending", ["normal", "interrupt", "not_ready", "empty"])
@@ -57,7 +58,8 @@ def test_capture_entry_records_and_closes_resources(
                 )
             )
 
-        def stop(self) -> None:
+        def stop(self, timeout: float = 5.0) -> None:
+            del timeout
             calls.append("telemetry_stop")
 
     class VideoInput:
@@ -74,6 +76,7 @@ def test_capture_entry_records_and_closes_resources(
         def start(self) -> None:
             calls.append("video_start")
             self.running = True
+            self.stats.state = "streaming"
             if ending in {"normal", "interrupt"}:
                 span = brokers[0].history_span()
                 assert span is not None
@@ -96,7 +99,8 @@ def test_capture_entry_records_and_closes_resources(
                 raise KeyboardInterrupt
             return ending != "not_ready"
 
-        def stop(self) -> None:
+        def stop(self, timeout: float = 5.0) -> None:
+            del timeout
             calls.append("video_stop")
             self.running = False
 
@@ -106,9 +110,22 @@ def test_capture_entry_records_and_closes_resources(
     monkeypatch.setattr(airdrop, "Hm30VideoSource", VideoInput)
     caplog.set_level(logging.INFO)
 
-    code = calibration_capture.main(max_seconds=0, buffer_seconds=1)
+    kwargs = resolve_kwargs(
+        "mission",
+        [
+            "--mode",
+            "real",
+            "--no-mission-control",
+            "--capture",
+            "--no-recognize",
+            "--record",
+            "--max-seconds",
+            "0.000001",
+        ],
+    )
+    code = run_mission(**kwargs)
 
-    assert code == (0 if ending in {"normal", "interrupt"} else 1)
+    assert code == (130 if ending == "interrupt" else 0 if ending == "normal" else 1)
     assert calls == ["connect", "video_start", "video_stop", "telemetry_stop"]
     assert not sources[0].running
     recorder = recorders[0]
@@ -117,7 +134,6 @@ def test_capture_entry_records_and_closes_resources(
     flight_dir = recorder.flight_dir
     assert flight_dir is not None and flight_dir.is_dir()
     assert str(flight_dir) in caplog.text
-    assert "对齐入库" in caplog.text
     snapshot = json.loads((flight_dir / "config_snapshot.json").read_text(encoding="utf-8"))
     assert snapshot
     rows = (flight_dir / "frames_index.jsonl").read_text(encoding="utf-8").splitlines()

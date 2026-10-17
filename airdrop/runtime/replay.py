@@ -5,7 +5,7 @@
     ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/20260913-185512
     ./.venv/Scripts/python.exe -m airdrop.run replay --speed 2.0
 
-    # SITL 架次（相机是"内参/外参按模型推导"的模拟标定，路径在 .sitl-recon-tmp/）：
+    # SITL 架次（模拟标定文件在 .sitl-recon-tmp/）：
     #   --calib     要用录这段素材时同一份标定，否则退回粗估模型、坐标不可信
     #   --land-plan 要规划"飞掠+降落"才需要；不给就只打印飞掠段
     #   --no-strict 帧被裁剪过的目录（索引里留着已删帧号）必须关严格模式
@@ -58,7 +58,7 @@ SELECTION_RULE: str | None = None  # None = 用 Config 默认（median）
 #: 相机标定文件；None = 用 Config 默认（仓库根的 ``camera_calib.json``，通常不存在，
 #: 那时会退回"60° 视场角粗估"的默认模型——坐标解算结果不可信）。
 #: ⚠ 回放要**用录这段素材时同一份标定**：SITL 架次是
-#: ``.sitl-recon-tmp/camera_calib_sim.json``（见 ``python -m airdrop.run sitl-recon``）。
+#: ``.sitl-recon-tmp/camera_calib_sim.json``（见 ``python -m airdrop.run mission --mode sitl``）。
 CALIB_FILE: str | None = None
 #: 降落航线 ``.plan``；None = 用 Config 默认（不配降落段 → 只打印飞掠段，不规划降落）。
 LAND_PLAN: str | None = None
@@ -129,18 +129,9 @@ def main(
     from airdrop import (
         DEFAULT_SIDE_TOLERANCE,
         AlignmentBuffer,
-        AlignmentWriter,
-        FrameTelemetryAligner,
-        LLARef,
-        PerceptionTargetSource,
-        PerceptionWorker,
-        PlanningError,
         ReplayVideoSource,
-        TargetTracker,
-        build_drop_mission,
         capacity_for,
         load_broker_from_log,
-        ned_to_wgs84,
     )
     from airdrop.perception.detector import FrameSizeMismatchError
 
@@ -166,29 +157,36 @@ def main(
     )
 
     # 3) 与实飞一致：对齐 → 环形缓冲 → 感知 → 坐标解算 → 目标统计
-    aligner = FrameTelemetryAligner(
-        broker,
-        max_wait=config.align.max_wait,
-        mode=config.align.mode,
-        on_timeout=config.align.on_timeout,
-        max_extrapolation=config.align.max_extrapolation,
-    )
     buffer = AlignmentBuffer(capacity_for(buffer_fps, buffer_seconds), storage="jpeg")
-    writer = AlignmentWriter(buffer, aligner)
-    camera = config.camera.load_model()
-    # 与实飞同一条装配：把标定交给检测器（预计算 remap + calib_size 守卫）
-    worker = PerceptionWorker(config.perception.to_pipeline_config(camera), buffer=buffer)
-    tracker = TargetTracker(
+    from .components import build_perception_components
+
+    perception = build_perception_components(
         config,
-        camera=camera,
+        broker,
+        buffer,
+        capture=True,
+        recognize=True,
         side_check_tolerance=(
             DEFAULT_SIDE_TOLERANCE if side_check_tolerance is None else float(side_check_tolerance)
         ),
     )
-    targets = PerceptionTargetSource(worker=worker, tracker=tracker)
+    if (
+        perception.writer is None
+        or perception.worker is None
+        or perception.tracker is None
+        or perception.targets is None
+    ):
+        raise RuntimeError("回放感知组件未完整创建")
+    writer, worker, tracker, targets = (
+        perception.writer,
+        perception.worker,
+        perception.tracker,
+        perception.targets,
+    )
 
     drained = False
     ready = False
+    source_failed = False
     try:
         worker.start()
         source.add_sink(writer)
@@ -196,16 +194,16 @@ def main(
         ready = source.wait_ready(timeout=30.0)
         if not ready:
             LOGGER.error("回放没有出帧：%s", source.stats.last_error or "未知原因")
-        # 示例里只等播放线程结束；直接碰私有属性是刻意的（没有公开的 join 接口）
-        thread = source._thread  # noqa: SLF001
-        if ready and thread is not None:
-            while thread.is_alive():
+        if ready:
+            while not source.wait_finished(timeout=0.1):
                 worker.raise_if_failed()
-                thread.join(timeout=0.1)
+            source.join(timeout=1.0)
             worker.raise_if_failed()
-    except FrameSizeMismatchError as exc:
+            if source.stats.state == "error":
+                raise RuntimeError(source.stats.last_error or "回放源异常")
+    except (FrameSizeMismatchError, RuntimeError) as exc:
         LOGGER.error("回放终止：%s", exc)
-        return 1
+        source_failed = True
     finally:
         stats = source.stats  # stop() 会改写状态，保留播放终态用于摘要和返回码。
         try:
@@ -214,6 +212,36 @@ def main(
                 drained = worker.drain(timeout=drain_timeout_s)
         finally:
             worker.stop()
+
+    return _report_replay(
+        config,
+        broker=broker,
+        stats=stats,
+        ready=ready and not source_failed,
+        drained=drained,
+        worker=worker,
+        writer=writer,
+        tracker=tracker,
+        targets=targets,
+        plan_drop_mission=plan_drop_mission,
+    )
+
+
+def _report_replay(
+    config,
+    *,
+    broker,
+    stats,
+    ready,
+    drained,
+    worker,
+    writer,
+    tracker,
+    targets,
+    plan_drop_mission,
+) -> int:
+    """汇总回放完整性、识别结果，并按需生成离线航线。"""
+    from airdrop import LLARef, PlanningError, build_drop_mission, ned_to_wgs84
 
     written, skipped = writer.stats()
     LOGGER.info(
@@ -226,8 +254,6 @@ def main(
         skipped,
     )
     LOGGER.info("感知：%s", worker.stats)
-
-    # 4) 结果坐标 →（可选）航线规划。不上传：这是离线迭代，不是飞任务。
     added = targets.pump()
     result = targets.result()
     LOGGER.info(
@@ -246,37 +272,31 @@ def main(
     if not result.ok:
         LOGGER.warning("没有可用结果（没看到目标 / 没有带编号的类）——实飞时走备用点分支")
         return 0
-
     LOGGER.info("结果：编号 %s @ NED (%.2f, %.2f)", result.code, result.north_m, result.east_m)
     LOGGER.info("候选类：%s", [cluster.as_dict() for cluster in result.clusters])
-
-    if plan_drop_mission:
-        # NED → WGS84 需要 NED 原点；回放素材里原点在遥测快照里（origin_*）
-        snapshot = broker.get_snapshot()
-        if None in (
-            snapshot.origin_latitude_deg,
-            snapshot.origin_longitude_deg,
-            snapshot.origin_altitude_m,
-        ):
-            LOGGER.warning(
-                "素材的遥测里没有 NED 原点，跳过航线规划（实飞时原点来自 GPS_GLOBAL_ORIGIN）"
-            )
-            return 0
-        origin = LLARef(
-            lon_deg=float(snapshot.origin_longitude_deg),
-            lat_deg=float(snapshot.origin_latitude_deg),
-            alt_m=float(snapshot.origin_altitude_m),
-        )
-        try:
-            plan = build_drop_mission(config, origin=origin, target_ned=result.ned)
-        except PlanningError as exc:
-            # 没配降落段（或降落几何过不了预检）时只做分析：回放入口不上传任务，
-            # 打印飞掠段所需的坐标就够了，不必把整次回放判成失败。
-            LOGGER.warning("跳过航线规划（%s）——目标坐标见上", exc)
-            return 0
-        lon, lat, _alt = ned_to_wgs84(plan.target_ned, origin)
-        LOGGER.info("飞掠航线：来源 %s，目标 WGS84 (%.6f, %.6f)", plan.source, lat, lon)
-        LOGGER.info("任务项 %d 个：%s", len(plan.items), [item.as_dict() for item in plan.items])
+    if not plan_drop_mission:
+        return 0
+    snapshot = broker.get_snapshot()
+    if None in (
+        snapshot.origin_latitude_deg,
+        snapshot.origin_longitude_deg,
+        snapshot.origin_altitude_m,
+    ):
+        LOGGER.warning("素材的遥测里没有 NED 原点，跳过航线规划")
+        return 0
+    origin = LLARef(
+        lon_deg=float(snapshot.origin_longitude_deg),
+        lat_deg=float(snapshot.origin_latitude_deg),
+        alt_m=float(snapshot.origin_altitude_m),
+    )
+    try:
+        plan = build_drop_mission(config, origin=origin, target_ned=result.ned)
+    except PlanningError as exc:
+        LOGGER.warning("跳过航线规划（%s）——目标坐标见上", exc)
+        return 0
+    lon, lat, _alt = ned_to_wgs84(plan.target_ned, origin)
+    LOGGER.info("飞掠航线：来源 %s，目标 WGS84 (%.6f, %.6f)", plan.source, lat, lon)
+    LOGGER.info("任务项 %d 个：%s", len(plan.items), [item.as_dict() for item in plan.items])
     return 0
 
 

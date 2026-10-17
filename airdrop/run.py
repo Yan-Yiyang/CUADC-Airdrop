@@ -34,6 +34,7 @@ class Option:
     #: str / int / float / path / choice / flag / flag-off / bool / pair / vec2 / vec3 / const
     kind: str = "str"
     choices: tuple[str, ...] = ()
+    metavar: str | None = None
     #: 默认值取自入口模块的这个常量（``const`` 用它作为"开关打开时要传的值"）
     source: str = ""
 
@@ -63,182 +64,94 @@ TOOL_COMMANDS = {
 
 #: 子命令注册表（唯一的命令行出处；顺序即 ``--help`` 里的显示顺序）
 SUBCOMMANDS: dict[str, Subcommand] = {
-    "full-mission": Subcommand(
-        name="full-mission",
-        module="examples.full_mission",
-        help="完整任务：自检 → 等起飞 → 侦查 → 飞掠投放 → 降落（正式任务档）",
+    "mission": Subcommand(
+        name="mission",
+        module="airdrop.runtime.mission",
+        help="统一任务入口：真实飞行或 PX4 SITL，按需启用采集、识别和任务阶段",
         options=(
             Option(
-                ("--system-address",),
-                "system_address",
-                "MAVSDK 系统地址（飞控连接）",
-                source="SYSTEM_ADDRESS",
+                ("--mode",),
+                "mode",
+                "运行模式",
+                kind="choice",
+                choices=("real", "sitl"),
+                source="MODE",
             ),
-            Option(("--rtsp-url",), "rtsp_url", "HM30 图传 RTSP 地址", source="RTSP_URL"),
             Option(
-                ("--telemetry-lag",),
-                "telemetry_lag_s",
-                "画面-遥测链路延时（秒）",
+                ("--mission-control",),
+                "run_mission",
+                "运行任务状态机；关闭后仅被动采集",
+                kind="bool",
+                source="RUN_MISSION",
+            ),
+            Option(("--capture",), "capture", "接入视频采集", kind="bool", source="CAPTURE"),
+            Option(
+                ("--recognize",),
+                "recognize",
+                "启用检测、识别与坐标解算",
+                kind="bool",
+                source="RECOGNIZE",
+            ),
+            Option(("--record",), "record", "写入标准飞行记录目录", kind="bool", source="RECORD"),
+            Option(
+                ("--drop-stage",),
+                "drop_stage",
+                "运行投放判据与飞掠阶段",
+                kind="bool",
+                source="DROP_STAGE",
+            ),
+            Option(
+                ("--real-release",),
+                "real_release",
+                "允许真实挂架投放（仅 real 模式）",
+                kind="bool",
+                source="REAL_RELEASE",
+            ),
+            Option(("--auto-recon",), "auto_recon", "自动上传并启动侦查航线", kind="bool"),
+            Option(
+                ("--auto-land",),
+                "auto_land",
+                "投放后自动执行降落段",
+                kind="bool",
+                source="AUTO_LAND",
+            ),
+            Option(
+                ("--max-seconds",),
+                "max_seconds",
+                "被动采集运行上限；省略时按 Ctrl+C 停止",
                 kind="float",
-                source="TELEMETRY_LAG_S",
             ),
+            Option(("--system-address",), "system_address", "MAVSDK 系统地址"),
+            Option(("--rtsp-url",), "rtsp_url", "视频源地址"),
+            Option(("--calib",), "calib_file", "相机标定 JSON 文件"),
             Option(
-                ("--land-plan",),
-                "land_plan",
-                "降落段用的 QGC .plan 路径（与内置降落航点二选一）",
-                source="LAND_PLAN",
+                ("--recon-plan",),
+                "recon_plan",
+                "QGC 侦查任务计划；自动侦查上传时必需",
             ),
+            Option(("--land-plan",), "land_plan", "QGC 降落计划；自动降落时必需"),
             Option(
-                ("--recon-upload",),
-                "recon_upload",
-                "侦查航线谁上传：operator=操作手在 QGC 启动（正式任务）/ auto=本包上传（自动测试）",
-                kind="choice",
-                choices=("operator", "auto"),
-                source="RECON_UPLOAD",
-            ),
-            Option(
-                ("--no-video",),
-                "use_video",
-                "本架次不接图传（跳过图传与感知，起飞前自检的四项检查也相应关闭）",
-                kind="flag-off",
-                source="USE_VIDEO",
-            ),
-            Option(
-                ("--no-preflight",),
-                "preflight",
-                "关闭 config.preflight 的全部检查（关闭不等于通过：每项仍记 ok=null 事件）",
-                kind="const",
-                source="PREFLIGHT_OFF",
-            ),
-            Option(
-                ("--require-airborne",),
-                "require_airborne",
-                "是否等到飞机确实在空中才进侦查（地面演练用 --no-require-airborne）",
-                kind="bool",
-                source="REQUIRE_AIRBORNE",
-            ),
-            Option(
-                ("--dry-run",),
-                "dry_run",
-                "投放只记日志、不下发指令（不装弹演练）",
-                kind="flag",
-                source="DRY_RUN",
-            ),
-            Option(
-                ("--no-record",),
-                "record",
-                "不写飞行目录（默认记录五个文件）",
-                kind="flag-off",
-                source="RECORD",
-            ),
-        ),
-    ),
-    "sitl": Subcommand(
-        name="sitl",
-        module="examples.sitl_mission",
-        help="PX4 SITL 演练：合成目标 + DryRunController（不装弹、不用图传）",
-        options=(
-            Option(
-                ("--system-address",),
-                "system_address",
-                "MAVSDK 系统地址（SITL 默认 udpin://0.0.0.0:14540）",
-                source="SYSTEM_ADDRESS",
-            ),
-            Option(
-                ("--land-plan",),
-                "land_plan",
-                "降落段用的 QGC .plan 路径（为空则用内置降落航点）",
-                source="LAND_PLAN",
-            ),
-            Option(
-                ("--recon-upload",),
-                "recon_upload",
-                "侦查航线谁上传：auto=本包上传（演练档）/ operator=等 QGC 启动",
-                kind="choice",
-                choices=("operator", "auto"),
-                source="RECON_UPLOAD",
-            ),
-            Option(
-                ("--require-airborne",),
-                "require_airborne",
-                "是否等到飞机确实在空中（演练默认不等待，见 REQUIRE_AIRBORNE）",
-                kind="bool",
-                source="REQUIRE_AIRBORNE",
-            ),
-            Option(
-                ("--target-offset",),
-                "target_offset_ned",
-                "合成目标相对盘旋点的 NED 偏移，格式 N,E,D（米）",
+                ("--backup-point",),
+                "backup_point",
+                "备用点 WGS84 纬度,经度,相对高度（米）",
                 kind="vec3",
-                source="TARGET_OFFSET_NED",
+                metavar="LAT,LON,ALT",
             ),
-            Option(
-                ("--no-record",),
-                "record",
-                "不写飞行目录（默认记录五个文件）",
-                kind="flag-off",
-                source="RECORD",
-            ),
-        ),
-    ),
-    "sitl-recon": Subcommand(
-        name="sitl-recon",
-        module="tools.sitl_recon",
-        help="SITL 侦查精度自动测试：真飞机 + 真感知，量「解算坐标 vs 天井中心」误差",
-        options=(
-            Option(
-                ("--manifest",),
-                "manifest_path",
-                "仿真 manifest：读取本次世界真值与相机参数；省略时使用默认 r2/seed 0",
-                kind="path",
-                source="MANIFEST_PATH",
-            ),
-            Option(
-                ("--system-address",),
-                "system_address",
-                "MAVSDK 系统地址（SITL 默认 udpin://0.0.0.0:14540）",
-                source="SYSTEM_ADDRESS",
-            ),
+            Option(("--manifest",), "manifest_path", "SITL 场景 manifest", kind="path"),
+            Option(("--work-dir",), "work_dir", "SITL 标定、SDP 与报告目录"),
             Option(
                 ("--lag",),
                 "lag_s",
-                "图传链路延时估计（秒；报告里还会给 lag 扫描）",
+                "SITL 帧遥测延时覆盖（秒）",
                 kind="float",
                 source="LAG_OVERRIDE_S",
-            ),
-            Option(
-                ("--recon-timeout",),
-                "recon_timeout_s",
-                "RECON 段的上限（秒，状态机在这一段等侦查航线飞完）",
-                kind="float",
-                source="RECON_TIMEOUT_S",
-            ),
-            Option(
-                ("--video-wait",),
-                "video_wait_s",
-                "等第一帧画面的上限（秒）",
-                kind="float",
-                source="VIDEO_WAIT_S",
-            ),
-            Option(
-                ("--work-dir",),
-                "work_dir",
-                "产物目录（标定/SDP/检测明细/报告）",
-                source="WORK_DIR",
-            ),
-            Option(
-                ("--no-record",),
-                "record",
-                "不写飞行目录（默认记录五个文件）",
-                kind="flag-off",
-                source="RECORD",
             ),
         ),
     ),
     "replay": Subcommand(
         name="replay",
-        module="examples.replay_flight",
-        help="回放全链路：识别 → 坐标 → 统计 → 航线（离线，不上传）",
+        module="airdrop.runtime.replay",
+        help="离线回放飞行目录并复用识别与坐标处理链路",
         options=(
             Option(
                 ("--flight",),
@@ -254,17 +167,11 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 kind="float",
                 source="SPEED",
             ),
-            Option(
-                ("--strict",),
-                "strict",
-                "回放异常（缺帧/sink 抛异常）就让本次以 error 结束",
-                kind="bool",
-                source="STRICT",
-            ),
+            Option(("--strict",), "strict", "回放异常时以失败结束", kind="bool", source="STRICT"),
             Option(
                 ("--drain-timeout",),
                 "drain_timeout_s",
-                "停止生产后等待尾帧与 OCR 完成的最长秒数",
+                "尾帧与 OCR 排空最长等待秒数",
                 kind="float",
                 source="DRAIN_TIMEOUT_S",
             ),
@@ -278,7 +185,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(
                 ("--perception-mode",),
                 "perception_mode",
-                "感知模式：ocr（YOLO + 读数）/ cls12（12 类直出）",
+                "感知模式",
                 kind="choice",
                 choices=("ocr", "cls12"),
                 source="PERCEPTION_MODE",
@@ -286,160 +193,39 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(
                 ("--selection-rule",),
                 "selection_rule",
-                "跨候选类选唯一结果的规则：median / max",
+                "跨候选类选唯一结果的规则",
                 kind="choice",
                 choices=("median", "max"),
                 source="SELECTION_RULE",
             ),
-            Option(
-                ("--calib",),
-                "calib_file",
-                "相机标定文件（要用录这段素材时同一份；SITL 架次是 .sitl-recon-tmp/camera_calib_sim.json）",
-                kind="str",
-                source="CALIB_FILE",
-            ),
-            Option(
-                ("--land-plan",),
-                "land_plan",
-                "降落航线 .plan（不给就只打印飞掠段，不规划降落）",
-                kind="str",
-                source="LAND_PLAN",
-            ),
+            Option(("--calib",), "calib_file", "相机标定文件", source="CALIB_FILE"),
+            Option(("--land-plan",), "land_plan", "离线规划使用的降落航线", source="LAND_PLAN"),
             Option(
                 ("--side-check",),
                 "side_check_tolerance",
-                "边长互校门限（默认关；回放优化时才给，如 0.25）",
+                "边长互校门限",
                 kind="float",
                 source="SIDE_CHECK_TOLERANCE",
-            ),
-        ),
-    ),
-    "basic": Subcommand(
-        name="basic",
-        module="examples.basic_usage",
-        help="最小示例：遥测订阅 + 按时间戳查询（可选 arm/takeoff/land 演示）",
-        options=(
-            Option(("--system-address",), "system_address", "MAVSDK 系统地址", source="ADDRESS"),
-            Option(
-                ("--demo-commands",),
-                "demo_commands",
-                "演示 arm → takeoff → land（仅在拆除桨叶或 SITL 环境中使用）",
-                kind="flag",
-                source="DEMO_COMMANDS",
-            ),
-        ),
-    ),
-    "hm30-video": Subcommand(
-        name="hm30-video",
-        module="examples.hm30_video",
-        help="HM30 图传拉流：统计链路质量（可选预览/存盘）",
-        options=(
-            Option(("--rtsp-url",), "url", "图传 RTSP 地址", source="URL"),
-            Option(
-                ("--preview",), "preview", "开窗口预览（按 q 退出）", kind="flag", source="PREVIEW"
-            ),
-            Option(
-                ("--save-path",), "save_path", "存成 mp4 的路径（默认不存）", source="SAVE_PATH"
-            ),
-            Option(
-                ("--duration",), "duration", "运行秒数（0=不限）", kind="float", source="DURATION"
-            ),
-        ),
-    ),
-    "video-sync": Subcommand(
-        name="video-sync",
-        module="examples.video_telemetry_sync",
-        help="帧-遥测对齐与逐帧留存演示（每一帧都进环形缓冲）",
-        options=(
-            Option(("--system-address",), "system_address", "MAVSDK 系统地址", source="ADDRESS"),
-            Option(("--rtsp-url",), "video_url", "图传 RTSP 地址", source="VIDEO_URL"),
-            Option(
-                ("--telemetry-lag",), "lag", "画面-遥测链路延时（秒）", kind="float", source="LAG"
-            ),
-            Option(
-                ("--run-seconds",),
-                "run_seconds",
-                "运行时长（0=一直跑）",
-                kind="float",
-                source="RUN_SECONDS",
-            ),
-        ),
-    ),
-    "calibration-capture": Subcommand(
-        name="calibration-capture",
-        module="examples.calibration_capture",
-        help="标定素材采集：录一个标准飞行目录给 calibrate 用",
-        options=(
-            Option(
-                ("--system-address",),
-                "system_address",
-                "MAVSDK 系统地址（None = 用默认）",
-                source="SYSTEM_ADDRESS",
-            ),
-            Option(
-                ("--rtsp-url",),
-                "rtsp_url",
-                "图传 RTSP 地址（None = 用默认 HM30 地址）",
-                source="RTSP_URL",
-            ),
-            Option(
-                ("--telemetry-lag",),
-                "telemetry_lag_s",
-                "写入录像配置的链路延时（秒）——本次采集不要用旧标定值",
-                kind="float",
-                source="TELEMETRY_LAG_S",
-            ),
-            Option(
-                ("--buffer-seconds",),
-                "buffer_seconds",
-                "环形缓冲保留时长（秒）",
-                kind="float",
-                source="BUFFER_SECONDS",
-            ),
-            Option(
-                ("--max-seconds",),
-                "max_seconds",
-                "采集上限（秒），到点自动停",
-                kind="float",
-                source="MAX_SECONDS",
             ),
         ),
     ),
     "calibrate": Subcommand(
         name="calibrate",
         module="airdrop_calibration.cli",
-        help="三步相机标定：内参 → 画面/遥测时间差 → 手眼外参",
+        help="三步相机标定：内参、时间差与手眼外参",
     ),
     "fit-ballistics": Subcommand(
         name="fit-ballistics",
         module="tools.fit_ballistics",
-        help="投放试验反演弹道参数（最小二乘 + 可辨识性诊断）",
+        help="投放试验弹道参数拟合",
         options=(
-            Option(
-                ("--drops",),
-                "drops",
-                "只跑这一个架次：飞行目录或 drops.jsonl（默认取最新架次）",
-                kind="path",
-                source="DROPS",
-            ),
-            Option(
-                ("--impacts",),
-                "impacts",
-                "实测落点文件（impacts.jsonl / impacts.csv）",
-                kind="path",
-                source="IMPACTS",
-            ),
-            Option(
-                ("--out",),
-                "output_path",
-                "反演报告 JSON 的输出路径",
-                kind="path",
-                source="OUTPUT_PATH",
-            ),
+            Option(("--drops",), "drops", "飞行目录或 drops.jsonl", kind="path", source="DROPS"),
+            Option(("--impacts",), "impacts", "实测落点文件", kind="path", source="IMPACTS"),
+            Option(("--out",), "output_path", "拟合报告路径", kind="path", source="OUTPUT_PATH"),
             Option(
                 ("--mass-kg",),
                 "mass_kg",
-                "弹体质量（kg）——实测值，不参与反演",
+                "实测弹体质量（kg）",
                 kind="float",
                 source="MEASURED_MASS_KG",
             ),
@@ -449,69 +235,23 @@ SUBCOMMANDS: dict[str, Subcommand] = {
         name="fetch-models",
         module="tools.fetch_models",
         help="把外部模型权重复制进 models/（只复制、不联网）",
-        options=(
-            Option(
-                ("--source-dir",),
-                "source_dir",
-                "YOLO 权重所在目录",
-                kind="path",
-                source="SOURCE_DIR",
-            ),
-            Option(
-                ("--source-ocr-dir",),
-                "source_ocr_dir",
-                "PP-OCR 权重所在目录",
-                kind="path",
-                source="SOURCE_OCR_DIR",
-            ),
-            Option(
-                ("--target-dir",),
-                "target_dir",
-                "目标目录（工程内）",
-                kind="path",
-                source="TARGET_DIR",
-            ),
-        ),
     ),
-    "make-world": Subcommand(
-        name="make-world",
-        module="airdrop_sim.cli",
-        help="生成 CUADC 赛区 Gazebo 世界（round1 图片靶标 / round2 数字靶标）",
-    ),
+    "make-world": Subcommand(name="make-world", module="airdrop_sim.cli", help="生成仿真世界"),
     "make-vehicle": Subcommand(
-        name="make-vehicle",
-        module="airdrop_sim.cli",
-        help="生成 rc_cessna 相机机型、模拟相机文件与仿真 manifest",
+        name="make-vehicle", module="airdrop_sim.cli", help="生成仿真机型与 manifest"
     ),
     "make-backdrops": Subcommand(
-        name="make-backdrops",
-        module="airdrop_sim.cli",
-        help="生成场景底图贴图：目标区地面纹理 + 比赛区域外的随机航拍干扰底图",
+        name="make-backdrops", module="airdrop_sim.cli", help="生成仿真场景底图"
     ),
     "preview-world": Subcommand(
-        name="preview-world",
-        module="airdrop_sim.cli",
-        help="把赛区世界渲染成俯视预览图（PNG，带中文标注，供人眼核对布局）",
+        name="preview-world", module="airdrop_sim.cli", help="预览仿真场景"
     ),
     "fetch-aerial": Subcommand(
-        name="fetch-aerial",
-        module="airdrop_sim.cli",
-        help="抓真实航拍底图（USGS NAIP，公有领域，需联网）替换程序化底图",
+        name="fetch-aerial", module="airdrop_sim.cli", help="抓取真实航拍底图"
     ),
-    "dump-api": Subcommand(
-        name="dump-api",
-        module="tools.dump_api",
-        help="自省导出接口清单（docs/api_reference.md）",
-        options=(
-            Option(
-                ("--out",), "output_path", "输出 Markdown 路径", kind="path", source="OUTPUT_PATH"
-            ),
-        ),
-    ),
+    "dump-api": Subcommand(name="dump-api", module="tools.dump_api", help="导出 API 接口清单"),
     "check-docs": Subcommand(
-        name="check-docs",
-        module="tools.check_docs",
-        help="核验 docs/handbook.md 与代码是否一致（0 = 全过 / 1 = 有缺口）",
+        name="check-docs", module="tools.check_docs", help="核验手册与代码一致性"
     ),
 }
 
@@ -538,7 +278,7 @@ def _add_option(parser: argparse.ArgumentParser, module: Any, option: Option) ->
             *option.flags, dest=option.dest, action="store_true", default=False, help=help_text
         )
         return
-    help_text = f"{option.help}（默认：{module.__name__}.{option.source} = {default!r}）"
+    help_text = option.help if default is None else f"{option.help}（默认：{default!r}）"
     common: dict[str, Any] = {"dest": option.dest, "default": default, "help": help_text}
     if option.kind == "flag":
         parser.add_argument(*option.flags, action="store_true", **common)
@@ -557,7 +297,7 @@ def _add_option(parser: argparse.ArgumentParser, module: Any, option: Option) ->
     elif option.kind == "vec2":
         parser.add_argument(*option.flags, type=_vec2, metavar="AZ,EL", **common)
     elif option.kind == "vec3":
-        parser.add_argument(*option.flags, type=_vec3, metavar="N,E,D", **common)
+        parser.add_argument(*option.flags, type=_vec3, metavar=option.metavar or "A,B,C", **common)
     elif option.kind == "str":
         parser.add_argument(*option.flags, **common)
     else:  # pragma: no cover - 注册表写错时立刻抛出异常，不静默
@@ -621,7 +361,7 @@ def build_parser(command: str | None = None) -> argparse.ArgumentParser:
         sub = subparsers.add_parser(
             spec.name,
             help=spec.help,
-            description=f"{spec.help}（入口模块：{spec.module}）",
+            description=spec.help,
         )
         sub.set_defaults(command=spec.name)
         if command == spec.name and spec.name not in TOOL_COMMANDS:
@@ -689,6 +429,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ModuleNotFoundError as exc:
         print(f"入口无法加载：{exc}", file=sys.stderr)
         return 2
+    except ValueError as exc:
+        parser.error(str(exc))
     return 0 if result is None else int(result)
 
 

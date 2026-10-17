@@ -25,13 +25,14 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
 import os
 import shutil
 import time
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -390,6 +391,16 @@ def _advance(runner: MissionRunner, controller: "StubController", clock: StepClo
             return
 
 
+def _submit_inline(operation: Callable[[], int], /) -> concurrent.futures.Future[int]:
+    """让离线状态机测试确定性执行传输事务。"""
+    future: concurrent.futures.Future[int] = concurrent.futures.Future()
+    try:
+        future.set_result(operation())
+    except BaseException as exc:  # noqa: BLE001 - 传递测试Future中的取消类异常
+        future.set_exception(exc)
+    return future
+
+
 def test_replay_drives_full_chain_to_target_coordinates(workdir: Path) -> None:
     """**验收用例**：回放素材 → 结果坐标；跨帧投票把一帧错读压掉。"""
     flight_dir = _write_flight(workdir)
@@ -427,6 +438,7 @@ def test_replay_drives_full_chain_to_target_coordinates(workdir: Path) -> None:
         on_event=lambda kind, data: events.append((kind, data)),
         clock=clock,
         sleep=clock.sleep,
+        transfer_submit=_submit_inline,
     )
     _advance(runner, controller, clock)
     assert runner.state is MissionState.LAND, runner.history[-1].reason
@@ -476,6 +488,7 @@ def test_chain_reports_no_result_when_target_is_never_labelled(workdir: Path) ->
         release_judge=None,
         clock=clock,
         sleep=clock.sleep,
+        transfer_submit=_submit_inline,
     )
     runner.update()  # INIT → RECON
     runner.update()  # 先看到一次"任务在跑"

@@ -403,6 +403,10 @@ class MissionConfig:
     abort_action: str = "hold"
     takeoff_first: bool = True
     land_last: bool = True
+    #: 是否在侦查后执行目标飞掠与投放阶段。
+    drop_stage: bool = True
+    #: 投放飞掠后是否装入并执行降落航线。
+    auto_land: bool = True
 
 
 # ---------------------------------------------------------------- 起飞前自检
