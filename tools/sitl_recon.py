@@ -6,7 +6,7 @@
 ----
 1) WSL/Linux 里起 SITL（带下视相机的机型 + CUADC r2 世界）::
 
-       HEADLESS=1 bash sim/run_sitl.sh r2      # 自动化一律用无头模式
+       HEADLESS=1 bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2      # 自动化一律用无头模式
 
    ⚠ **`HEADLESS=1` 不是可选项**：带 GUI 时 Gazebo 会和感知抢同一块 GPU，实测把仿真
    拖到 ~0.5x 实时（ulog 里"侦查飞完"=53.6 模拟秒 vs 遥测 101.6 实时秒）⇒ 感知落后
@@ -46,13 +46,13 @@ SITL 里临时改两条飞控参数（跑完在 ``finally`` 里还原成机型�
   "Failsafe activated: entering Hold for 5 seconds" → RTL）。
 
 另一条 ``MIS_TKO_LAND_REQ`` 已经在**仿真机型里永久置 0**（见
-``sim/airframes/4007_gz_rc_cessna_down_cam``）：真实流程的投弹航线要等空中出结果才能
+``vendor/airdrop-sim/airdrop_sim/assets/airframes/4007_gz_rc_cessna_down_cam``）：真实流程的投弹航线要等空中出结果才能
 生成、降落段没法预先和侦查段拼成一条任务，而 ``rc.fw_defaults`` 默认要求"带起飞就
 必须带降落"（否则 ``mission_feasibility_checker`` 直接拒任务、连解锁都不会发生）。
 
 精度预算里的三个刻意安排
 ------------------------
-* **相机是机体固连、不垂直向下**：内参/外参按 ``sim/vehicles/rc_cessna_down_cam``
+* **相机是机体固连、不垂直向下**：内参/外参按 ``vendor/airdrop-sim/airdrop_sim/assets/vehicles/rc_cessna_down_cam``
   的模型写死（hfov 1.74 rad、绕机体 z +90°、杆臂 ``(-0.08, 0, +0.08)``）——
   姿态一变视线就偏，这正是要测的东西，不做"目标在正下方"的近似；
 * **转弯会倾斜、也照样测**：扫掠段实测横滚常年在 5~15°（真实飞行也会有大倾角，
@@ -92,6 +92,13 @@ from typing import Any
 
 from airdrop import Config, TelemetryBroker, Waypoint
 from airdrop.telemetry._operations import get_operation_gate
+from tools.optional_tools import load_tool_module
+from tools.recon_scene import ReconScene, load_recon_scene
+
+load_tool_module("airdrop_sim")
+
+from airdrop_sim.camera import CameraConfig  # noqa: E402
+from airdrop_sim.stream import write_stream_sdp as _write_stream_sdp  # noqa: E402
 
 LOGGER = logging.getLogger("sitl_recon")
 PARAM_RPC_TIMEOUT_S = 15.0
@@ -99,17 +106,14 @@ PARAM_RPC_TIMEOUT_S = 15.0
 #: MAVSDK 连 SITL 的地址（与其它 SITL 入口一致）
 SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
 
-#: 世界的 ENU 原点（``sim/worlds/cuadc/*.sdf`` 的 ``spherical_coordinates``）
-WORLD_ORIGIN_LLA = (8.546163739800146, 47.397971057728974, 0.0)
+#: 世界的 ENU 原点（``vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/*.sdf`` 的 ``spherical_coordinates``）
+_DEFAULT_SCENE = load_recon_scene()
+WORLD_ORIGIN_LLA = _DEFAULT_SCENE.origin_lla
 
 #: r2 世界（seed 0）A 区三座天井的真值：编号 → 中心 (east_m, north_m)（ENU 米）。
-#: 与 ``tools/make_world.py`` 的布局一致（``tests/test_world.py`` 核验过这一批坐标），
+#: 与 ``vendor/airdrop-sim/airdrop_sim/make_world.py`` 的布局一致（``vendor/airdrop-sim/tests/test_world.py`` 核验过这一批坐标），
 #: 误差口径 = "解算坐标到天井中心"。
-WELLS_A_ENU: dict[int, tuple[float, float]] = {
-    94: (213.11, 6.91),
-    12: (178.01, -13.99),
-    56: (200.30, -10.80),
-}
+WELLS_A_ENU = _DEFAULT_SCENE.wells_enu
 
 #: 起飞爬升点高度（任务首项 = 起飞项，固定翼由它承担起飞）
 TAKEOFF_ALT_M = 30.0
@@ -125,10 +129,10 @@ RECON_ALT_M = 15.0
 #: ``R = v² / (g·tanφ)``——速度一高半径就跟着涨，转弯就做不出来。
 #: 2026-09-30 实测沿迹速度 14.84 m/s（反向诊断里的 ``speed_m_s``），取整留余量。
 RECON_SPEED_M_S = 15.0
-#: 相机模型（与 ``sim/vehicles/rc_cessna_down_cam`` 一致）
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 720
-CAMERA_HFOV_RAD = 1.74
+#: 相机模型（与 ``vendor/airdrop-sim/airdrop_sim/assets/vehicles/rc_cessna_down_cam`` 一致）
+CAMERA_WIDTH = _DEFAULT_SCENE.camera.width_px
+CAMERA_HEIGHT = _DEFAULT_SCENE.camera.height_px
+CAMERA_HFOV_RAD = _DEFAULT_SCENE.camera.hfov_rad
 #: 允许的最大倾角（度）。rc_cessna / PX4 固定翼默认上限 60°，这里留余量。
 TURN_MAX_BANK_DEG = 45.0
 #: **观测段**的倾角预算（度）——不是转弯允许的倾角，是"算覆盖还够不够"用的那个。
@@ -213,10 +217,11 @@ RECON_LEGS_ENU: tuple[tuple[tuple[float, float], tuple[float, float]], ...] = (
 #: 这架次的精度是合格的**（12 → 0.364 m、94 → 1.268 m，都 < 2 m）。也就是说整轮测试
 #: 被一个**时序竞争**作废了。配了备用点就会走 Q11 那条设计好的分支（照常飞掠投放，
 #: 报告里 ``source="backup"``），时序 unlucky 也不会把整轮作废。
-BACKUP_POINT_ENU = (197.14, -5.96)
+BACKUP_POINT_ENU = _DEFAULT_SCENE.backup_point_enu
 
 #: 降落段：操作手在 QGC 画好、入库的 ``routes/land.plan``（已对准本赛区跑道）。
-LAND_PLAN = "routes/land.plan"
+LAND_PLAN = str(Path(__file__).resolve().parents[1] / "routes" / "land.plan")
+MANIFEST_PATH = None
 
 #: RECON 段的上限（秒）：状态机在这一段等"侦查航线飞完"（生产默认 600 s）。
 RECON_TIMEOUT_S = 600.0
@@ -248,11 +253,12 @@ OCR_DEDUPE_PX = 250.0
 #: ≈0.49 s；x264 编码未开零延迟时会缓冲几十帧）。⚠ 这是**链路属性**，与真机 HM30 的
 #: ≈0.15 s 完全不同（`VideoConfig.telemetry_lag`）——报告里会给"自标定 + 延时扫描"
 #: 作证据：自标定用已知的世界真值把本架次的链路延时解出来（留一个天井只做验证）。
-TELEMETRY_LAG_S = 0.49
+TELEMETRY_LAG_S = _DEFAULT_SCENE.camera.telemetry_lag_s
+LAG_OVERRIDE_S = None
 #: 相机系 → 机体系（OpenCV 相机系 → NED 机体系）：绕机体 z +90°
-CAMERA_R_BC = ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+CAMERA_R_BC = tuple(tuple(row) for row in _DEFAULT_SCENE.camera.r_bc())
 #: 相机光心在机体系的位置（杆臂，米）：base_link (-0.08, 0, -0.08) 的 NED 写法
-CAMERA_T_BC = (-0.08, 0.0, 0.08)
+CAMERA_T_BC = _DEFAULT_SCENE.camera.t_bc()
 
 #: 视频流（RTP/H.264）的接收端口与 SDP 文件名
 STREAM_PORT = 5600
@@ -270,11 +276,13 @@ READY_TIMEOUT_S = 60.0
 LAG_SWEEP_S = tuple(round(0.02 * index, 2) for index in range(0, 31))
 
 
-def _enu_to_waypoint(east_m: float, north_m: float, alt_m: float):
+def _enu_to_waypoint(
+    east_m: float, north_m: float, alt_m: float, *, scene: ReconScene | None = None
+):
     """ENU（相对世界原点）→ :class:`Waypoint`（经纬度 + 相对高度）。"""
     from airdrop import ned_to_wgs84
 
-    lon, lat, _ = ned_to_wgs84((north_m, east_m, 0.0), ref=WORLD_ORIGIN_LLA)
+    lon, lat, _ = ned_to_wgs84((north_m, east_m, 0.0), ref=(scene or _DEFAULT_SCENE).origin_lla)
     return Waypoint(lat=lat, lon=lon, alt_m=alt_m)
 
 
@@ -348,7 +356,7 @@ def round_corners(
     return tuple(out)
 
 
-def recon_route() -> tuple[Waypoint, ...]:
+def recon_route(*, scene: ReconScene | None = None) -> tuple[Waypoint, ...]:
     """扫掠线 → 航点：先摊平折线，再把每个尖角切成半径已知的圆弧。
 
     首点取 :data:`TAKEOFF_ALT_M`（起飞爬升），其余取 :data:`RECON_ALT_M`。
@@ -360,9 +368,41 @@ def recon_route() -> tuple[Waypoint, ...]:
                 flat.append(point)
     dense = round_corners(flat, TURN_RADIUS_M)
     return tuple(
-        _enu_to_waypoint(east, north, TAKEOFF_ALT_M if index == 0 else RECON_ALT_M)
+        _enu_to_waypoint(east, north, TAKEOFF_ALT_M if index == 0 else RECON_ALT_M, scene=scene)
         for index, (east, north) in enumerate(dense)
     )
+
+
+def _validate_builtin_recon(scene: ReconScene) -> None:
+    """固定航线只用于已覆盖的下视场景，其它场景须显式给航线。"""
+    angles = scene.camera.mount_rpy_rad
+    expected = _DEFAULT_SCENE.camera.mount_rpy_rad
+    if any(not math.isclose(a, b, abs_tol=1e-6) for a, b in zip(angles, expected, strict=True)):
+        raise ValueError("非默认相机安装姿态需要显式提供经过覆盖核验的 route")
+    camera_height = RECON_ALT_M - scene.camera.t_bc()[2]
+    if not scene.camera.near_m < camera_height < scene.camera.far_m:
+        raise ValueError("相机光心高度不在可用裁剪范围内，需要核验 route 与安装位置")
+    margin = effective_half_width_m(altitude_m=camera_height, hfov_rad=scene.camera.hfov_rad)
+    margin -= math.hypot(*scene.camera.mount_translation_frd_m[:2])
+
+    def distance(point: tuple[float, float], leg) -> float:
+        (ax, ay), (bx, by) = leg
+        dx, dy = bx - ax, by - ay
+        length_sq = dx * dx + dy * dy
+        weight = (
+            0.0
+            if length_sq == 0
+            else max(0.0, min(1.0, ((point[0] - ax) * dx + (point[1] - ay) * dy) / length_sq))
+        )
+        return math.hypot(point[0] - ax - weight * dx, point[1] - ay - weight * dy)
+
+    missed = [
+        code
+        for code, point in scene.wells_enu.items()
+        if min(distance(point, leg) for leg in RECON_LEGS_ENU) > margin
+    ]
+    if missed:
+        raise ValueError(f"场景靶标 {missed} 超出内置侦查航线覆盖，请显式提供 route")
 
 
 def build_config(
@@ -372,18 +412,26 @@ def build_config(
     route: tuple[Waypoint, ...] | None = None,
     land_plan: str = LAND_PLAN,
     recon_timeout_s: float = RECON_TIMEOUT_S,
+    scene: ReconScene | None = None,
 ) -> Config:
     """装配测试配置：真航线（侦查 + 降落）、真感知参数、模拟相机标定、标准任务流程。"""
+    context = scene or _DEFAULT_SCENE
+    if land_plan == LAND_PLAN and context.origin_lla != WORLD_ORIGIN_LLA:
+        raise ValueError("非默认世界原点必须显式提供与该场景匹配的 land_plan")
+    if route is None:
+        _validate_builtin_recon(context)
     base = Config()
     return Config(
         telemetry=replace(base.telemetry, system_address=system_address),
         routes=replace(
             base.routes,
-            recon_route=route if route is not None else recon_route(),
+            recon_route=route if route is not None else recon_route(scene=scene),
             land_plan=land_plan,
             # ⚠ 必须配：没有它就没有"无目标"这条分支，感知晚一步就整架次 ABORT
             # （见 BACKUP_POINT_ENU 的说明）。
-            backup_point=_enu_to_waypoint(*BACKUP_POINT_ENU, alt_m=0.0),
+            backup_point=_enu_to_waypoint(
+                *(scene or _DEFAULT_SCENE).backup_point_enu, alt_m=0.0, scene=scene
+            ),
         ),
         camera=replace(base.camera, calib_file=calib_file),
         # 模拟相机没有畸变：不让检测器做去畸变（像素与内参保持同一张图）。
@@ -463,7 +511,7 @@ def zero_test_params(
       失控保护拉成 RTL（"Failsafe activated: entering Hold for 5 seconds" → RTL）。
 
     ⚠ "起飞项/降落项是否必需"那条检查（``MIS_TKO_LAND_REQ``）**不在这里改**：
-    它已经在仿真机型里永久置 0（``sim/airframes/4007_gz_rc_cessna_down_cam``，附了原因）
+    它已经在仿真机型里永久置 0（``vendor/airdrop-sim/airdrop_sim/assets/airframes/4007_gz_rc_cessna_down_cam``，附了原因）
     ——投弹航线要空中出结果才能生成、降落段没法预先和侦查段拼成一条任务。
     """
     if ledger is None:
@@ -530,7 +578,7 @@ def operator_takeoff(
     * **先解锁、再启动**：``MISSION_START`` 里的 ``arm(mission_start)`` 实测只切模式、
       不解锁（ulog: nav_state=3 / arming_state=1），飞机不动；
     * **任务先过可行性检查**：装了起飞项就必须满足 ``MIS_TKO_LAND_REQ``
-      （仿真机型里已永久置 0，见 ``sim/airframes/4007_gz_rc_cessna_down_cam``）。
+      （仿真机型里已永久置 0，见 ``vendor/airdrop-sim/airdrop_sim/assets/airframes/4007_gz_rc_cessna_down_cam``）。
 
     返回 ``None`` 表示已在空中，否则返回退出码（4 没解锁 / 5 没进任务模式 / 6 没起飞）。
     """
@@ -622,53 +670,19 @@ def calibrate_lag(
     }
 
 
-def write_sim_calib(path: Path | str, *, lag_s: float = TELEMETRY_LAG_S) -> Path:
-    """写一份**模拟相机**的标定文件（内参/外参由模型推导，不是标定出来的）。
-
-    ``fx = (w/2)/tan(hfov/2)``（Gazebo 相机的水平视场定义），畸变为零；
-    ``R_bc``/``t_bc`` 见文件顶部常量。``telemetry_lag`` 原样写进去，便于核对。
-    """
-    fx = (CAMERA_WIDTH / 2.0) / math.tan(CAMERA_HFOV_RAD / 2.0)
-    payload = {
-        "camera_matrix": [
-            [fx, 0.0, CAMERA_WIDTH / 2.0],
-            [0.0, fx, CAMERA_HEIGHT / 2.0],
-            [0.0, 0.0, 1.0],
-        ],
-        "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
-        "R_bc": [list(row) for row in CAMERA_R_BC],
-        "t_bc": list(CAMERA_T_BC),
-        "image_size": [CAMERA_WIDTH, CAMERA_HEIGHT],
-        "telemetry_lag": float(lag_s),
-        "meta": {"source": "sim/vehicles/rc_cessna_down_cam（由模型推导，非标定）"},
-    }
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return target
+def write_sim_calib(
+    path: Path | str, *, lag_s: float | None = None, camera: CameraConfig | None = None
+) -> Path:
+    """从生成 SDF 的同一相机配置导出模型推导值。"""
+    model = camera or _DEFAULT_SCENE.camera
+    if lag_s is not None:
+        model = replace(model, telemetry_lag_s=float(lag_s))
+    return model.write_calibration(path)
 
 
 def write_stream_sdp(path: Path | str, *, port: int = STREAM_PORT) -> Path:
-    """写接收 RTP/H.264 的 SDP（ffmpeg 靠它认动态 payload type 96）。"""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        "\n".join(
-            [
-                "v=0",
-                "o=- 0 0 IN IP4 127.0.0.1",
-                "s=CUADC SITL down camera",
-                "c=IN IP4 127.0.0.1",
-                "t=0 0",
-                f"m=video {port} RTP/AVP 96",
-                "a=rtpmap:96 H264/90000",
-                "a=recvonly",
-                "",
-            ]
-        ),
-        encoding="ascii",
-    )
-    return target
+    """兼容入口；独立仿真工具负责 SDP 格式与参数校验。"""
+    return _write_stream_sdp(path, port=port)
 
 
 def _wait_for(predicate, timeout_s: float, what: str, *, interval_s: float = 0.2) -> bool:
@@ -704,6 +718,7 @@ class PerceptionSetup:
     worker: Any
     tracker: Any
     source: Any
+    image_size: tuple[int, int] = (CAMERA_WIDTH, CAMERA_HEIGHT)
 
     @classmethod
     def build(cls, config: Config, buffer: Any, *, on_detection: Any = None) -> "PerceptionSetup":
@@ -716,7 +731,12 @@ class PerceptionSetup:
         worker = PerceptionWorker(config.perception.to_pipeline_config(camera), buffer=buffer)
         tracker = TargetTracker(config, camera=camera)
         source = PerceptionTargetSource(worker=worker, tracker=tracker, on_detection=on_detection)
-        return cls(worker=worker, tracker=tracker, source=source)
+        return cls(
+            worker=worker,
+            tracker=tracker,
+            source=source,
+            image_size=camera.image_size or (CAMERA_WIDTH, CAMERA_HEIGHT),
+        )
 
     # ------------------------------------------------------------------
     # 报告用的统计（口径来自 PerceptionWorker.stats）
@@ -754,7 +774,7 @@ class PerceptionSetup:
 
     def warmup(self) -> None:
         """起飞前把 YOLO 权重与 OCR 进程池热起来（与生产入口一致）。"""
-        self.worker.detector.warmup(CAMERA_WIDTH, CAMERA_HEIGHT)
+        self.worker.detector.warmup(*self.image_size)
         self.worker.start()
 
     def stop(self, timeout: float = 10.0) -> None:
@@ -912,13 +932,16 @@ class PerformanceMonitor:
 # ----------------------------------------------------------------------
 # 结果分析
 # ----------------------------------------------------------------------
-def _well_truth_ned(code: int, origin_lla: tuple[float, float, float]) -> tuple[float, float]:
+def _well_truth_ned(
+    code: int, origin_lla: tuple[float, float, float], *, scene: ReconScene | None = None
+) -> tuple[float, float]:
     '运行接口与行为以当前实现及测试为准。'
     from airdrop import ned_to_wgs84, wgs84_to_ned
 
-    east_m, north_m = WELLS_A_ENU[code]
-    lon, lat, _ = ned_to_wgs84((north_m, east_m, 0.0), ref=WORLD_ORIGIN_LLA)
-    north, east, _ = wgs84_to_ned(lon, lat, WORLD_ORIGIN_LLA[2], ref=origin_lla)
+    context = scene or _DEFAULT_SCENE
+    east_m, north_m = context.wells_enu[code]
+    lon, lat, _ = ned_to_wgs84((north_m, east_m, 0.0), ref=context.origin_lla)
+    north, east, _ = wgs84_to_ned(lon, lat, context.origin_lla[2], ref=origin_lla)
     return north, east
 
 
@@ -941,6 +964,7 @@ def lag_sweep(
     calib_file: str,
     sweeps: tuple[float, ...] = LAG_SWEEP_S,
     base_lag: float = TELEMETRY_LAG_S,
+    scene: ReconScene | None = None,
 ) -> list[dict[str, Any]]:
     """同一批检测按不同链路延时重算坐标（纯离线：只用像素 + 拍摄时刻 + 遥测）。
 
@@ -988,11 +1012,11 @@ def lag_sweep(
             origin.origin_altitude_m,
         )
         codes: dict[int, float] = {}
-        for code in WELLS_A_ENU:
+        for code in (scene or _DEFAULT_SCENE).wells_enu:
             cluster = _select_by_code(result.clusters, code)
             if cluster is None:
                 continue
-            codes[code] = _cluster_error(cluster, _well_truth_ned(code, origin_lla))
+            codes[code] = _cluster_error(cluster, _well_truth_ned(code, origin_lla, scene=scene))
         selected = result.selected
         results.append(
             {
@@ -1004,7 +1028,10 @@ def lag_sweep(
                     None
                     if selected is None
                     else round(
-                        _cluster_error(selected, _well_truth_ned(selected.code, origin_lla)), 3
+                        _cluster_error(
+                            selected, _well_truth_ned(selected.code, origin_lla, scene=scene)
+                        ),
+                        3,
                     )
                 ),
                 "code_errors_m": {str(code): round(value, 3) for code, value in codes.items()},
@@ -1130,6 +1157,7 @@ def _per_observation_errors(
     *,
     origin_lla: tuple[float, float, float],
     calib_file: str,
+    scene: ReconScene | None = None,
 ) -> list[dict[str, Any]]:
     """逐观测的落点误差 + 该观测的航向偏差（米 / 度）。
 
@@ -1143,7 +1171,7 @@ def _per_observation_errors(
     rows: list[dict[str, Any]] = []
     for row in detections:
         code = row.get("code")
-        if code is None or code not in WELLS_A_ENU:
+        if code is None or code not in (scene or _DEFAULT_SCENE).wells_enu:
             continue
         snap = row.get("telemetry") or {}
         if snap.get("north_m") is None or snap.get("roll_deg") is None:
@@ -1157,7 +1185,7 @@ def _per_observation_errors(
         )
         if not fix.ok or fix.ned is None:
             continue
-        truth = _well_truth_ned(code, origin_lla)
+        truth = _well_truth_ned(code, origin_lla, scene=scene)
         course = _course_deg(snap)
         rows.append(
             {
@@ -1367,6 +1395,7 @@ class _RunOutcome:
     tracker: Any = None
     #: 装配好的配置（重聚要用它的 ``targeting``）
     config: Any = None
+    scene: ReconScene | None = None
 
 
 def _analysis_broker(outcome: _RunOutcome) -> TelemetryBroker:
@@ -1505,7 +1534,7 @@ def _analyze_with_retry(outcome: _RunOutcome) -> tuple[Any, float]:
     base = outcome.config.targeting
     first = analyze(tuple(points), base)
     labeled = sum(1 for cluster in first.clusters if cluster.code is not None)
-    if labeled >= len(WELLS_A_ENU):
+    if labeled >= len((getattr(outcome, "scene", None) or _DEFAULT_SCENE).wells_enu):
         return first, float(base.eps_m)
     widened = analyze(tuple(points), _replace(base, eps_m=RETRY_EPS_M))
     labeled_wide = sum(1 for cluster in widened.clusters if cluster.code is not None)
@@ -1519,6 +1548,7 @@ def _observation_errors(
     *,
     origin_lla: tuple[float, float, float],
     calib_file: str,
+    scene: ReconScene | None = None,
 ) -> dict[str, Any]:
     """逐观测落点误差的两个口径（全量 / 航向一致子集）。
 
@@ -1527,7 +1557,9 @@ def _observation_errors(
     诊断失败不抛，返回 ``{"failed": ...}`` 让报告继续。
     """
     try:
-        per_obs = _per_observation_errors(detections, origin_lla=origin_lla, calib_file=calib_file)
+        per_obs = _per_observation_errors(
+            detections, origin_lla=origin_lla, calib_file=calib_file, scene=scene
+        )
     except Exception as exc:  # noqa: BLE001 - 诊断失败不影响主结果
         LOGGER.warning("逐观测误差分析失败：%s", exc)
         return {"failed": str(exc)}
@@ -1547,13 +1579,14 @@ def _report_heading_and_errors(
     *,
     origin_lla: tuple[float, float, float],
     calib_file: str,
+    scene: ReconScene | None = None,
 ) -> dict[str, Any]:
     """航向一致性 + 逐观测误差：算完打印、超阈告警，返回两块直接并进报告。
 
     合成一个函数是为了不把 :func:`_report` 的分支数顶破上限（它本来就有 15 个）。
     """
     observation_errors = _observation_errors(
-        detections, origin_lla=origin_lla, calib_file=calib_file
+        detections, origin_lla=origin_lla, calib_file=calib_file, scene=scene
     )
     heading = _heading_consistency(detections)
     if heading.get("n"):
@@ -1609,8 +1642,10 @@ def _report(outcome: _RunOutcome) -> dict[str, Any]:
     video_stats = outcome.video_stats
     writer_stats = outcome.writer_stats
     perception = outcome.perception
+    scene = getattr(outcome, "scene", None) or _DEFAULT_SCENE
     report: dict[str, Any] = {
-        "world": "sim/worlds/cuadc/cuadc_recon_strike_r2.sdf（A 区真值 94/12/56）",
+        "world": scene.world_name,
+        "simulation": {"seed": scene.seed, "round": scene.round_no, "origin_lla": scene.origin_lla},
         "lag_s": outcome.lag_s,
         "flight_s": None if outcome.flown_s is None else round(outcome.flown_s, 1),
         "video": {
@@ -1632,8 +1667,8 @@ def _report(outcome: _RunOutcome) -> dict[str, Any]:
         "performance": _performance_summary(outcome.perf),
         "roll": _roll_stats(outcome.detail),
         "truth_ned": {
-            str(code): [round(value, 2) for value in _well_truth_ned(code, origin_lla)]
-            for code in WELLS_A_ENU
+            str(code): [round(value, 2) for value in _well_truth_ned(code, origin_lla, scene=scene)]
+            for code in scene.wells_enu
         },
         "code_errors_m": {},
     }
@@ -1659,15 +1694,15 @@ def _report(outcome: _RunOutcome) -> dict[str, Any]:
             "north_m": round(selected.north_m, 2),
             "east_m": round(selected.east_m, 2),
             "error_m": round(
-                _cluster_error(selected, _well_truth_ned(selected.code, origin_lla)), 3
+                _cluster_error(selected, _well_truth_ned(selected.code, origin_lla, scene=scene)), 3
             ),
         }
     )
-    for code in WELLS_A_ENU:
+    for code in scene.wells_enu:
         cluster = _select_by_code(result.clusters, code)
         if cluster is not None:
             report["code_errors_m"][str(code)] = round(
-                _cluster_error(cluster, _well_truth_ned(code, origin_lla)), 3
+                _cluster_error(cluster, _well_truth_ned(code, origin_lla, scene=scene)), 3
             )
 
     print("\n===== SITL 侦查精度测试 =====")
@@ -1743,7 +1778,7 @@ def _report(outcome: _RunOutcome) -> dict[str, Any]:
     # 逐观测误差 + 航向一致性：把"精度被姿态估计吃掉"这件事摆在明面上（口径见 HEADING_TOL_DEG）
     report.update(
         _report_heading_and_errors(
-            outcome.detail, origin_lla=origin_lla, calib_file=str(outcome.calib)
+            outcome.detail, origin_lla=origin_lla, calib_file=str(outcome.calib), scene=scene
         )
     )
 
@@ -1753,7 +1788,7 @@ def _report(outcome: _RunOutcome) -> dict[str, Any]:
     )
     for cluster in result.clusters:
         code = cluster.code
-        truth = _well_truth_ned(code, origin_lla) if code in WELLS_A_ENU else None
+        truth = _well_truth_ned(code, origin_lla, scene=scene) if code in scene.wells_enu else None
         error = None if truth is None else _cluster_error(cluster, truth)
         print(
             "  编号 %s @ NED (%8.2f, %8.2f)  %5d 点  置信 %.2f  真值 (%s)  误差 %s"
@@ -1768,7 +1803,9 @@ def _report(outcome: _RunOutcome) -> dict[str, Any]:
             )
         )
     if result.selected is not None:
-        error = _cluster_error(result.selected, _well_truth_ned(result.selected.code, origin_lla))
+        error = _cluster_error(
+            result.selected, _well_truth_ned(result.selected.code, origin_lla, scene=scene)
+        )
         print(
             "任务结果    : 编号 %s @ (%.2f, %.2f)，误差 %.2f m（要求 < 2 m）"
             % (result.selected.code, result.selected.north_m, result.selected.east_m, error)
@@ -1789,12 +1826,13 @@ def _report(outcome: _RunOutcome) -> dict[str, Any]:
                 broker=sweep_broker,
                 calib_file=str(outcome.calib),
                 base_lag=outcome.lag_s,
+                scene=scene,
             )
             report["reverse"] = _reverse_diagnostic(
                 outcome.detail,
                 sweep_broker,
                 calib_file=str(outcome.calib),
-                code=56,
+                code=scene.holdout_code,
                 lag_s=outcome.lag_s,
                 base_lag=outcome.lag_s,
             )
@@ -1812,7 +1850,9 @@ def _report(outcome: _RunOutcome) -> dict[str, Any]:
                     row["code_errors_m"],
                 )
             )
-    calibrated_lag, calibration = calibrate_lag(report["lag_sweep"])
+    calibrated_lag, calibration = calibrate_lag(
+        report["lag_sweep"], holdout_code=scene.holdout_code
+    )
     report["lag_calibrated_s"] = calibrated_lag
     report["lag_calibration"] = calibration
     if calibrated_lag is not None:
@@ -1852,10 +1892,11 @@ def _report(outcome: _RunOutcome) -> dict[str, Any]:
 def main(
     *,
     work_dir: str = WORK_DIR,
-    lag_s: float = TELEMETRY_LAG_S,
+    lag_s: float | None = LAG_OVERRIDE_S,
     record: bool = RECORD,
     recon_timeout_s: float = RECON_TIMEOUT_S,
     video_wait_s: float = VIDEO_WAIT_S,
+    manifest_path: Path | str | None = MANIFEST_PATH,
     **config_overrides,
 ) -> int:
     """跑一次 SITL 侦查精度测试（**完全走标准流程**）。
@@ -1889,13 +1930,16 @@ def main(
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    scene = load_recon_scene(manifest_path)
+    lag_s = scene.camera.telemetry_lag_s if lag_s is None else lag_s
     work = Path(work_dir)
+    calib = work / "camera_calib_sim.json"
+    config = build_config(
+        calib_file=str(calib), recon_timeout_s=recon_timeout_s, scene=scene, **config_overrides
+    )
     work.mkdir(parents=True, exist_ok=True)
     sdp = write_stream_sdp(work / STREAM_SDP_NAME)
-    calib = write_sim_calib(work / "camera_calib_sim.json", lag_s=lag_s)
-    config = build_config(
-        calib_file=str(calib), recon_timeout_s=recon_timeout_s, **config_overrides
-    )
+    write_sim_calib(calib, lag_s=lag_s, camera=scene.camera)
 
     # ---- 与生产入口逐件对齐：遥测 → 记录 → 控制器 → 图传 → 感知 → 判据 → 状态机 ----
     broker = TelemetryBroker(
@@ -1919,8 +1963,8 @@ def main(
         replace(
             config.video,
             url=str(sdp),
-            width=CAMERA_WIDTH,
-            height=CAMERA_HEIGHT,
+            width=scene.camera.width_px,
+            height=scene.camera.height_px,
             telemetry_lag=lag_s,
             # SDP 里写了 udp/rtp，ffmpeg 需要放开这两条协议才能收
             extra_input_args=("-protocol_whitelist", "file,udp,rtp"),
@@ -2013,12 +2057,12 @@ def main(
         if read_param(thread, "MIS_TKO_LAND_REQ") != 0:
             LOGGER.warning(
                 "MIS_TKO_LAND_REQ != 0：只带起飞的侦查任务会被 PX4 拒掉"
-                "（查 sim/install_px4.sh 是否装好机型）"
+                "（查 vendor/airdrop-sim/airdrop_sim/assets/install_px4.sh 是否装好机型）"
             )
         if read_param(thread, "FW_LND_USETER") != 0:
             LOGGER.warning(
                 "FW_LND_USETER != 0：SITL 机型没有测距传感器，降落会在进入降落段 10 s 后"
-                " abort、在落点上方 30 m 无限盘旋（查 sim/airframes/4007_gz_rc_cessna_down_cam）"
+                " abort、在落点上方 30 m 无限盘旋（查 vendor/airdrop-sim/airdrop_sim/assets/airframes/4007_gz_rc_cessna_down_cam）"
             )
 
         perception.worker.start()
@@ -2139,6 +2183,7 @@ def main(
                     ),
                     tracker=perception.tracker,
                     config=config,
+                    scene=scene,
                 )
             )
         except Exception:

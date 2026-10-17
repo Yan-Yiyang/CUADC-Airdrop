@@ -16,6 +16,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# 工具测试独立运行；主仓集成测试只在子模块存在时导入它们。
+for repository in ("airdrop-sim", "airdrop-calibration"):
+    location = REPO_ROOT / "vendor" / repository
+    if location.is_dir():
+        sys.path.insert(0, str(location))
+
 TEST_TEMP_ROOTS = (
     ".replay-test-tmp",
     ".calibrate-test-tmp",

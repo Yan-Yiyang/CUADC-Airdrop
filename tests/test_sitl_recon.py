@@ -9,7 +9,7 @@
 
   前置（本测试只**驱动**，不负责启动飞控/世界/图传）::
 
-      bash sim/run_sitl.sh r2          # WSL 里起 PX4 SITL + Gazebo + 图传
+      bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2          # WSL 里起 PX4 SITL + Gazebo + 图传
 
   断言（都取自 ``.sitl-recon-tmp/report.json``）：
 
@@ -42,6 +42,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+pytest.importorskip("airdrop_sim", reason="SITL 集成需要仿真子模块")
 
 from airdrop import Config, TelemetryBroker, TelemetrySnapshot, load_broker_from_log
 
@@ -80,7 +82,7 @@ def _sitl_is_up(timeout: float = 8.0) -> bool:
 @pytest.mark.timeout(1800)  # 分钟级全流程：放宽到 30 min，但**不**像 timeout(0) 那样彻底关掉兜底
 def test_sitl_recon_accuracy() -> None:
     if not _sitl_is_up():
-        pytest.skip("SITL 没在跑（先 bash sim/run_sitl.sh r2）")
+        pytest.skip("SITL 没在跑（先 bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2）")
 
     from tools import sitl_recon
 

@@ -1,4 +1,4 @@
-"""标定采集示例：录一个标准飞行目录给 ``tools/calibrate.py`` 用。
+"""标定采集示例：录一个标准飞行目录给 ``airdrop_calibration.calibrate`` 用。
 
 用法（集中式入口在 airdrop/run.py）::
 
@@ -11,7 +11,7 @@
 采集方法（"板子不动、飞机在动"）
 --------------------------------
 1. 棋盘格固定放在地面/桌面，板面平整，方格边长用尺量准（``BOARD_SQUARE_M``
-   只是提醒——真正填进 ``tools/calibrate.py`` 的是你量出来的那个值）；
+   只是提醒——真正填进 ``airdrop_calibration.calibrate`` 的是你量出来的那个值）；
 2. 飞机通电（飞控输出姿态）、相机正常拉流；
 3. 手持飞机在棋盘格上方缓慢平移 + 旋转，让棋盘格全程可见，并且要有充分的
    旋转激励（至少绕两个不平行的轴转）——时间差互相关与手眼标定都靠它；
@@ -39,7 +39,7 @@ TELEMETRY_LAG_S = 0.15  # 只影响写进索引的 capture_timestamp；时间差
 ATTITUDE_RATE_HZ = 50.0  # 标定建议 ≥50Hz（姿态内差直接进外参）
 POSITION_RATE_HZ = 20.0
 BUFFER_SECONDS = 300.0  # 缓冲够长，免得采到一半被驱逐
-BOARD_SQUARE_M = 0.025  # 只作提醒：真正用到的值填在 tools/calibrate.py 里
+BOARD_SQUARE_M = 0.025  # 只作提醒：标定时通过 --square 传入实际测量值
 MAX_SECONDS = 180.0  # 采集上限（秒），到点自动停
 
 LOGGER = logging.getLogger("calibration_capture")
@@ -96,7 +96,7 @@ def main(
     )
     LOGGER.info(
         "采集开始：棋盘格固定、手持飞机在其上方平移+旋转（方格边长 %.3fm，"
-        "填进 tools/calibrate.py 的 BOARD_SQUARE_M）；最多采 %.0fs，Ctrl-C 提前结束",
+        "通过标定工具的 --square 传入方格边长）；最多采 %.0fs，Ctrl-C 提前结束",
         BOARD_SQUARE_M,
         max_seconds,
     )

@@ -70,7 +70,6 @@ REQUIRED_ENTRIES: tuple[str, ...] = (
     "tests/test_perception.py",
     "tests/test_perception_realdata.py",
     "tests/test_georef.py",
-    "tests/test_calibrate.py",
     "tests/test_targeting.py",
     "tests/test_ballistics.py",
     "tests/test_mission.py",
@@ -80,7 +79,9 @@ REQUIRED_ENTRIES: tuple[str, ...] = (
     "tests/test_handbook.py",
     "tests/test_plan.py",
     "tests/test_cli.py",
-    "tests/test_world.py",
+    "tests/test_tool_repositories.py",
+    "tests/test_calibration_contract.py",
+    "tests/test_sim_integration.py",
 )
 
 #: 手册必须覆盖的主题关键词

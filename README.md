@@ -23,7 +23,7 @@
 | `airdrop.ballistics` | 二次阻力 RK4 落点预测 + 投放判据（越过目标后强制投放判据 `force_after_pass` + 锁存）+ **投放记录与参数反演** | `test_ballistics.py`、`test_fit.py` |
 | `airdrop.mission` | 状态机 + 飞掠/降落航线拼接 + 候选类→坐标 + 主循环 | `test_mission.py`、`test_e2e.py` |
 | `airdrop.record` | 飞行记录（五个记录文件 + 投放记录）+ 按原时间轴回放 | `test_recorder/replay.py` |
-| `tools.calibrate` | 三步标定：内参 → 画面/遥测时间差 → 手眼外参 | `test_calibrate.py` |
+| `airdrop_calibration.calibrate` | 三步标定：内参 → 画面/遥测时间差 → 手眼外参 | `test_calibrate.py` |
 | `tools.fit_ballistics` | 投放试验反演弹道参数（最小二乘 + 可辨识性诊断） | `test_fit.py` |
 
 > **第一次上手先看 [`docs/handbook.md`](docs/handbook.md)**（项目手册：目录总览、各模块调用方法与
@@ -36,7 +36,7 @@
 
 ```text
 airdrop/
-  run.py               # **唯一的命令行入口**（argparse 子命令 → 关键字覆盖到各入口的 build_config）
+  run.py               # **主仓命令行入口**（argparse 子命令 → 关键字覆盖到各入口的 build_config）
   _lazy.py             # PEP 562 惰性导出：import airdrop / --help 不加载 cv2、mavsdk、torch
   config.py            # 全部参数的唯一集中处（frozen dataclass + 取值域校验，参数本身不带命令行）
   telemetry/           # models / broker / mavsdk_thread / controller（mission+gripper+原点）
@@ -47,13 +47,15 @@ airdrop/
   ballistics/          # model（RK4 二次阻力）/ release（判据）/ drops（投放记录）/ fit（参数反演）
   mission/             # states（状态机）/ planner（航线）/ targets（坐标解算）/ runner（主循环）
   record/              # recorder（五个记录文件 + drops.jsonl）/ replay（回放源 + 遥测回填）
-tools/                 # 纯库模块：fetch_models / calibrate / fit_ballistics / make_world / dump_api / check_docs
+tools/                 # 主仓工具：fetch_models / fit_ballistics / sitl_recon / dump_api / check_docs
 examples/              # 纯库模块：full_mission / replay_flight / calibration_capture / sitl_mission / 其余演示
-sim/                   # 仿真模块：赛区世界（生成产物）+ 带下视相机的机型 + airframe + install/run 脚本
+vendor/                # 固定版本的 airdrop-sim 与 airdrop-calibration 子模块
 tests/                 # 全部离线（GPU 与真实素材的用例标 realdata，默认跳过）
 ```
 
 ## 安装
+
+可选工具已拆成两个独立仓库，初始化、独立运行和本地镜像方式见 [工具仓库说明](docs/tool_repositories.md)。主任务运行与帮助无需工具子模块。
 
 ```bash
 uv sync                 # 依赖见 pyproject.toml（索引走清华镜像）
@@ -62,7 +64,7 @@ python -m airdrop.run fetch-models    # 把 YOLO / PP-OCR 权重取进 models/�
 
 ## 几个入口
 
-**只有 `airdrop/run.py` 一个命令行入口**（argparse 子命令）：`examples/*.py` 与 `tools/*.py`
+**主仓以 `airdrop/run.py` 为命令行入口**（argparse 子命令）：`examples/*.py` 与 `tools/*.py`
 都是纯库模块——文件顶部的常量就是默认值，`build_config(**覆盖)` / `main(**kwargs)`
 按需传值；选项到配置走关键字覆盖，默认值直接取自模块常量。
 `--help` 与 `check-docs` **不加载** torch / cv2 / mavsdk 这些重依赖（惰性导出 + 函数体内导入）。
@@ -79,7 +81,7 @@ python -m airdrop.run full-mission --land-plan routes/land.plan       # --dry-ru
 python -m airdrop.run full-mission --no-video --no-preflight          # 无图传/免自检的演练档
 
 # 3) SITL 演练：只走控制链路（合成目标 + 投放只记日志，默认不等起飞）
-python -m airdrop.run sitl --target-offset 0,-20,0      # 航线已对准 sim/worlds/cuadc 的赛区
+python -m airdrop.run sitl --target-offset 0,-20,0      # 航线已对准 vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc 的赛区
 
 # 4) 标定采集：录一个标准飞行目录给 calibrate 用
 python -m airdrop.run calibration-capture
@@ -134,7 +136,7 @@ python -m airdrop.run make-world --rounds 2 --seed 3 --wind 5,2,0
 | `telemetry` | `system_address`、各流速率 | 位置/姿态速率决定帧-遥测内插精度上限 |
 | `video` | `url`、`telemetry_lag` | lag 是**链路属性**，标定后回填 |
 | `perception` | `mode`（`ocr`/`cls12`）、`model_path`、`device` | 权重必须用 `best2.pt`（另两个是废弃权重） |
-| `camera` | `calib_file` | `tools/calibrate.py` 产出的 `camera_calib.json` |
+| `camera` | `calib_file` | `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 产出的 `camera_calib.json` |
 | `ground` | 地面点 GPS | `ground_z` = 原点海拔 − 地面点海拔（平地假设） |
 | `targeting` | `eps_m`、`min_samples`、`selection_rule` | `median`/`max` **起飞前二选一** |
 | `ballistics`/`drop` | 质量/Cd/面积、`radius_m`、`force_after_pass`、`delay_s` | **质量按实测称重填入**；Cd 用投放试验反演（`tools/fit_ballistics.py`）；`delay_s` 也可反演后回填 |
@@ -291,7 +293,7 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
   你改变投放剖面）。飞掠段长/航向同样**待实验验证**。
 - **标定的真实素材复测未做**；`t_bc` 以尺量为准，`telemetry_lag` 的实测值需一次真实采集。
 - SITL 演练使用合成目标，不能验证真实感知或实机投放精度；完整任务在侦查前要求确认飞机已离地。
-- **CUADC 赛区世界已入库**（`sim/worlds/cuadc/`：起降区 + A/B 两个 60×60m 目标区（分列起飞线两端，各距起降区约 200m）+ 8 座五边形天井（**位置与朝向按规则随机**，`--seed` 复现，默认 seed 0 = 入库布局；规则里只是示意的 4m/6m 打击圈与"天井箭头"默认不画；太阳位置可换 `--sun 方位,仰角`，或 `--sun-random` 由 seed 随机；目标区底色按种子取常见路面色、比赛区域外随机铺航拍干扰底图 `--aerial-patches`，都可以重新生成以模拟不同光照/背景），r1 图片靶标 / r2 数字靶标；`python -m airdrop.run make-world` 重生成）。世界的几何与贴图方向做过离屏渲染核对，演练航线（`examples/sitl_mission.py`，对准入库布局的中位数天井）与降落航线（`routes/land.plan`）已对准它；SITL 默认机型是带下视相机的 `gz_rc_cessna_down_cam`。**未验证**：把 Gazebo 相机接进感知闭环、世界与真机场地的差异。启动步骤见 `docs/simulation_world.md`。
+- **CUADC 赛区世界已入库**（`vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/`：起降区 + A/B 两个 60×60m 目标区（分列起飞线两端，各距起降区约 200m）+ 8 座五边形天井（**位置与朝向按规则随机**，`--seed` 复现，默认 seed 0 = 入库布局；规则里只是示意的 4m/6m 打击圈与"天井箭头"默认不画；太阳位置可换 `--sun 方位,仰角`，或 `--sun-random` 由 seed 随机；目标区底色按种子取常见路面色、比赛区域外随机铺航拍干扰底图 `--aerial-patches`，都可以重新生成以模拟不同光照/背景），r1 图片靶标 / r2 数字靶标；`python -m airdrop.run make-world` 重生成）。世界的几何与贴图方向做过离屏渲染核对，演练航线（`examples/sitl_mission.py`，对准入库布局的中位数天井）与降落航线（`routes/land.plan`）已对准它；SITL 默认机型是带下视相机的 `gz_rc_cessna_down_cam`。**未验证**：把 Gazebo 相机接进感知闭环、世界与真机场地的差异。启动步骤见 `docs/simulation_world.md`。
 - PX4 侧需要自己配置：gripper 输出、起飞项的航点动作、任务结束后的行为。
 - `cls12` 的 12 类权重目前不存在（`best2.pt` 是单类），该模式当前只能跑出编号 1。
 - **无 CI**：pytest / ruff / pyright 都只在本地跑。

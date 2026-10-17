@@ -1,38 +1,7 @@
-"""集中式运行模块：``python -m airdrop.run <子命令> [选项]``。
+"""主仓命令行入口：按需加载所选命令，默认值读取相应库模块常量。
 
-为什么要有它
-------------
-示例与工具都是纯库模块（顶部常量 = 默认值，暴露 ``build_config(**覆盖)`` 与
-``main(**kwargs)``）；命令行解析只在这里做一份，于是：
-
-* 每个入口不必各自 ``import argparse``、各自写一遍参数；
-* 参数到配置走关键字覆盖（各模块内部用 ``dataclasses.replace`` 派生），
-  默认值直接取入口模块的常量，这里不重复写第二遍；
-* 重依赖（torch / ultralytics / cv2 / mavsdk / rapidocr / onnxruntime）只在
-  handler 真正跑的时候才由各模块的函数体导入——``--help`` 与 ``check-docs``
-  都不会加载它们（``tests/test_cli.py` 用子进程盯着这条）。
-
-用法
-----
-::
-
-    ./.venv/Scripts/python.exe -m airdrop.run --help
-    ./.venv/Scripts/python.exe -m airdrop.run full-mission --help
-    ./.venv/Scripts/python.exe -m airdrop.run full-mission --rtsp-url rtsp://... --no-preflight
-    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/20260913-185512 --speed 2
-    ./.venv/Scripts/python.exe -m airdrop.run calibrate --flight flights/20260913-185512 --strict
-    ./.venv/Scripts/python.exe -m airdrop.run check-docs
-
-退出码
-------
-``0`` 正常；``2`` 参数/子命令不合法（argparse 的约定，也是各 handler 自己的"未成功"
-口径）；其余由 handler 决定（例如 ``fit-ballistics`` 的 2 = 参数不可信、3 = 缺测量）。
-
-加一个子命令
-------------
-在 :data:`SUBCOMMANDS` 里加一条即可：``module`` 指向入口模块，``handler`` 是它的函数名，
-``options`` 用 :class:`Option` 描述（``source`` 写入口模块里的常量名，默认值取自它）。
-``tools/check_docs.py`` 会用这份注册表核验手册是否覆盖了全部子命令。
+总帮助不导入入口模块。可选工具旧命令由独立工具 CLI 解析；缺失子模块
+会返回初始化提示，不自动安装。主仓新命令在 SUBCOMMANDS 注册。
 """
 
 from __future__ import annotations
@@ -79,6 +48,17 @@ class Subcommand:
     options: tuple[Option, ...] = ()
     #: 入口模块里干活的函数（签名形如 ``main(**kwargs) -> int``）
     handler: str = "main"
+
+
+#: 旧工具命令仅在调用时转发，参数定义由独立 CLI 维护。
+TOOL_COMMANDS = {
+    "calibrate": "airdrop_calibration",
+    "make-world": "airdrop_sim",
+    "make-vehicle": "airdrop_sim",
+    "make-backdrops": "airdrop_sim",
+    "fetch-aerial": "airdrop_sim",
+    "preview-world": "airdrop_sim",
+}
 
 
 #: 子命令注册表（唯一的命令行出处；顺序即 ``--help`` 里的显示顺序）
@@ -207,6 +187,13 @@ SUBCOMMANDS: dict[str, Subcommand] = {
         help="SITL 侦查精度自动测试：真飞机 + 真感知，量「解算坐标 vs 天井中心」误差",
         options=(
             Option(
+                ("--manifest",),
+                "manifest_path",
+                "仿真 manifest：读取本次世界真值与相机参数；省略时使用默认 r2/seed 0",
+                kind="path",
+                source="MANIFEST_PATH",
+            ),
+            Option(
                 ("--system-address",),
                 "system_address",
                 "MAVSDK 系统地址（SITL 默认 udpin://0.0.0.0:14540）",
@@ -217,7 +204,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 "lag_s",
                 "图传链路延时估计（秒；报告里还会给 lag 扫描）",
                 kind="float",
-                source="TELEMETRY_LAG_S",
+                source="LAG_OVERRIDE_S",
             ),
             Option(
                 ("--recon-timeout",),
@@ -420,54 +407,8 @@ SUBCOMMANDS: dict[str, Subcommand] = {
     ),
     "calibrate": Subcommand(
         name="calibrate",
-        module="tools.calibrate",
+        module="airdrop_calibration.cli",
         help="三步相机标定：内参 → 画面/遥测时间差 → 手眼外参",
-        options=(
-            Option(
-                ("--flight",), "flight_dir", "标定采集的飞行目录", kind="path", source="FLIGHT_DIR"
-            ),
-            Option(
-                ("--out",),
-                "output_path",
-                "标定结果 JSON 的输出路径",
-                kind="path",
-                source="OUTPUT_PATH",
-            ),
-            Option(
-                ("--pattern",),
-                "pattern_size",
-                "棋盘格内角点数，格式 列,行（内角点数，不是方格数）",
-                kind="pair",
-                source="PATTERN_SIZE",
-            ),
-            Option(
-                ("--square",), "square_size", "方格边长（米）", kind="float", source="SQUARE_SIZE_M"
-            ),
-            Option(
-                ("--lag-search",),
-                "lag_search_s",
-                "时间差搜索半径（秒）",
-                kind="float",
-                source="LAG_SEARCH_S",
-            ),
-            Option(
-                ("--lag-step",),
-                "lag_step_s",
-                "时间差搜索步长（秒）",
-                kind="float",
-                source="LAG_STEP_S",
-            ),
-            Option(
-                ("--max-frames",), "max_frames", "最多读取多少帧", kind="int", source="MAX_FRAMES"
-            ),
-            Option(
-                ("--strict",),
-                "strict",
-                "严格模式：外参/时间差没标出来就返回 2（默认只警告）",
-                kind="flag",
-                source="STRICT",
-            ),
-        ),
     ),
     "fit-ballistics": Subcommand(
         name="fit-ballistics",
@@ -534,163 +475,28 @@ SUBCOMMANDS: dict[str, Subcommand] = {
     ),
     "make-world": Subcommand(
         name="make-world",
-        module="tools.make_world",
+        module="airdrop_sim.cli",
         help="生成 CUADC 赛区 Gazebo 世界（round1 图片靶标 / round2 数字靶标）",
-        options=(
-            Option(
-                ("--out-dir",),
-                "out_dir",
-                "输出目录（默认 sim/worlds/cuadc）",
-                kind="path",
-                source="OUT_DIR",
-            ),
-            Option(
-                ("--seed",),
-                "seed",
-                "随机种子（决定各天井朝向；默认 0 = 入库布局）",
-                kind="int",
-                source="SEED",
-            ),
-            Option(
-                ("--rounds",),
-                "rounds",
-                "生成哪几轮：both / 1 / 2",
-                kind="choice",
-                choices=("both", "1", "2"),
-                source="ROUNDS",
-            ),
-            Option(
-                ("--wind",),
-                "wind_enu_m_s",
-                "世界恒定风（东,北,天 m/s），默认静风",
-                kind="vec3",
-                source="WIND_ENU_M_S",
-            ),
-            Option(
-                ("--well-arrows",),
-                "well_arrows",
-                '在天井里画"天井箭头"（规则文本提到、规则图 2/4 里没有；默认不画）',
-                kind="flag",
-                source="WELL_ARROWS",
-            ),
-            Option(
-                ("--sun",),
-                "sun_azel_deg",
-                "太阳位置（方位角,仰角 度；方位从北起顺时针，仰角 0~90）——换阴影环境用，"
-                "例如 90,12 = 东侧低角度长阴影",
-                kind="vec2",
-                source="SUN_AZEL_DEG",
-            ),
-            Option(
-                ("--sun-random",),
-                "sun_random",
-                "太阳位置由 seed 随机（方位全向、仰角 15~80°，换 seed 换光照）；"
-                "开了它 --sun 的固定值不生效",
-                kind="flag",
-                source="SUN_RANDOM",
-            ),
-            Option(
-                ("--aerial-patches",),
-                "aerial_patches",
-                # 默认值由 _add_option 自动附在帮助末尾（从模块常量读），
-                # 这里不要再手写数字——原来写的"默认 6"与常量 12 对不上。
-                "比赛区域外铺几块航拍干扰底图（0 = 不铺）",
-                kind="int",
-                source="AERIAL_PATCHES",
-            ),
-        ),
+    ),
+    "make-vehicle": Subcommand(
+        name="make-vehicle",
+        module="airdrop_sim.cli",
+        help="生成 rc_cessna 相机机型、模拟相机文件与仿真 manifest",
     ),
     "make-backdrops": Subcommand(
         name="make-backdrops",
-        module="tools.make_backdrops",
+        module="airdrop_sim.cli",
         help="生成场景底图贴图：目标区地面纹理 + 比赛区域外的随机航拍干扰底图",
-        options=(
-            Option(
-                ("--out-dir",),
-                "out_dir",
-                "输出目录（默认 sim/worlds/cuadc）",
-                kind="path",
-                source="OUT_DIR",
-            ),
-            Option(
-                ("--seed",),
-                "seed",
-                "随机种子（决定底图长什么样；默认 0）",
-                kind="int",
-                source="SEED",
-            ),
-            Option(
-                ("--size",),
-                "size",
-                "贴图边长（像素，默认 512）",
-                kind="int",
-                source="SIZE_PX",
-            ),
-            Option(
-                ("--parts",),
-                "parts",
-                "写哪一类：all / ground（只目标区纹理，不动 fetch-aerial 抓来的航拍图）/ aerial",
-                kind="choice",
-                choices=("all", "ground", "aerial"),
-                source="PARTS",
-            ),
-        ),
     ),
     "preview-world": Subcommand(
         name="preview-world",
-        module="tools.preview_world",
+        module="airdrop_sim.cli",
         help="把赛区世界渲染成俯视预览图（PNG，带中文标注，供人眼核对布局）",
-        options=(
-            Option(
-                ("--world-dir",),
-                "world_dir",
-                "世界目录（默认 sim/worlds/cuadc）",
-                kind="path",
-                source="WORLD_DIR",
-            ),
-            Option(
-                ("--round",),
-                "round_no",
-                "预览哪一轮（1 = 图片靶标 / 2 = 数字靶标）",
-                kind="int",
-                source="ROUND",
-            ),
-            Option(
-                ("--out",),
-                "out_path",
-                "输出 PNG 路径（默认 sim/worlds/cuadc/preview.png，已进 .gitignore）",
-                kind="path",
-                source="OUT_PATH",
-            ),
-        ),
     ),
     "fetch-aerial": Subcommand(
         name="fetch-aerial",
-        module="tools.fetch_aerial",
+        module="airdrop_sim.cli",
         help="抓真实航拍底图（USGS NAIP，公有领域，需联网）替换程序化底图",
-        options=(
-            Option(
-                ("--out-dir",),
-                "out_dir",
-                "输出目录（默认 sim/worlds/cuadc）",
-                kind="path",
-                source="OUT_DIR",
-            ),
-            Option(
-                ("--size",),
-                "size",
-                "贴图边长（像素，默认 512）",
-                kind="int",
-                source="SIZE_PX",
-            ),
-            Option(
-                ("--tile-width-m",),
-                "tile_width_m",
-                "每张底图覆盖的地面宽度（米，默认 160）",
-                kind="float",
-                source="TILE_WIDTH_M",
-            ),
-        ),
     ),
     "dump-api": Subcommand(
         name="dump-api",
@@ -782,28 +588,46 @@ def _vec3(text: str) -> tuple[float, float, float]:
     return float(parts[0]), float(parts[1]), float(parts[2])
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """按 :data:`SUBCOMMANDS` 建出完整解析器（会 import 入口模块读默认值）。
+class _CommandParser(argparse.ArgumentParser):
+    """保留 build_parser().parse_args() 用法，解析时才读取所选命令。"""
+
+    prepared_command: str | None = None
+
+    def parse_args(self, args=None, namespace=None):
+        arguments = list(sys.argv[1:] if args is None else args)
+        if self.prepared_command is None and arguments and arguments[0] in SUBCOMMANDS:
+            return build_parser(arguments[0]).parse_args(arguments, namespace)
+        return super().parse_args(arguments, namespace)
+
+
+def build_parser(command: str | None = None) -> argparse.ArgumentParser:
+    """构建命令列表，仅为所选主仓命令读取模块默认值。
 
     入口模块都是"纯库模块"（重依赖在函数体内），所以建解析器这一步不加载
     cv2 / mavsdk / torch——``--help`` 因此是廉价的。
     """
-    parser = argparse.ArgumentParser(
+    if command in TOOL_COMMANDS:
+        from tools.optional_tools import load_tool_module
+
+        return load_tool_module(SUBCOMMANDS[command].module).build_parser()
+    parser = _CommandParser(
         prog="python -m airdrop.run",
         description="CUADC固定翼无人机侦查与打击控制项目：集中式入口（子命令 + 选项，参数到配置走关键字覆盖）",
         epilog="子命令的 --help 给出该入口的全部选项与默认值来源。",
     )
+    parser.prepared_command = command
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<子命令>")
     for spec in SUBCOMMANDS.values():
-        module = importlib.import_module(spec.module)
         sub = subparsers.add_parser(
             spec.name,
             help=spec.help,
             description=f"{spec.help}（入口模块：{spec.module}）",
         )
         sub.set_defaults(command=spec.name)
-        for option in spec.options:
-            _add_option(sub, module, option)
+        if command == spec.name and spec.name not in TOOL_COMMANDS:
+            module = importlib.import_module(spec.module)
+            for option in spec.options:
+                _add_option(sub, module, option)
     return parser
 
 
@@ -830,7 +654,12 @@ def resolve_kwargs(command: str, argv: Sequence[str]) -> dict[str, Any]:
     spec = SUBCOMMANDS.get(command)
     if spec is None:
         raise KeyError(f"未知子命令：{command!r}（可选 {sorted(SUBCOMMANDS)}）")
-    parser = build_parser()
+    if command in TOOL_COMMANDS:
+        from tools.optional_tools import load_tool_module
+
+        cli = load_tool_module(spec.module)
+        return cli.resolve_kwargs(command, argv)
+    parser = build_parser(command)
     # 借用完整解析器：只传入该子命令的选项，避免各子命令的解析器被复制一份
     args = parser.parse_args([command, *argv])
     module = importlib.import_module(spec.module)
@@ -838,13 +667,28 @@ def resolve_kwargs(command: str, argv: Sequence[str]) -> dict[str, Any]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """命令行入口；返回进程退出码（参数不合法时由 argparse 以 2 退出）。"""
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    spec = SUBCOMMANDS[args.command]
-    module = importlib.import_module(spec.module)
-    handler = getattr(module, spec.handler)
-    result = handler(**_kwargs_of(spec, module, args))
+    """仅加载被选择的入口；工具旧命令显式转发至独立 CLI。"""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    command = arguments[0] if arguments else None
+    if command in TOOL_COMMANDS:
+        from tools.optional_tools import load_tool_module
+
+        try:
+            cli = load_tool_module(SUBCOMMANDS[command].module)
+            return cli.main(arguments)
+        except ModuleNotFoundError as exc:
+            print(f"工具无法加载：{exc}", file=sys.stderr)
+            return 2
+    try:
+        parser = build_parser(command)
+        args = parser.parse_args(arguments)
+        spec = SUBCOMMANDS[args.command]
+        module = importlib.import_module(spec.module)
+        handler = getattr(module, spec.handler)
+        result = handler(**_kwargs_of(spec, module, args))
+    except ModuleNotFoundError as exc:
+        print(f"入口无法加载：{exc}", file=sys.stderr)
+        return 2
     return 0 if result is None else int(result)
 
 

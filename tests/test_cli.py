@@ -60,6 +60,8 @@ def test_every_subcommand_has_a_parser_and_a_handler() -> None:
     assert set(registered) == set(run.SUBCOMMANDS), "注册表与解析器必须一一对应"
 
     for name, spec in run.SUBCOMMANDS.items():
+        if name in run.TOOL_COMMANDS:
+            continue
         module = importlib.import_module(spec.module)
         handler = getattr(module, spec.handler, None)
         assert callable(handler), f"{name}: {spec.module}.{spec.handler} 不可调用"
@@ -89,6 +91,7 @@ def test_subcommand_list_covers_the_old_entries() -> None:
         "fit-ballistics",
         "fetch-models",
         "make-world",
+        "make-vehicle",
         "make-backdrops",
         "fetch-aerial",
         "preview-world",
@@ -121,7 +124,10 @@ print("HEAVY", [name for name in {heavy!r} if name in sys.modules] or "NONE")
 """
 
 
-@pytest.mark.parametrize("argv", [["--help"], *([name, "--help"] for name in run.SUBCOMMANDS)])
+@pytest.mark.parametrize(
+    "argv",
+    [["--help"], *([name, "--help"] for name in run.SUBCOMMANDS if name not in run.TOOL_COMMANDS)],
+)
 def test_help_does_not_load_heavy_libraries(argv: list[str]) -> None:
     """顶层与每个子命令的 ``--help``：退出码 0，且 sys.modules 里没有重依赖。"""
     result = _run_in_subprocess(_HELP_PROBE.format(argv=argv, heavy=HEAVY_MODULES))
@@ -168,6 +174,11 @@ def test_check_docs_subcommand_is_light_and_passes() -> None:
 # ----------------------------------------------------------------------
 # 3) 参数校验：未知子命令 / 非法参数以 2 退出
 # ----------------------------------------------------------------------
+def test_build_parser_still_parses_selected_options() -> None:
+    args = run.build_parser().parse_args(["full-mission", "--telemetry-lag", "0.3"])
+    assert args.telemetry_lag_s == pytest.approx(0.3)
+
+
 def test_unknown_subcommand_exits_with_two() -> None:
     result = _run_in_subprocess("import airdrop.run; airdrop.run.main(['nope'])")
     assert result.returncode == 2, result.stdout + result.stderr
@@ -185,9 +196,6 @@ def test_missing_subcommand_exits_with_two() -> None:
         (["full-mission", "--recon-upload", "manual"], "枚举取值不在集合里"),
         (["full-mission", "--unknown-option"], "未知选项"),
         (["sitl", "--target-offset", "300,0"], "三元组少一个数"),
-        (["calibrate", "--pattern", "9"], "二元组少一个数"),
-        (["make-world", "--sun", "218"], "太阳参数少一个数"),
-        (["preview-world", "--round", "abc"], "轮次不是整数"),
         (["replay", "--speed", "fast"], "浮点参数写错"),
     ],
 )
@@ -252,45 +260,6 @@ def test_full_mission_options_override_the_config() -> None:
     assert kwargs["dry_run"] is True and kwargs["use_video"] is False
 
 
-def test_make_world_options_override_the_config() -> None:
-    """make-world 的太阳/天井开关真的进了 build_config()。"""
-    from tools import make_world
-
-    kwargs = run.resolve_kwargs(
-        "make-world",
-        ["--seed", "7", "--sun", "90,12", "--well-arrows", "--wind", "5,2,0"],
-    )
-    config = make_world.build_config(**_config_kwargs("tools.make_world", kwargs))
-    assert config.seed == 7
-    assert config.sun_azel_deg == (90.0, 12.0)
-    assert config.sun_random is False, "默认不随机；只有给了 --sun-random 才随机"
-    assert config.well_arrows is True
-    assert config.wind_enu_m_s == (5.0, 2.0, 0.0)
-
-    random_kwargs = run.resolve_kwargs("make-world", ["--sun-random"])
-    random_config = make_world.build_config(**_config_kwargs("tools.make_world", random_kwargs))
-    assert random_config.sun_random is True
-
-    patches_kwargs = run.resolve_kwargs("make-world", ["--aerial-patches", "3"])
-    patches_config = make_world.build_config(**_config_kwargs("tools.make_world", patches_kwargs))
-    assert patches_config.aerial_patches == 3
-
-
-def test_backdrop_options_override_the_config() -> None:
-    """make-backdrops / fetch-aerial 的选项真的进了各自的 build_config()。"""
-    from tools import fetch_aerial, make_backdrops
-
-    kwargs = run.resolve_kwargs(
-        "make-backdrops", ["--seed", "3", "--size", "256", "--parts", "ground"]
-    )
-    config = make_backdrops.build_config(**_config_kwargs("tools.make_backdrops", kwargs))
-    assert config.seed == 3 and config.size == 256 and config.parts == "ground"
-
-    kwargs = run.resolve_kwargs("fetch-aerial", ["--size", "640", "--tile-width-m", "200"])
-    config = fetch_aerial.build_config(**_config_kwargs("tools.fetch_aerial", kwargs))
-    assert config.size == 640 and config.tile_width_m == pytest.approx(200.0)
-
-
 def test_sitl_options_override_the_config() -> None:
     from examples import sitl_mission
 
@@ -331,21 +300,6 @@ def test_replay_options_override_the_config() -> None:
     assert config.perception.mode == "cls12"
 
 
-def test_calibrate_options_override_the_config() -> None:
-    from tools import calibrate
-
-    kwargs = run.resolve_kwargs(
-        "calibrate",
-        ["--flight", "flights/y", "--pattern", "7,5", "--square", "0.03", "--strict"],
-    )
-    settings = calibrate.build_config(**kwargs)
-
-    assert settings.flight_dir == Path("flights/y")
-    assert settings.pattern_size == (7, 5)
-    assert settings.square_size == pytest.approx(0.03)
-    assert settings.strict is True
-
-
 def test_fit_ballistics_options_override_the_config() -> None:
     from tools import fit_ballistics
 
@@ -363,7 +317,6 @@ def test_fit_ballistics_options_override_the_config() -> None:
 def test_defaults_come_from_the_module_constants() -> None:
     """不带选项时，关键字必须等于入口模块的常量（默认值不写第二遍）。"""
     from examples import full_mission, sitl_mission
-    from tools import calibrate
 
     kwargs = run.resolve_kwargs("full-mission", [])
     assert kwargs["rtsp_url"] == full_mission.RTSP_URL
@@ -373,10 +326,6 @@ def test_defaults_come_from_the_module_constants() -> None:
     sitl = run.resolve_kwargs("sitl", [])
     assert sitl["target_offset_ned"] == sitl_mission.TARGET_OFFSET_NED
     assert sitl["system_address"] == sitl_mission.SYSTEM_ADDRESS
-
-    cal = run.resolve_kwargs("calibrate", [])
-    assert cal["pattern_size"] == calibrate.PATTERN_SIZE
-    assert cal["flight_dir"] == calibrate.FLIGHT_DIR
 
 
 def test_fetch_models_reports_a_wrong_source_dir_as_failure(tmp_path: Path) -> None:

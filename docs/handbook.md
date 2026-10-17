@@ -60,10 +60,10 @@
 | `airdrop/config.py` | **全部参数的唯一集中处**（frozen dataclass + 取值域校验） | `Config`、`Config.validated` | 是 |
 | `tools/` | 一次性离线工具（**纯库模块**：文件内常量 = 默认值，暴露 `build_config(**覆盖)` / `main(**kwargs)`；命令行解析归 §6.2 的 `airdrop/run.py`） | `fetch_models.py`、`calibrate.py`、`fit_ballistics.py`、`make_world.py`、`dump_api.py`、`check_docs.py` | 是 |
 | `examples/` | 七个入口示例（同样是纯库模块：常量 = 默认值；重依赖只在函数体内导入，所以 `import` 它们**不加载** cv2/mavsdk/torch） | `full_mission.py`、`replay_flight.py`、`sitl_mission.py` | 是 |
-| `airdrop/run.py` | **唯一的命令行入口**：argparse 子命令 → 关键字覆盖到各入口的 `build_config`/`main`（见 §6.2） | `run.py`、`airdrop/_lazy.py`（PEP 562 惰性导出） | 是 |
+| `airdrop/run.py` | **主仓命令行入口**：argparse 子命令 → 关键字覆盖到各入口的 `build_config`/`main`（见 §6.2） | `run.py`、`airdrop/_lazy.py`（PEP 562 惰性导出） | 是 |
 | `tests/` | pytest 套件（21 个测试文件，全部离线；`realdata` 标记默认跳过） | `conftest.py`、`test_e2e.py`、`test_fit.py`、`test_plan.py`、`test_world.py`、`test_sim_scripts.py` | 是 |
 | `docs/` | 专题笔记（5 篇实测记录）+ 本手册 | `handbook.md`、`simulation_world.md`、`calibration_opencv.md`、`video_hm30_ffmpeg.md`、`perception_ocr.md`、`ballistics_fit.md` | 是 |
-| `sim/` | **仿真模块**：世界（生成产物：两个 `.sdf` + 网格/贴图）+ 带下视相机的机型 + PX4 airframe + 装机/启动脚本；生成器是 `tools/make_world.py`，布局与启动见 [`simulation_world.md`](simulation_world.md)，模块说明见 [`../sim/README.md`](../sim/README.md) | `sim/worlds/cuadc/cuadc_recon_strike_r1.sdf`、`r2.sdf` | 是 |
+| `vendor/airdrop-sim/` | **仿真模块**：世界（生成产物：两个 `.sdf` + 网格/贴图）+ 带下视相机的机型 + PX4 airframe + 装机/启动脚本；生成器是 `vendor/airdrop-sim/airdrop_sim/make_world.py`，布局与启动见 [`simulation_world.md`](simulation_world.md)，模块说明见 [`../vendor/airdrop-sim/README.md`](../vendor/airdrop-sim/README.md) | `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/cuadc_recon_strike_r1.sdf`、`r2.sdf` | 是 |
 | `routes/` | **操作手在 QGC 里画好的 `.plan` 航线**（`recon.plan` / `land.plan`），由配置按需导入 | `land.plan` | 是（航线是飞行输入，跟着版本走） |
 | `models/` | 本地模型权重与字典（**字典入库、权重不入库**） | `best2.pt`、`ppocr/*.pth`、`ppocr/ppocrv6_dict.txt` | 字典是；权重否 |
 | `.venv/` | 项目虚拟环境（uv 创建，Python 3.14.6，**里面没有 pip**） | — | 否 |
@@ -963,7 +963,7 @@ CameraModel(camera_matrix, dist_coeffs=<全零>, r_bc=<DEFAULT_R_BC>, t_bc=<零�
 两个构造入口：
 
 - `default_camera_model(width=1280, height=720)`：按视场角凑出的占位内参（`is_calibrated()` 为 `False`）。它只够"能跑通"，精度靠标定。
-- `load_camera_model(path, *, fallback_size=(1280, 720))`：读 `tools/calibrate.py` 写出的标定文件；缺字段时用兜底尺寸补一个默认模型（不抛异常，便于缺标定也能起飞）。
+- `load_camera_model(path, *, fallback_size=(1280, 720))`：读 `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 写出的标定文件；缺字段时用兜底尺寸补一个默认模型（不抛异常，便于缺标定也能起飞）。
 
 #### 3.5.2 像素 → 坐标
 
@@ -2016,7 +2016,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `events.jsonl` | 各模块经 `recorder.events.emit(kind, **data)`（线程安全、写完即 flush） | `{timestamp, kind, ...}`，`kind` 目录见 §5.2 | 人、复盘脚本 | ⚠ 建议只读（这是任务时间线） |
 | `drops.jsonl` | `MissionRunner(on_drop=…)` → `recorder.drops.append(DropRecord)` | 投放瞬间**原始状态**：位置/速度/姿态（欧拉角+四元数）/风/离地高度/NED 原点/目标点/判据前推位置与预测落点（**数值不四舍五入**） | `tools/fit_ballistics.py`、人 | ⚠ 只读；实测落点写在 `impacts.jsonl`，别改这个文件 |
 | `frames/%06d.jpg` | recorder 的 frame writer 线程（**零重编码**：把缓冲里的 jpeg 字节直接写入磁盘） | 逐帧 JPEG，文件名 = 缓冲序号 | `record.replay.ReplayVideoSource` | ⚠ 删帧会让回放 `strict=True` 报错 |
-| `frames_index.jsonl` | 同上 | `index`、`filename`、`capture_timestamp`、`received_timestamp`、`lag`、`extrapolated`、`offset`、`bytes`（`capture = received − lag`；**标定第 2/3 步用 `received_timestamp`**，见 §5.3） | `record.replay.FlightLog`、`tools/calibrate.py` | ⚠ 只读（时间戳必须递增） |
+| `frames_index.jsonl` | 同上 | `index`、`filename`、`capture_timestamp`、`received_timestamp`、`lag`、`extrapolated`、`offset`、`bytes`（`capture = received − lag`；**标定第 2/3 步用 `received_timestamp`**，见 §5.3） | `record.replay.FlightLog`、`vendor/airdrop-calibration/airdrop_calibration/calibrate.py` | ⚠ 只读（时间戳必须递增） |
 | `config_snapshot.json` | `start()` 时立刻写 | `asdict(Config)` 全量（含视频地址、标定文件路径） | 人、审查 | ⚠ 只读（"当时怎么配的"证据） |
 | `impacts.jsonl` / `impacts.csv` | **人**（现场量完落点后填） | `index` + 经纬度（`lat_deg`/`lon_deg`/`alt_m`）**或** NED（`north_m`/`east_m`/`down_m`） | `tools/fit_ballistics.py` | ✅ 本来就要手填（模板见 `write_impact_template`） |
 
@@ -2047,14 +2047,14 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `image_size_mismatch` | `TargetTracker` | 检测画面尺寸与相机不符：含帧号、拍摄时刻、实际及预期尺寸；该条不解算 |
 | `recorder_started` / `recorder_stopped` | `FlightRecorder` | 目录、频率、缓冲容量 / 各类计数 |
 
-### 5.3 `camera_calib.json`（`tools/calibrate.py` 产出）
+### 5.3 `camera_calib.json`（`vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 产出）
 
 | 键 | 来源 | 是否权威 |
 | --- | --- | --- |
 | `camera_matrix`（3×3）、`dist_coeffs` | 步骤一：棋盘格多视图 `calibrateCamera` | ✅（质量看 `meta.intrinsics.rms_px`） |
 | `image_size` | 同上 | ✅ 标定分辨率——换分辨率要用 `CameraModel.scaled()` 换算 |
 | `R_bc` | 步骤三：手眼标定 `A X = X B` | ✅ 旋转以标定为准 |
-| `t_bc` | **尺量常量**（`tools/calibrate.py` 顶部 `MEASURED_T_BC`） | ✅ 平移以尺量为准；标定估计值只在 `meta.extrinsics.lever_arm` 里供对比（可采信与否看残差 **+** 遥测/画面位置跨度两条判据，见 `telemetry_span_ok`） |
+| `t_bc` | **尺量常量**（`vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 顶部 `MEASURED_T_BC`） | ✅ 平移以尺量为准；标定估计值只在 `meta.extrinsics.lever_arm` 里供对比（可采信与否看残差 **+** 遥测/画面位置跨度两条判据，见 `telemetry_span_ok`） |
 | `telemetry_lag` | 步骤二：画面角速度 × 飞控角速度互相关（用**收到帧的时刻** `received_timestamp` 测） | ✅ 标定后回填 `VideoConfig.telemetry_lag`；它是**绝对对齐量** = 视频链路延时 − 遥测链路延时，与录制时配置的 lag 无关 |
 | `meta.intrinsics` | `rms_px`、`views`、`per_view_errors`、`pattern_size`、`square_size_m` | 诊断 |
 | `meta.time_offset` | `lag_s`（= 绝对对齐量，同 `telemetry_lag`）、`peak_correlation`、`samples`、`search_s`、`step_s`、`curve`；另加时间轴与互核：`time_base`（恒 `received`）、`lag_baseline_s`（录制时配置的 lag）、`lag_residual_on_capture_axis_s`、`cross_check_ok`、`cross_check_tolerance_s`、`note` | 诊断（相关系数低 → 激励不足，重采；`cross_check_ok=False` → 素材索引里的 lag 与录制配置不一致，只告警，结果仍以 received 轴为准） |
@@ -2105,11 +2105,10 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | --- | --- | --- |
 | `.e2e-test-tmp/` | `tests/test_e2e.py` 的 `workdir` fixture | 手写合成飞行目录，用完即删 |
 | `.fit-test-tmp/` | `tests/test_fit.py` 的 `workdir` fixture | 投放记录 / 测量文件 / 工具端到端 |
-| `.calibrate-test-tmp/` | `tests/test_calibrate.py` 的 `workdir` fixture | 合成标定飞行目录（渲染棋盘格帧） |
+| `.calibrate-test-tmp/` | `vendor/airdrop-calibration/tests/test_calibrate.py` 的 `workdir` fixture | 合成标定飞行目录（渲染棋盘格帧） |
 | `.plan-test-tmp/` | `tests/test_plan.py` 的 `workdir` fixture | 现场造的 QGC `.plan`（含复杂项） |
 | `.handbook-test-tmp/` | `tests/test_handbook.py` 的 `workdir` fixture | 手册 §3 示例真跑时的工作目录 |
-| `.world-test-tmp/` | `tests/test_world.py` 的 `workdir` fixture | 生成到别处的赛区世界（含贴图复制） |
-| `.sim-script-tmp/` | `tests/test_sim_scripts.py` 的 `workdir` fixture | 复制一份 `sim/` + 驱动脚本，放工作区内是为了让 WSL 能从 `/mnt/c/…` 读到 |
+| `.world-test-tmp/` | `vendor/airdrop-sim/tests/test_world.py` 的 `workdir` fixture | 生成到别处的赛区世界（含贴图复制） |
 | `.replay-test-tmp/` | `tests/test_replay.py` | 手写的最小飞行目录 |
 | `.sitl-test-tmp/` | **人工**（SITL 演练） | 演练日志、机上任务备份、ulog 探查脚本；不是测试 fixture |
 | `.pytest-tmp/` | 历史遗留（`--basetemp` 落点） | 已可删除，无用 |
@@ -2151,19 +2150,20 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | --- | --- | --- | --- | --- |
 | `python -m airdrop.run full-mission` | `examples/full_mission.py` | 飞控 + 图传 + `camera_calib.json` + 航线配置；`--dry-run` 可不装弹。**这是正式任务档**：`INIT→PREFLIGHT`（载入模型 + 视频自检）→`WAIT_AIRBORNE`→`RECON`（侦查航线由操作手在 QGC 上传并启动，`recon_upload="operator"`） | `flights/<ts>/` 一整套；终端打印任务与统计 | 0 成功 / 2 未到 DONE / 130 中断 / 1 异常 |
 | `python -m airdrop.run sitl` | `examples/sitl_mission.py` | PX4 SITL 在 `udpin://0.0.0.0:14540`；`--land-plan` 指向的 `routes/land.plan` 要在（不给则用内置 `LANDING_ROUTE`）。**这是自动测试档**：自检全关、`recon_upload="auto"`（本包上传侦查航线）、**不等起飞**（`require_airborne=False`，见 §4.13） | 终端"演练记录"：状态轨迹 / 上传与投放次数 / 判据评估次数 / 飞掠计划；`flights/<ts>/` 记录 | 0 成功 / 2 未到 DONE / 130 中断 / 1 异常 |
-| `python -m airdrop.run sitl-recon` | `tools/sitl_recon.py` | WSL 里起 SITL（`bash sim/run_sitl.sh r2`）+ Gazebo 自带的 RTP/H.264 图传（**不必用 HM30**）。**完全标准流程**：本脚本只扮演操作手（上传/启动「起飞任务」与「侦查航线」），其余交给 `MissionRunner` 状态机 + 真 `Preflight` + `PerceptionWorker`（OCR 进程池）+ `DryRunController`：监视侦查 → 空中出目标 → 飞掠投放 → 降落（**没有任何 offboard 设定点**）。测试期间临时把 `NAV_DLL_ACT` 置 0（跑完还原成 2）；`MIS_TKO_LAND_REQ` 已在仿真机型里永久置 0（理由见 `sim/airframes/4007_gz_rc_cessna_down_cam` 的注释——只飞侦查段，投弹航线要空中出结果才能生成） | 终端精度报告 + `.sitl-recon-tmp/report.json`（任务结果与分井误差、延时敏感性、反向诊断）+ `flights/<ts>/` 记录 | 0 成功 / 2 没遥测 / 3 没画面 / 4 没解锁 / 5 没进任务模式 / 6 没起飞 / 7 没飞完（仍出报告） / 1 异常 |
+| `python -m airdrop.run sitl-recon` | `tools/sitl_recon.py` | WSL 里起 SITL（`bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2`）+ Gazebo 自带的 RTP/H.264 图传（**不必用 HM30**）。**完全标准流程**：本脚本只扮演操作手（上传/启动「起飞任务」与「侦查航线」），其余交给 `MissionRunner` 状态机 + 真 `Preflight` + `PerceptionWorker`（OCR 进程池）+ `DryRunController`：监视侦查 → 空中出目标 → 飞掠投放 → 降落（**没有任何 offboard 设定点**）。测试期间临时把 `NAV_DLL_ACT` 置 0（跑完还原成 2）；`MIS_TKO_LAND_REQ` 已在仿真机型里永久置 0（理由见 `vendor/airdrop-sim/airdrop_sim/assets/airframes/4007_gz_rc_cessna_down_cam` 的注释——只飞侦查段，投弹航线要空中出结果才能生成） | 终端精度报告 + `.sitl-recon-tmp/report.json`（任务结果与分井误差、延时敏感性、反向诊断）+ `flights/<ts>/` 记录 | 0 成功 / 2 没遥测 / 3 没画面 / 4 没解锁 / 5 没进任务模式 / 6 没起飞 / 7 没飞完（仍出报告） / 1 异常 |
 | `python -m airdrop.run replay` | `examples/replay_flight.py` | 一份飞行目录（`--flight`，不给则取 `flights/` 最新） | 终端：播放终态、帧统计、目标点、聚类结果、飞掠航线（**不上传**） | 0 完成（没目标也为 0）；1 播放失败、排空超时或处理不完整 |
 | `python -m airdrop.run calibration-capture` | `examples/calibration_capture.py` | 图传（不给 `--rtsp-url` 用默认 HM30 地址）+ 飞控遥测 | 一个标定用飞行目录（姿态 50Hz、位置 20Hz、缓冲 300s） | 0；一帧没收到 = 1 |
-| `python -m airdrop.run calibrate` | `tools/calibrate.py` | 上面那份标定目录（`--flight`） | `camera_calib.json`；终端打印每步残差/相关系数 | 0；`--strict` 且外参/时间差没标出来 = 2 |
+| `python -m airdrop.run calibrate` | `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` | 上面那份标定目录（`--flight`） | `camera_calib.json`；终端打印每步残差/相关系数 | 0；`--strict` 且外参/时间差没标出来 = 2 |
 | `python -m airdrop.run fit-ballistics` | `tools/fit_ballistics.py` | 投放试验的飞行目录 + `--impacts`（实测落点） | `ballistics_fit.json` + 终端对照表 + 可粘回的 `BallisticsConfig(...)` | 0 可信 / 2 不可信 / 3 缺测量 / 1 出错（§5.4） |
 | `python -m airdrop.run basic` | `examples/basic_usage.py` | 飞控（只看遥测部分则不必） | 订阅推送、按时间戳查询与指令演示 | 0；15s 收不到遥测 = 1 |
 | `python -m airdrop.run hm30-video` | `examples/hm30_video.py` | HM30 图传 | 链路统计；`--preview` 开窗、`--save-path` 存 mp4 | 0 |
 | `python -m airdrop.run video-sync` | `examples/video_telemetry_sync.py` | HM30 图传 + 飞控 | 对齐 + 逐帧入缓冲 + 读者线程演示 | 0；首帧超时/一帧没收到 = 1 |
 | `python -m airdrop.run fetch-models` | `tools/fetch_models.py` | 本地素材目录（`--source-dir`；**只复制、不联网**） | 权重复制进 `models/` | 0 |
-| `python -m airdrop.run make-world` | `tools/make_world.py` | — | `sim/worlds/cuadc/` 里的两个 CUADC 赛区世界 + 网格/材质（`--out-dir` 会把贴图一起复制过去）；布局与 SITL 启动见 [`simulation_world.md`](simulation_world.md) | 0 成功 / 1 参数非法或缺资产 |
-| `python -m airdrop.run make-backdrops` | `tools/make_backdrops.py` | —（离线；要 Pillow） | `sim/worlds/cuadc/materials/textures/` 里的目标区地面纹理 `ground_*.png` + 程序化航拍底图 `aerial_*.png`；`--parts ground` 只写前者（不覆盖抓来的真实航拍图） | 0 / 1 参数非法 |
-| `python -m airdrop.run fetch-aerial` | `tools/fetch_aerial.py` | **联网**（USGS NAIP 影像服务；公有领域） | 用真实航拍影像覆盖 `aerial_*.png`（比赛区域外那块干扰底图） | 0 / 1 联网或下载失败 |
-| `python -m airdrop.run preview-world` | `tools/preview_world.py` | —（要 Pillow；只读世界文件，不重新生成） | 俯视预览图 `sim/worlds/cuadc/preview.png`（带中文标注：天井编号/两位数、航拍块编号、图例；**标注只在这张 PNG 里**） | 0 / 1 世界文件读不了 |
+| `python -m airdrop.run make-world` | `vendor/airdrop-sim/airdrop_sim/make_world.py` | — | `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/` 里的两个 CUADC 赛区世界 + 网格/材质（`--out-dir` 会把贴图一起复制过去）；布局与 SITL 启动见 [`simulation_world.md`](simulation_world.md) | 0 成功 / 1 参数非法或缺资产 |
+| `python -m airdrop.run make-vehicle` | `vendor/airdrop-sim/airdrop_sim/make_vehicle.py` | — | 参数化相机机型、`camera_calib.json`、`simulation.manifest.json`；不修改 PX4 参考源码 | 0 成功 / 1 参数非法 |
+| `python -m airdrop.run make-backdrops` | `vendor/airdrop-sim/airdrop_sim/make_backdrops.py` | —（离线；要 Pillow） | `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/materials/textures/` 里的目标区地面纹理 `ground_*.png` + 程序化航拍底图 `aerial_*.png`；`--parts ground` 只写前者（不覆盖抓来的真实航拍图） | 0 / 1 参数非法 |
+| `python -m airdrop.run fetch-aerial` | `vendor/airdrop-sim/airdrop_sim/fetch_aerial.py` | **联网**（USGS NAIP 影像服务；公有领域） | 用真实航拍影像覆盖 `aerial_*.png`（比赛区域外那块干扰底图） | 0 / 1 联网或下载失败 |
+| `python -m airdrop.run preview-world` | `vendor/airdrop-sim/airdrop_sim/preview_world.py` | —（要 Pillow；只读世界文件，不重新生成） | 俯视预览图 `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/preview.png`（带中文标注：天井编号/两位数、航拍块编号、图例；**标注只在这张 PNG 里**） | 0 / 1 世界文件读不了 |
 | `python -m airdrop.run dump-api` | `tools/dump_api.py` | — | 把公开签名与默认值自省成 `docs/api_reference.md`（核对文档用） | 0 |
 | `python -m airdrop.run check-docs` | `tools/check_docs.py` | — | 核验 `docs/handbook.md` 与代码是否一致 | 0 一致 / 1 有缺口 |
 
@@ -2195,7 +2195,11 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | `--seed N` | make-world | 天井位置与朝向的随机种子（默认 0 = 入库布局） |
 | `--rounds {both,1,2}` | make-world | 生成哪几轮（第一轮图片靶标 / 第二轮数字靶标） |
 | `--wind E,N,U` | make-world | 世界的恒定风（东,北,天 m/s；默认静风） |
-| `--out-dir DIR` | make-world | 世界与资产写到哪个目录（默认 `sim/worlds/cuadc`） |
+| `--out-dir DIR` | make-world | 世界与资产写到哪个目录（默认 `simulation-output/worlds/cuadc`） |
+| `--origin-lat` / `--origin-lon` / `--origin-alt` | make-world / make-vehicle | WGS84 原点纬度、经度（度）与海拔（米）；写入世界及 manifest |
+| `--width` / `--height` / `--hfov` | make-vehicle | 相机尺寸（像素）与水平视场（弧度），同时用于 SDF 与相机内参 |
+| `--mount` / `--pitch` | make-vehicle | FRD 光心杆臂（米）与 SDF FLU 安装俯仰（弧度） |
+| `--manifest PATH` | sitl-recon | 使用本次世界原点、真值与相机参数；默认仍为 r2/seed 0 |
 | `--well-arrows` | make-world | 画"天井箭头"（规则文本有、规则图 2/4 没有；默认不画） |
 | `--sun AZ,EL` | make-world | 太阳位置（方位角,仰角 度；换阴影环境用，如 `90,12` = 东侧长阴影） |
 | `--sun-random` | make-world | 太阳由 seed + 轮次随机（方位全向、仰角 15–80°；换 seed 换光照） |
@@ -2204,9 +2208,9 @@ torch / cv2 / mavsdk / ultralytics / rapidocr / onnxruntime——重依赖只在
 | `--seed N` | make-backdrops | 底图随机种子（`ground_*` / 程序化 `aerial_*` 长什么样） |
 | `--parts {all,ground,aerial}` | make-backdrops | 只写哪一类底图（默认 all） |
 | `--tile-width-m M` | fetch-aerial | 每张真实航拍图覆盖的地面宽度（米，默认 160） |
-| `--world-dir DIR` | preview-world | 预览哪个世界目录（默认 `sim/worlds/cuadc`） |
+| `--world-dir DIR` | preview-world | 预览哪个世界目录（默认 `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc`） |
 | `--round {1,2}` | preview-world | 预览哪一轮（默认 2） |
-| `--out FILE` | preview-world | 输出 PNG 路径（默认 `sim/worlds/cuadc/preview.png`） |
+| `--out FILE` | preview-world | 输出 PNG 路径（默认 `simulation-output/worlds/cuadc/preview.png`，输入默认世界来自包内资产） |
 
 参数不合法（未知子命令、未知选项、取值越界）一律由 argparse 以 **2** 退出。
 
@@ -2280,14 +2284,16 @@ HOLD_PROCESS → OVERFLY（飞掠 + 投放）→ LAND → DONE
 * **把"关掉自检"当成"自检通过"**：`--no-preflight` 只是跳过（事件里 `ok=null`）。
 
 **SITL 用哪个世界**：`examples/sitl_mission.py` 的航线与合成目标已对准
-`sim/worlds/cuadc/cuadc_recon_strike_r2.sdf`（CUADC 赛区：跑道 + A/B 两个 60x60m 目标区
+`vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/cuadc_recon_strike_r2.sdf`（CUADC 赛区：跑道 + A/B 两个 60x60m 目标区
 分列起飞线两端、8 座天井在区内随机摆放，第二轮数字靶标；航线常量按 seed 0 手写，
-`tests/test_world.py` 会核验它对准 A 区中位数天井）。起 SITL 前要把世界挂进 PX4 的 worlds 目录并把
-`sim/worlds/cuadc` 加进 `GZ_SIM_RESOURCE_PATH`——两条命令的完整步骤、几何与规则出处见
-[`simulation_world.md`](simulation_world.md)；一键版本是 `bash sim/run_sitl.sh r2`
+`vendor/airdrop-sim/tests/test_world.py` 会核验它对准 A 区中位数天井）。启动脚本在 PX4 树外准备独立运行目录并设置世界/资源路径；不修改 PX4 源码。已有构建、运行目录与环境前提见
+[`simulation_world.md`](simulation_world.md)；一键版本是 `bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2`
 （机型默认 `gz_rc_cessna_down_cam`：带 1280x720 下视相机，感知取图用的那个）。
 **视频流是 PX4 官方机制**：`gz_bridge/server.config` 自动加载 `GstCameraSystem`，把世界里的
 第一台相机编码成 RTP/H.264 推到 UDP 5600，QGC 设 “UDP h.264 / 5600” 就能看（详见世界文档 §5.1）。
+
+标定工具自有输入类型、相机文件和仿真 manifest 的字段、单位及独立调用方式见
+[`tool_contracts.md`](tool_contracts.md)。仿真配置和数学工具不导入主任务包；SITL 集成协调器保留在主仓。
 
 ### 6.4 改配置的三种方式
 
@@ -2332,7 +2338,10 @@ config = Config(
 | `tests/test_capture_entry.py` | 标定采集入口正常/中断/视频未就绪/零帧的返回码、摘要、文件与资源清理 | 否 |
 | `tests/test_perception_realdata.py` | 真 YOLO + 真 OCR 的外部素材回归（素材不随仓库提供） | ✅ GPU + 素材绝对路径 |
 | `tests/test_georef.py` | 相机模型加载/回退、像素→NED、边长法交叉验证（**沙箱里挂 `tmp_path`**） | 否 |
-| `tests/test_calibrate.py` | 标定三步合成链路（含整个 `calibrate()` 的输出契约） | 否 |
+| `vendor/airdrop-calibration/tests/test_calibrate.py` | 标定三步合成链路（含整个 `calibrate()` 的输出契约） | 否 |
+| `tests/test_calibration_contract.py` | 标定自有 DTO、飞行 JSONL、坏帧配对、独立导入与相机文件兼容 | 否 |
+| `vendor/airdrop-sim/tests/test_simulation_contract.py` | 配置与 SDF/相机文件/manifest 的一致性、默认机型和路径独立性 | 否 |
+| `tests/test_sim_integration.py` | manifest → 主仓场景/报告/几何链路、CLI 及非法场景提前拒绝 | 否 |
 | `tests/test_targeting.py` | DBSCAN 语义（eps 闭区间、样本权重是绝对权重）、众数、median/max | 否 |
 | `tests/test_ballistics.py` | 无阻力/有阻力对照解析解、终端速度、风平移、判据触发/越过目标后的强制投放/锁存 | 否 |
 | `tests/test_mission.py` | 状态机、航线规划、主循环（假控制器 + 假时钟，分钟级任务毫秒级跑完）；起飞前自检（真 `Preflight` 的四项检查/装配错误/视频帧数/分辨率核对）与等起飞 | 否 |
@@ -2343,12 +2352,12 @@ config = Config(
 | `tests/test_sitl_recon.py` | **SITL 侦查精度（可选，标 `sitl`；默认被 `-m "not realdata and not sitl"` 排除，显式 `-m sitl` 才跑）**：驱动 `tools/sitl_recon.py` 跑完整标准流程，断言状态机 `DONE`、三个编号全识别、任务选中 56、误差与留一验证都 < 2 m；探活用**裸 UDP 听 14540 心跳**（不建 MAVSDK 会话），没在跑就 skip | 否（要 WSL 里已起 PX4 SITL） |
 | `tests/test_cli.py` | 集中式入口：子命令注册表（parser + handler）、`--help`/`check-docs` **不加载重库**（干净子进程实测）、参数不合法退出码 2、选项覆盖真的进了 `build_config()` | 否 |
 | `tests/test_handbook.py` | **本手册 §3 的 11 段示例逐条真跑**（文档里的代码必须能运行） | 否 |
-| `tests/test_world.py` | CUADC 赛区世界：**生成结果 == 入库文件**、目标区在起飞线两端（±200, 0）、天井区内随机摆放且间距 > 20m、五边形环壁（厚 5mm、高 400mm）、**规则里只是示意的东西不许出现**（4m/6m 打击圈、天井箭头）、同区天井同色、贴地标线不共面重叠（防 z-fighting）、两轮靶标摆位（第二轮中位数落在第 3 座）、演练航线对准中位数天井、目标区底色（常见路面色 + 少量纹理）、周边航拍底图（不压跑道/目标区、互不重叠）、底图生成器（可复现/离线校验）、俯视预览图（尺寸/可复现/参数校验）、资产逐级存在、数字板必须是**白底黑字** | 否 |
-| `tests/test_sim_scripts.py` | `sim/install_px4.sh` 的生命周期：**在 WSL 里跑**（软链语义只能在 ext4 上验，Windows 的 Git Bash 里 `ln -s` 会退化成复制）、`bash -n` 语法、装→幂等重装→PX4 升级后重装→卸载的 20 条行为断言（软链真建出来且没有嵌套、CMakeLists 真还原、**备份不停在第一次**且旧备份另存 `.stale`、卸载不回滚 PX4 自己的条目、遇实体副本不自动删也**不中途 abort**、世界文件缺失要报错且不留名字里带 `*` 的垃圾软链、提示语不断言代码没做的事、仓库侧缺资产时不删实体副本）。**没有 WSL 就整组跳过**（`skipif`，不是 marker，不影响默认 `-m` 过滤） | 否 |
+| `vendor/airdrop-sim/tests/test_world.py` | CUADC 赛区世界：**生成结果 == 入库文件**、目标区在起飞线两端（±200, 0）、天井区内随机摆放且间距 > 20m、五边形环壁（厚 5mm、高 400mm）、**规则里只是示意的东西不许出现**（4m/6m 打击圈、天井箭头）、同区天井同色、贴地标线不共面重叠（防 z-fighting）、两轮靶标摆位（第二轮中位数落在第 3 座）、演练航线对准中位数天井、目标区底色（常见路面色 + 少量纹理）、周边航拍底图（不压跑道/目标区、互不重叠）、底图生成器（可复现/离线校验）、俯视预览图（尺寸/可复现/参数校验）、资产逐级存在、数字板必须是**白底黑字** | 否 |
+| `vendor/airdrop-sim/tests/test_sim_scripts.py` | WSL/ext4 临时假构建：资产软链、幂等、启动参数/插件配置、卸载保留日志、拒绝覆盖实体或在 PX4 树内创建运行目录，比较假 PX4 树前后不变 | 否 |
 
 ### 6.6 一次真实任务的推荐顺序
 
-1. **标定**：`examples/calibration_capture.py` 录素材 → `tools/calibrate.py` 出 `camera_calib.json`
+1. **标定**：`examples/calibration_capture.py` 录素材 → `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 出 `camera_calib.json`
    → 把 `telemetry_lag` 回填 `VideoConfig`（标定用**收到帧的时刻**测量，输出就是可直接回填的
    绝对对齐量；一步同时解决相机外参与时间差）。
 2. **配置**：`RECON_ROUTE`/`BACKUP_POINT` + 降落段——**要么**用操作手在 QGC 里画好的
@@ -2523,7 +2532,7 @@ config = Config(
 | `cls12` 模式 | 无 12 类权重（`best2.pt` 单类）→ 编号恒为 1，代码路径可跑但无实际意义 |
 | 方向分类交叉验证（**诊断用，默认关**，不参与识别） | 旧样本出现过误报，不能据此保证其他素材上的判定可靠性 |
 | PX4 侧配置 | gripper 输出、起飞项航点动作、任务结束后是否 RTL 都不在本包范围内 |
-| 仿真世界 | `sim/worlds/cuadc/` 的两个赛区世界已按规则（2026 版第 19–25 页）搭好并做离屏渲染核对（几何/尺寸/贴图方向，见 [`simulation_world.md`](simulation_world.md)）；天井位置与朝向按规则随机（`--seed` 复现，入库 = seed 0）；**未验证**：把 Gazebo 相机接进感知闭环、真机与世界的差异 |
+| 仿真世界 | `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/` 的两个赛区世界已按规则（2026 版第 19–25 页）搭好并做离屏渲染核对（几何/尺寸/贴图方向，见 [`simulation_world.md`](simulation_world.md)）；天井位置与朝向按规则随机（`--seed` 复现，入库 = seed 0）；**未验证**：把 Gazebo 相机接进感知闭环、真机与世界的差异 |
 | 工程设施 | 无 CI（pytest/ruff/pyright 在本地运行）；覆盖率以当前测试报告为准；沙箱权限问题须与代码失败分别核实 |
 | 声明但尚未接入的参数 | 见 §4.18 的表（`save_crops`/`crop_dir`/`max_crops`/`lag_warn_frames`/相机 `undistort`/`flat`+经纬度/记录 `video`/`event_eval_hz`） |
 
@@ -2551,3 +2560,11 @@ config = Config(
 
 改动代码后：① 跑 `tools.check_docs`；② 参数变了同步 §4；③ 新增产物/字段同步 §5；
 ④ 行为约束变了同步 §7 与相关源码说明；⑤ 边界变了同步 §9.1 与 `README.md` 的"已知边界与风险"。
+
+
+
+## 独立工具与检查范围
+
+工具代码和资产仅保存在两个 Git 子模块，详见 [初始化与升级](tool_repositories.md)。主仓 `check-docs` 只核对主包 API、配置、记录文件和主 CLI（含兼容转发）；工具 API、算法、资产与 CLI 的契约由各子仓测试负责。跨仓文件契约保留在 `tests/test_calibration_contract.py`、`tests/test_sim_integration.py`，缺少工具时显式跳过。
+
+`tests/test_tool_repositories.py` 验证缺失子模块时的主仓导入/帮助及兼容转发；子模块 gitlink 与 `.gitmodules` 不参与发布工具的平面文件同步。

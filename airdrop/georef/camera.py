@@ -15,7 +15,7 @@
 * ``R_bc``：**相机系向量 → 机体系向量**的旋转，即 ``v_body = R_bc @ v_cam``；
 * ``t_bc``：相机光心在**机体系**中的位置（杆臂），默认零。
 
-``Config.camera.calib_file`` 指向 ``tools/calibrate.py`` 产出的 ``camera_calib.json``；
+``Config.camera.calib_file`` 指向 ``airdrop_calibration.calibrate`` 产出的 ``camera_calib.json``；
 文件不存在时用默认值并 warning（**不静默**），这样"忘了标定"会立刻在日志里看到。
 """
 
@@ -202,7 +202,7 @@ def load_camera_model(
 ) -> CameraModel:
     """读 ``camera_calib.json``；缺失/损坏时退化为默认模型并 warning。
 
-    文件格式（``tools/calibrate.py`` 产出）::
+    文件格式（``airdrop_calibration.calibrate`` 产出）::
 
         {
           "camera_matrix": [[fx,0,cx],[0,fy,cy],[0,0,1]],
@@ -218,7 +218,7 @@ def load_camera_model(
     if not file_path.is_file():
         LOGGER.warning(
             "标定文件不存在: %s —— 使用默认相机模型（外参=绕 z +90°，内参按 60° 视场角"
-            "粗估）。坐标解算结果不可信，正式任务前请先跑 tools/calibrate.py",
+            "粗估）。坐标解算结果不可信，正式任务前请先跑 airdrop_calibration.calibrate",
             file_path,
         )
         return default_camera_model(*fallback_size)

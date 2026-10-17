@@ -1,0 +1,7 @@
+[submodule "vendor/airdrop-sim"]
+	path = vendor/airdrop-sim
+	url = https://github.com/Yan-Yiyang/airdrop-sim.git
+
+[submodule "vendor/airdrop-calibration"]
+	path = vendor/airdrop-calibration
+	url = https://github.com/Yan-Yiyang/airdrop-calibration.git
