@@ -17,8 +17,10 @@ import shutil
 import time
 import uuid
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -27,6 +29,7 @@ import pytest
 from airdrop import (
     AlignmentBuffer,
     AlignmentWriter,
+    Config,
     FlightLog,
     FlightLogError,
     FrameIndexError,
@@ -39,6 +42,9 @@ from airdrop import (
     TelemetrySnapshot,
     load_broker_from_log,
 )
+from airdrop.config import QgcVideoConfig
+from airdrop.runtime import replay as replay_runtime
+from airdrop.runtime.components import PerceptionComponents
 
 # 手写素材的落点：工作区内，避免依赖系统临时目录的权限
 WORK_ROOT = Path(__file__).resolve().parents[1] / ".replay-test-tmp"
@@ -707,6 +713,111 @@ def test_replay_strict_raises_on_missing_frame(workdir: Path) -> None:
         assert "000002.jpg" in (source.stats.last_error or "")
     finally:
         source.stop()
+
+
+def test_replay_keyboard_interrupt_during_source_stop_still_cleans_display(
+    monkeypatch: pytest.MonkeyPatch,
+    workdir: Path,
+) -> None:
+    import airdrop
+    import airdrop.runtime.components as runtime_components
+    import airdrop.runtime.qgc as runtime_qgc
+
+    calls: list[str] = []
+
+    class Source:
+        running = True
+        stats = SimpleNamespace(
+            state="finished", frames=0, total=0, duration_s=0.0, last_error=None
+        )
+
+        def add_sink(self, sink: object) -> None:
+            del sink
+
+        def start(self) -> None:
+            return
+
+        def wait_ready(self, timeout: float) -> bool:
+            del timeout
+            return True
+
+        def wait_finished(self, timeout: float) -> bool:
+            del timeout
+            return True
+
+        def join(self, timeout: float) -> None:
+            del timeout
+
+        def stop(self) -> None:
+            calls.append("source.stop")
+            self.running = False
+            raise KeyboardInterrupt("stop interrupted")
+
+    class Worker:
+        stats = object()
+
+        def start(self) -> None:
+            return
+
+        def raise_if_failed(self) -> None:
+            return
+
+        def drain(self, timeout: float) -> bool:
+            del timeout
+            calls.append("worker.drain")
+            return True
+
+        def stop(self) -> None:
+            calls.append("worker.stop")
+
+    class Writer:
+        def __call__(self, frame: object) -> None:
+            del frame
+
+    class Targets:
+        def pump(self) -> int:
+            calls.append("targets.pump")
+            return 0
+
+    class Display:
+        running = False
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+        def start(self) -> None:
+            self.running = True
+
+        def stop(self) -> None:
+            calls.append("display.stop")
+            self.running = False
+
+    config = replace(Config(), qgc_video=replace(QgcVideoConfig(), enabled=True))
+    source = Source()
+    worker = Worker()
+    targets = Targets()
+    monkeypatch.setattr(replay_runtime, "build_config", lambda **_kwargs: config)
+    monkeypatch.setattr(replay_runtime, "resolve_flight_dir", lambda _path: workdir)
+    monkeypatch.setattr(
+        airdrop, "load_broker_from_log", lambda _path: (object(), SimpleNamespace(total=0))
+    )
+    monkeypatch.setattr(airdrop, "ReplayVideoSource", lambda *_args, **_kwargs: source)
+    monkeypatch.setattr(
+        runtime_components,
+        "build_perception_components",
+        lambda *_args, **_kwargs: cast(
+            PerceptionComponents,
+            SimpleNamespace(
+                writer=Writer(), camera=None, worker=worker, tracker=object(), targets=targets
+            ),
+        ),
+    )
+    monkeypatch.setattr(runtime_qgc, "QgcVideoRuntime", Display)
+
+    with pytest.raises(KeyboardInterrupt, match="stop interrupted"):
+        replay_runtime.main(flight_dir=workdir)
+
+    assert calls == ["source.stop", "worker.drain", "worker.stop", "targets.pump", "display.stop"]
 
 
 def test_replay_rejects_bad_params(workdir: Path) -> None:

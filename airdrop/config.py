@@ -19,6 +19,9 @@
 
 from __future__ import annotations
 
+import ipaddress
+import math
+import re
 from dataclasses import dataclass, field, replace
 
 from .video.source import HM30_DEFAULT_RTSP, VideoConfig
@@ -34,6 +37,7 @@ __all__ = [
     "MissionConfig",
     "OverflyConfig",
     "PerceptionConfig",
+    "QgcVideoConfig",
     "RecordConfig",
     "RoutesConfig",
     "TargetingConfig",
@@ -448,6 +452,87 @@ class RecordConfig:
     event_eval_hz: float = 5.0  # 释放评估摘要频率
 
 
+@dataclass(frozen=True, slots=True)
+class QgcVideoConfig:
+    """可选的 QGC 实时视频发布配置。"""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 5602
+    transport: str = "rtp"
+    fps: float = 12.0
+    bitrate_kbps: int = 2500
+    ffmpeg_executable: str | None = None
+    history_frames: int = 8
+    cloud_max: int = 2000
+    eta_window_s: float = 2.0
+    write_timeout_s: float = 3.0
+    shutdown_timeout_s: float = 5.0
+    restart_delay_s: float = 1.0
+    max_restarts: int = 3
+
+    def validated(self) -> QgcVideoConfig:  # noqa: PLR0912 - 各参数各自验证便于定位
+        """验证网络地址、RTP 端口对与编码参数。"""
+        if (
+            not isinstance(self.host, str)
+            or not self.host
+            or any(
+                char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:%[]"
+                for char in self.host
+            )
+        ):
+            raise ValueError("qgc_video.host 必须是主机名或 IP 地址")
+        if self.host.lower() != "localhost":
+            bracketed = self.host.startswith("[") and self.host.endswith("]")
+            if (self.host.startswith("[") or self.host.endswith("]")) and not bracketed:
+                raise ValueError("qgc_video.host 的 IPv6 方括号不匹配")
+            address = self.host[1:-1] if bracketed else self.host
+            address_part, separator, zone = address.partition("%")
+            if separator and not zone:
+                raise ValueError("qgc_video.host IPv6 区域标识不能为空")
+            try:
+                ipaddress.ip_address(address_part)
+            except ValueError:
+                if ":" in address or separator or bracketed:
+                    raise ValueError("qgc_video.host IP 地址格式无效") from None
+                hostname = self.host[:-1] if self.host.endswith(".") else self.host
+                labels = hostname.split(".")
+                if (
+                    len(hostname) > 253
+                    or all(label.isdecimal() for label in labels)
+                    or any(
+                        len(label) > 63
+                        or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label) is None
+                        for label in labels
+                    )
+                ):
+                    raise ValueError("qgc_video.host 主机名格式无效") from None
+        if self.transport not in {"rtp", "mpegts"}:
+            raise ValueError("qgc_video.transport 只支持 rtp 或 mpegts")
+        if not 1 <= self.port <= 65535:
+            raise ValueError("qgc_video.port 必须在 1 到 65535 之间")
+        if self.transport == "rtp" and self.port == 65535:
+            raise ValueError("RTP 视频端口必须留出后续 RTCP 端口")
+        if not math.isfinite(self.fps) or not 0 < self.fps <= 60:
+            raise ValueError("qgc_video.fps 必须在 (0, 60] 范围内")
+        if self.bitrate_kbps < 64 or self.bitrate_kbps > 100_000:
+            raise ValueError("qgc_video.bitrate_kbps 必须在 64 到 100000 之间")
+        for name, value, minimum in (
+            ("history_frames", self.history_frames, 1),
+            ("cloud_max", self.cloud_max, 1),
+            ("max_restarts", self.max_restarts, 0),
+        ):
+            if value < minimum:
+                raise ValueError(f"qgc_video.{name} 必须大于等于 {minimum}")
+        for name in ("eta_window_s", "write_timeout_s", "shutdown_timeout_s", "restart_delay_s"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"qgc_video.{name} 必须是正的有限秒数")
+        if self.ffmpeg_executable is not None and not self.ffmpeg_executable.strip():
+            raise ValueError("qgc_video.ffmpeg_executable 不能为空字符串")
+        return self
+
+
 # ---------------------------------------------------------------- 顶层装配
 @dataclass(frozen=True, slots=True)
 class Config:
@@ -468,6 +553,7 @@ class Config:
     mission: MissionConfig = field(default_factory=MissionConfig)
     preflight: PreflightConfig = field(default_factory=PreflightConfig)
     record: RecordConfig = field(default_factory=RecordConfig)
+    qgc_video: QgcVideoConfig = field(default_factory=QgcVideoConfig)
 
     def validated(self) -> Config:  # noqa: PLR0912 - 逐片段的取值域检查，串行铺开最直观
         """取值域检查：不合法就抛错，别等飞到一半才发现。"""
@@ -575,6 +661,7 @@ class Config:
                 f"preflight.video_min_frames 至少为 1：{self.preflight.video_min_frames}"
             )
         self.video.validated()
+        self.qgc_video.validated()
         return self
 
     def _validated_ballistics(self) -> None:

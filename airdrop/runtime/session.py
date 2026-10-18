@@ -98,6 +98,17 @@ class Recorder(Protocol):
     def stop(self, timeout: float = 5.0) -> None: ...
 
 
+class DisplayPublisher(Protocol):
+    """可独立降级的 QGC 视频发布器。"""
+
+    @property
+    def running(self) -> bool: ...
+
+    def start(self) -> object: ...
+
+    def stop(self, timeout: float | None = None) -> None: ...
+
+
 class Targets(Protocol):
     """目标结果消费接口。"""
 
@@ -121,6 +132,7 @@ class LiveComponents:
     worker: Drainable | None = None
     targets: Targets | None = None
     recorder: Recorder | None = None
+    display: DisplayPublisher | None = None
     runner: TaskRunner | None = None
     controller: object | None = None
     broker: TelemetryBroker | None = None
@@ -174,6 +186,20 @@ class LiveSession:
                     raise RuntimeError("视频采集启动后未收到视频帧")
                 if c.source.stats.frames < 1:
                     raise RuntimeError("视频采集未收到任何视频帧")
+        if c.display is not None:
+            display = c.display
+            try:
+                display.start()
+                if not display.running:
+                    raise RuntimeError("QGC 视频发布器启动后未运行")
+            except Exception:
+                LOGGER.exception("QGC 视频发布启动失败；继续任务并关闭显示")
+                try:
+                    display.stop()
+                except Exception:
+                    LOGGER.exception("QGC 视频发布器启动失败后的清理也失败")
+                else:
+                    c.display = None
         if c.on_start is not None:
             start_result = c.on_start()
             if start_result:
@@ -201,7 +227,7 @@ class LiveSession:
             raise RuntimeError(f"被动采集结束时视频源状态异常：{source.stats.state}")
         return 0
 
-    def _cleanup(self, status: int) -> int:
+    def _cleanup(self, status: int) -> int:  # noqa: PLR0912 - 每个异步资源都需独立释放
         """逐项收尾；任何错误都不跳过后续资源，尤其是 MAVSDK 线程。"""
         c = self.components
         errors: list[BaseException] = []
@@ -242,6 +268,8 @@ class LiveSession:
                 errors.append(exc)
                 LOGGER.exception("清理步骤失败：worker.stop")
         attempt("targets.pump", None if c.targets is None else c.targets.pump)
+        if c.display is not None:
+            attempt("display.stop", c.display.stop)
         if c.recorder is not None:
             try:
                 c.recorder.stop()

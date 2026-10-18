@@ -12,7 +12,12 @@ from airdrop import Config, Waypoint
 from airdrop.telemetry._operations import get_operation_gate
 
 from . import sitl_analysis, sitl_geometry, sitl_operations, sitl_report
-from .mission import build_live_components, prepare_config, run_configured
+from .mission import (
+    _apply_qgc_video_overrides,
+    build_live_components,
+    prepare_config,
+    run_configured,
+)
 from .options import RunOptions
 from .sitl_monitoring import PerformanceMonitor
 from .sitl_scene import load_recon_scene
@@ -44,6 +49,12 @@ def main(  # noqa: PLR0913, PLR0915
     auto_recon: bool | None = None,
     auto_land: bool = True,
     max_seconds: float | None = None,
+    qgc_video: bool | None = None,
+    qgc_host: str | None = None,
+    qgc_port: int | None = None,
+    qgc_transport: str | None = None,
+    qgc_fps: float | None = None,
+    qgc_bitrate_kbps: int | None = None,
     work_dir: str = WORK_DIR,
     lag_s: float | None = LAG_OVERRIDE_S,
     recon_timeout_s: float | None = None,
@@ -71,7 +82,9 @@ def main(  # noqa: PLR0913, PLR0915
         auto_recon=auto_recon,
         auto_land=auto_land,
         max_seconds=max_seconds,
+        qgc_video=qgc_video,
     ).validated()
+    generated_sdp = config is None and options.capture and rtsp_url is None
     write_generated_calib = config is None and calib_file is None and recognize
     scene = load_recon_scene(manifest_path)
     lag = (
@@ -175,7 +188,20 @@ def main(  # noqa: PLR0913, PLR0915
             ),
         ),
     ).validated()
-    config = prepare_config(options, config)
+    config = _apply_qgc_video_overrides(
+        config,
+        enabled=qgc_video,
+        host=qgc_host,
+        port=qgc_port,
+        transport=qgc_transport,
+        fps=qgc_fps,
+        bitrate_kbps=qgc_bitrate_kbps,
+    )
+    config = prepare_config(
+        options,
+        config,
+        qgc_input_rtp_port=STREAM_PORT if generated_sdp else None,
+    )
     sdp = sitl_geometry.write_stream_sdp(work / STREAM_SDP_NAME) if options.capture else None
     if write_generated_calib:
         sitl_geometry.write_sim_calib(calib, lag_s=lag, camera=scene.camera)

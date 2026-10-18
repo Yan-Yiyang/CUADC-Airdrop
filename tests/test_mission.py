@@ -2235,7 +2235,13 @@ def test_runner_aborts_when_the_mission_ends_without_a_release() -> None:
 def test_runner_aborts_when_gripper_release_is_refused() -> None:
     clock = FakeClock()
     controller = FakeController(release_ok=False)
-    runner = _runner(clock, controller, judge=FakeJudge([ReleaseDecision(True, "predict")]))
+    events: list[tuple[str, dict[str, Any]]] = []
+    runner = _runner(
+        clock,
+        controller,
+        judge=FakeJudge([ReleaseDecision(True, "predict")]),
+        events=events,
+    )
     _drive(runner, clock, ticks=2)  # 第 1 拍 INIT→RECON，第 2 拍让看门狗看到"任务在跑"
     controller.finish_mission()
     _drive_until(runner, clock, MissionState.OVERFLY)
@@ -2244,6 +2250,34 @@ def test_runner_aborts_when_gripper_release_is_refused() -> None:
     assert runner.state is MissionState.ABORT
     assert runner.history[-1].reason == "gripper_release_failed"
     assert runner.stats.releases == 0
+    assert _events_of(events, "drop_released") == []
+    assert _events_of(events, "drop_command_pending")
+    assert _events_of(events, "drop_command_failed")
+    assert _events_of(events, "drop_command_sent") == []
+
+
+def test_runner_marks_release_command_unknown_after_controller_exception() -> None:
+    clock = FakeClock()
+    controller = FakeController()
+    controller.fail_on.add("gripper_release")
+    events: list[tuple[str, dict[str, Any]]] = []
+    runner = _runner(
+        clock,
+        controller,
+        judge=FakeJudge([ReleaseDecision(True, "predict")]),
+        events=events,
+    )
+
+    _drive(runner, clock, ticks=2)
+    controller.finish_mission()
+    _drive_until(runner, clock, MissionState.OVERFLY)
+    _drive(runner, clock, ticks=2)
+
+    assert runner.state is MissionState.ABORT
+    assert _events_of(events, "drop_command_pending")
+    assert _events_of(events, "drop_command_unknown")
+    assert _events_of(events, "drop_command_sent") == []
+    assert _events_of(events, "drop_released") == []
 
 
 def test_runner_aborts_when_planning_fails() -> None:
@@ -2767,7 +2801,13 @@ def test_runner_reaches_done_with_a_dry_run_controller() -> None:
     clock = FakeClock()
     inner = FakeController()
     dry = DryRunController(inner)
-    runner = _runner(clock, dry, judge=FakeJudge([ReleaseDecision(True, "predict")]))
+    events: list[tuple[str, dict[str, Any]]] = []
+    runner = _runner(
+        clock,
+        dry,
+        judge=FakeJudge([ReleaseDecision(True, "predict")]),
+        events=events,
+    )
 
     _drive(runner, clock, ticks=2)
     inner.finish_mission()
@@ -2775,6 +2815,18 @@ def test_runner_reaches_done_with_a_dry_run_controller() -> None:
     _drive_until(runner, clock, MissionState.LAND)
     assert runner.state is MissionState.LAND
     assert dry.releases == 1
+    assert [
+        name
+        for name, _ in events
+        if name
+        in {
+            "drop_command_pending",
+            "drop_command_sent",
+            "drop_released",
+        }
+    ] == ["drop_command_pending", "drop_command_sent", "drop_released"]
+    released = _events_of(events, "drop_released")
+    assert len(released) == 1 and released[0]["simulated"] is True
 
     _drive(runner, clock, ticks=1)
     inner.finish_mission()

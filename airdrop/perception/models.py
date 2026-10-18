@@ -15,11 +15,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
+
+import numpy as np
 
 from ..telemetry.models import TelemetrySnapshot
 
-__all__ = ["Detection", "PixelBox"]
+__all__ = [
+    "Detection",
+    "DetectionSnapshot",
+    "PixelBox",
+    "PoseSnapshot",
+    "ProcessedFrame",
+    "readonly_image",
+    "snapshot_detection",
+    "snapshot_pose",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,3 +138,131 @@ class Detection:
             },
             **({"extra": dict(self.extra)} if self.extra else {}),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PoseSnapshot:
+    """显示线程使用的纯标量位姿；origin_lla 顺序为经度、纬度、海拔。"""
+
+    position_ned: tuple[float, float, float] | None
+    quaternion_wxyz: tuple[float, float, float, float] | None
+    euler_deg: tuple[float, float, float] | None
+    origin_lla: tuple[float, float, float] | None
+
+    @classmethod
+    def from_telemetry(cls, telemetry: TelemetrySnapshot) -> PoseSnapshot | None:
+        """从可变遥测对象提取纯标量位姿。"""
+        position = cast(
+            tuple[float, float, float] | None,
+            _finite_tuple(telemetry.north_m, telemetry.east_m, telemetry.down_m),
+        )
+        quaternion = cast(
+            tuple[float, float, float, float] | None,
+            _finite_tuple(
+                telemetry.quaternion_w,
+                telemetry.quaternion_x,
+                telemetry.quaternion_y,
+                telemetry.quaternion_z,
+            ),
+        )
+        euler = cast(
+            tuple[float, float, float] | None,
+            _finite_tuple(telemetry.roll_deg, telemetry.pitch_deg, telemetry.yaw_deg),
+        )
+        origin = cast(
+            tuple[float, float, float] | None,
+            _finite_tuple(
+                telemetry.origin_longitude_deg,
+                telemetry.origin_latitude_deg,
+                telemetry.origin_altitude_m,
+            ),
+        )
+        if all(value is None for value in (position, quaternion, euler, origin)):
+            return None
+        return cls(position, quaternion, euler, origin)
+
+
+@dataclass(frozen=True, slots=True)
+class DetectionSnapshot:
+    """检测的显示副本；不含可变遥测与 extra 字典。"""
+
+    frame_index: int
+    capture_timestamp: float
+    pixel: tuple[float, float]
+    box: tuple[float, float, float, float]
+    confidence: float
+    code: int | None
+    side_px: float
+    raw_text: str
+    ocr_confidence: float
+    mode: str
+    pose: PoseSnapshot | None = None
+    image_size: tuple[int, int] | None = None
+    undistorted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessedFrame:
+    """跨线程传递的单帧只读快照。图像由不可变 bytes 支撑，无法恢复写权限。"""
+
+    frame_index: int
+    received_timestamp: float
+    capture_timestamp: float
+    processed_timestamp: float
+    image: np.ndarray
+    image_size: tuple[int, int]
+    camera_matrix: tuple[tuple[float, float, float], ...] | None
+    undistorted: bool
+    pose: PoseSnapshot | None
+    detections: tuple[DetectionSnapshot, ...]
+
+
+def snapshot_detection(detection: Detection) -> DetectionSnapshot:
+    """把业务检测收窄为不含可变引用的显示数据。"""
+    box = detection.box
+    return DetectionSnapshot(
+        frame_index=detection.frame_index,
+        capture_timestamp=detection.capture_timestamp,
+        pixel=(float(detection.pixel[0]), float(detection.pixel[1])),
+        box=(float(box.x1), float(box.y1), float(box.x2), float(box.y2)),
+        confidence=float(detection.confidence),
+        code=detection.code,
+        side_px=float(detection.side_px),
+        raw_text=str(detection.raw_text),
+        ocr_confidence=float(detection.ocr_confidence),
+        mode=str(detection.mode),
+        pose=PoseSnapshot.from_telemetry(detection.telemetry),
+        image_size=_image_size(detection.extra.get("image_size")),
+        undistorted=bool(detection.extra.get("undistorted", False)),
+    )
+
+
+def snapshot_pose(telemetry: TelemetrySnapshot | None) -> PoseSnapshot | None:
+    """提取只读位姿；空遥测或完全无几何字段时返回 None。"""
+    return None if telemetry is None else PoseSnapshot.from_telemetry(telemetry)
+
+
+def readonly_image(image: np.ndarray) -> np.ndarray:
+    """复制图像到不可变 bytes 底层，调用方不能重新打开其写权限。"""
+    array = np.asarray(image)
+    return np.frombuffer(array.tobytes(), dtype=array.dtype).reshape(array.shape)
+
+
+def _finite_tuple(*values: float | None) -> tuple[float, ...] | None:
+    if any(value is None for value in values):
+        return None
+    result = tuple(float(value) for value in values if value is not None)
+    if len(result) != len(values) or not all(np.isfinite(value) for value in result):
+        return None
+    return result
+
+
+def _image_size(value: object) -> tuple[int, int] | None:
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    width, height = value
+    if not isinstance(width, (int, float)) or not isinstance(height, (int, float)):
+        return None
+    if not np.isfinite(width) or not np.isfinite(height) or width <= 0 or height <= 0:
+        return None
+    return int(width), int(height)

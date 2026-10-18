@@ -21,6 +21,7 @@ class RunOptions:
     auto_recon: bool | None = None
     auto_land: bool = True
     max_seconds: float | None = None
+    qgc_video: bool | None = None
 
     def validated(self) -> RunOptions:
         """检查互斥与模式约束，确保失败发生在任何资源创建之前。"""
@@ -28,6 +29,8 @@ class RunOptions:
             raise ValueError("运行模式只能是 real 或 sitl")
         if self.recognize and not self.capture:
             raise ValueError("开启识别必须同时开启视频采集")
+        if self.qgc_video and not self.capture:
+            raise ValueError("开启 QGC 视频发布必须同时开启视频采集")
         if self.real_release and (
             self.mode != "real" or not self.run_mission or not self.drop_stage
         ):

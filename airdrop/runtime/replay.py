@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -110,7 +112,7 @@ def resolve_flight_dir(flight_dir: Path = FLIGHT_DIR) -> Path:
     return candidates[-1]
 
 
-def main(
+def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命周期
     *,
     flight_dir: Path = FLIGHT_DIR,
     speed: float = SPEED,
@@ -120,6 +122,12 @@ def main(
     strict: bool = STRICT,
     drain_timeout_s: float = DRAIN_TIMEOUT_S,
     side_check_tolerance: float | None = SIDE_CHECK_TOLERANCE,
+    qgc_video: bool | None = None,
+    qgc_host: str | None = None,
+    qgc_port: int | None = None,
+    qgc_transport: str | None = None,
+    qgc_fps: float | None = None,
+    qgc_bitrate_kbps: int | None = None,
     **config_overrides,
 ) -> int:
     """回放一次；``config_overrides`` 原样交给 :func:`build_config`。"""
@@ -141,6 +149,17 @@ def main(
         datefmt="%H:%M:%S",
     )
     config = build_config(**config_overrides)
+    from .mission import _apply_qgc_video_overrides
+
+    config = _apply_qgc_video_overrides(
+        config,
+        enabled=qgc_video,
+        host=qgc_host,
+        port=qgc_port,
+        transport=qgc_transport,
+        fps=qgc_fps,
+        bitrate_kbps=qgc_bitrate_kbps,
+    )
     resolved = resolve_flight_dir(Path(flight_dir))
 
     # 1) 遥测回填：专用 broker + 按帧推进的 pacer（帧拍摄时刻必然落在历史区间内）
@@ -183,12 +202,39 @@ def main(
         perception.tracker,
         perception.targets,
     )
+    display = None
+    display_error = False
+    if config.qgc_video.enabled:
+        from .qgc import QgcVideoRuntime
+
+        display = QgcVideoRuntime(
+            config,
+            source,
+            broker,
+            perception.camera,
+            worker,
+            replay_mode=True,
+        )
 
     drained = False
     ready = False
     source_failed = False
     try:
         worker.start()
+        if display is not None:
+            try:
+                display.start()
+                if not display.running:
+                    raise RuntimeError("QGC 视频发布器启动后未运行")
+            except Exception:
+                LOGGER.exception("QGC 视频发布启动失败；继续回放并关闭显示")
+                try:
+                    display.stop()
+                except Exception:
+                    display_error = True
+                    LOGGER.exception("QGC 视频发布器启动失败后的清理也失败")
+                else:
+                    display = None
         source.add_sink(writer)
         source.start()
         ready = source.wait_ready(timeout=30.0)
@@ -205,13 +251,50 @@ def main(
         LOGGER.error("回放终止：%s", exc)
         source_failed = True
     finally:
+        active_exception = sys.exception()
+        interruptions: list[BaseException] = []
         stats = source.stats  # stop() 会改写状态，保留播放终态用于摘要和返回码。
-        try:
-            source.stop()
-            if not source.running:
+
+        def cleanup(
+            label: str,
+            callback: Callable[[], object],
+            *,
+            display_step: bool = False,
+        ) -> None:
+            nonlocal source_failed, display_error
+            try:
+                callback()
+            except BaseException as exc:
+                LOGGER.exception("回放清理步骤失败：%s", label)
+                if isinstance(exc, Exception):
+                    if display_step:
+                        display_error = True
+                    else:
+                        source_failed = True
+                else:
+                    interruptions.append(exc)
+
+        cleanup("source.stop", source.stop)
+        if not source.running:
+
+            def drain_worker() -> None:
+                nonlocal drained
                 drained = worker.drain(timeout=drain_timeout_s)
-        finally:
-            worker.stop()
+
+            cleanup("worker.drain", drain_worker)
+        else:
+            source_failed = True
+            LOGGER.error("回放源未确认停止，无法排空感知工作器")
+        cleanup("worker.stop", worker.stop)
+        cleanup("targets.pump", targets.pump)
+        if display is not None:
+            cleanup("display.stop", display.stop, display_step=True)
+        if active_exception is not None:
+            raise active_exception
+        if interruptions:
+            if len(interruptions) == 1:
+                raise interruptions[0]
+            raise BaseExceptionGroup("回放收尾期间发生多个中断", interruptions)
 
     return _report_replay(
         config,
@@ -224,10 +307,11 @@ def main(
         tracker=tracker,
         targets=targets,
         plan_drop_mission=plan_drop_mission,
+        display_error=display_error,
     )
 
 
-def _report_replay(
+def _report_replay(  # noqa: PLR0913 - 汇总所需数据来自彼此独立的回放组件
     config,
     *,
     broker,
@@ -239,6 +323,7 @@ def _report_replay(
     tracker,
     targets,
     plan_drop_mission,
+    display_error=False,
 ) -> int:
     """汇总回放完整性、识别结果，并按需生成离线航线。"""
     from airdrop import LLARef, PlanningError, build_drop_mission, ned_to_wgs84
@@ -259,7 +344,13 @@ def _report_replay(
     LOGGER.info(
         "目标点 %d 个（本次抽干 %d 条），统计：%s", len(tracker.points), added, tracker.stats
     )
-    if not ready or stats.state != "finished" or not drained or worker.stats.frames != written:
+    if (
+        display_error
+        or not ready
+        or stats.state != "finished"
+        or not drained
+        or worker.stats.frames != written
+    ):
         LOGGER.error(
             "回放未完整完成：播放=%s 排空=%s 处理=%d/%d，错误=%s",
             stats.state,

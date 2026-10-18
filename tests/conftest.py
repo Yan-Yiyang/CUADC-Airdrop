@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -56,8 +57,6 @@ from airdrop import TelemetryBroker
 from airdrop.video.source import Hm30VideoSource, VideoConfig, _find_ffmpeg
 
 # 本地测试流的参数（多个模块共用）
-STREAM_PORT = 51234
-STREAM_URL = f"udp://127.0.0.1:{STREAM_PORT}"
 SRC_W, SRC_H, SRC_FPS = 640, 360, 30
 FIRST_FRAME_TIMEOUT = 12.0
 BIND_GRACE = 0.8  # 先让接收端 bind 住 UDP 端口，再起发送端
@@ -69,8 +68,9 @@ class StreamSender:
     用例自己决定何时起、何时停——断流重连那几组要的就是"中途把流掐掉"。
     """
 
-    def __init__(self, executable: str) -> None:
+    def __init__(self, executable: str, url: str) -> None:
         self._executable = executable
+        self._url = url
         self._processes: list[subprocess.Popen] = []
 
     def start(self) -> subprocess.Popen:
@@ -97,7 +97,7 @@ class StreamSender:
                 "yuv420p",
                 "-f",
                 "mpegts",
-                STREAM_URL,
+                self._url,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -127,9 +127,18 @@ def ffmpeg_exe() -> str:
 
 
 @pytest.fixture
-def sender(ffmpeg_exe: str) -> Iterator[StreamSender]:
+def stream_url() -> str:
+    '运行接口与行为以当前实现及测试为准。'
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"udp://127.0.0.1:{port}"
+
+
+@pytest.fixture
+def sender(ffmpeg_exe: str, stream_url: str) -> Iterator[StreamSender]:
     """本地测试流发送端，用例结束后自动清理全部子进程。"""
-    helper = StreamSender(ffmpeg_exe)
+    helper = StreamSender(ffmpeg_exe, stream_url)
     yield helper
     helper.stop_all()
 
@@ -149,9 +158,9 @@ def received(broker: TelemetryBroker) -> list:
 
 
 @pytest.fixture
-def stream_config() -> VideoConfig:
+def stream_config(stream_url: str) -> VideoConfig:
     """本地测试流的默认拉流配置（640x360，输出尺寸与源一致）。"""
-    return VideoConfig(url=STREAM_URL, width=SRC_W, height=SRC_H)
+    return VideoConfig(url=stream_url, width=SRC_W, height=SRC_H)
 
 
 @pytest.fixture

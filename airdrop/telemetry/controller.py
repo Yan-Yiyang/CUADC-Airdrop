@@ -502,6 +502,11 @@ class DryRunController:
         self._on_event = on_event
         self.releases = 0
 
+    @property
+    def simulated(self) -> bool:
+        """标记本控制器只演练投放、不驱动投放机构。"""
+        return True
+
     # ---- 全部委托给真控制器 ------------------------------------------
     def upload_mission(self, items: Sequence[MissionItem], /) -> int:
         return self._inner.upload_mission(items)

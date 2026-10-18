@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+from urllib.parse import urlsplit
 
 from airdrop import HM30_DEFAULT_RTSP, Config, Waypoint
 
@@ -98,7 +100,16 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
     )
     thread = MavsdkThread.from_config(config.telemetry, broker=broker)
     recorder = FlightRecorder(config) if options.record else None
-    on_event = (lambda kind, data: recorder.events.emit(kind, **data)) if recorder else None
+    display_runtime = None
+
+    def on_event(kind: str, data: dict[str, object]) -> None:
+        if recorder is not None:
+            try:
+                recorder.events.emit(kind, **data)
+            except Exception:
+                LOGGER.exception("飞行事件写入失败：%s", kind)
+        if display_runtime is not None:
+            display_runtime.on_event(kind, data)
 
     def append_drop(item: DropRecord) -> None:
         if recorder is not None:
@@ -124,6 +135,20 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         perception.targets,
     )
     source = Hm30VideoSource(config.video) if options.capture else None
+    if config.qgc_video.enabled:
+        if source is None:
+            raise ValueError("QGC 视频发布需要开启视频采集")
+        from .qgc import QgcVideoRuntime
+
+        display_runtime = QgcVideoRuntime(
+            config,
+            source,
+            broker,
+            camera,
+            worker,
+            on_event=on_event,
+            simulated_release=not options.real_release,
+        )
 
     runner = None
     if options.run_mission:
@@ -173,6 +198,7 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         worker=worker,
         targets=targets,
         recorder=recorder,
+        display=display_runtime,
         runner=runner,
         controller=None if runner is None else controller,
         broker=broker,
@@ -193,6 +219,12 @@ def main(  # noqa: PLR0913
     auto_recon: bool | None = None,
     auto_land: bool = True,
     max_seconds: float | None = None,
+    qgc_video: bool | None = None,
+    qgc_host: str | None = None,
+    qgc_port: int | None = None,
+    qgc_transport: str | None = None,
+    qgc_fps: float | None = None,
+    qgc_bitrate_kbps: int | None = None,
     config: Config | None = None,
     components_factory: Callable[[RunOptions, Config], LiveComponents] | None = None,
     manifest_path: Path | str | None = None,
@@ -212,6 +244,7 @@ def main(  # noqa: PLR0913
         auto_recon=auto_recon,
         auto_land=auto_land,
         max_seconds=max_seconds,
+        qgc_video=qgc_video,
     ).validated()
     config_overrides = {key: value for key, value in config_overrides.items() if value is not None}
     if mode == "sitl":
@@ -228,6 +261,12 @@ def main(  # noqa: PLR0913
             auto_recon=auto_recon,
             auto_land=auto_land,
             max_seconds=max_seconds,
+            qgc_video=qgc_video,
+            qgc_host=qgc_host,
+            qgc_port=qgc_port,
+            qgc_transport=qgc_transport,
+            qgc_fps=qgc_fps,
+            qgc_bitrate_kbps=qgc_bitrate_kbps,
             manifest_path=manifest_path,
             work_dir=WORK_DIR if work_dir is None else work_dir,
             lag_s=lag_s,
@@ -246,16 +285,62 @@ def main(  # noqa: PLR0913
     if config is not None and config_overrides:
         raise ValueError("传入 config 时不能再混用配置覆盖参数")
     config = config or build_config(**config_overrides)
+    config = _apply_qgc_video_overrides(
+        config,
+        enabled=qgc_video,
+        host=qgc_host,
+        port=qgc_port,
+        transport=qgc_transport,
+        fps=qgc_fps,
+        bitrate_kbps=qgc_bitrate_kbps,
+    )
     return run_configured(options, config, components_factory=components_factory)
 
 
-def prepare_config(options: RunOptions, config: Config) -> Config:
+def _apply_qgc_video_overrides(
+    config: Config,
+    *,
+    enabled: bool | None,
+    host: str | None,
+    port: int | None,
+    transport: str | None,
+    fps: float | None,
+    bitrate_kbps: int | None,
+) -> Config:
+    """只覆盖命令行明确给出的 QGC 参数，保留注入配置的其它字段。"""
+    updates = {
+        name: value
+        for name, value in {
+            "enabled": enabled,
+            "host": host,
+            "port": port,
+            "transport": transport,
+            "fps": fps,
+            "bitrate_kbps": bitrate_kbps,
+        }.items()
+        if value is not None
+    }
+    if not updates:
+        return config
+    return replace(config, qgc_video=replace(config.qgc_video, **updates)).validated()
+
+
+def prepare_config(
+    options: RunOptions,
+    config: Config,
+    *,
+    qgc_input_rtp_port: int | None = None,
+) -> Config:
     """在构造运行资源前归一化阶段配置并拒绝不完整的航线。"""
     from dataclasses import replace
 
     if not isinstance(options, RunOptions):
         raise TypeError("options 必须是 RunOptions")
     options.validated()
+    if options.qgc_video is True and not options.capture:
+        raise ValueError("开启 QGC 视频发布必须同时开启视频采集")
+    if options.qgc_video is not None:
+        config = replace(config, qgc_video=replace(config.qgc_video, enabled=options.qgc_video))
     if options.real_release and not config.gripper.enabled:
         raise ValueError("真实投弹已启用，但 Config.gripper.enabled=False")
     preflight = replace(
@@ -280,6 +365,9 @@ def prepare_config(options: RunOptions, config: Config) -> Config:
             recon_upload=options.recon_upload,
         ),
     ).validated()
+    if config.qgc_video.enabled and not options.capture:
+        raise ValueError("配置启用了 QGC 视频发布，但视频采集已关闭")
+    _validate_qgc_video_ports(options, config, known_input_rtp_port=qgc_input_rtp_port)
     if options.run_mission:
         if options.recon_upload == "auto" and not (
             config.routes.recon_route or config.routes.recon_plan
@@ -317,6 +405,49 @@ def prepare_config(options: RunOptions, config: Config) -> Config:
             if enabled and path and not Path(path).is_file():
                 raise ValueError(f"{label}文件不存在：{path}")
     return config
+
+
+def _validate_qgc_video_ports(
+    options: RunOptions, config: Config, *, known_input_rtp_port: int | None = None
+) -> None:
+    """在场景文件或输出目录创建前拒绝 QGC 与输入视频占用同一 UDP 端口。"""
+    qgc = config.qgc_video
+    if not qgc.enabled:
+        return
+    input_url = config.video.url
+    parsed_url = urlsplit(input_url)
+    if parsed_url.scheme.lower() in {"rtsp", "rtsps"}:
+        return
+    input_port: int | None = known_input_rtp_port
+    candidate = Path(input_url)
+    if input_port is not None:
+        pass
+    elif candidate.is_file() or candidate.suffix.lower() == ".sdp":
+        if candidate.is_file():
+            match = re.search(
+                r"(?im)^m=video\s+(\d+)\s+RTP/", candidate.read_text(encoding="utf-8")
+            )
+            if match:
+                input_port = int(match.group(1))
+        elif options.mode == "sitl":
+            input_port = 5600
+    elif parsed_url.scheme.lower() in {"udp", "rtp"}:
+        try:
+            input_port = parsed_url.port
+        except ValueError as exc:
+            raise ValueError(f"输入视频 URL 端口无效：{input_url}") from exc
+    elif options.mode == "sitl":
+        input_port = 5600
+    if input_port is None:
+        return
+    input_ports = {input_port, input_port + 1}
+    output_ports = {qgc.port}
+    if qgc.transport == "rtp":
+        output_ports.add(qgc.port + 1)
+    if input_ports & output_ports:
+        raise ValueError(
+            f"QGC 视频输出端口 {sorted(output_ports)} 与输入视频端口 {sorted(input_ports)} 重叠"
+        )
 
 
 def run_configured(

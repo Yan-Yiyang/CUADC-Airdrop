@@ -123,6 +123,18 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             ),
             Option(("--system-address",), "system_address", "MAVSDK 系统地址"),
             Option(("--rtsp-url",), "rtsp_url", "视频源地址"),
+            Option(("--qgc-video",), "qgc_video", "向 QGroundControl 发布实时视频", kind="bool"),
+            Option(("--qgc-host",), "qgc_host", "QGC 视频接收主机"),
+            Option(("--qgc-port",), "qgc_port", "QGC 视频接收端口", kind="int"),
+            Option(
+                ("--qgc-transport",),
+                "qgc_transport",
+                "QGC 视频传输格式",
+                kind="choice",
+                choices=("rtp", "mpegts"),
+            ),
+            Option(("--qgc-fps",), "qgc_fps", "QGC 视频帧率", kind="float"),
+            Option(("--qgc-bitrate-kbps",), "qgc_bitrate_kbps", "QGC 视频码率", kind="int"),
             Option(("--calib",), "calib_file", "相机标定 JSON 文件"),
             Option(
                 ("--recon-plan",),
@@ -199,6 +211,18 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 source="SELECTION_RULE",
             ),
             Option(("--calib",), "calib_file", "相机标定文件", source="CALIB_FILE"),
+            Option(("--qgc-video",), "qgc_video", "向 QGroundControl 发布回放视频", kind="bool"),
+            Option(("--qgc-host",), "qgc_host", "QGC 视频接收主机"),
+            Option(("--qgc-port",), "qgc_port", "QGC 视频接收端口", kind="int"),
+            Option(
+                ("--qgc-transport",),
+                "qgc_transport",
+                "QGC 视频传输格式",
+                kind="choice",
+                choices=("rtp", "mpegts"),
+            ),
+            Option(("--qgc-fps",), "qgc_fps", "QGC 视频帧率", kind="float"),
+            Option(("--qgc-bitrate-kbps",), "qgc_bitrate_kbps", "QGC 视频码率", kind="int"),
             Option(("--land-plan",), "land_plan", "离线规划使用的降落航线", source="LAND_PLAN"),
             Option(
                 ("--side-check",),
@@ -252,6 +276,27 @@ SUBCOMMANDS: dict[str, Subcommand] = {
     "dump-api": Subcommand(name="dump-api", module="tools.dump_api", help="导出 API 接口清单"),
     "check-docs": Subcommand(
         name="check-docs", module="tools.check_docs", help="核验手册与代码一致性"
+    ),
+    "qgc-video-test": Subcommand(
+        name="qgc-video-test",
+        module="tools.qgc_video_test",
+        help="合成 QGC 视频测试画面并发布，不连接飞控",
+        options=(
+            Option(("--host",), "host", "视频接收主机", source="HOST"),
+            Option(("--port",), "port", "视频接收端口", kind="int", source="PORT"),
+            Option(
+                ("--transport",),
+                "transport",
+                "视频传输格式",
+                kind="choice",
+                choices=("rtp", "mpegts"),
+                source="TRANSPORT",
+            ),
+            Option(("--fps",), "fps", "合成帧率", kind="float", source="FPS"),
+            Option(("--seconds",), "seconds", "测试时长", kind="float", source="SECONDS"),
+            Option(("--preview",), "preview_path", "保存合成画面预览", kind="path"),
+            Option(("--ffmpeg",), "ffmpeg_executable", "FFmpeg 可执行文件"),
+        ),
     ),
 }
 

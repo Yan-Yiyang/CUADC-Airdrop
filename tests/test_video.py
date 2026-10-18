@@ -1,4 +1,4 @@
-'HM30 图传拉流的集成测试。\n\n标记说明：``@pytest.mark.stream`` 需要 ffmpeg 与 UDP 端口 51234；\n``@pytest.mark.network`` 走网络错误路径（会等超时或连接被拒）。\n'
+'HM30 图传拉流的集成测试。'
 
 from __future__ import annotations
 

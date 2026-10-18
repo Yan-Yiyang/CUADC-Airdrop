@@ -33,7 +33,7 @@ __version__ = "3.0.0"
 # ----------------------------------------------------------------------
 # 惰性导出（PEP 562）：import airdrop 不再加载任何重依赖
 # ----------------------------------------------------------------------
-# 背景：下面 176 个公开名字分布在 9 个子包里。若在这里逐个 import 子包，"只想取一个
+# 背景：下面的公开名字分布在多个子包里。若在这里逐个 import 子包，"只想取一个
 # Waypoint"也会把 cv2 / mavsdk / torch 拉进进程——CLI 光是打一份 --help 就要等整套
 # GPU / 飞控栈加载完。所以改成按需解析：属性第一次被访问时才 import 提供它的叶子模块，
 # 随后把结果缓存进本模块的命名空间（之后走正常属性查找）。
@@ -63,6 +63,7 @@ _EXPORTS: dict[str, str] = {
                 "OverflyConfig",
                 "PerceptionConfig",
                 "PreflightConfig",
+                "QgcVideoConfig",
                 "RecordConfig",
                 "RoutesConfig",
                 "TargetingConfig",
@@ -211,9 +212,11 @@ _EXPORTS: dict[str, str] = {
             "georef.project",
             (
                 "GroundIntersection",
+                "ProjectedPoint",
                 "SideLengthCheck",
                 "cross_check_by_side",
                 "estimate_depth_by_side",
+                "ned_to_pixel",
                 "pixel_to_ned",
                 "pixel_to_ray_ned",
                 "quaternion_to_matrix",
@@ -445,6 +448,7 @@ __all__ = [
     "GripperConfig",
     "GroundConfig",
     "GroundIntersection",
+    "ProjectedPoint",
     "HM30_CAMERA_IP",
     "HM30_DEFAULT_RTSP",
     "HM30_GROUND_IP",
@@ -497,6 +501,7 @@ __all__ = [
     "Preflight",
     "PreflightCheck",
     "PreflightConfig",
+    "QgcVideoConfig",
     "PreflightError",
     "PreflightLike",
     "QgcPlan",
@@ -551,6 +556,7 @@ __all__ = [
     "open_hm30_video",
     "overfly_positions",
     "overfly_waypoints",
+    "ned_to_pixel",
     "pixel_to_ned",
     "pixel_to_ray_ned",
     "predict_record_impact",

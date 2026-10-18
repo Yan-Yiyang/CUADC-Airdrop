@@ -37,14 +37,20 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
 from ..video.buffer import AlignmentBuffer, BufferedFrame
 from .cropproc import OcrEngineConfig
 from .detector import Detector, DetectorConfig, FrameSizeMismatchError
-from .models import Detection
+from .models import (
+    Detection,
+    DetectionSnapshot,
+    ProcessedFrame,
+    snapshot_detection,
+    snapshot_pose,
+)
 from .ocr_worker import OcrResult, OcrWorkerPool
 
 LOGGER = logging.getLogger(__name__)
@@ -187,6 +193,9 @@ class PerceptionWorker:
         #: 送检中的 OCR 请求：request_id → 该帧的基础 Detection（结果回来时回填编号）
         self._pending: dict[int, Detection] = {}
         self._on_detection: Callable[[Detection], None] | None = None
+        self._observer_lock = threading.Lock()
+        self._frame_observers: set[Callable[[ProcessedFrame], None]] = set()
+        self._result_observers: set[Callable[[DetectionSnapshot], None]] = set()
 
     # ------------------------------------------------------------------
     # 状态
@@ -222,6 +231,26 @@ class PerceptionWorker:
     def set_result_callback(self, callback: Callable[[Detection], None] | None) -> None:
         """注册检测结果回调（在工作线程里被调用，必须快）。"""
         self._on_detection = callback
+
+    def add_frame_observer(self, callback: Callable[[ProcessedFrame], None]) -> None:
+        """添加整帧旁路观察者；每帧检测和 OCR 送检后调用，包括零检测帧。"""
+        with self._observer_lock:
+            self._frame_observers.add(callback)
+
+    def remove_frame_observer(self, callback: Callable[[ProcessedFrame], None]) -> None:
+        """移除整帧旁路观察者。"""
+        with self._observer_lock:
+            self._frame_observers.discard(callback)
+
+    def add_result_observer(self, callback: Callable[[DetectionSnapshot], None]) -> None:
+        """添加结果旁路观察者，不消费业务结果队列。"""
+        with self._observer_lock:
+            self._result_observers.add(callback)
+
+    def remove_result_observer(self, callback: Callable[[DetectionSnapshot], None]) -> None:
+        """移除结果旁路观察者。"""
+        with self._observer_lock:
+            self._result_observers.discard(callback)
 
     @property
     def processing(self) -> bool:
@@ -471,6 +500,7 @@ class PerceptionWorker:
 
         if self._config.mode == "cls12":
             # 编号已由类别给出，直接产出
+            self._notify_frame_observers(frame, batch.image, batch.undistorted, batch.detections)
             for detection in batch.detections:
                 self._emit(detection)
             return
@@ -488,6 +518,60 @@ class PerceptionWorker:
             if self._dedupe_enabled():
                 self._remember(detection)
             self._submit(detection, crop)
+        self._notify_frame_observers(frame, batch.image, batch.undistorted, batch.detections)
+
+    def _make_frame_snapshot(
+        self,
+        frame: BufferedFrame,
+        image: np.ndarray,
+        undistorted: bool,
+        detections: tuple[Detection, ...],
+    ) -> ProcessedFrame:
+        """复制图像和姿态标量，构造与业务对象无共享可变引用的帧快照。"""
+        snapshot = frame.snapshot
+        pose = snapshot_pose(snapshot)
+        configured_matrix = self._detector.config.camera_matrix
+        matrix = None
+        if configured_matrix is not None:
+            values = np.asarray(configured_matrix, dtype=np.float64).reshape(3, 3)
+            if np.isfinite(values).all():
+                matrix = cast(
+                    tuple[tuple[float, float, float], ...],
+                    tuple(tuple(float(value) for value in row) for row in values),
+                )
+        height, width = image.shape[:2]
+        immutable_image = np.frombuffer(image.tobytes(), dtype=image.dtype).reshape(image.shape)
+        immutable_image.flags.writeable = False
+        return ProcessedFrame(
+            frame_index=frame.index,
+            received_timestamp=float(frame.received_timestamp),
+            capture_timestamp=float(frame.capture_timestamp),
+            processed_timestamp=time.time(),
+            image=immutable_image,
+            image_size=(int(width), int(height)),
+            camera_matrix=matrix,
+            undistorted=bool(undistorted),
+            pose=pose,
+            detections=tuple(snapshot_detection(item) for item in detections),
+        )
+
+    def _notify_frame_observers(
+        self,
+        source_frame: BufferedFrame,
+        image: np.ndarray,
+        undistorted: bool,
+        detections: tuple[Detection, ...],
+    ) -> None:
+        with self._observer_lock:
+            observers = tuple(self._frame_observers)
+        if not observers:
+            return
+        frame = self._make_frame_snapshot(source_frame, image, undistorted, detections)
+        for observer in observers:
+            try:
+                observer(frame)
+            except Exception:
+                LOGGER.exception("处理帧观察者异常")
 
     # ------------------------------------------------------------------
     # 去重
@@ -665,3 +749,11 @@ class PerceptionWorker:
                 callback(detection)
             except Exception:
                 LOGGER.exception("检测结果回调异常")
+        with self._observer_lock:
+            observers = tuple(self._result_observers)
+        display_snapshot = snapshot_detection(detection)
+        for observer in observers:
+            try:
+                observer(display_snapshot)
+            except Exception:
+                LOGGER.exception("检测结果观察者异常")

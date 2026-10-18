@@ -27,6 +27,7 @@ __all__ = [
     "CropResult",
     "Detection",
     "DetectionBatch",
+    "DetectionSnapshot",
     "Detector",
     "DetectorConfig",
     "OCR_CHAR_MAP",
@@ -42,6 +43,8 @@ __all__ = [
     "PerceptionStats",
     "PerceptionWorker",
     "PixelBox",
+    "PoseSnapshot",
+    "ProcessedFrame",
     "correct_ocr_number",
     "ocr_worker_main",
 ]

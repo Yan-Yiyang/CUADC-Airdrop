@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import cv2
 import numpy as np
@@ -38,9 +38,12 @@ LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "GroundIntersection",
+    "ProjectedPoint",
     "SideLengthCheck",
     "cross_check_by_side",
     "estimate_depth_by_side",
+    "ned_to_pixel",
+    "ned_to_pixels",
     "normalize",
     "pixel_to_ned",
     "pixel_to_ray_ned",
@@ -65,6 +68,16 @@ class GroundIntersection(NamedTuple):
     distance_h_m: float = 0.0  # 飞机到交点的水平距离
     ray_ned: tuple[float, float, float] = (0.0, 0.0, 0.0)
     cam_origin_ned: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+class ProjectedPoint(NamedTuple):
+    """NED 点到图像的投影；越界点保留有限像素供边缘指示使用。"""
+
+    ned: tuple[float, float, float] | None
+    pixel: tuple[float, float] | None
+    valid: bool
+    in_bounds: bool
+    reason: str = ""
 
 
 class SideLengthCheck(NamedTuple):
@@ -226,6 +239,185 @@ def pixel_to_ned(
         ray_ned=ray_triple,
         cam_origin_ned=origin_triple,
     )
+
+
+def ned_to_pixel(
+    point_ned: tuple[float, float, float],
+    *,
+    camera: CameraModel,
+    position_ned: tuple[float, float, float],
+    image_size: tuple[int, int],
+    quaternion: tuple[float, float, float, float] | None = None,
+    euler_deg: tuple[float, float, float] | None = None,
+    distort: bool = True,
+    camera_matrix: np.ndarray | tuple[tuple[float, float, float], ...] | None = None,
+) -> ProjectedPoint:
+    """按 ``pixel_to_ned`` 的姿态和杆臂约定投影 NED 点。
+
+    ``distort=False`` 用于已经由检测器 remap 的帧；当前检测器保持 ``K'=K``。
+    原始畸变图使用 ``distort=True``。有效但在画面外的点仍返回像素坐标。
+    """
+    point = np.asarray(point_ned, dtype=np.float64).reshape(3)
+    body = np.asarray(position_ned, dtype=np.float64).reshape(3)
+    if not np.isfinite(point).all() or not np.isfinite(body).all():
+        return ProjectedPoint(None, None, False, False, "NED 坐标含非有限值")
+    try:
+        rotation_nb = _attitude_matrix(quaternion=quaternion, euler_deg=euler_deg)
+    except (ValueError, TypeError) as exc:
+        return ProjectedPoint(_as_ned(point), None, False, False, str(exc))
+    if not np.isfinite(rotation_nb).all():
+        return ProjectedPoint(_as_ned(point), None, False, False, "姿态无效")
+    cam_origin = body + rotation_nb @ camera.t_bc
+    point_cam = camera.r_bc.T @ rotation_nb.T @ (point - cam_origin)
+    if not np.isfinite(point_cam).all():
+        return ProjectedPoint(_as_ned(point), None, False, False, "相机坐标含非有限值")
+    if point_cam[2] <= 1e-9:
+        return ProjectedPoint(_as_ned(point), None, False, False, "目标位于相机后方")
+
+    matrix = (
+        camera.camera_matrix
+        if camera_matrix is None
+        else np.asarray(camera_matrix, dtype=np.float64).reshape(3, 3)
+    )
+    if not np.isfinite(matrix).all():
+        return ProjectedPoint(_as_ned(point), None, False, False, "相机内参无效")
+    distortion = camera.dist_coeffs if distort else np.zeros_like(camera.dist_coeffs)
+    projected, _ = cv2.projectPoints(
+        point_cam.reshape(1, 1, 3),
+        np.zeros(3, dtype=np.float64),
+        np.zeros(3, dtype=np.float64),
+        matrix,
+        distortion,
+    )
+    u, v = (float(item) for item in projected.reshape(2))
+    if not math.isfinite(u) or not math.isfinite(v):
+        return ProjectedPoint(_as_ned(point), None, False, False, "投影结果含非有限值")
+    width, height = image_size
+    in_bounds = 0.0 <= u < width and 0.0 <= v < height
+    return ProjectedPoint(
+        _as_ned(point),
+        (u, v),
+        True,
+        in_bounds,
+        "" if in_bounds else "目标投影在画面外",
+    )
+
+
+def ned_to_pixels(  # noqa: PLR0912
+    points_ned: tuple[tuple[float, float, float] | None, ...],
+    *,
+    camera: CameraModel,
+    position_ned: tuple[float, float, float],
+    image_size: tuple[int, int],
+    quaternion: tuple[float, float, float, float] | None = None,
+    euler_deg: tuple[float, float, float] | None = None,
+    distort: bool = True,
+    camera_matrix: np.ndarray | tuple[tuple[float, float, float], ...] | None = None,
+) -> tuple[ProjectedPoint, ...]:
+    """批量投影观测云，复用姿态变换并一次调用 OpenCV。"""
+    normalized: list[np.ndarray | None] = []
+    invalid: dict[int, ProjectedPoint] = {}
+    for index, point in enumerate(points_ned):
+        if point is None:
+            normalized.append(None)
+            invalid[index] = ProjectedPoint(None, None, False, False, "观测无有效坐标")
+            continue
+        try:
+            item = np.asarray(point, dtype=np.float64).reshape(3)
+        except ValueError, TypeError:
+            normalized.append(None)
+            invalid[index] = ProjectedPoint(None, None, False, False, "NED 坐标维度无效")
+            continue
+        if not np.isfinite(item).all():
+            normalized.append(None)
+            invalid[index] = ProjectedPoint(None, None, False, False, "NED 坐标含非有限值")
+            continue
+        normalized.append(item)
+
+    try:
+        body = np.asarray(position_ned, dtype=np.float64).reshape(3)
+        rotation_nb = _attitude_matrix(quaternion=quaternion, euler_deg=euler_deg)
+    except (ValueError, TypeError) as exc:
+        return _fallback_projection(normalized, invalid, str(exc))
+    if not np.isfinite(body).all() or not np.isfinite(rotation_nb).all():
+        return _fallback_projection(normalized, invalid, "位置或姿态无效")
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return _fallback_projection(normalized, invalid, "图像尺寸无效")
+    matrix = (
+        camera.camera_matrix
+        if camera_matrix is None
+        else np.asarray(camera_matrix, dtype=np.float64).reshape(3, 3)
+    )
+    if not np.isfinite(matrix).all():
+        return _fallback_projection(normalized, invalid, "相机内参无效")
+
+    cam_origin = body + rotation_nb @ camera.t_bc
+    camera_points: list[np.ndarray] = []
+    indices: list[int] = []
+    for index, point in enumerate(normalized):
+        if point is None:
+            continue
+        point_cam = (point - cam_origin) @ rotation_nb @ camera.r_bc
+        if not np.isfinite(point_cam).all():
+            invalid[index] = ProjectedPoint(
+                _as_ned(point), None, False, False, "相机坐标含非有限值"
+            )
+        elif point_cam[2] <= 1e-9:
+            invalid[index] = ProjectedPoint(_as_ned(point), None, False, False, "目标位于相机后方")
+        else:
+            indices.append(index)
+            camera_points.append(point_cam)
+
+    results = dict(invalid)
+    if camera_points:
+        distortion = camera.dist_coeffs if distort else np.zeros_like(camera.dist_coeffs)
+        projected, _ = cv2.projectPoints(
+            np.asarray(camera_points, dtype=np.float64).reshape(-1, 1, 3),
+            np.zeros(3, dtype=np.float64),
+            np.zeros(3, dtype=np.float64),
+            matrix,
+            distortion,
+        )
+        for index, pixel in zip(indices, projected.reshape(-1, 2), strict=True):
+            u, v = float(pixel[0]), float(pixel[1])
+            point = normalized[index]
+            assert point is not None
+            if not math.isfinite(u) or not math.isfinite(v):
+                results[index] = ProjectedPoint(
+                    _as_ned(point), None, False, False, "投影结果含非有限值"
+                )
+                continue
+            in_bounds = 0 <= u < width and 0 <= v < height
+            results[index] = ProjectedPoint(
+                _as_ned(point),
+                (u, v),
+                True,
+                in_bounds,
+                "" if in_bounds else "目标投影在画面外",
+            )
+    return tuple(results[i] for i in range(len(points_ned)))
+
+
+def _fallback_projection(
+    points: list[np.ndarray | None],
+    invalid: dict[int, ProjectedPoint],
+    reason: str,
+) -> tuple[ProjectedPoint, ...]:
+    """为尚未投影的有效点填写统一错误，并保留输入错误原因。"""
+    result: list[ProjectedPoint] = []
+    for index, point in enumerate(points):
+        if index in invalid:
+            result.append(invalid[index])
+        else:
+            assert point is not None
+            result.append(ProjectedPoint(_as_ned(point), None, False, False, reason))
+    return tuple(result)
+
+
+def _as_ned(point: np.ndarray) -> tuple[float, float, float]:
+    """将已校验的三维数组转为静态可见的三元组。"""
+    return cast(tuple[float, float, float], tuple(float(value) for value in point))
 
 
 def estimate_depth_by_side(

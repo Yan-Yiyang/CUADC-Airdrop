@@ -45,7 +45,10 @@ def test_registry_has_one_mission_and_offline_commands() -> None:
     assert run.SUBCOMMANDS["mission"].module == "airdrop.runtime.mission"
 
 
-@pytest.mark.parametrize("argv", [["--help"], ["mission", "--help"], ["replay", "--help"]])
+@pytest.mark.parametrize(
+    "argv",
+    [["--help"], ["mission", "--help"], ["replay", "--help"], ["qgc-video-test", "--help"]],
+)
 def test_help_does_not_load_heavy_libraries(argv: list[str]) -> None:
     code = (
         "import sys; from airdrop.run import main; "
@@ -81,13 +84,38 @@ def test_mission_options_parse_to_runtime_keywords() -> None:
     defaults = run.resolve_kwargs("mission", ["--mode", "sitl"])
     assert all(
         defaults[key] is None
-        for key in ("system_address", "rtsp_url", "calib_file", "recon_plan", "land_plan")
+        for key in (
+            "system_address",
+            "rtsp_url",
+            "calib_file",
+            "recon_plan",
+            "land_plan",
+            "qgc_video",
+            "qgc_host",
+            "qgc_port",
+            "qgc_transport",
+            "qgc_fps",
+            "qgc_bitrate_kbps",
+        )
     )
 
 
 def test_real_release_has_explicit_positive_and_negative_flags() -> None:
     assert run.resolve_kwargs("mission", ["--real-release"])["real_release"] is True
     assert run.resolve_kwargs("mission", ["--no-real-release"])["real_release"] is False
+
+
+def test_qgc_cli_options_resolve_to_config_overrides_and_tool_arguments() -> None:
+    mission = run.resolve_kwargs("mission", ["--mode", "real", "--qgc-video", "--qgc-port", "5614"])
+    assert mission["qgc_video"] is True
+    assert mission["qgc_port"] == 5614
+    tool = run.resolve_kwargs(
+        "qgc-video-test",
+        ["--port", "5616", "--preview", "preview.png", "--ffmpeg", "ffmpeg.exe"],
+    )
+    assert tool["port"] == 5616
+    assert tool["preview_path"] == Path("preview.png")
+    assert tool["ffmpeg_executable"] == "ffmpeg.exe"
 
 
 def test_real_cli_keywords_run_through_injected_factory() -> None:
@@ -107,6 +135,9 @@ def test_real_cli_keywords_run_through_injected_factory() -> None:
         assert config.video.url == "rtsp://example.test/stream"
         assert config.routes.recon_plan == "custom-recon.plan"
         assert config.routes.land_plan == "custom-land.plan"
+        assert config.qgc_video.enabled
+        assert config.qgc_video.host == "localhost"
+        assert config.qgc_video.port == 5612
         return LiveComponents(thread=Thread())
 
     kwargs = run.resolve_kwargs(
@@ -115,7 +146,6 @@ def test_real_cli_keywords_run_through_injected_factory() -> None:
             "--mode",
             "real",
             "--no-mission-control",
-            "--no-capture",
             "--no-recognize",
             "--no-record",
             "--max-seconds",
@@ -128,6 +158,11 @@ def test_real_cli_keywords_run_through_injected_factory() -> None:
             "custom-recon.plan",
             "--land-plan",
             "custom-land.plan",
+            "--qgc-video",
+            "--qgc-host",
+            "localhost",
+            "--qgc-port",
+            "5612",
         ],
     )
 
@@ -142,6 +177,7 @@ def test_real_cli_keywords_run_through_injected_factory() -> None:
         ["mission", "--mode", "unknown"],
         ["mission", "--max-seconds", "nan"],
         ["mission", "--backup-point", "31,121"],
+        ["mission", "--no-capture", "--no-recognize", "--qgc-video"],
         ["replay", "--speed", "fast"],
     ],
 )

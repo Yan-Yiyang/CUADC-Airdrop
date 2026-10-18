@@ -682,12 +682,36 @@ class MissionRunner:
         )
         payload["target_source"] = None if self._plan is None else self._plan.source
         self._emit("drop", payload)
+        self._emit(
+            "drop_command_pending",
+            {
+                "timestamp": float(self._clock()),
+                "count": self._stats.releases + 1,
+                "simulated": bool(getattr(self._controller, "simulated", False)),
+            },
+        )
         try:
             released = self._controller.gripper_release()
-        except ControllerError as exc:
+        except Exception as exc:  # noqa: BLE001 - RPC 异常可能发生在命令已到达之后
+            self._emit(
+                "drop_command_unknown",
+                {
+                    "timestamp": float(self._clock()),
+                    "count": self._stats.releases + 1,
+                    "simulated": bool(getattr(self._controller, "simulated", False)),
+                },
+            )
             self._fail("gripper_release", exc)
             return
         if not released:
+            self._emit(
+                "drop_command_failed",
+                {
+                    "timestamp": float(self._clock()),
+                    "count": self._stats.releases + 1,
+                    "simulated": bool(getattr(self._controller, "simulated", False)),
+                },
+            )
             self._fail(
                 "gripper_release",
                 ControllerError("投放指令没有发出（gripper 未启用或飞控拒绝）"),
@@ -695,11 +719,28 @@ class MissionRunner:
             return
         self._stats.releases += 1
         self._released = True
-        # 投放已经发生了，从这里往后任何失败都只记日志：记录写不进去不能改变
-        # 任务状态（真实世界里的弹已经出去了）。
+        sent_at = float(self._clock())
+        self._emit(
+            "drop_command_sent",
+            {
+                "timestamp": sent_at,
+                "count": self._stats.releases,
+                "simulated": bool(getattr(self._controller, "simulated", False)),
+            },
+        )
+        # 控制器已接受指令；软件没有挂架或载荷分离的物理反馈。
+        # 从这里往后记录失败只记日志，不撤销控制器的成功返回。
         self._record_drop(
             decision,
             snapshot if snapshot is not None else self._broker.get_snapshot(),
+        )
+        self._emit(
+            "drop_released",
+            {
+                "timestamp": sent_at,
+                "count": self._stats.releases,
+                "simulated": bool(getattr(self._controller, "simulated", False)),
+            },
         )
         if self._config.mission.auto_land:
             self._transition(MissionState.LAND, f"released_{decision.reason}", now)
