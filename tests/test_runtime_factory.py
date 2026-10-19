@@ -2,20 +2,32 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Literal, cast
 
+import numpy as np
 import pytest
 
 import airdrop
-from airdrop import Config, MissionItem, MissionRunner, MissionState, NedOrigin, Waypoint
+from airdrop import (
+    AlignedSample,
+    Config,
+    MissionItem,
+    MissionRunner,
+    MissionState,
+    NedOrigin,
+    TelemetrySnapshot,
+    Waypoint,
+)
 from airdrop.run import resolve_kwargs
 from airdrop.runtime.mission import build_live_components, main
 from airdrop.runtime.options import RunOptions
 from airdrop.telemetry.broker import TelemetryBroker
+from airdrop.video.source import VideoFrame
 
 
 class _FlightInput:
@@ -74,6 +86,136 @@ class _Controller:
     def gripper_release(self) -> bool:
         self.calls.append("real.release")
         return True
+
+
+def test_mission_capture_writer_waits_for_airborne_and_seals_on_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """即使关闭识别，任务采集也只从起飞判据之后进入共享缓冲。"""
+    aligned: list[int] = []
+    alignment_entered = threading.Event()
+    release_alignment = threading.Event()
+    controller_actions: list[str] = []
+
+    class TelemetryInput:
+        @classmethod
+        def from_config(cls, config, *, broker):
+            del config, broker
+            return object()
+
+    class Source:
+        def __init__(self, config) -> None:
+            del config
+            self.frame = VideoFrame(
+                index=7,
+                image=np.zeros((8, 8, 3), dtype=np.uint8),
+                timestamp=10.0,
+                lag=0.0,
+            )
+
+        def latest(self) -> VideoFrame:
+            return self.frame
+
+    class Aligner:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def align(self, frame: VideoFrame) -> AlignedSample:
+            aligned.append(frame.index)
+            alignment_entered.set()
+            if not release_alignment.wait(3.0):
+                raise AssertionError("未释放对齐屏障")
+            return AlignedSample(
+                frame=frame,
+                snapshot=TelemetrySnapshot(timestamp=frame.timestamp),
+                timestamp=frame.timestamp,
+                lag=frame.lag,
+                mode="interpolate",
+            )
+
+    class ControllerInput:
+        @classmethod
+        def from_config(cls, *args, **kwargs):
+            del args, kwargs
+            return _Controller(controller_actions)
+
+    monkeypatch.setattr(airdrop, "MavsdkThread", TelemetryInput)
+    monkeypatch.setattr(airdrop, "Hm30VideoSource", Source)
+    monkeypatch.setattr(airdrop, "FrameTelemetryAligner", Aligner)
+    monkeypatch.setattr(airdrop, "DroneController", ControllerInput)
+    options = RunOptions(
+        mode="real",
+        run_mission=True,
+        capture=True,
+        recognize=False,
+        record=False,
+        drop_stage=False,
+    )
+    components = build_live_components(options, Config())
+    assert components.writer is not None
+    assert components.runner is not None
+    assert isinstance(components.runner, MissionRunner)
+    assert isinstance(components.source, Source)
+    assert components.buffer is not None
+    writer = components.writer
+    runner = cast(MissionRunner, components.runner)
+    source = components.source
+    buffer = components.buffer
+
+    writer(source.latest())
+    assert aligned == []
+    assert len(buffer) == 0
+
+    runner._emit("airborne", {"source": "in_air"})
+    writer(source.latest())
+    assert aligned == []
+    next_frame = VideoFrame(
+        index=8,
+        image=source.latest().image,
+        timestamp=10.1,
+        lag=0.0,
+    )
+    writer_errors: list[BaseException] = []
+
+    def write_in_flight_frame() -> None:
+        try:
+            writer(next_frame)
+        except BaseException as exc:  # noqa: BLE001 - 把后台写帧异常交回主线程断言
+            writer_errors.append(exc)
+
+    writer_thread = threading.Thread(target=write_in_flight_frame)
+    writer_thread.start()
+    assert alignment_entered.wait(2.0)
+
+    stop_done = threading.Event()
+    stop_errors: list[BaseException] = []
+
+    def stop_runner() -> None:
+        try:
+            runner.stop("test_stop")
+        except BaseException as exc:  # noqa: BLE001 - 把停止线程异常交回主线程断言
+            stop_errors.append(exc)
+        finally:
+            stop_done.set()
+
+    stop_thread = threading.Thread(target=stop_runner)
+    stop_thread.start()
+    assert stop_done.wait(2.0), "runner.stop 被在途帧的对齐操作阻塞"
+    assert controller_actions == ["hold"]
+    assert len(buffer) == 0
+
+    release_alignment.set()
+    writer_thread.join(2.0)
+    stop_thread.join(2.0)
+    assert not writer_thread.is_alive() and not stop_thread.is_alive()
+    assert writer_errors == [] and stop_errors == []
+    assert aligned == [8]
+    assert buffer.indices() == (1, 1)
+
+    runner._emit("airborne", {"source": "late"})
+    release_alignment.set()
+    writer(VideoFrame(index=9, image=next_frame.image, timestamp=10.2, lag=0.0))
+    assert aligned == [8]
 
 
 @pytest.mark.parametrize(

@@ -66,7 +66,7 @@ import logging
 import operator
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 
 import cv2
@@ -623,14 +623,33 @@ class AlignmentWriter:
     :mod:`airdrop.video.align` 的"关于等待"）。
     """
 
-    def __init__(self, buffer: AlignmentBuffer, aligner: FrameTelemetryAligner) -> None:
+    def __init__(
+        self,
+        buffer: AlignmentBuffer,
+        aligner: FrameTelemetryAligner,
+        *,
+        defer_until_airborne: bool = False,
+    ) -> None:
         self._buffer = buffer
         self._aligner = aligner
         self._lock = threading.Lock()
         self._written = 0
         self._skipped = 0
+        self._accepting = not defer_until_airborne
+        self._defer_until_airborne = defer_until_airborne
+        self._source_cutoff: int | None = None
+        self._sealed = False
 
     def __call__(self, frame: VideoFrame) -> None:
+        with self._lock:
+            if (
+                self._sealed
+                or not self._accepting
+                or (self._source_cutoff is not None and frame.index <= self._source_cutoff)
+            ):
+                return
+
+        # 对齐和 JPEG 编码可能等待；不占门锁，终态回调可以立即 seal。
         sample = self._aligner.align(frame)
         if sample is None:
             with self._lock:
@@ -639,6 +658,22 @@ class AlignmentWriter:
         self._buffer.put(sample, materialize=False)
         with self._lock:
             self._written += 1
+
+    def begin_after(self, source_index: int | Callable[[], int | None] | None) -> bool:
+        """只放行 cutoff 之后的源帧；cutoff 回调在 writer 门锁内取快照。"""
+        with self._lock:
+            if self._sealed or self._accepting or not self._defer_until_airborne:
+                return False
+            index = source_index() if callable(source_index) else source_index
+            self._source_cutoff = 0 if index is None else int(index)
+            self._accepting = True
+            return True
+
+    def seal(self) -> None:
+        """终态后停止接纳新帧；在途帧继续完成，且 writer 不可再次开启。"""
+        with self._lock:
+            self._sealed = True
+            self._accepting = False
 
     @property
     def buffer(self) -> AlignmentBuffer:

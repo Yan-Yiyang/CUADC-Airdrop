@@ -38,6 +38,7 @@ def build_perception_components(
     recorder: FlightRecorder | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
     side_check_tolerance: float | None = None,
+    defer_until_airborne: bool = False,
 ) -> PerceptionComponents:
     """按需构造共享感知链路；关闭识别时完全不加载相机或模型。"""
     if recognize and not capture:
@@ -58,6 +59,7 @@ def build_perception_components(
             on_timeout=config.align.on_timeout,
             max_extrapolation=config.align.max_extrapolation,
         ),
+        defer_until_airborne=defer_until_airborne,
     )
     if not recognize:
         return PerceptionComponents(writer=writer)

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from airdrop.ballistics.drops import DropRecord
+    from airdrop.video.buffer import AlignmentWriter
 
     from .session import LiveComponents
 
@@ -101,8 +102,23 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
     thread = MavsdkThread.from_config(config.telemetry, broker=broker)
     recorder = FlightRecorder(config) if options.record else None
     display_runtime = None
+    runner: MissionRunner | None = None
+    source = Hm30VideoSource(config.video) if options.capture else None
+    writer: AlignmentWriter | None = None
+
+    def latest_source_index() -> int | None:
+        frame = None if source is None else source.latest()
+        return None if frame is None else frame.index
 
     def on_event(kind: str, data: dict[str, object]) -> None:
+        if writer is not None:
+            if kind in {"airborne", "airborne_skipped"}:
+                if runner is not None and (runner.stopped or runner.machine.is_terminal):
+                    writer.seal()
+                else:
+                    writer.begin_after(latest_source_index)
+            elif kind == "state" and str(data.get("to_state")) in {"ABORT", "DONE"}:
+                writer.seal()
         if recorder is not None:
             try:
                 recorder.events.emit(kind, **data)
@@ -127,6 +143,7 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         recognize=options.recognize,
         recorder=recorder,
         on_event=on_event,
+        defer_until_airborne=options.run_mission,
     )
     camera, writer, worker, targets = (
         perception.camera,
@@ -134,7 +151,6 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         perception.worker,
         perception.targets,
     )
-    source = Hm30VideoSource(config.video) if options.capture else None
     if config.qgc_video.enabled:
         if source is None:
             raise ValueError("QGC 视频发布需要开启视频采集")
@@ -149,8 +165,6 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
             on_event=on_event,
             simulated_release=not options.real_release,
         )
-
-    runner: MissionRunner | None = None
 
     def preflight_cancelled() -> bool:
         return runner is not None and (runner.stopped or runner.machine.is_terminal)

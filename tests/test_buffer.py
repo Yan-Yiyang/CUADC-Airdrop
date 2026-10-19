@@ -502,6 +502,129 @@ def test_alignment_writer() -> None:
     assert last.snapshot.timestamp == pytest.approx(expected)
 
 
+def test_deferred_alignment_writer_ignores_ground_frames_and_opens_after_cutoff() -> None:
+    """任务起飞前仍可更新预览源，但不对齐或缓存画面。"""
+
+    class Aligner:
+        calls = 0
+
+        def align(self, frame: VideoFrame) -> AlignedSample:
+            self.calls += 1
+            return make_sample(frame.timestamp - frame.lag)
+
+    aligner = Aligner()
+    buffer = AlignmentBuffer(capacity=10)
+    writer = AlignmentWriter(buffer, aligner, defer_until_airborne=True)
+    latest: VideoFrame | None = None
+
+    for index in range(1, 4):
+        latest = VideoFrame(index=index, image=make_frame(10.0).image, timestamp=10.0, lag=0.0)
+        writer(latest)
+
+    assert latest is not None and latest.index == 3
+    assert aligner.calls == 0
+    assert writer.stats() == (0, 0)
+    assert len(buffer) == 0
+
+    assert writer.begin_after(lambda: latest.index if latest is not None else None)
+    writer(latest)  # sink 延迟到达的地面帧仍必须跳过
+    next_frame = VideoFrame(index=4, image=latest.image, timestamp=10.1, lag=0.0)
+    writer(next_frame)
+
+    assert aligner.calls == 1
+    assert writer.stats() == (1, 0)
+    assert buffer.indices() == (1, 1)
+
+
+def test_deferred_writer_cutoff_snapshot_and_sink_race_are_serialized() -> None:
+    """放行快照期间发布的帧被纳入 cutoff，不会穿过门控。"""
+    buffer = AlignmentBuffer(capacity=10)
+
+    class Aligner:
+        def align(self, frame: VideoFrame) -> AlignedSample:
+            return make_sample(frame.timestamp)
+
+    writer = AlignmentWriter(buffer, Aligner(), defer_until_airborne=True)
+    snapshot_entered = threading.Event()
+    release_snapshot = threading.Event()
+    latest_index = [2]
+    errors: list[AssertionError] = []
+
+    def snapshot() -> int | None:
+        snapshot_entered.set()
+        if not release_snapshot.wait(2.0):
+            raise AssertionError("未释放 cutoff 快照屏障")
+        return latest_index[0]
+
+    def open_writer() -> None:
+        try:
+            writer.begin_after(snapshot)
+        except AssertionError as exc:
+            errors.append(exc)
+
+    opener = threading.Thread(target=open_writer)
+    opener.start()
+    assert snapshot_entered.wait(2.0)
+
+    latest_index[0] = 3
+    frame3 = VideoFrame(index=3, image=make_frame(10.0).image, timestamp=10.0, lag=0.0)
+    sink_done = threading.Event()
+
+    def delayed_sink() -> None:
+        writer(frame3)
+        sink_done.set()
+
+    sink = threading.Thread(target=delayed_sink)
+    sink.start()
+    release_snapshot.set()
+    opener.join(2.0)
+    sink.join(2.0)
+
+    assert not opener.is_alive() and not sink.is_alive()
+    assert sink_done.is_set()
+    assert errors == []
+    assert len(buffer) == 0  # 新快照 N=3，N 帧必须跳过
+    frame4 = VideoFrame(index=4, image=frame3.image, timestamp=10.1, lag=0.0)
+    writer(frame4)
+    assert buffer.indices() == (1, 1)
+
+
+def test_deferred_writer_repeat_open_is_idempotent_and_seal_is_terminal() -> None:
+    buffer = AlignmentBuffer(capacity=10)
+
+    class Aligner:
+        def align(self, frame: VideoFrame) -> AlignedSample:
+            return make_sample(frame.timestamp)
+
+    writer = AlignmentWriter(buffer, Aligner(), defer_until_airborne=True)
+    assert writer.begin_after(2)
+    assert not writer.begin_after(100)
+    writer(VideoFrame(index=3, image=make_frame(10.0).image, timestamp=10.0, lag=0.0))
+    assert buffer.indices() == (1, 1)
+
+    writer.seal()
+    writer.seal()
+    assert not writer.begin_after(0)
+    writer(VideoFrame(index=4, image=make_frame(10.1).image, timestamp=10.1, lag=0.0))
+    assert buffer.indices() == (1, 1)
+    assert writer.stats() == (1, 0)
+
+
+def test_deferred_writer_default_still_accepts_passive_capture() -> None:
+    """非任务采集默认保持原有逐帧入缓冲行为。"""
+
+    class Aligner:
+        def align(self, frame: VideoFrame) -> AlignedSample:
+            return make_sample(frame.timestamp)
+
+    buffer = AlignmentBuffer(capacity=10)
+    writer = AlignmentWriter(buffer, Aligner())
+    writer(VideoFrame(index=1, image=make_frame(10.0).image, timestamp=10.0, lag=0.0))
+
+    assert buffer.indices() == (1, 1)
+    assert writer.stats() == (1, 0)
+
+
 # ----------------------------------------------------------------------
 # 参数校验 / 换算 / 统计
 # ----------------------------------------------------------------------

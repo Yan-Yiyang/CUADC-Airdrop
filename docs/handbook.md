@@ -495,7 +495,7 @@ print(record.index, record.snapshot.north_m, writer.stats())  # 1 100.0 (1, 0)
 
 ```python
 AlignmentBuffer(capacity=5400, *, storage="jpeg", jpeg_quality=80, max_bytes=None)
-AlignmentWriter(buffer, aligner)      # 可调用对象：__call__(frame)
+AlignmentWriter(buffer, aligner, *, defer_until_airborne=False)  # 可调用对象：__call__(frame)
 ```
 
 | 方法 | 说明 |
@@ -508,12 +508,16 @@ AlignmentWriter(buffer, aligner)      # 可调用对象：__call__(frame)
 | `read_jpeg_bytes(index)` | 内部 API：取原始 jpeg 字节（`FlightRecorder` 零重编码写入磁盘用） |
 | `clear()` | 清空（不影响已发出的记录对象） |
 | `AlignmentWriter.stats()` | `(written, skipped)`：`skipped` 只因"该时刻取不到遥测"增加 |
+| `AlignmentWriter.begin_after(source_index)` | 开启延迟写入，只接收源帧序号大于 cutoff 的帧；可传回调在 writer 锁内读取 cutoff，首次调用后幂等 |
+| `AlignmentWriter.seal()` | 停止接纳新帧；已接纳在途帧仍完成对齐与入缓冲，且 writer 不可再次开启 |
 | `BufferStats` | `storage` / `capacity` / `max_bytes` / `frames` / `put` / `evicted` / `bytes` / `last_index` |
 
 默认 `storage="jpeg"`：720p 约 0.1–0.2 MB/帧，满载（`capacity_for(30, 180)` = 5400 帧）约
 0.6–1 GiB；`storage="raw"` 无损但 5400 帧约 13.9 GiB。满了从**最旧**一端驱逐。
 `capacity_for(fps=30.0, seconds=180.0)` 做换算；`raw_frame_bytes(width, height, channels=3)`
 算未压缩一帧的字节数。
+
+正式任务装配可延迟接收至起飞判定后；延迟期间视频源的 `latest()` 与统计仍可用于预览和预检，但帧不对齐、不入缓冲，也不会被感知或记录器消费。被动采集与回放默认立即接收。
 
 **易错点**：ffmpeg 后端的 `VideoFrame.image` 是**复用管道缓冲区的视图**——
 `AlignmentBuffer` 内部已拷贝，但你若自己跨帧保存必须 `.copy()`；`raw` 模式读到的 image 是
