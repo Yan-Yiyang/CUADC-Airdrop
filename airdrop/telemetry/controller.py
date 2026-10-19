@@ -56,6 +56,8 @@ __all__ = [
 
 #: MAVLink ``mission_type``：0 = 普通任务（fence / rally 本包不用）。
 MISSION_TYPE_MISSION = 0
+_GLOBAL_FRAME_EQUIVALENTS = frozenset({0, 5})
+_RELATIVE_ALT_FRAME_EQUIVALENTS = frozenset({3, 6})
 
 
 class ControllerError(RuntimeError):
@@ -87,17 +89,24 @@ def to_raw_item(item: MissionItem, index: int) -> RawMissionItem:
     ⚠ ``current`` 只能给第 0 项置 1：MAVSDK 会校验，全 0 直接报 ``CURRENT_INVALID``
     （实测），全 1 则含义错乱。⚠ ``autocontinue`` 在 protobuf 里是 **int**，
     传 bool 会被 MAVSDK 直接拒（``Expected an int, got a boolean``，实测）。
+    ``NAV_LAND`` 未指定的 param1–param3 发出时编码为 0，以匹配 PX4 存储语义；
+    param4 与其他命令的未指定参数仍保留 NaN。
     """
+    from ..mission.items import MAV_CMD_NAV_LAND
+
+    params = [float(item.param1), float(item.param2), float(item.param3), float(item.param4)]
+    if int(item.command) == MAV_CMD_NAV_LAND:
+        params[:3] = [0.0 if math.isnan(value) else value for value in params[:3]]
     return RawMissionItem(
         seq=int(index),
         frame=int(item.frame),
         command=int(item.command),
         current=1 if index == 0 else 0,
         autocontinue=1 if item.autocontinue else 0,
-        param1=float(item.param1),
-        param2=float(item.param2),
-        param3=float(item.param3),
-        param4=float(item.param4),
+        param1=params[0],
+        param2=params[1],
+        param3=params[2],
+        param4=params[3],
         x=int(round(float(item.lat) * 1e7)),
         y=int(round(float(item.lon) * 1e7)),
         z=float(item.alt_m),
@@ -244,7 +253,7 @@ class DroneController:
             return list(await drone.mission_raw.download_mission())
 
     def _verify_upload(self, specs: tuple[MissionItem, ...]) -> None:
-        """回读飞控上的任务，逐项比对有效MAVLink字段；不一致抛错误。"""
+        """按发送端 raw 编码回读比对；只接受 PX4 的同高度基准 INT 帧规范化。"""
         from ..mission.items import command_name  # 惰性导入：避免 telemetry ↔ mission 成环
 
         stored = self._run(self._download, "回读任务", mutating=False)
@@ -254,6 +263,7 @@ class DroneController:
             )
         problems: list[str] = []
         for index, (sent, got) in enumerate(zip(specs, stored, strict=True)):
+            expected = to_raw_item(sent, index)
             if int(got.seq) != index:
                 problems.append(f"第 {index} 项seq不符：发 {index}、回读 {got.seq}")
             if int(got.command) != int(sent.command):
@@ -262,32 +272,50 @@ class DroneController:
                     f"→ 飞控 {got.command}({command_name(got.command)})"
                 )
                 continue
-            if int(got.frame) != int(sent.frame):
-                problems.append(f"第 {index} 项frame不符：发 {sent.frame}、回读 {got.frame}")
-            if int(got.autocontinue) != (1 if sent.autocontinue else 0):
+            expected_frame = int(expected.frame)
+            actual_frame = int(got.frame)
+            frame_matches = actual_frame == expected_frame
+            if sent.is_positional:
+                frame_matches = (
+                    frame_matches
+                    or (
+                        expected_frame in _GLOBAL_FRAME_EQUIVALENTS
+                        and actual_frame in _GLOBAL_FRAME_EQUIVALENTS
+                    )
+                    or (
+                        expected_frame in _RELATIVE_ALT_FRAME_EQUIVALENTS
+                        and actual_frame in _RELATIVE_ALT_FRAME_EQUIVALENTS
+                    )
+                )
+            if not frame_matches:
+                problems.append(f"第 {index} 项frame不符：发 {expected_frame}、回读 {actual_frame}")
+            if int(got.autocontinue) != int(expected.autocontinue):
                 problems.append(
                     f"第 {index} 项autocontinue不符：发 {int(sent.autocontinue)}、"
                     f"回读 {got.autocontinue}"
                 )
-            if int(got.mission_type) != MISSION_TYPE_MISSION:
+            if int(got.mission_type) != int(expected.mission_type):
                 problems.append(
-                    f"第 {index} 项mission_type不符：发 {MISSION_TYPE_MISSION}、"
+                    f"第 {index} 项mission_type不符：发 {expected.mission_type}、"
                     f"回读 {got.mission_type}"
                 )
             for field_name in ("param1", "param2", "param3", "param4"):
-                expected = float(getattr(sent, field_name))
+                expected_value = float(getattr(expected, field_name))
                 actual = float(getattr(got, field_name))
-                if not _same_float(expected, actual):
+                if not _same_float(expected_value, actual):
                     problems.append(
-                        f"第 {index} 项{field_name}不符：发 {expected!r}、回读 {actual!r}"
+                        f"第 {index} 项{field_name}不符：发 {expected_value!r}、回读 {actual!r}"
                     )
             if not sent.is_positional:
                 continue
             lat, lon, alt = got.x / 1e7, got.y / 1e7, float(got.z)
             if (
-                abs(lat - float(sent.lat)) > 2e-7
-                or abs(lon - float(sent.lon)) > 2e-7
-                or abs(alt - float(sent.alt_m)) > 0.01
+                not math.isfinite(lat)
+                or not math.isfinite(lon)
+                or not math.isfinite(alt)
+                or abs(lat - expected.x / 1e7) > 2e-7
+                or abs(lon - expected.y / 1e7) > 2e-7
+                or abs(alt - float(expected.z)) > 0.01
             ):
                 problems.append(
                     f"第 {index} 项位置不符：发 ({sent.lat:.7f}, {sent.lon:.7f}, {sent.alt_m:.2f})、"

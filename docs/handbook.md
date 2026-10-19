@@ -370,7 +370,7 @@ DroneController(thread, *, gripper_instance=0, gripper_enabled=True,
 
 | 方法 | 返回 | 说明 |
 | --- | --- | --- |
-| `upload_mission(items, /)` | `int` | 上传任务（覆盖飞控上的旧任务），返回任务项数；**走 `mission_raw`** 并**回读校验**（数量、命令、坐标系、位置、继续标志及参数逐项比对，浮点量化容差与 NaN 对等处理；不一致抛错） |
+| `upload_mission(items, /)` | `int` | 上传任务（覆盖飞控上的旧任务），返回任务项数；**走 `mission_raw`** 并**回读校验**（数量、命令、坐标系、位置、继续标志及参数逐项比对，浮点量化容差与 NaN 对等处理；位置帧仅接受同高度基准的 INT 帧等价，`NAV_LAND` 未指定 param1–3 按 PX4 存储值 0 校验；不一致抛错） |
 | `start_mission()` | None | 启动任务：**先 `set_current_mission_item(0)` 复位再启动**（否则同 CRC 的旧任务可能停在 `HOLD`） |
 | `in_mission_mode()` | `bool` | 飞控**是否真的**在任务模式（读快照 `flight_mode`）；流未就绪 → 抛 `ControllerError` |
 | `mission_finished()` | `bool` | 是否飞完（读快照 `mission_current == mission_total`）；进度流未就绪 → 抛 `ControllerError` |
