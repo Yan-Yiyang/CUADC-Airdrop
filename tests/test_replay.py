@@ -1,22 +1,17 @@
 """回放（P4）离线测试：读飞行目录 → 按原时间轴重放帧与遥测。
 
-这个套件不起 ffmpeg、不连飞控、不用 tmp_path：素材由用例自己按
+这个套件不起 ffmpeg、不连飞控：素材由用例自己按
 ``FlightRecorder`` 写入磁盘的格式手写（帧索引 + jpeg + telemetry.jsonl），
-写到工作区下的临时目录里，测完删除。
-
-为什么不用 ``tmp_path``：部分受限执行环境里 pytest 的 basetemp 目录不可枚举
-（``PermissionError: [WinError 5]``），会让用例在 setup 阶段就挂掉；素材格式
-本来就是公开约定，手写更可控。
+写到 pytest 管理的用例级 ``tmp_path``。
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import shutil
+import threading
 import time
 import uuid
-from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,8 +41,9 @@ from airdrop.config import QgcVideoConfig
 from airdrop.runtime import replay as replay_runtime
 from airdrop.runtime.components import PerceptionComponents
 
-# 手写素材的落点：工作区内，避免依赖系统临时目录的权限
-WORK_ROOT = Path(__file__).resolve().parents[1] / ".replay-test-tmp"
+pytestmark = pytest.mark.integration
+
+# 手写素材的落点：pytest 管理的每用例临时目录
 
 
 # ----------------------------------------------------------------------
@@ -142,15 +138,9 @@ def _write_flight(
 
 
 @pytest.fixture
-def workdir() -> Iterator[Path]:
-    """工作区内的临时目录；用例结束整棵删掉。"""
-    WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    path = WORK_ROOT / uuid.uuid4().hex[:8]
-    path.mkdir()
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
+def workdir(tmp_path: Path) -> Path:
+    """为本用例提供独立素材目录。"""
+    return tmp_path
 
 
 def _play_to_completion(source: ReplayVideoSource, timeout: float = 20.0) -> None:
@@ -638,17 +628,32 @@ def test_replay_read_skips_like_live_source_but_sink_does_not(workdir: Path) -> 
     flight_dir, *_ = _write_flight(workdir, frames=5)
     source = ReplayVideoSource(flight_dir, speed=0.0)
     sunk: list[int] = []
-    source.add_sink(lambda f: sunk.append(f.index))
+    first_in_sink = threading.Event()
+    release_first = threading.Event()
+
+    def sink(frame) -> None:
+        sunk.append(frame.index)
+        if frame.index == 1:
+            first_in_sink.set()
+            assert release_first.wait(timeout=5.0)
+
+    source.add_sink(sink)
     source.start()
     try:
+        assert first_in_sink.wait(timeout=5.0)
         first = source.read(timeout=15.0)
         assert first is not None and first.index == 1
-        time.sleep(0.2)  # 慢消费：生产早已播完
+        release_first.set()
+        thread = source._thread
+        assert thread is not None
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "回放线程未送完尾帧"
         later = source.read(timeout=15.0)
         assert later is not None and later.index == 5
         # 中间 2/3/4 是"实时路径没看上"的帧，如实计数（sink 侧一帧不少）
         assert source.stats.dropped == 3
     finally:
+        release_first.set()
         source.stop()
     assert sunk == [1, 2, 3, 4, 5], "sink 路径丢了帧"
 
@@ -659,7 +664,6 @@ def test_replay_stop_is_idempotent_and_interrupts(workdir: Path) -> None:
     source = ReplayVideoSource(flight_dir, speed=1.0)
     source.start()
     assert source.wait_ready(timeout=10.0)
-    time.sleep(0.2)
     source.stop()
     source.stop()  # 幂等
     assert not source.running

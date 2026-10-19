@@ -1,8 +1,7 @@
-'pytest 公共装置（fixture）与本地测试流。\n\n常用命令::\n\n    ./.venv/Scripts/python.exe -m pytest                     # 全部\n    ./.venv/Scripts/python.exe -m pytest -m "not stream"     # 跳过要起 ffmpeg 的用例\n    ./.venv/Scripts/python.exe -m pytest -k alignment -v     # 只跑对齐相关\n    ./.venv/Scripts/python.exe -m pytest --no-cov            # 不统计覆盖率'
+'pytest 公共装置（fixture）与本地测试流。\n\n常用命令::\n\n    ./.venv/Scripts/python.exe -m pytest                     # fast（默认）\n    ./.venv/Scripts/python.exe -m pytest --test-tier offline\n    ./.venv/Scripts/python.exe -m pytest --test-tier platform\n    ./.venv/Scripts/python.exe -m pytest --test-tier all     # 所有层级\n    ./.venv/Scripts/python.exe -m pytest --test-tier all -m realdata\n    ./.venv/Scripts/python.exe -m pytest -k alignment -v     # 只跑对齐相关'
 
 from __future__ import annotations
 
-import shutil
 import socket
 import subprocess
 import sys
@@ -23,36 +22,6 @@ for repository in ("airdrop-sim", "airdrop-calibration"):
     if location.is_dir():
         sys.path.insert(0, str(location))
 
-TEST_TEMP_ROOTS = (
-    ".replay-test-tmp",
-    ".calibrate-test-tmp",
-    ".e2e-test-tmp",
-    ".fit-test-tmp",
-    ".handbook-test-tmp",
-    ".plan-test-tmp",
-    ".pytest-tmp",
-    ".world-test-tmp",
-)
-
-
-def _cleanup_test_temp_dirs() -> None:
-    """清理测试在工作区根目录创建的临时目录。"""
-    for name in TEST_TEMP_ROOTS:
-        shutil.rmtree(REPO_ROOT / name, ignore_errors=True)
-    for path in REPO_ROOT.glob("pytest-cache-files-*"):
-        shutil.rmtree(path, ignore_errors=True)
-
-
-@pytest.fixture(scope="session", autouse=True)
-def cleanup_test_temp_dirs() -> Iterator[None]:
-    """测试会话前后清理工作区内的临时目录。"""
-    _cleanup_test_temp_dirs()
-    try:
-        yield
-    finally:
-        _cleanup_test_temp_dirs()
-
-
 from airdrop import TelemetryBroker
 from airdrop.video.source import Hm30VideoSource, VideoConfig, _find_ffmpeg
 
@@ -60,6 +29,58 @@ from airdrop.video.source import Hm30VideoSource, VideoConfig, _find_ffmpeg
 SRC_W, SRC_H, SRC_FPS = 640, 360, 30
 FIRST_FRAME_TIMEOUT = 12.0
 BIND_GRACE = 0.8  # 先让接收端 bind 住 UDP 端口，再起发送端
+
+_FILE_INTEGRATION_FIXTURES = {
+    "tmp_path",
+    "tmp_path_factory",
+    "tmpdir",
+    "tmpdir_factory",
+    "workdir",
+    "core_checkout",
+}
+
+
+def pytest_itemcollected(item: pytest.Item) -> None:
+    """按实际 fixture 依赖自动把文件/目录测试放入 integration 层。"""
+    if isinstance(item, pytest.Function) and _FILE_INTEGRATION_FIXTURES.intersection(
+        item.fixturenames
+    ):
+        item.add_marker(pytest.mark.integration)
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """注册按运行环境分层的测试选择参数。"""
+    parser.addoption(
+        "--test-tier",
+        choices=("fast", "offline", "platform", "all"),
+        default="fast",
+        help="选择测试环境层级：fast、offline、platform 或 all",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """按显式 marker 筛选 tier，pytest 自带的 -m 仍作为额外筛选。"""
+    tier = config.getoption("--test-tier")
+    if not isinstance(tier, str):
+        raise pytest.UsageError("--test-tier 必须是 fast、offline、platform 或 all")
+    allowed = {
+        "fast": set(),
+        "offline": {"integration"},
+        "platform": {"stream", "network", "integration", "wsl"},
+        "all": {"stream", "network", "integration", "wsl", "realdata", "sitl"},
+    }[tier]
+    deselected: list[pytest.Item] = []
+    selected: list[pytest.Item] = []
+    for item in items:
+        restricted = {"stream", "network", "integration", "wsl", "realdata", "sitl"}
+        denied = {mark.name for mark in item.iter_markers() if mark.name in restricted} - allowed
+        if denied:
+            deselected.append(item)
+        else:
+            selected.append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
 
 
 class StreamSender:

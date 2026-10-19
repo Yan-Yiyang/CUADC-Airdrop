@@ -11,7 +11,7 @@
 
       bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2          # WSL 里起 PX4 SITL + Gazebo + 图传
 
-  断言（都取自 ``.sitl-recon-tmp/report.json``）：
+  断言（报告写入用例级临时目录的 ``report.json``）：
 
   * 状态机走到 ``DONE``——标准流程：起飞 → 侦查监视 → 空中出目标 → 飞掠投放 → 降落；
   * 三个编号 94/12/56 全部识别，任务结果按"中位数"选中 **56**；
@@ -32,11 +32,8 @@ import concurrent.futures
 import contextlib
 import json
 import math
-import shutil
 import socket
 import threading
-import uuid
-from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -48,9 +45,6 @@ pytest.importorskip("airdrop_sim", reason="SITL 集成需要仿真子模块")
 from airdrop import Config, TelemetryBroker, TelemetrySnapshot, load_broker_from_log
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REPORT = REPO_ROOT / ".sitl-recon-tmp" / "report.json"
-#: 合成飞行目录的落点（与 tests/test_replay.py 同一套约定：不用 tmp_path）
-WORK_ROOT = REPO_ROOT / ".replay-test-tmp"
 
 
 def _sitl_is_up(timeout: float = 8.0) -> bool:
@@ -80,17 +74,17 @@ def _sitl_is_up(timeout: float = 8.0) -> bool:
 
 @pytest.mark.sitl
 @pytest.mark.timeout(1800)  # 分钟级全流程：放宽到 30 min，但**不**像 timeout(0) 那样彻底关掉兜底
-def test_sitl_recon_accuracy() -> None:
+def test_sitl_recon_accuracy(tmp_path: Path) -> None:
     if not _sitl_is_up():
         pytest.skip("SITL 没在跑（先 bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2）")
 
     from airdrop.runtime import sitl
 
-    exit_code = sitl.main()
+    exit_code = sitl.main(work_dir=str(tmp_path))
     # 先断言退出码：否则退出码非 0 时下面读 report 会先抛 FileNotFoundError /
     # JSONDecodeError，把真正的失败原因盖掉
     assert exit_code in (0, 7), f"退出码 {exit_code}"
-    report = json.loads(REPORT.read_text(encoding="utf-8"))
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
 
     # ⚠ 键名是 "mission"（tools/sitl_recon.py 写的就是它）；曾经这里读的是
     # "runner_stats"——那个名字只是 _RunOutcome 的字段名，report.json 里根本没有，
@@ -311,19 +305,9 @@ def test_timed_out_parameter_write_finishes_before_recovery_write(
 # 报告阶段的原点解析（**纯离线**，默认跑）
 # ----------------------------------------------------------------------
 @pytest.fixture
-def workdir() -> Iterator[Path]:
-    """工作区内的临时目录；用例结束整棵删掉。
-
-    不用 ``tmp_path``：部分受限执行环境里 pytest 的 basetemp 目录建好后不可枚举、
-    不可删除（``PermissionError: [WinError 5]``）。
-    """
-    WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    path = WORK_ROOT / uuid.uuid4().hex[:8]
-    path.mkdir()
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
+def workdir(tmp_path: Path) -> Path:
+    """为本用例提供独立素材目录。"""
+    return tmp_path
 
 
 def _flight_with_origin(flight_dir: Path, *, count: int = 5) -> None:
@@ -563,11 +547,12 @@ def test_circular_mean_deg_does_not_flip_at_180() -> None:
     assert sitl_analysis._circular_mean_deg([350.0, 10.0]) == pytest.approx(0.0, abs=0.1)
 
 
-def test_reverse_diagnostic_on_a_recorded_flight() -> None:
+@pytest.mark.realdata
+def test_reverse_diagnostic_on_a_recorded_flight(tmp_path: Path) -> None:
     """真跑一遍：拿架次 20260930-151637 的记录验同轴校验真的会拦住那条误导输出。"""
     from airdrop.runtime import sitl_analysis, sitl_geometry
 
-    flight = Path("flights/20260930-151637")
+    flight = REPO_ROOT / "flights/20260930-151637"
     if not (flight / "telemetry.jsonl").is_file():
         pytest.skip(f"没有架次记录：{flight}")
     detail = sitl_analysis._load_detail(flight / "detections.jsonl")
@@ -581,7 +566,7 @@ def test_reverse_diagnostic_on_a_recorded_flight() -> None:
     result = sitl_analysis._reverse_diagnostic(
         detail,
         broker,
-        calib_file=".sitl-recon-tmp/camera_calib_sim.json",
+        calib_file=str(tmp_path / "camera_calib_sim.json"),
         code=min(code for code in codes if code is not None),
         lag_s=sitl_geometry.TELEMETRY_LAG_S,
     )

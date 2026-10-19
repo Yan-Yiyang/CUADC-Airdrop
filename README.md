@@ -224,10 +224,12 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
 ## 测试与代码规范
 
 ```bash
-./.venv/Scripts/python.exe -m pytest                 # 全部（默认已排除 realdata/sitl）
-./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"  # 再跳过要起 ffmpeg 的用例
-./.venv/Scripts/python.exe -m pytest -m realdata     # 真实素材用例（需要相应本地素材与 GPU）
-./.venv/Scripts/python.exe -m pytest -m sitl         # WSL 里已起 PX4 SITL + 图传（分钟级）
+./.venv/Scripts/python.exe -m pytest --test-tier fast       # 默认：不启动 ffmpeg/WSL/GPU/飞控
+./.venv/Scripts/python.exe -m pytest --test-tier offline    # 加入本地文件与跨仓集成
+./.venv/Scripts/python.exe -m pytest --test-tier platform   # 加入 ffmpeg/UDP 与 WSL
+./.venv/Scripts/python.exe -m pytest --test-tier all        # 加入 GPU 真实素材与 SITL
+./.venv/Scripts/python.exe -m pytest --test-tier all -m realdata  # -m 是 tier 上的额外筛选
+./.venv/Scripts/python.exe -m pytest --test-tier all --cov=airdrop --cov-branch --cov-report=term-missing:skip-covered
 ./.venv/Scripts/python.exe -m pytest -k mission -v   # 只跑某个主题
 
 ./.venv/Scripts/ruff.exe check .                     # 代码规范（配置在 pyproject.toml）
@@ -235,19 +237,6 @@ ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f
 ./.venv/Scripts/ruff.exe format .                    # 统一格式
 ./.venv/Scripts/pyright.exe                          # 类型检查（同上）
 ```
-
-- 套件**全部离线**：不需要飞控/图传；`stream` 标记的用例会起本地 ffmpeg 并占 UDP 51234。
-- 端到端在 `tests/test_e2e.py`：回放素材 → 感知 → 坐标 → 统计 → 航线，其中
-  `-m realdata` 那条用**真视频 + 真 YOLO + 真 OCR**（位姿是合成的，见用例 docstring）。
-- 投放反演在 `tests/test_fit.py`：用**已知真值**的弹道模型造出"实测落点"再反演，
-  并钉住三种必须拒绝的退化情形、测量文件的各种写法、以及工具的现场流程。
-- **`ruff check`、`ruff format --check`、`pyright` 三者都保持零告警**（都在 `dev` 依赖组里）。
-  ruff 选的是贴合本项目的规则集（中文注释里的全角标点走 `allowed-confusables` 精确放行，
-  不是把 `RUF001/002/003` 关掉）；pyright 用 `basic`，`airdrop/` 全绿。
-  全库已按 `[tool.ruff.format]` 格式化过一遍，改完代码跑一次 `ruff format .` 即可。
-- ⚠ 受限沙箱里 pytest 的 `tmp_path` 不可用（`PermissionError`），12 个 `test_recorder.py`
-  + 8 个 `test_georef.py` 会挂在 fixture 上——那是沙箱限制、不是代码问题
-  （`tests/test_fit.py` 因此自带工作区内的 `workdir` fixture）。
 
 ## 已知边界与风险（不应视为已完成）
 

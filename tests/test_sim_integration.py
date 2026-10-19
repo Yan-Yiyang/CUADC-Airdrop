@@ -26,6 +26,8 @@ from airdrop_sim.stream import write_stream_sdp
 from airdrop.runtime import sitl, sitl_analysis, sitl_geometry, sitl_report
 from airdrop.runtime.sitl_scene import load_recon_scene
 
+pytestmark = pytest.mark.integration
+
 
 def _custom_scene(tmp_path: Path):
     """从真实生成入口取得与缺省布局不同的场景，不拼造内部 DTO。"""

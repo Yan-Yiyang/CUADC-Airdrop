@@ -18,8 +18,6 @@ import csv
 import json
 import math
 import shutil
-import uuid
-from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 
@@ -50,8 +48,6 @@ from airdrop import (
 from airdrop.ballistics.drops import IMPACTS_JSONL_NAME, ImpactMeasurement
 from airdrop.ballistics.fit import FIT_PARAMETERS
 
-WORK_ROOT = Path(__file__).resolve().parents[1] / ".fit-test-tmp"
-
 #: NED 原点（合成用）：中纬度、海拔 500m
 ORIGIN = LLARef(lon_deg=8.0, lat_deg=47.0, alt_m=500.0)
 #: 合成"真值"：阻力系数 0.95（基准配置里是 0.6 的占位值）
@@ -63,15 +59,9 @@ WIND = (2.0, -1.5, 0.0)
 
 
 @pytest.fixture
-def workdir() -> Iterator[Path]:
-    """工作区内的临时目录；用例结束整棵删掉（不用 ``tmp_path``：见 AGENTS）。"""
-    WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    path = WORK_ROOT / uuid.uuid4().hex[:8]
-    path.mkdir()
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
+def workdir(tmp_path: Path) -> Path:
+    """为本用例提供独立素材目录。"""
+    return tmp_path
 
 
 # ----------------------------------------------------------------------

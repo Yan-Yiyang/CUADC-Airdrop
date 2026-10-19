@@ -49,6 +49,7 @@ def test_registry_has_one_mission_and_offline_commands() -> None:
     "argv",
     [["--help"], ["mission", "--help"], ["replay", "--help"], ["qgc-video-test", "--help"]],
 )
+@pytest.mark.integration
 def test_help_does_not_load_heavy_libraries(argv: list[str]) -> None:
     code = (
         "import sys; from airdrop.run import main; "
@@ -172,20 +173,26 @@ def test_real_cli_keywords_run_through_injected_factory() -> None:
 
 
 @pytest.mark.parametrize(
-    "argv",
+    ("argv", "message"),
     [
-        ["mission", "--mode", "unknown"],
-        ["mission", "--max-seconds", "nan"],
-        ["mission", "--backup-point", "31,121"],
-        ["mission", "--no-capture", "--no-recognize", "--qgc-video"],
-        ["replay", "--speed", "fast"],
+        (["mission", "--mode", "unknown"], "invalid choice"),
+        (["mission", "--max-seconds", "nan"], "必须是正的有限秒数"),
+        (["mission", "--backup-point", "31,121"], "要三个数"),
+        (["mission", "--no-capture", "--no-recognize", "--qgc-video"], "必须同时开启视频采集"),
+        (["replay", "--speed", "fast"], "invalid float value"),
     ],
 )
-def test_invalid_arguments_fail_at_cli_boundary(argv: list[str]) -> None:
-    result = _run(f"from airdrop.run import main; main({argv!r})")
-    assert result.returncode == 2, result.stdout + result.stderr
+def test_invalid_arguments_fail_at_cli_boundary(
+    argv: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        run.main(argv)
+    captured = capsys.readouterr()
+    assert exc.value.code == 2
+    assert message in captured.err
 
 
+@pytest.mark.integration
 def test_importing_real_runtime_does_not_import_sitl_or_heavy_libraries() -> None:
     result = _run(
         "import sys; import airdrop.runtime.mission as mission; "
@@ -198,6 +205,7 @@ def test_importing_real_runtime_does_not_import_sitl_or_heavy_libraries() -> Non
     assert "SITL False" in result.stdout
 
 
+@pytest.mark.integration
 def test_docs_check_subcommand_passes() -> None:
     result = _run("from airdrop.run import main; raise SystemExit(main(['check-docs']))")
     assert result.returncode == 0, result.stdout + result.stderr

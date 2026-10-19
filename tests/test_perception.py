@@ -1630,6 +1630,7 @@ def test_pipeline_start_is_idempotent() -> None:
         worker.stop()
 
 
+@pytest.mark.integration
 def test_pipeline_iter_results_ends_after_stop() -> None:
     buffer = _buffer_with(2)
     pool = _FakePool(numbers=[11, 22])
@@ -1639,9 +1640,20 @@ def test_pipeline_iter_results_ends_after_stop() -> None:
         detector=_FakeDetector(),
         pool=pool,
     )
+    drained = threading.Event()
+    completed: list[object] = []
+
+    def on_result(_detection) -> None:
+        completed.append(_detection)
+        if len(completed) == 2:
+            drained.set()
+
+    worker.set_result_callback(on_result)
     worker.start()
-    time.sleep(0.5)
-    worker.stop()
+    try:
+        assert drained.wait(timeout=2.0), "两条推理结果未完成"
+    finally:
+        worker.stop()
     codes = [d.code for d in worker.iter_results(timeout=0.2)]
     assert sorted(c for c in codes if c is not None) == [11, 22]
 
@@ -1849,6 +1861,7 @@ def test_ocr_child_reports_warmup_outcome(monkeypatch, outcome) -> None:
     assert results.empty()
 
 
+@pytest.mark.integration
 def test_ocr_spawn_reports_initialization_error() -> None:
     """真实 Windows spawn 验证错误可跨进程返回，不加载模型或 GPU。"""
     from airdrop.perception.ocr_worker import OcrWorkerPool

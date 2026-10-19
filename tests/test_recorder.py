@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -28,9 +29,12 @@ from airdrop import (
     EventLog,
     FlightRecorder,
     TelemetryBroker,
+    TelemetrySnapshot,
     VideoFrame,
 )
 from airdrop.config import RecordConfig
+
+pytestmark = pytest.mark.integration
 
 
 # ----------------------------------------------------------------------
@@ -612,8 +616,9 @@ def test_recorder_logger_handler_removed_after_stop(
 # ----------------------------------------------------------------------
 # 遥测节流（10Hz vs 30Hz 输入）
 # ----------------------------------------------------------------------
-def test_telemetry_throttle_reduces_high_rate_input(tmp_path: Path) -> None:
-    """10Hz 配置下，~200Hz 注入 1 秒应得 5~15 条（远小于 200）。"""
+@pytest.mark.integration
+def test_telemetry_throttle_respects_snapshot_timestamp_boundaries(tmp_path: Path) -> None:
+    """真实 broker 与 recorder 按快照时间戳处理阈值前、等于和之后的输入。"""
     broker = TelemetryBroker(history_maxlen=200, history_interval=0.0)
     buffer = AlignmentBuffer(capacity=2)
     record_cfg = RecordConfig(dir=str(tmp_path), telemetry_hz=10.0)
@@ -623,19 +628,32 @@ def test_telemetry_throttle_reduces_high_rate_input(tmp_path: Path) -> None:
     config = replace(Config().validated(), record=record_cfg)
 
     recorder = FlightRecorder(config, base_dir=tmp_path)
+    observations: queue.Queue[tuple[float | None, bool]] = queue.Queue()
+    wait_next = broker.wait_next_snapshot
+
+    def tracked_wait_next_snapshot(*, predicate=None, timeout=None):
+        def track(snapshot):
+            accepted = predicate(snapshot) if predicate is not None else True
+            observations.put((snapshot.timestamp, accepted))
+            return accepted
+
+        return wait_next(predicate=track, timeout=timeout)
+
+    broker.wait_next_snapshot = tracked_wait_next_snapshot
     recorder.start(broker=broker, buffer=buffer)
     try:
-        # ~200Hz 注入 1 秒
-        end = time.monotonic() + 1.0
-        while time.monotonic() < end:
-            _bump_broker(broker, time.time())
-        # 给 telemetry writer 一点时间追
-        time.sleep(0.3)
+        for timestamp in (1000.0, 1000.099, 1000.1, 1000.199, 1000.2, 1000.301):
+            broker.publish(TelemetrySnapshot(timestamp=timestamp, north_m=1, east_m=2, down_m=3))
+            while True:
+                observed, accepted = observations.get(timeout=1.0)
+                if observed == timestamp:
+                    assert accepted is (timestamp in {1000.0, 1000.1, 1000.2, 1000.301})
+                    break
     finally:
         recorder.stop()
 
     flight_dir = recorder.flight_dir
     assert flight_dir is not None
     lines = (flight_dir / "telemetry.jsonl").read_text(encoding="utf-8").strip().split("\n")
-    # 10Hz × 1.3s ≈ 13 行；留 5~25 的余量；绝对不能 == 200
-    assert 3 <= len(lines) <= 25, f"节流异常: {len(lines)} 行"
+    timestamps = [json.loads(line)["timestamp"] for line in lines]
+    assert timestamps == pytest.approx([1000.0, 1000.1, 1000.2, 1000.301])

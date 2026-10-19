@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
+
+pytestmark = pytest.mark.integration
 
 pytest.importorskip("airdrop_calibration", reason="跨仓契约需要标定子模块")
 
@@ -31,6 +34,7 @@ def test_handwritten_flightrecorder_files_and_camera_model_contract(
     from airdrop_calibration.report import build_calibration_report
 
     from airdrop.georef import load_camera_model
+    from airdrop.georef.project import pixel_to_ned
 
     flight = tmp_path / "flight"
     frames = flight / "frames"
@@ -90,7 +94,7 @@ def test_handwritten_flightrecorder_files_and_camera_model_contract(
         measurement=LagMeasurement(lag, None, 0.2, True),
         extrinsics=ExtrinsicsResult(
             r_bc=calibrate.rotation_z(90.0),
-            t_bc=np.zeros(3),
+            t_bc=np.array([1.0, 2.0, 0.5]),
             pairs=8,
             residual_rotation_deg=0.01,
         ),
@@ -99,6 +103,7 @@ def test_handwritten_flightrecorder_files_and_camera_model_contract(
         square_size=0.03,
         lag_search_s=0.5,
         lag_step_s=0.005,
+        measured_t_bc=(1.0, 2.0, 0.5),
         source="simulated_calibration",
     )
     assert calibrate.CalibrateConfig().source == "measured_calibration"
@@ -111,3 +116,26 @@ def test_handwritten_flightrecorder_files_and_camera_model_contract(
     camera = load_camera_model(calibration_path)
     assert camera.image_size == (32, 20)
     assert camera.telemetry_lag == pytest.approx(0.15)
+
+    pose = (1.0, 2.0, -10.0)
+    center = pixel_to_ned(
+        (16.0, 10.0),
+        camera=camera,
+        ground_z=0.0,
+        position_ned=pose,
+        euler_deg=(0.0, 0.0, 0.0),
+        undistort=False,
+    )
+    assert center.ok and center.ned == pytest.approx((2.0, 4.0, 0.0), abs=1e-9)
+
+    off_axis = pixel_to_ned(
+        (24.0, 10.0),
+        camera=camera,
+        ground_z=0.0,
+        position_ned=pose,
+        euler_deg=(0.0, 0.0, 0.0),
+        undistort=False,
+    )
+    down = 1.0 / math.sqrt(1.0001)
+    assert off_axis.ok and off_axis.ned == pytest.approx((2.0, 4.095, 0.0), abs=1e-9)
+    assert off_axis.ray_ned == pytest.approx((0.0, 0.01 * down, down), abs=1e-9)

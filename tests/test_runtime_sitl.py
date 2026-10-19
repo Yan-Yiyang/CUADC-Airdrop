@@ -245,6 +245,7 @@ def test_explicit_environment_overrides_update_supplied_config(tmp_path: Path) -
     assert prepared.mission.recon_max_s == 37.0
 
 
+@pytest.mark.integration
 def test_sitl_optional_tool_loads_without_pytest_conftest_before_config_rejection() -> None:
     root = Path(__file__).resolve().parents[1]
     script = """

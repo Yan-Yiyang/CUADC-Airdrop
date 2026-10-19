@@ -40,6 +40,7 @@ def wait_reconnect(source: Hm30VideoSource, timeout: float = 15.0) -> None:
         time.sleep(0.2)
 
 
+@pytest.mark.stream
 def test_stream_basic(live_source) -> None:
     source = live_source()
     frames = read_some(source, 20)
@@ -61,6 +62,7 @@ def test_stream_basic(live_source) -> None:
     assert 0.0 <= source.latest().age < 2.0
 
 
+@pytest.mark.stream
 def test_stream_scaling(live_source) -> None:
     """缩放到目标尺寸（拉到推理分辨率，降低管道带宽）。"""
     source = live_source(width=320, height=180)
@@ -69,6 +71,7 @@ def test_stream_scaling(live_source) -> None:
     assert frames[-1].image.shape == (180, 320, 3)
 
 
+@pytest.mark.stream
 def test_frame_carries_telemetry_lag(live_source) -> None:
     """帧必须携带链路延时——帧-遥测时间对齐的前提（见 airdrop.alignment）。"""
     source = live_source(telemetry_lag=0.2)
@@ -85,6 +88,7 @@ def test_frame_carries_telemetry_lag(live_source) -> None:
     assert VideoConfig().telemetry_lag == pytest.approx(DEFAULT_TELEMETRY_LAG)
 
 
+@pytest.mark.stream
 def test_sink_receives_every_frame(live_source) -> None:
     """每帧都必须经过 sink——这是"一帧都不能丢"的保证点。
 
@@ -128,6 +132,7 @@ def test_sink_receives_every_frame(live_source) -> None:
     assert failing_sink in source.sinks
 
 
+@pytest.mark.stream
 def test_stream_reconnect(make_source, sender, stream_config) -> None:
     """断流判定与 stop() 脱身能力。
 
@@ -161,6 +166,7 @@ def test_stream_reconnect(make_source, sender, stream_config) -> None:
 
 
 @pytest.mark.network
+@pytest.mark.stream
 def test_invalid_url_is_reported(make_source) -> None:
     """地址无效要显式报错，而不是静默重试到天荒地老。
 
@@ -219,6 +225,7 @@ def test_source_is_not_started_eagerly() -> None:
         Hm30VideoSource(VideoConfig(width=0))
 
 
+@pytest.mark.stream
 def test_stop_is_clean(make_source) -> None:
     source = make_source(VideoConfig(url="udp://127.0.0.1:1", width=640, height=360))
     source.start()

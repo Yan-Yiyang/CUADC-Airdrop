@@ -10,18 +10,14 @@
 约定
 ----
 * 用例名与被验证的小节一一对应，改了手册那一段就改这里的同名函数；
-* 需要临时目录的用例用本文件的 workdir fixture（不用 tmp_path：受限沙箱里它会挂在
-  fixture 上；权限限制以实际环境为准）；
+* 需要临时目录的用例用本文件的 workdir fixture（由 pytest 的 tmp_path 管理）；
 * 全部离线：不需要飞控、图传、GPU。
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 import time
-import uuid
-from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -65,20 +61,15 @@ from airdrop import (
 )
 from airdrop.perception import OpenCvPostProcess, PerceptionConfigLike, PerceptionWorker
 
-WORK_ROOT = Path(__file__).resolve().parents[1] / ".handbook-test-tmp"
+pytestmark = pytest.mark.integration
+
 CAMERA = default_camera_model(320, 180)
 
 
 @pytest.fixture
-def workdir() -> Iterator[Path]:
-    """工作区内的临时目录；用例结束整棵删掉（不用 tmp_path：见模块 docstring）。"""
-    WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    path = WORK_ROOT / uuid.uuid4().hex[:8]
-    path.mkdir()
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
+def workdir(tmp_path: Path) -> Path:
+    """为本用例提供独立素材目录。"""
+    return tmp_path
 
 
 # ----------------------------------------------------------------------

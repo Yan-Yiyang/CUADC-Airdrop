@@ -61,7 +61,7 @@
 | `tools/` | 一次性离线工具（**纯库模块**：文件内常量 = 默认值，暴露 `build_config(**覆盖)` / `main(**kwargs)`；命令行解析归 §6.2 的 `airdrop/run.py`） | `fetch_models.py`、`calibrate.py`、`fit_ballistics.py`、`make_world.py`、`dump_api.py`、`check_docs.py` | 是 |
 | `airdrop/runtime/` | real/SITL 在线任务、运行参数、共享组件与生命周期；离线回放复用感知组件 | `options.py`、`components.py`、`session.py` | 是 |
 | `airdrop/run.py` | **主仓命令行入口**：argparse 子命令 → 关键字覆盖到各入口的 `build_config`/`main`（见 §6.2） | `run.py`、`airdrop/_lazy.py`（PEP 562 惰性导出） | 是 |
-| `tests/` | pytest 套件（21 个测试文件，全部离线；`realdata` 标记默认跳过） | `conftest.py`、`test_e2e.py`、`test_fit.py`、`test_plan.py`、`test_world.py`、`test_sim_scripts.py` | 是 |
+| `tests/` | pytest 套件，按 fast/offline/platform/all 分层选择 | `conftest.py`、`test_e2e.py`、`test_fit.py`、`test_plan.py`、`test_world.py`、`test_sim_scripts.py` | 是 |
 | `docs/` | 专题笔记（5 篇实测记录）+ 本手册 | `handbook.md`、`simulation_world.md`、`calibration_opencv.md`、`video_hm30_ffmpeg.md`、`perception_ocr.md`、`ballistics_fit.md` | 是 |
 | `vendor/airdrop-sim/` | **仿真模块**：世界（生成产物：两个 `.sdf` + 网格/贴图）+ 带下视相机的机型 + PX4 airframe + 装机/启动脚本；生成器是 `vendor/airdrop-sim/airdrop_sim/make_world.py`，布局与启动见 [`simulation_world.md`](simulation_world.md)，模块说明见 [`../vendor/airdrop-sim/README.md`](../vendor/airdrop-sim/README.md) | `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/cuadc_recon_strike_r1.sdf`、`r2.sdf` | 是 |
 | `routes/` | **操作手在 QGC 里画好的 `.plan` 航线**（`recon.plan` / `land.plan`），由配置按需导入 | `land.plan` | 是（航线是飞行输入，跟着版本走） |
@@ -71,7 +71,7 @@
 | `qgroundcontrol-master/` | QGC 地面站源码，同上（`MissionManager/LandingComplexItem.cc` 是 `.plan` 复杂项展开的权威依据） | — | 否 |
 | `flights/` | **运行期产物**：`record.dir` 默认值，每次飞行一个子目录 | 见 §5.1 | 否（已 ignore） |
 | `log/` | 运行期产物：`perception.crop_dir` 默认 `log/target`（裁剪排故图） | — | 否（已 ignore） |
-| `.e2e-test-tmp/`、`.fit-test-tmp/`、`.calibrate-test-tmp/`、`.replay-test-tmp/`、`.pytest-tmp/`、`.plan-test-tmp/`、`.handbook-test-tmp/`、`.world-test-tmp/` | 测试用的**工作区内**临时目录（见 §5.6） | — | 否（已 ignore） |
+| pytest `tmp_path` | 测试用的系统临时工作目录，每个用例隔离（见 §5.6） | — | 否 |
 | `.sitl-test-tmp/` | SITL 演练的临时产物（演练日志、机上任务备份、ulog 探查脚本） | — | 否（已 ignore） |
 | `.idea/`、`.vscode/`、`.workbuddy/` | 编辑器/工具配置 | — | 否（已 ignore） |
 
@@ -104,7 +104,7 @@
 | `flights/` | **飞行记录产物**（`FlightRecorder` 的输出目录，一次飞行几十~几百 MB） |
 | `.coverage*`、`coverage.xml`、`htmlcov/` | 覆盖率产物 |
 | `.venv/`、`__pycache__/`、`*.py[cod]`、`.pytest_cache/` 等 | 环境与缓存 |
-| `.replay-test-tmp/`、`.calibrate-test-tmp/`、`.e2e-test-tmp/`、`.fit-test-tmp/`、`.plan-test-tmp/`、`.handbook-test-tmp/`、`.world-test-tmp/`、`.pytest-tmp/`、`.sitl-test-tmp/`、`pytest-cache-files-*/` | 测试与演练临时目录（§5.6） |
+| `.sitl-test-tmp/`、`pytest-cache-files-*/` | SITL 演练与 pytest 缓存临时目录 |
 | `PX4-Autopilot-1.17.0/`、`qgroundcontrol-master/`、`px4.tar.gz`、`qgc.tar.gz` | 参考源码与压缩包 |
 
 ⚠ **一处没有被 ignore、需要人工注意**：
@@ -555,7 +555,7 @@ from airdrop import (
     load_broker_from_log,
 )
 
-work = Path(".fit-test-tmp") / uuid.uuid4().hex[:8]  # 任意可写目录
+work = Path(tempfile.mkdtemp(prefix="fit-example-"))  # 任意可写目录
 work.mkdir(parents=True, exist_ok=True)
 config = Config()
 
@@ -2123,23 +2123,11 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 
 取权重：`python -m airdrop.run fetch-models --source-dir <本地素材目录>`。
 
-### 5.6 测试与临时目录
+### 5.6 测试分层与临时目录
 
-| 目录 | 谁用 | 说明 |
-| --- | --- | --- |
-| `.e2e-test-tmp/` | `tests/test_e2e.py` 的 `workdir` fixture | 手写合成飞行目录，用完即删 |
-| `.fit-test-tmp/` | `tests/test_fit.py` 的 `workdir` fixture | 投放记录 / 测量文件 / 工具端到端 |
-| `.calibrate-test-tmp/` | `vendor/airdrop-calibration/tests/test_calibrate.py` 的 `workdir` fixture | 合成标定飞行目录（渲染棋盘格帧） |
-| `.plan-test-tmp/` | `tests/test_plan.py` 的 `workdir` fixture | 现场造的 QGC `.plan`（含复杂项） |
-| `.handbook-test-tmp/` | `tests/test_handbook.py` 的 `workdir` fixture | 手册 §3 示例真跑时的工作目录 |
-| `.world-test-tmp/` | `vendor/airdrop-sim/tests/test_world.py` 的 `workdir` fixture | 生成到别处的赛区世界（含贴图复制） |
-| `.replay-test-tmp/` | `tests/test_replay.py` | 手写的最小飞行目录 |
-| `.sitl-test-tmp/` | **人工**（SITL 演练） | 演练日志、机上任务备份、ulog 探查脚本；不是测试 fixture |
-| `.pytest-tmp/` | 历史遗留（`--basetemp` 落点） | 已可删除，无用 |
+测试默认使用 `fast` tier，只收未标记用例，不启动 ffmpeg、WSL、GPU 或飞控。依赖 pytest `tmp_path`、`tmp_path_factory`、`tmpdir`、`tmpdir_factory`、`workdir` 或 `core_checkout` fixture 的测试在收集时自动标记为 `integration`，由 `offline` 层运行；该规则按 fixture 依赖分类，不依据测试文件名。纯配置、数学和受控线程测试仍可留在 `fast`。`offline` 也包含显式标记的跨模块、跨仓或真实子进程测试；`platform` 再加入 `stream`、`network` 与 `wsl`；`all` 还包括 `realdata` 和 `sitl`。fixture 自动标记在 pytest 原生 `-m` 过滤前完成，`-m` 只会进一步筛选当前 tier，不会扩大 tier。覆盖率默认关闭，需要时显式传 `--cov=airdrop --cov-branch`。
 
-**为什么不用 `tmp_path`**：受限沙箱里 pytest 的 basetemp 目录"创建后在别的进程里不可枚举、不可删除"
-（`PermissionError: [WinError 5]`），20 个用例（12 个 `test_recorder.py` + 8 个 `test_georef.py`）会挂在
-fixture 上——这是**环境限制不是代码问题**，`--basetemp` 指向工作区内也绕不开。上表目录都已在 `.gitignore` 里。
+测试临时文件通过 pytest `tmp_path` 创建，测试结束后由 pytest 清理，不在仓库根目录创建固定工作目录。SITL 人工演练目录 `.sitl-test-tmp/` 与测试 fixture 无关。
 
 ⚠ **同一时刻只能有一个 `mavsdk_server`**（它固定占用 gRPC 50051）：一边跑示例/演练，一边想再起一个
 `System()` 去查状态会争抢端口。调试时用
@@ -2154,7 +2142,7 @@ fixture 上——这是**环境限制不是代码问题**，`--basetemp` 指向�
 ```bash
 uv sync                                                # 依赖（清华镜像，见 pyproject.toml）
 ./.venv/Scripts/python.exe -m tools.fetch_models       # 把权重放进 models/
-./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"   # 冒烟：全部离线用例
+./.venv/Scripts/python.exe -m pytest --test-tier fast                                  # 快速回归
 ```
 
 ### 6.2 入口清单：`python -m airdrop.run <子命令>`
@@ -2221,11 +2209,13 @@ config = Config(
 ### 6.5 测试怎么跑
 
 ```bash
-./.venv/Scripts/python.exe -m pytest                     # 全部（附覆盖率；默认已排除 realdata/sitl）
-./.venv/Scripts/python.exe -m pytest -m "not realdata and not sitl and not stream"  # 再跳过要起 ffmpeg 的用例
-./.venv/Scripts/python.exe -m pytest -m realdata         # GPU + 外部真实素材（需另行提供）
-./.venv/Scripts/python.exe -m pytest -m sitl             # WSL 里已起 PX4 SITL + 图传（分钟级）
-./.venv/Scripts/python.exe -m pytest -k mission -v       # 只跑某个主题
+./.venv/Scripts/python.exe -m pytest --test-tier fast
+./.venv/Scripts/python.exe -m pytest --test-tier offline
+./.venv/Scripts/python.exe -m pytest --test-tier platform
+./.venv/Scripts/python.exe -m pytest --test-tier all -m realdata
+./.venv/Scripts/python.exe -m pytest --test-tier all -m sitl
+./.venv/Scripts/python.exe -m pytest --test-tier all --cov=airdrop --cov-branch --cov-report=term-missing:skip-covered
+./.venv/Scripts/python.exe -m pytest --test-tier fast -k mission -v
 ```
 
 ⚠ 命令行的 `-m` 是**覆盖** `addopts` 里的默认表达式，不是追加：写 `-m "not stream"` 会把 `realdata` 与 `sitl`
@@ -2353,7 +2343,7 @@ config = Config(
 - [ ] 失败路径是否**显式**（抛错 / `ok=False` / `None` 三选一，并在 docstring 写明）？
 - [ ] 是否碰了 §7.1 中的行为约束？若有变化，更新对应源码说明、测试与相关专题文档。
 - [ ] 碰了任务项 / 航线来源 / 启动与完成判定（§7 第 31–35 条）时，除了离线用例，**跑一次 SITL 演练**（`mission --mode sitl`）——这四条都是"离线测不出来、真飞控才暴露"的。
-- [ ] 回归用例加了吗（`tests/` 是回归落点）？跑过 `pytest -m "not realdata and not sitl and not stream"` 吗？
+- [ ] 回归用例加了吗（`tests/` 是回归落点）？跑过 `pytest --test-tier fast` 或对应 tier 吗？
 - [ ] 相关文档是否同步：`README.md`（怎么用）、本手册（目录/参数/产物）及任务涉及的专题文档？
 
 ---

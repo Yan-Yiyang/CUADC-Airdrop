@@ -14,9 +14,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import shutil
-import uuid
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +47,7 @@ from airdrop import (
     load_plan,
 )
 
-WORK_ROOT = Path(__file__).resolve().parents[1] / ".plan-test-tmp"
+pytestmark = pytest.mark.integration
 
 #: 合成原点（中纬度、海拔 500m）
 ORIGIN = NedOrigin(lat_deg=47.0, lon_deg=8.0, alt_m=500.0)
@@ -62,15 +59,9 @@ STEEP_TOUCHDOWN = (46.99835, 8.000, 0.0)
 
 
 @pytest.fixture
-def workdir() -> Iterator[Path]:
-    """工作区内的临时目录；用例结束整棵删掉（不用 ``tmp_path``：见 AGENTS）。"""
-    WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    path = WORK_ROOT / uuid.uuid4().hex[:8]
-    path.mkdir()
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
+def workdir(tmp_path: Path) -> Path:
+    """为本用例提供独立素材目录。"""
+    return tmp_path
 
 
 # ----------------------------------------------------------------------

@@ -29,10 +29,9 @@ import concurrent.futures
 import json
 import math
 import os
-import shutil
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -69,8 +68,9 @@ from airdrop import (
     load_broker_from_log,
 )
 
+pytestmark = pytest.mark.integration
+
 # 素材与相机（两处口径共用）
-WORK_ROOT = Path(__file__).resolve().parents[1] / ".e2e-test-tmp"
 CAMERA = default_camera_model(320, 180)
 _CAMERA_CX, _CAMERA_CY = 160.0, 90.0
 
@@ -83,7 +83,7 @@ GROUND_ALT = 500.0  # 地面点与原点的**高差为 0** ⇒ ground_z = 0
 
 
 # ----------------------------------------------------------------------
-# 素材构造（按 FlightRecorder 的落盘格式手写；不用 tmp_path，见 AGENTS）
+# 素材构造（按 FlightRecorder 的落盘格式手写）
 # ----------------------------------------------------------------------
 def _jpeg(image: np.ndarray) -> bytes:
     ok, buffer = cv2.imencode(".jpg", image)
@@ -137,7 +137,7 @@ def _write_flight(
     这样 MissionRunner 的链路看门狗（默认 5s 陈旧）在测试里不会误触发。
     """
     images = list(frames) if frames else [_blank_image() for _ in range(4)]
-    flight_dir = WORK_ROOT / uuid.uuid4().hex[:12]
+    flight_dir = root / uuid.uuid4().hex[:12]
     (flight_dir / "frames").mkdir(parents=True)
     start = (time.time() - 2.0) if t0 is None else float(t0)
     lag = 0.15
@@ -174,15 +174,9 @@ def _write_flight(
 
 
 @pytest.fixture
-def workdir() -> Iterator[Path]:
-    """工作区内的临时目录；用例结束整棵删掉（不用 ``tmp_path``：见 AGENTS）。"""
-    WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    path = WORK_ROOT / uuid.uuid4().hex[:8]
-    path.mkdir()
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
+def workdir(tmp_path: Path) -> Path:
+    """为本用例提供独立素材目录。"""
+    return tmp_path
 
 
 # ----------------------------------------------------------------------

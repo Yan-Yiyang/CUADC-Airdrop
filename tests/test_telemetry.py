@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -232,7 +233,9 @@ def test_angle_wrap_interpolation() -> None:
     assert abs(abs(snap.yaw_deg) - 180.0) < 1.0
 
 
-def test_wall_clock_regression_does_not_freeze_or_corrupt_history() -> None:
+def test_wall_clock_regression_does_not_freeze_or_corrupt_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """墙钟回退不能让历史停写，更不能留下乱序数据。
 
     节流判据曾用 ``snapshot.timestamp - _last >= interval``，而 ``time.time()``
@@ -250,31 +253,34 @@ def test_wall_clock_regression_does_not_freeze_or_corrupt_history() -> None:
     base = 1_700_000_000.0
     wall = {"t": base}
     mono = {"t": 1000.0}
-    real_time, real_mono = time.time, time.monotonic
-    broker_mod.time.time = lambda: wall["t"]  # type: ignore[assignment]
-    broker_mod.time.monotonic = lambda: mono["t"]  # type: ignore[assignment]
-    try:
-        broker = TelemetryBroker(history_maxlen=200, history_interval=0.1)
-        for i in range(20):
-            wall["t"] = base + i * 0.1
-            mono["t"] = 1000.0 + i * 0.1
-            broker.update_global_position(make_position(30.0 + i * 0.001, 8.0, 500.0, 10.0))
-        before = len(broker._history)
-        assert before > 5, "正常情况下历史应当增长"
+    monkeypatch.setattr(
+        broker_mod,
+        "time",
+        SimpleNamespace(
+            time=lambda: wall["t"],
+            monotonic=lambda: mono["t"],
+            strftime=time.strftime,
+            localtime=time.localtime,
+        ),
+    )
+    broker = TelemetryBroker(history_maxlen=200, history_interval=0.1)
+    for i in range(20):
+        wall["t"] = base + i * 0.1
+        mono["t"] = 1000.0 + i * 0.1
+        broker.update_global_position(make_position(30.0 + i * 0.001, 8.0, 500.0, 10.0))
+    before = len(broker._history)
+    assert before > 5, "正常情况下历史应当增长"
 
-        # 墙钟回退 1 小时，monotonic 照常前进
-        for i in range(20):
-            wall["t"] = base - 3600.0 + i * 0.1
-            mono["t"] = 1002.0 + i * 0.1
-            broker.update_global_position(make_position(31.0 + i * 0.001, 8.0, 500.0, 10.0))
+    # 墙钟回退 1 小时，monotonic 照常前进
+    for i in range(20):
+        wall["t"] = base - 3600.0 + i * 0.1
+        mono["t"] = 1002.0 + i * 0.1
+        broker.update_global_position(make_position(31.0 + i * 0.001, 8.0, 500.0, 10.0))
 
-        stamps = [s.timestamp for s in broker._history]
-        assert stamps == sorted(stamps), f"历史乱序：{stamps}"
-        # 关键：即使墙钟仍处于回退状态，节流也必须照常推进（用单调钟）
-        assert len(broker._history) > 5, "墙钟回退后历史停写了（节流判据用错了时钟）"
-    finally:
-        broker_mod.time.time = real_time  # type: ignore[assignment]
-        broker_mod.time.monotonic = real_mono  # type: ignore[assignment]
+    stamps = [s.timestamp for s in broker._history]
+    assert stamps == sorted(stamps), f"历史乱序：{stamps}"
+    # 关键：即使墙钟仍处于回退状态，节流也必须照常推进（用单调钟）
+    assert len(broker._history) > 5, "墙钟回退后历史停写了（节流判据用错了时钟）"
 
 
 def test_stop_takes_the_supervisor_lock_that_connect_holds() -> None:
@@ -513,19 +519,28 @@ def test_release_never_blocks_the_caller(monkeypatch) -> None:
 
         def _stop_mavsdk_server(self):
             entered.set()
-            forever.wait()  # 模拟实测到的"永不返回"
+            forever.wait(timeout=2.0)  # 模拟实测到的"永不返回"，测试 finally 可释放
 
     monkeypatch.setattr(mt, "System", HangingSystem)
+    release_drone = mt.MavsdkThread._release_drone
+    monkeypatch.setattr(
+        mt.MavsdkThread,
+        "_release_drone",
+        staticmethod(lambda drone: release_drone(drone, timeout=0.05)),
+    )
 
     mav = mt.MavsdkThread(reconnect=False)
     started = time.monotonic()
-    supervisor = mav.submit(mav._serve("udpin://127.0.0.1:1"))
-    supervisor.result(timeout=30.0)  # 会话收尾不能被释放路径卡死
-    mav.stop()  # 调用方也不能被拖死
-    elapsed = time.monotonic() - started
+    try:
+        supervisor = mav.submit(mav._serve("udpin://127.0.0.1:1"))
+        supervisor.result(timeout=1.0)  # 会话收尾不能被释放路径卡死
+        mav.stop(timeout=0.1)  # 调用方也不能被拖死
+        elapsed = time.monotonic() - started
 
-    assert entered.is_set(), "没走到释放路径，用例没覆盖到目标场景"
-    assert elapsed < mt.RELEASE_TIMEOUT_S * 2 + 5.0, f"收尾耗时 {elapsed:.1f}s，超时兜底没生效"
+        assert entered.wait(timeout=0.2), "没走到释放路径，用例没覆盖到目标场景"
+        assert elapsed < 0.5, f"收尾耗时 {elapsed:.1f}s，超时兜底没生效"
+    finally:
+        forever.set()
 
 
 # ----------------------------------------------------------------------
