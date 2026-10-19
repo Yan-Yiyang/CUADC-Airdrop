@@ -166,6 +166,9 @@ def test_entry_runs_selected_stages_with_actual_runner_and_preflight(
     assert isinstance(components.runner, MissionRunner)
     runner = components.runner
     assert runner.state is MissionState.DONE
+    assert runner._preflight is not None
+    assert runner._preflight._cancel_requested is not None
+    assert runner._preflight._cancel_requested(), "真实装配的取消回调应读取已终态 runner"
     assert runner.history[-1].reason == "holding"
     assert runner.stats.uploads == int(mode == "real") + int(drop_stage)
     assert runner.stats.releases == int(drop_stage)

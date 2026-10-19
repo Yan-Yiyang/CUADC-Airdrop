@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import math
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -903,6 +904,263 @@ def test_real_preflight_reports_a_failing_loader_with_the_check_name() -> None:
 
     with pytest.raises(PreflightError, match="camera: "):
         _preflight(config, loaders={"camera": boom}).run()
+
+
+def test_preflight_cancellation_during_video_probe_is_bounded_and_not_cached() -> None:
+    from airdrop.preflight import _PreflightCancelled
+
+    cancel = threading.Event()
+    clock = FakeClock(start=1000.0)
+    source = FakeVideoSource(frames=0)
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def cancel_during_wait(seconds: float) -> None:
+        clock.sleep(seconds)
+        cancel.set()
+
+    preflight = Preflight(
+        PreflightConfig(
+            load_detector=False,
+            load_ocr=False,
+            load_camera=False,
+            check_video=True,
+            video_probe_s=1.0,
+            video_min_frames=1,
+        ),
+        video_source=source,
+        camera_model=_camera_model(),
+        cancel_requested=cancel.is_set,
+        clock=clock,
+        sleep=cancel_during_wait,
+        on_event=lambda kind, data: events.append((kind, data)),
+    )
+
+    with pytest.raises(_PreflightCancelled):
+        preflight.run()
+
+    assert preflight._done is None
+    reported = _events_of(events, "preflight")
+    assert all(item["ok"] is None for item in reported)
+    assert all(item["check"] != "video" for item in reported)
+
+
+def test_stopping_runner_during_real_preflight_loader_preserves_abort() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+    events: list[tuple[str, dict[str, Any]]] = []
+    config = _config(
+        preflight=PreflightConfig(
+            load_detector=True,
+            load_ocr=True,
+            load_camera=True,
+            check_video=True,
+            video_probe_s=0.5,
+            video_min_frames=1,
+        )
+    )
+
+    def detector_loader() -> str:
+        calls.append("detector")
+        entered.set()
+        assert release.wait(5)
+        raise RuntimeError("loader returned after stop")
+
+    class CountingVideo(FakeVideoSource):
+        latest_calls = 0
+
+        def latest(self):
+            self.latest_calls += 1
+            return super().latest()
+
+    source = CountingVideo(frames=10)
+    runner_ref: list[MissionRunner] = []
+
+    def cancelled() -> bool:
+        if not runner_ref:
+            return False
+        current = runner_ref[0]
+        return current.stopped or current.machine.is_terminal
+
+    preflight = Preflight(
+        config.preflight,
+        model_loaders={
+            "detector": detector_loader,
+            "ocr": lambda: calls.append("ocr"),
+            "camera": lambda: calls.append("camera"),
+        },
+        video_source=source,
+        camera_model=_camera_model(),
+        cancel_requested=cancelled,
+        on_event=lambda kind, data: events.append((kind, data)),
+    )
+    runner = _runner(
+        FakeClock(),
+        FakeController(),
+        config=config,
+        events=events,
+        preflight=preflight,
+    )
+    runner_ref.append(runner)
+    updater = threading.Thread(target=runner.update)
+    updater.start()
+    assert entered.wait(2)
+
+    runner.stop("operator_requested_stop")
+    release.set()
+    updater.join(timeout=2)
+
+    assert not updater.is_alive()
+    assert runner.state is MissionState.ABORT
+    assert runner.history[-1].reason == "operator_requested_stop"
+    assert all(record.to_state is not MissionState.WAIT_AIRBORNE for record in runner.history)
+    assert calls == ["detector"]
+    assert source.latest_calls == 0
+    assert preflight._done is None
+    assert _events_of(events, "preflight") == []
+
+
+@pytest.mark.parametrize("preflight", [None, "ready"])
+def test_stop_wins_before_preflight_wait_transition(
+    preflight: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    active_preflight = None if preflight is None else FakePreflight()
+    runner = _runner(FakeClock(), FakeController(), preflight=active_preflight)
+    original = runner._transition_preflight_to_wait
+
+    def paused_transition(reason: str, now: float) -> bool:
+        entered.set()
+        assert release.wait(5)
+        return original(reason, now)
+
+    monkeypatch.setattr(runner, "_transition_preflight_to_wait", paused_transition)
+    runner.machine.transition(MissionState.PREFLIGHT, reason="test", now=0.0)
+
+    def tick_preflight() -> None:
+        try:
+            runner._tick_preflight(0.0)
+        except BaseException as exc:  # noqa: BLE001 - 在线程边界收集测试失败
+            errors.append(exc)
+
+    updater = threading.Thread(target=tick_preflight)
+    updater.start()
+    assert entered.wait(2)
+    runner.stop("operator_requested_stop")
+    release.set()
+    updater.join(timeout=2)
+
+    assert not updater.is_alive()
+    assert errors == []
+    assert runner.state is MissionState.ABORT
+    assert runner.history[-1].reason == "operator_requested_stop"
+    assert all(record.to_state is not MissionState.WAIT_AIRBORNE for record in runner.history)
+
+
+def test_stop_waits_for_preflight_wait_transition_then_aborts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transition_entered = threading.Event()
+    allow_transition = threading.Event()
+    stop_lock_attempted = threading.Event()
+    stop_finished = threading.Event()
+    errors: list[BaseException] = []
+    runner = _runner(FakeClock(), FakeController(), preflight=None)
+
+    class ObservedRLock:
+        def __init__(self) -> None:
+            self._lock = threading.RLock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "stopper":
+                stop_lock_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            self._lock.release()
+
+    monkeypatch.setattr(runner, "_state_lock", ObservedRLock())
+    original_transition = runner._transition
+
+    def paused_wait_transition(to_state: MissionState, reason: str, now: float) -> None:
+        if to_state is MissionState.WAIT_AIRBORNE:
+            transition_entered.set()
+            assert allow_transition.wait(5)
+        original_transition(to_state, reason, now)
+
+    monkeypatch.setattr(runner, "_transition", paused_wait_transition)
+    runner.machine.transition(MissionState.PREFLIGHT, reason="test", now=0.0)
+
+    def tick_preflight() -> None:
+        try:
+            runner._tick_preflight(0.0)
+        except BaseException as exc:  # noqa: BLE001 - 在线程边界收集测试失败
+            errors.append(exc)
+
+    def stop_runner() -> None:
+        try:
+            runner.stop("operator_requested_stop")
+        except BaseException as exc:  # noqa: BLE001 - 在线程边界收集测试失败
+            errors.append(exc)
+        finally:
+            stop_finished.set()
+
+    updater = threading.Thread(target=tick_preflight)
+    updater.start()
+    assert transition_entered.wait(2)
+    stopper = threading.Thread(target=stop_runner, name="stopper")
+    stopper.start()
+    assert stop_lock_attempted.wait(2)
+    allow_transition.set()
+    updater.join(timeout=2)
+    stopper.join(timeout=2)
+
+    assert not updater.is_alive() and not stopper.is_alive()
+    assert stop_finished.is_set()
+    assert errors == []
+    assert runner.state is MissionState.ABORT
+    assert runner.history[-1].reason == "operator_requested_stop"
+    assert any(record.to_state is MissionState.WAIT_AIRBORNE for record in runner.history)
+
+
+@pytest.mark.parametrize("outcome", ["success", "known_error", "unexpected_error"])
+def test_runner_stop_after_preflight_run_preserves_abort_and_skips_wait(outcome: str) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    class BlockingPreflight:
+        def run(self):
+            entered.set()
+            assert release.wait(5)
+            if outcome == "known_error":
+                raise PreflightError("ocr: 初始化失败")
+            if outcome == "unexpected_error":
+                raise RuntimeError("预检意外失败")
+            return (PreflightCheck("detector", True, "ready"),)
+
+    runner = _runner(
+        FakeClock(),
+        FakeController(),
+        events=events,
+        preflight=BlockingPreflight(),
+    )
+    updater = threading.Thread(target=runner.update)
+    updater.start()
+    assert entered.wait(2)
+
+    runner.stop("operator_requested_stop")
+    release.set()
+    updater.join(timeout=2)
+
+    assert not updater.is_alive()
+    assert runner.state is MissionState.ABORT
+    assert runner.history[-1].reason == "operator_requested_stop"
+    assert all(record.to_state is not MissionState.WAIT_AIRBORNE for record in runner.history)
+    assert not [data for kind, data in events if kind == "error"]
 
 
 def test_real_preflight_video_check_needs_enough_frames() -> None:

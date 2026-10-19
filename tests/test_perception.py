@@ -12,12 +12,14 @@ import contextlib
 import json
 import logging
 import queue
+import sys
 import threading
 import time
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -573,6 +575,115 @@ def test_detector_missing_weights_raises() -> None:
         detector.load()
 
 
+def test_detector_load_is_serialized_and_publishes_names_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    class Model:
+        def __init__(self) -> None:
+            self.names = {0: "目标", 1: "背景"}
+
+    def yolo(path: str) -> Model:
+        nonlocal calls
+        assert path.endswith("weights.pt")
+        calls += 1
+        entered.set()
+        assert release.wait(5)
+        return Model()
+
+    module = cast(Any, ModuleType("ultralytics"))
+    module.YOLO = yolo
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+    weights = tmp_path / "weights.pt"
+    weights.write_bytes(b"test")
+    detector = Detector(DetectorConfig(model_path=str(weights)))
+    second_lock_attempted = threading.Event()
+    results: list[Detector] = []
+    errors: list[BaseException] = []
+
+    class ObservedLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "second-loader":
+                second_lock_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            self._lock.release()
+
+    detector._load_lock = cast(Any, ObservedLock())
+
+    def load_detector(*, second: bool = False) -> None:
+        try:
+            results.append(detector.load())
+        except BaseException as exc:  # noqa: BLE001 - 在线程边界收集测试失败
+            errors.append(exc)
+
+    first = threading.Thread(target=load_detector)
+    second = threading.Thread(target=load_detector, name="second-loader")
+    first.start()
+    assert entered.wait(2)
+    second.start()
+    assert second_lock_attempted.wait(2)
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert results == [detector, detector]
+    assert calls == 1
+    assert detector.loaded
+    assert detector.names == {0: "目标", 1: "背景"}
+    names = detector.names
+    names.clear()
+    assert detector.class_count == 2
+
+
+def test_detector_load_failure_does_not_publish_partial_state_and_can_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = 0
+
+    class InvalidModel:
+        def __init__(self) -> None:
+            self.names = {"bad-index": "目标"}
+
+    class Model:
+        def __init__(self) -> None:
+            self.names = {0: "目标"}
+
+    def yolo(path: str) -> InvalidModel | Model:
+        nonlocal calls
+        del path
+        calls += 1
+        return InvalidModel() if calls == 1 else Model()
+
+    module = cast(Any, ModuleType("ultralytics"))
+    module.YOLO = yolo
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+    weights = tmp_path / "weights.pt"
+    weights.write_bytes(b"test")
+    detector = Detector(DetectorConfig(model_path=str(weights)))
+
+    with pytest.raises(ValueError):
+        detector.load()
+    assert not detector.loaded
+    assert detector.names == {}
+    assert detector.class_count == 0
+
+    assert detector.load() is detector
+    assert detector.loaded
+    assert detector.names == {0: "目标"}
+    assert calls == 2
+
+
 def test_detector_undistort_is_skipped_without_camera_matrix() -> None:
     detector = Detector(DetectorConfig(undistort=True, camera_matrix=None))
     image = np.zeros((48, 64, 3), np.uint8)
@@ -875,6 +986,24 @@ def _buffer_with(frames: int = 3, *, storage: str = "jpeg") -> AlignmentBuffer:
     return buffer
 
 
+class _UnboundedWaitCondition(threading.Condition):
+    """测试用等待器：忽略期限，以通知作为唯一唤醒来源。"""
+
+    def __init__(self, lock: threading.RLock, entered: threading.Event) -> None:
+        super().__init__(lock)
+        self.entered = entered
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.entered.set()
+        return super().wait(None)
+
+
+def _make_unbounded_wait(buffer: AlignmentBuffer) -> threading.Event:
+    entered = threading.Event()
+    buffer._condition = _UnboundedWaitCondition(buffer._lock, entered)
+    return entered
+
+
 def test_drain_waits_for_inflight_frame_and_late_ocr() -> None:
     """游标已推进但检测未结束，以及尾部 OCR 未返回，都不能算排空。"""
     entered = threading.Event()
@@ -912,6 +1041,143 @@ def test_drain_waits_for_inflight_frame_and_late_ocr() -> None:
         release.set()
         ocr_ready.set()
         worker.stop()
+
+
+def test_stop_wakes_worker_waiting_on_empty_buffer() -> None:
+    buffer = _buffer_with(0)
+    entered = _make_unbounded_wait(buffer)
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=buffer,
+        detector=_FakeDetector(),
+    ).start()
+    assert entered.wait(2)
+
+    worker.stop(timeout=2)
+
+    assert not worker.running
+    assert worker._thread is None
+    assert worker._wait_cancel.is_set()
+
+
+def test_finish_input_cancels_old_buffer_wait_then_stop_wakes_snapshot() -> None:
+    original = _buffer_with(0)
+    entered = _make_unbounded_wait(original)
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=original,
+        detector=_FakeDetector(),
+    ).start()
+    assert entered.wait(2)
+    old_cancel = worker._wait_cancel
+
+    assert worker.finish_input() == 0
+    frozen = worker._buffer
+    assert frozen is not original
+    assert old_cancel.is_set()
+    worker.stop(timeout=2)
+
+    assert not worker.running
+    assert worker._thread is None
+    assert worker._buffer is frozen
+
+
+def test_stop_restart_and_repeated_stop_use_fresh_wait_generation() -> None:
+    buffer = _buffer_with(0)
+    entered = _make_unbounded_wait(buffer)
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=buffer,
+        detector=_FakeDetector(),
+    ).start()
+    assert entered.wait(2)
+    first_cancel = worker._wait_cancel
+    worker.stop(timeout=2)
+    worker.stop(timeout=2)
+    assert first_cancel.is_set()
+
+    worker.start()
+    second_cancel = worker._wait_cancel
+    assert second_cancel is not first_cancel
+    assert not second_cancel.is_set()
+    worker.stop(timeout=2)
+
+    assert first_cancel.is_set() and second_cancel.is_set()
+    assert not worker.running
+
+
+def test_stop_timeout_retains_live_thread_and_pool_until_frame_finishes() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Detector(_FakeDetector):
+        def detect(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return super().detect(*args, **kwargs)
+
+    class Pool(_FakePool):
+        def __init__(self) -> None:
+            super().__init__(numbers=[42])
+            self.stop_calls = 0
+
+        def stop(self, timeout: float = 5.0) -> None:
+            self.stop_calls += 1
+            super().stop(timeout)
+
+    pool = Pool()
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr"),
+        buffer=_buffer_with(1),
+        detector=Detector(),
+        pool=pool,
+    )
+    worker._owns_pool = True
+    worker.start()
+    assert entered.wait(2)
+    thread = worker._thread
+
+    worker.stop(timeout=0.01)
+
+    assert worker.running and worker._thread is thread
+    assert pool._started and pool.stop_calls == 0
+    release.set()
+    worker.stop(timeout=5)
+
+    assert not worker.running and worker._thread is None
+    assert not pool._started and pool.stop_calls == 1
+
+
+def test_decoded_frame_returned_during_stop_is_not_accepted(monkeypatch) -> None:
+    buffer = _buffer_with(1)
+    decoded = threading.Event()
+    release = threading.Event()
+    original_wait_new = buffer.wait_new
+
+    def wait_then_pause(*args, **kwargs):
+        frame = original_wait_new(*args, **kwargs)
+        if frame is not None:
+            decoded.set()
+            assert release.wait(5)
+        return frame
+
+    monkeypatch.setattr(buffer, "wait_new", wait_then_pause)
+    detector = _FakeDetector()
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=buffer,
+        detector=detector,
+    ).start()
+    assert decoded.wait(2)
+
+    worker.stop(timeout=0.01)
+    assert worker.running
+    release.set()
+    worker.stop(timeout=5)
+
+    assert detector.calls == []
+    assert worker.stats.frames == 0
+    assert not worker.running
 
 
 def test_drain_empty_and_failed_worker() -> None:
@@ -1355,11 +1621,14 @@ def test_pipeline_sends_every_frame_to_ocr_by_default() -> None:
     try:
         deadline = time.monotonic() + 10.0
         results: list[Detection] = []
-        while len(results) < 1 and time.monotonic() < deadline:
+        while (
+            worker.stats.frames < 5 or len(pool.submitted) < 5 or len(results) < 1
+        ) and time.monotonic() < deadline:
             results.extend(worker.drain_results())
             time.sleep(0.02)
     finally:
         worker.stop()
+    assert worker.stats.frames == 5, "必须确认完整 5 帧输入都已处理"
     # 默认关闭去重，5 帧里同一位置的目标仍逐帧送检
     assert len(pool.submitted) == 5
     stats = worker.stats

@@ -177,6 +177,7 @@ class PerceptionWorker:
         self._stats = PerceptionStats()
         self._stats_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._wait_cancel = threading.Event()
         self._drained = threading.Event()
         self._drain_to: int | None = None
         self._drain_ok = False
@@ -262,8 +263,15 @@ class PerceptionWorker:
         """固定侦查截止帧（幂等）；新图传仍写原缓冲，感知只排空固定范围。"""
         with self._input_lock:
             if self._cutoff is None:
-                self._buffer = self._buffer.freeze(after_index=self._cursor)
-                self._cutoff = self._buffer.latest_index()
+                old_buffer = self._buffer
+                frozen = old_buffer.freeze(after_index=self._cursor)
+                cutoff = frozen.latest_index()
+                old_cancel = self._wait_cancel
+                old_cancel.set()
+                self._buffer = frozen
+                self._wait_cancel = threading.Event()
+                self._cutoff = cutoff
+                old_buffer.wake_waiters()
             return self._cutoff
 
     def raise_if_failed(self) -> None:
@@ -307,13 +315,15 @@ class PerceptionWorker:
             # cls12 不需要 OCR：编号直接来自 YOLO 类别
             self._detector.load()
 
-        self._stop_event.clear()
-        self._run_finished = False
-        self._drained.clear()
-        self._drain_to = None
-        self._drain_ok = False
-        self._thread = threading.Thread(target=self._run, name="perception", daemon=True)
-        self._thread.start()
+        with self._input_lock:
+            self._wait_cancel = threading.Event()
+            self._stop_event.clear()
+            self._run_finished = False
+            self._drained.clear()
+            self._drain_to = None
+            self._drain_ok = False
+            self._thread = threading.Thread(target=self._run, name="perception", daemon=True)
+            self._thread.start()
         LOGGER.info(
             "感知线程已启动（mode=%s，buffer 现有 %d 帧）",
             self._config.mode,
@@ -324,6 +334,9 @@ class PerceptionWorker:
     def stop(self, timeout: float = 10.0) -> None:
         """停工作线程与 OCR 进程池（幂等）。"""
         self._stop_event.set()
+        with self._input_lock:
+            self._wait_cancel.set()
+            self._buffer.wake_waiters()
         thread = self._thread
         if thread is not None:
             if thread.is_alive():
@@ -420,9 +433,18 @@ class PerceptionWorker:
     # ------------------------------------------------------------------
     def _run(self) -> None:
         try:
-            while not self._stop_event.is_set():
-                source_buffer = self._buffer
-                frame = source_buffer.wait_new(after_index=self._cursor, timeout=0.5)
+            while True:
+                with self._input_lock:
+                    if self._stop_event.is_set():
+                        break
+                    source_buffer = self._buffer
+                    wait_cancel = self._wait_cancel
+                    cursor = self._cursor
+                frame = source_buffer.wait_new(
+                    after_index=cursor,
+                    timeout=0.5,
+                    cancel_event=wait_cancel,
+                )
                 if frame is None:
                     # 缓冲里暂时没有新帧：先把 OCR 结果收回来，保持结果流不断
                     self._collect_remaining(timeout=0.0)
@@ -431,7 +453,12 @@ class PerceptionWorker:
                     continue
                 with self._input_lock:
                     # 截止可能发生在等待或解码期间；改从固定快照重新取，不能送检新帧。
-                    if source_buffer is not self._buffer:
+                    if (
+                        self._stop_event.is_set()
+                        or source_buffer is not self._buffer
+                        or wait_cancel is not self._wait_cancel
+                        or wait_cancel.is_set()
+                    ):
                         continue
                     self._cursor = frame.index
                 try:

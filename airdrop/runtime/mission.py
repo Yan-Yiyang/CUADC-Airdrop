@@ -150,7 +150,11 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
             simulated_release=not options.real_release,
         )
 
-    runner = None
+    runner: MissionRunner | None = None
+
+    def preflight_cancelled() -> bool:
+        return runner is not None and (runner.stopped or runner.machine.is_terminal)
+
     if options.run_mission:
         inner = DroneController.from_config(config, thread, on_event=on_event)
         controller = inner if options.real_release else DryRunController(inner, on_event=on_event)
@@ -177,6 +181,7 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
             video_source=source,
             camera_model=camera,
             on_event=on_event,
+            cancel_requested=preflight_cancelled,
         )
         runner = MissionRunner(
             config,

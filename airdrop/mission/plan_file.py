@@ -74,7 +74,7 @@ __all__ = [
 PLAN_FIRMWARE_PX4 = 12
 #: QGC ``mission.vehicleType``：1 = 固定翼
 PLAN_VEHICLE_FIXED_WING = 1
-#: PX4 ``FW_LND_ANG`` 的出厂默认值（度）。飞机改过这个参数时，把新值传进来。
+#: 本项目离线降落预检的默认角度（度）；按实际机型读取 ``FW_LND_ANG`` 并显式传入。
 FW_DEFAULT_LAND_ANGLE_DEG = 8.0
 #: PX4 判据里的 0.1° 浮点余量（``FeasibilityChecker.cpp`` 原文）。
 _GLIDE_SLOPE_MARGIN_DEG = 0.1

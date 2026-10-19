@@ -424,7 +424,18 @@ class AlignmentBuffer:
             if crossed_end:
                 return
 
-    def wait_new(self, after_index: int = 0, timeout: float | None = None) -> BufferedFrame | None:
+    def wake_waiters(self) -> None:
+        """唤醒等待者以便其检查取消信号，不修改缓冲记录或读者游标。"""
+        with self._condition:
+            self._condition.notify_all()
+
+    def wait_new(
+        self,
+        after_index: int = 0,
+        timeout: float | None = None,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> BufferedFrame | None:
         """阻塞等待比 ``after_index`` 更新的记录，返回**最早**满足条件的那条。
 
         这是给"按序号完整消费"的读者用的——保证不漏中间记录::
@@ -456,6 +467,8 @@ class AlignmentBuffer:
             stored: StoredFrame | None = None
             with self._condition:
                 while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return None
                     records = self._records
                     if records:
                         first_index = records[0].index
@@ -475,6 +488,8 @@ class AlignmentBuffer:
             # ——实测 30fps 下 put() 从 0.00ms 涨到平均 11.7ms（720p），
             # 30% 左右的帧周期被白占。latest()/at() 同样在锁外解码。
             frame = self._materialize(stored)
+            if cancel_event is not None and cancel_event.is_set():
+                return None
             if frame is not None:
                 return frame
             after_index = stored.index

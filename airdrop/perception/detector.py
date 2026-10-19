@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,7 @@ class Detector:
 
     def __init__(self, config: DetectorConfig | None = None) -> None:
         self._config = config or DetectorConfig()
+        self._load_lock = threading.Lock()
         self._model: Any = None
         self._names: dict[int, str] = {}
         self._remap: tuple[np.ndarray, np.ndarray] | None = None
@@ -85,37 +87,43 @@ class Detector:
     @property
     def loaded(self) -> bool:
         """权重是否已加载（未加载时 :meth:`detect` 会自动加载）。"""
-        return self._model is not None
+        with self._load_lock:
+            return self._model is not None
 
     @property
     def names(self) -> dict[int, str]:
         """类别索引 → 名称（加载后可用）。"""
-        return dict(self._names)
+        with self._load_lock:
+            return dict(self._names)
 
     @property
     def class_count(self) -> int:
-        return len(self._names)
+        with self._load_lock:
+            return len(self._names)
 
     # ------------------------------------------------------------------
     # 加载与预热
     # ------------------------------------------------------------------
     def load(self) -> "Detector":
         """加载权重（幂等）。找不到文件时抛出带路径的错误。"""
-        if self._model is not None:
-            return self
-        path = Path(self._config.model_path)
-        if not path.is_file():
-            raise FileNotFoundError(
-                f"YOLO 权重不存在: {path.resolve()}（PerceptionConfig.model_path）"
-            )
-        from ultralytics import YOLO  # 惰性：重型依赖
+        with self._load_lock:
+            if self._model is not None:
+                return self
+            path = Path(self._config.model_path)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"YOLO 权重不存在: {path.resolve()}（PerceptionConfig.model_path）"
+                )
+            from ultralytics import YOLO  # 惰性：重型依赖
 
-        LOGGER.info("加载 YOLO 权重 %s（device=%s）", path, self._config.device)
-        self._model = YOLO(str(path))
-        names = getattr(self._model, "names", None) or {}
-        self._names = {int(k): str(v) for k, v in dict(names).items()}
-        LOGGER.info("权重类别 %d 个: %s", len(self._names), self._names)
-        return self
+            LOGGER.info("加载 YOLO 权重 %s（device=%s）", path, self._config.device)
+            model = YOLO(str(path))
+            model_names = getattr(model, "names", None) or {}
+            names = {int(key): str(value) for key, value in dict(model_names).items()}
+            self._names = names
+            self._model = model
+            LOGGER.info("权重类别 %d 个: %s", len(names), names)
+            return self
 
     def warmup(self, width: int, height: int) -> bool:
         """按目标分辨率跑一次空推理，把 CUDA 上下文/内核编译开销挪到起飞前。
@@ -319,10 +327,12 @@ class Detector:
 
     def replace_config(self, **changes: Any) -> "Detector":
         """派生一个改了参数的 detector（权重重新加载）。"""
-        self._config = replace(self._config, **changes)
-        self._model = None
-        self._remap = None
-        self._remap_shape = None
-        self._undistort_skipped_logged = False
-        self._calib_size_rejected_logged = False
+        with self._load_lock:
+            self._config = replace(self._config, **changes)
+            self._model = None
+            self._names = {}
+            self._remap = None
+            self._remap_shape = None
+            self._undistort_skipped_logged = False
+            self._calib_size_rejected_logged = False
         return self

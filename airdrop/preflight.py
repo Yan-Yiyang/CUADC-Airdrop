@@ -46,6 +46,10 @@ class PreflightError(RuntimeError):
     """起飞前自检失败（消息里带检查名与原因）。"""
 
 
+class _PreflightCancelled(Exception):
+    """任务停止或进入终态后，中断尚未完成的预检。"""
+
+
 @dataclass(frozen=True, slots=True)
 class PreflightCheck:
     """一项检查的结果。``ok=None`` 表示该项被配置关掉（**没有把关**，不是通过）。"""
@@ -97,6 +101,7 @@ class Preflight:
         video_source: Any | None = None,
         camera_model: Any | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -105,6 +110,7 @@ class Preflight:
         self._video_source = video_source
         self._camera_model = camera_model
         self._on_event = on_event
+        self._cancel_requested = cancel_requested
         self._clock = clock
         self._sleep = sleep
         self._done: tuple[PreflightCheck, ...] | None = None
@@ -114,10 +120,14 @@ class Preflight:
         """跑一遍预检（幂等）。失败抛 :class:`PreflightError`。"""
         if self._done is not None:
             return self._done
+        self._check_cancelled()
         checks: list[PreflightCheck] = []
         for name in CHECK_NAMES:
+            self._check_cancelled()
             checks.append(self._load_one(name))
+        self._check_cancelled()
         checks.append(self._check_video())
+        self._check_cancelled()
         self._done = tuple(checks)
         LOGGER.info(
             "起飞前自检通过：%s",
@@ -129,7 +139,13 @@ class Preflight:
     def _switch(self, name: str) -> bool:
         return bool(getattr(self._config, f"load_{name}", True))
 
+    def _check_cancelled(self) -> None:
+        """在任务停止后立即中断预检，避免继续触碰外部资源。"""
+        if self._cancel_requested is not None and self._cancel_requested():
+            raise _PreflightCancelled("任务已停止或进入终态，预检取消")
+
     def _load_one(self, name: str) -> PreflightCheck:
+        self._check_cancelled()
         if not self._switch(name):
             return self._report(PreflightCheck(name, None, "配置里关掉了（未检查）"))
         loader = self._loaders.get(name)
@@ -138,23 +154,33 @@ class Preflight:
             raise PreflightError(f"{name}: 这项检查开着但没有注入载入回调")
         try:
             detail = loader()
+            self._check_cancelled()
+        except _PreflightCancelled:
+            raise
         except Exception as exc:
+            self._check_cancelled()
             self._report(PreflightCheck(name, False, f"{type(exc).__name__}: {exc}"))
             raise PreflightError(f"{name}: {exc}") from exc
         return self._report(PreflightCheck(name, True, "" if detail is None else str(detail)))
 
     def _check_video(self) -> PreflightCheck:
+        self._check_cancelled()
         if not self._config.check_video:
             return self._report(PreflightCheck("video", None, "配置里关掉了（未检查）"))
         try:
             detail = self._probe_video()
+            self._check_cancelled()
+        except _PreflightCancelled:
+            raise
         except Exception as exc:
+            self._check_cancelled()
             self._report(PreflightCheck("video", False, str(exc)))
             raise PreflightError(f"video: {exc}") from exc
         return self._report(PreflightCheck("video", True, detail))
 
     def _probe_video(self) -> str:
         """只核验本次窗口内的新帧，缺少核验依据即失败。"""
+        self._check_cancelled()
         if self._video_source is None:
             raise ValueError("没有接入视频源")
         size = self._expected_size()
@@ -168,13 +194,17 @@ class Preflight:
         baseline = self._frames()
         frames = 0
         while frames < want and self._clock() < deadline:
+            self._check_cancelled()
             self._sleep(min(0.1, deadline - self._clock()))
+            self._check_cancelled()
             frames = self._frames() - baseline
             if frames < 0:
                 raise ValueError("视频帧计数回退，无法核验新增帧")
         if frames < want:
             raise ValueError(f"{window:.1f}s 内只收到 {frames} 帧（要求新增 ≥ {want}）")
+        self._check_cancelled()
         frame = self._video_source.latest()
+        self._check_cancelled()
         if frame is None:
             raise ValueError("无法取得最新画面")
         stamp = float(frame.timestamp)
@@ -217,6 +247,7 @@ class Preflight:
         return (width, height)
 
     def _report(self, check: PreflightCheck) -> PreflightCheck:
+        self._check_cancelled()
         LOGGER.info("起飞前自检 %s：%s", check.name, check.detail or "通过")
         if self._on_event is not None:
             try:

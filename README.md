@@ -86,7 +86,7 @@ python -m airdrop.run calibrate --flight flights/<架次> --strict
 python -m airdrop.run fit-ballistics --help
 ```
 
-正式任务先按场地设置侦查航线、备用点、飞掠参数和降落航线，并使用对应相机标定。只采集模式不要求识别模型或相机标定；启用识别时必须接收视频。SITL 的世界、相机和真值来自可选仿真工具包，使用方法见 [仿真说明](docs/simulation_world.md)。
+正式任务先按场地设置侦查航线、备用点、飞掠参数和降落航线，并使用对应相机标定。只采集模式不要求识别模型或相机标定；启用识别时必须接收视频。SIH/QGC 已验证只读任务同步、任务替换、断连重连、进度完成及仿真落地；Gazebo 相机到被动采集、录制和合成输出已在受控配置下联通，完整感知/投放闭环和真实设备仍待验收。SITL 的世界、相机和真值来自可选仿真工具包，使用方法见 [仿真说明](docs/simulation_world.md)。
 
 可选的 QGC 合成视频由 `mission` / `replay` 的 `--qgc-video` 开启；`qgc-video-test --seconds 10` 可在不连接飞控、不加载模型时测试接收。默认 UDP 端口为 5602，画面、封装与资源隔离见 [QGC 视频说明](docs/qgc_video.md)。
 

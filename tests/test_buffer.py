@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
+from queue import Queue
 
 import numpy as np
 import pytest
@@ -21,6 +22,7 @@ from airdrop import (
     AlignedSample,
     AlignmentBuffer,
     AlignmentWriter,
+    BufferedFrame,
     FrameTelemetryAligner,
     TelemetryBroker,
     TelemetrySnapshot,
@@ -278,6 +280,123 @@ def test_wait_new() -> None:
     # 但中间被驱逐的 1、2 在此路径上不可见——需要完整消费请用 iter_between）
     lagging = buffer.wait_new(1, timeout=0.2)
     assert lagging is not None and lagging.index == 3
+
+
+class _WaitObservedCondition(threading.Condition):
+    """测试用 Condition：在线程进入 wait 边界时发出通知。"""
+
+    def __init__(self, lock: threading.RLock, entered: Queue[None]) -> None:
+        super().__init__(lock)
+        self.entered = entered
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.entered.put(None)
+        return super().wait(timeout)
+
+
+class _UnboundedObservedCondition(_WaitObservedCondition):
+    """忽略超时，让测试只能靠显式通知结束等待。"""
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.entered.put(None)
+        return super().wait(None)
+
+
+def test_wait_new_pre_cancelled_returns_none_even_when_data_exists() -> None:
+    buffer = AlignmentBuffer(capacity=4)
+    buffer.put(make_sample(1000.0))
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    assert buffer.wait_new(cancel_event=cancel_event) is None
+    assert buffer.wait_new() is not None
+
+
+def test_wait_new_cancel_notifies_an_infinite_waiter() -> None:
+    buffer = AlignmentBuffer(capacity=4)
+    entered: Queue[None] = Queue()
+    buffer._condition = _UnboundedObservedCondition(buffer._lock, entered)
+    cancel_event = threading.Event()
+    result: list[BufferedFrame | None] = []
+    waiter = threading.Thread(
+        target=lambda: result.append(buffer.wait_new(timeout=None, cancel_event=cancel_event))
+    )
+    waiter.start()
+    assert entered.get(timeout=2) is None
+    cancel_event.set()
+    buffer.wake_waiters()
+    waiter.join(timeout=2)
+
+    assert not waiter.is_alive()
+    assert result == [None]
+
+
+def test_wait_new_cancellation_at_wait_boundary_cannot_lose_wakeup() -> None:
+    buffer = AlignmentBuffer(capacity=4)
+    entered = threading.Event()
+    release_wait = threading.Event()
+    cancel_set = threading.Event()
+
+    class BoundaryCondition(threading.Condition):
+        def wait(self, timeout: float | None = None) -> bool:
+            entered.set()
+            assert release_wait.wait(2)
+            return super().wait(timeout)
+
+    buffer._condition = BoundaryCondition(buffer._lock)
+    cancel_event = threading.Event()
+    result: list[BufferedFrame | None] = []
+    waiter = threading.Thread(
+        target=lambda: result.append(buffer.wait_new(timeout=None, cancel_event=cancel_event))
+    )
+    waiter.start()
+    assert entered.wait(2)
+
+    def cancel() -> None:
+        cancel_event.set()
+        cancel_set.set()
+        buffer.wake_waiters()
+
+    notifier = threading.Thread(target=cancel)
+    notifier.start()
+    assert cancel_set.wait(2)
+    release_wait.set()
+    waiter.join(timeout=2)
+    notifier.join(timeout=2)
+
+    assert not waiter.is_alive() and not notifier.is_alive()
+    assert result == [None]
+
+
+def test_wait_new_cancels_only_one_reader_and_buffer_remains_writable() -> None:
+    buffer = AlignmentBuffer(capacity=4)
+    entered: Queue[None] = Queue()
+    buffer._condition = _WaitObservedCondition(buffer._lock, entered)
+    cancel_event = threading.Event()
+    cancelled: list[BufferedFrame | None] = []
+    continuing: list[BufferedFrame | None] = []
+    reader_a = threading.Thread(
+        target=lambda: cancelled.append(buffer.wait_new(after_index=0, cancel_event=cancel_event))
+    )
+    reader_b = threading.Thread(target=lambda: continuing.append(buffer.wait_new(after_index=0)))
+    reader_a.start()
+    reader_b.start()
+    assert entered.get(timeout=2) is None
+    assert entered.get(timeout=2) is None
+
+    cancel_event.set()
+    buffer.wake_waiters()
+    reader_a.join(timeout=2)
+    assert not reader_a.is_alive()
+    assert reader_b.is_alive()
+    buffer.put(make_sample(1000.0))
+    reader_b.join(timeout=2)
+    next_frame = buffer.put(make_sample(1001.0))
+
+    assert not reader_b.is_alive()
+    assert cancelled == [None]
+    assert continuing[0] is not None and continuing[0].index == 1
+    assert next_frame is not None and next_frame.index == 2
 
 
 def test_wait_new_decodes_outside_the_lock() -> None:

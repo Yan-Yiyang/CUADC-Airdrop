@@ -44,7 +44,7 @@ from ..ballistics.model import wind_from_snapshot
 from ..ballistics.release import ReleaseDecision
 from ..config import Config
 from ..georef import LLARef
-from ..preflight import PreflightError, PreflightLike
+from ..preflight import PreflightError, PreflightLike, _PreflightCancelled
 from ..targeting.models import TargetingResult
 from ..telemetry.broker import TelemetryBroker
 from ..telemetry.controller import (
@@ -231,6 +231,7 @@ class MissionRunner:
         self._machine = MissionStateMachine(on_event=on_event)
         self._stats = MissionStats()
         self._stop = threading.Event()
+        self._state_lock = threading.RLock()
         self._monitor = MissionMonitor()
 
         self._origin: LLARef | None = None
@@ -317,8 +318,9 @@ class MissionRunner:
 
     def stop(self, reason: str = "stopped") -> None:
         """请求退出主循环；在途上传协作取消，恢复动作由worker收尾。"""
-        self._stop.set()
-        self.abort(reason)
+        with self._state_lock:
+            self._stop.set()
+            self.abort(reason)
 
     def close(self, *, timeout: float | None = None) -> None:
         """等待任务传输及恢复动作实际收尾；必须早于 MAVSDK 线程停止。"""
@@ -394,10 +396,11 @@ class MissionRunner:
 
     def abort(self, reason: str) -> None:
         """进入 ``ABORT``（终态时是空操作）；操作手/外部故障也可以直接调。"""
-        if self._machine.is_terminal:
-            return
-        stamp = float(self._clock())
-        self._transition(MissionState.ABORT, reason, stamp)
+        with self._state_lock:
+            if self._machine.is_terminal:
+                return
+            stamp = float(self._clock())
+            self._transition(MissionState.ABORT, reason, stamp)
 
     # ------------------------------------------------------------------
     # 各状态的一拍
@@ -427,38 +430,52 @@ class MissionRunner:
             )
         self._transition(MissionState.PREFLIGHT, "telemetry_ready", now)
 
-    def _tick_preflight(self, now: float) -> None:
+    def _tick_preflight(self, now: float) -> None:  # noqa: PLR0911 - 取消与失败出口需各自保留
         """``PREFLIGHT``：载入模型 + 视频自检（一次性，见 :mod:`airdrop.preflight`）。
 
         * 没有注入预检（离线测试）→ 记一条 ``preflight_skipped`` 事件后放过；
         * 任一项失败（异常或 ``ok=False``）→ ``ABORT("preflight_failed:<check>")``；
         * 整体超过 ``PreflightConfig.max_s`` → ``ABORT("preflight_timeout")``。
         """
+        if self._stop.is_set() or self._machine.is_terminal:
+            return
         if self._preflight is None:
             self._emit(
                 "preflight_skipped",
                 {"reason": "没有注入预检（离线测试/演练）"},
             )
             LOGGER.warning("没有注入起飞前自检：跳过（正式入口必须传 preflight）")
-            self._transition(MissionState.WAIT_AIRBORNE, "preflight_skipped", now)
+            self._transition_preflight_to_wait("preflight_skipped", now)
             return
         started = float(self._clock())
         try:
             checks = self._preflight.run()
+        except _PreflightCancelled:
+            return
         except PreflightError as exc:
+            if self._stop.is_set() or self._machine.is_terminal:
+                return
             self._preflight_failed(str(exc).split(":")[0].strip() or "unknown", exc)
             return
         except Exception as exc:  # noqa: BLE001 - 预检自己不抛别的，防御性兜底
+            if self._stop.is_set() or self._machine.is_terminal:
+                return
             self._preflight_failed("unknown", exc)
+            return
+        if self._stop.is_set() or self._machine.is_terminal:
             return
         failed = [check for check in checks if check.ok is False]
         if failed:
+            if self._stop.is_set() or self._machine.is_terminal:
+                return
             self._preflight_failed(
                 failed[0].name,
                 PreflightError(f"{failed[0].name}: {failed[0].detail}"),
             )
             return
         elapsed = float(self._clock()) - started
+        if self._stop.is_set() or self._machine.is_terminal:
+            return
         if elapsed > float(self._config.preflight.max_s):
             self._stats.errors += 1
             LOGGER.error("起飞前自检超时：%.1fs", elapsed)
@@ -472,7 +489,15 @@ class MissionRunner:
             )
             self.abort("preflight_timeout")
             return
-        self._transition(MissionState.WAIT_AIRBORNE, "preflight_ok", now)
+        self._transition_preflight_to_wait("preflight_ok", now)
+
+    def _transition_preflight_to_wait(self, reason: str, now: float) -> bool:
+        """仅在预检仍有效时原子地进入等待起飞状态。"""
+        with self._state_lock:
+            if self._stop.is_set() or self._machine.is_terminal:
+                return False
+            self._transition(MissionState.WAIT_AIRBORNE, reason, now)
+            return True
 
     def _preflight_failed(self, check: str, exc: BaseException) -> None:
         """预检失败：记错误事件与计数，然后 ``ABORT("preflight_failed:<check>")``。"""

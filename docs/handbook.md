@@ -354,6 +354,12 @@ MAVSDK 提供的变化通知与进度没有任务 ID，因此程序无法证明�
 哪一条任务。新回读后的首条完成进度会保守保持未知，直到观察到非终态进度；这能挡住常见的旧
 完成状态残留，但不能识别所有同长度任务切换后的缓存序列。
 
+**实测边界**：SIH/QGC 已验证任务从 0 项到 3 项、再到 4 项，以及同为 4 项但坐标变化时任务 ID
+更新、旧进度清空并回读 4 项；专用 MAVLink 断连时 `connected=False` 且 broker 数据清空，恢复后新会话
+再次回读 4 项。操作手在 QGC 中执行任务上传、替换与启动；只读观察器未上传、启动或清空飞控任务。任务进度
+已从 1/24 到 24/24，随后检测到仿真落地并自动上锁。此结果覆盖 SIH/QGC 任务同步和仿真任务落地，不代表
+完整 Gazebo 相机/感知/投放链路或真实设备已验收。
+
 #### 3.1.3 `DroneController`（任务级控制）
 
 ```python
@@ -497,7 +503,8 @@ AlignmentWriter(buffer, aligner)      # 可调用对象：__call__(frame)
 | `put(sample)` | 存入一条对齐结果（内部会拷贝图像），返回 `BufferedFrame` |
 | `latest()` / `at(index)` / `latest_index()` / `indices()` | 取最新 / 按序号取 / 序号范围 |
 | `iter_between(start=None, end=None, *, batch=16)` | **按时间区间分批迭代**（回看历史的正道） |
-| `wait_new(after_index=0, timeout=None)` | 等一条更新记录，返回**最早**满足条件的那条（读者各自持游标） |
+| `wait_new(after_index=0, timeout=None, *, cancel_event=None)` | 等一条更新记录，返回**最早**满足条件的那条（读者各自持游标）；取消事件已置位时返回 `None` |
+| `wake_waiters()` | 仅唤醒等待线程，让它们检查各自的取消事件；不改缓存或读者游标 |
 | `read_jpeg_bytes(index)` | 内部 API：取原始 jpeg 字节（`FlightRecorder` 零重编码写入磁盘用） |
 | `clear()` | 清空（不影响已发出的记录对象） |
 | `AlignmentWriter.stats()` | `(written, skipped)`：`skipped` 只因"该时刻取不到遥测"增加 |
@@ -707,7 +714,7 @@ DetectorConfig(model_path='models/best2.pt', device='0', conf_threshold=0.25,
 
 | 方法 | 说明 |
 | --- | --- |
-| `load()` | 惰性 `import ultralytics` 并加载权重；返回自身（可链式） |
+| `load()` | 惰性 `import ultralytics` 并加载权重；同一检测器并发调用只构造一次，失败后可重试；返回自身（可链式） |
 | `warmup(width, height)` | 用一张空图跑一次，避免首帧卡顿；返回是否成功 |
 | `prepare_undistort(width, height, *, force=False)` | 预计算 remap 映射表；**映射表锁定在标定分辨率上**，尺寸不符直接返回 `False` 并告警 |
 | `undistort(image)` | 返回 `(纠正后图像, 是否真的纠正了)` |
@@ -718,6 +725,7 @@ DetectorConfig(model_path='models/best2.pt', device='0', conf_threshold=0.25,
 三个必须知道的行为：
 
 - **`device` 显式指定**（默认 `'0'`），确保运行设备由配置决定。
+- 权重与类别名称会在加载成功后一起发布；同一 `Detector` 的并发初始化会串行化。已经开始的模型构造无法强制中断。
 - **去畸变用预计算 remap**，复用映射表以避免逐帧建表。`detect` 在推理前检查 `calib_size`（缺失时使用已建映射表的尺寸），不匹配就抛异常终止处理；关闭去畸变也不能绕过。感知线程锁存错误，`raise_if_failed()` 交给主线程：回放停止生产并返回 1；完整任务和 SITL 侦查通过 `MissionRunner(health_check=...)` 每拍检查，进入 ABORT 并执行配置的收尾动作。修正标定后重新启动，不逐帧跳过等尺寸恢复。单独调用底层 `undistort` 仍保留返回原图和 `False` 的行为，不代表尺寸已核对通过。
 - `detect` 写入 `Detection.extra["undistorted"]` 和 `image_size`，供解算端核对。改变分辨率时，需把显式缩放/重新标定的同一相机模型交给检测器和 `TargetTracker`；`force=True` 仅重建映射表，不负责换算内参。
 
@@ -841,8 +849,9 @@ PerceptionWorker(config: PerceptionConfigLike, *, buffer: AlignmentBuffer,
 ```
 
 - `buffer` 必须是 `AlignmentBuffer`（不是别的可迭代对象）：worker 用 `wait_new` 逐帧跟随，**一帧不落**。`start_index` 决定从哪一帧开始（断点续跑用）。
+- `wait_new` 可用 keyword-only 的 `cancel_event` 取消无限等待；置位事件后调用 `wake_waiters()`。取消只影响传入该事件的读者，其他读者和后续写入不受影响。
 - `detector` / `pool` 可注入：传假对象即可离线测整条流水线（`tests/test_perception.py` 正是这么做的），这也是它们存在的理由。
-- 收尾先停止生产者，再调用 `drain(timeout=120.0)` 等待既有帧和 OCR 回填；它不消费结果队列，成功后仍需抽取结果再 `stop()`。超时、未启动或处理失败返回 `False`。`stop()` 超时会保留工作线程和池，避免并发操作正在使用的池。
+- 收尾先停止生产者，再调用 `drain(timeout=120.0)` 等待既有帧和 OCR 回填；它不消费结果队列，成功后仍需抽取结果再 `stop()`。超时、未启动或处理失败返回 `False`。`finish_input()` 冻结成功后会取消旧缓冲等待并切换到冻结快照；`stop()` 会取消当前代际的等待并唤醒缓冲。`stop()` 超时会保留工作线程和池，避免并发操作正在使用的池。
 - `PerceptionConfigLike` 只要求这些字段：`mode`、`model_path`、`device`、`conf_threshold`、`imgsz`、`target_color`、`ocr_conf_threshold`、`ocr_workers`、`ocr_queue_size`、`ocr_dedupe_s`、`ocr_dedupe_px`、`min_side_px`、`max_side_px`、`engine`（默认 `None`）。真实的参数类是 `PerceptionConfig`，字段更多（见 §4）。
 
 两种模式：
@@ -1328,7 +1337,7 @@ check_fixed_wing_landing(items, *, preceding=None,
 PlanError(ValueError)                 # 读不了 / 结构不认识 / 内容不合法（消息带文件路径与原因）
 PLAN_FIRMWARE_PX4 = 12                # QGC mission.firmwareType
 PLAN_VEHICLE_FIXED_WING = 1           # QGC mission.vehicleType
-FW_DEFAULT_LAND_ANGLE_DEG = 8.0       # PX4 FW_LND_ANG 出厂默认
+FW_DEFAULT_LAND_ANGLE_DEG = 8.0       # 本项目离线预检默认值，不代表 PX4 通用默认值
 ```
 
 - **复杂项在本地展开**：QGC 把"固定翼降落航线"存成一个 `ComplexItem`。本模块照 QGC
@@ -1345,6 +1354,10 @@ FW_DEFAULT_LAND_ANGLE_DEG = 8.0       # PX4 FW_LND_ANG 出厂默认
   距离用与 PX4 `get_distance_to_next_waypoint` 同款的**球面 haversine**（半径 6371000，
   `_EARTH_RADIUS_M`）——刻意不换椭球/Geod，保证预检与飞控是同一把尺子。
   `preceding` 用来说明"`items` 之前还有一项"（飞掠段插在降落段前面时就是飞掠段的 exit）。
+- 更换机型或固件参数后，先回读飞控的 `MIS_TKO_LAND_REQ`、`FW_LND_ANG`、`FW_LND_USETER`，并按实际机型的
+  `FW_LND_ANG` 调用 `check_fixed_wing_landing`。离线函数默认角度为 8°；已核对的 SIH 配置为 5°，不能把默认值
+  当作该机型参数。只有隔离 SITL 且任务确实没有降落航线时，才在该 SITL 配置中设 `MIS_TKO_LAND_REQ=0`；
+  不要据此修改真机配置或关闭其他 failsafe。
 - 不合格的航线在**规划阶段**就带着原因失败（`PlanningError`），而不是上传后被飞控整条拒掉、
   飞机原地盘旋——2026-09 的 SITL 演练里为此空等了 15 分钟。
 
@@ -1686,6 +1699,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 行为细节：
 
 - **开着却没注入回调 = 装配错误**：那一项直接判失败并抛 `PreflightError`（绝不静默当成通过）；
+- 构造参数 `cancel_requested: Callable[[], bool] | None = None` 可选；真实任务用它检查 runner 是否已停止或进入终态。命中取消后不记录该项成功，也不缓存未完成结果；正在运行的模型加载器不能被强制中断，返回后会停止后续加载与视频探测。
 - **关掉的项**记一条 `preflight` 事件（`detail='配置里关掉了（未检查）'`、`ok=null`）后跳过；
 - 视频自检 = 在 `video_probe_s` 窗口内新增至少 `video_min_frames` 帧，历史累计帧不计入。
   最新帧接收时间须在本次窗口内，尺寸必须与有效 `camera_model.image_size` 一致；
@@ -1980,7 +1994,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `MAV_FRAME_GLOBAL` / `MAV_FRAME_MISSION` / `MAV_FRAME_GLOBAL_RELATIVE_ALT` / `MAV_FRAME_GLOBAL_TERRAIN_ALT` | `airdrop.mission.items` | `0` / `2` / `3` / `10` |
 | `DEFAULT_WAYPOINT_ACCEPTANCE_M` | `airdrop.mission.items` | `3.0`（生成航点的默认接受半径） |
 | `DEFAULT_TAKEOFF_PITCH_DEG` | `airdrop.mission.items` | `15.0`（起飞项 `param1`） |
-| `FW_DEFAULT_LAND_ANGLE_DEG` | `airdrop.mission.plan_file` | `8.0`（PX4 `FW_LND_ANG` 出厂默认） |
+| `FW_DEFAULT_LAND_ANGLE_DEG` | `airdrop.mission.plan_file` | `8.0`（本项目离线预检默认值；机型参数以飞控回读的 `FW_LND_ANG` 为准） |
 | `PLAN_FIRMWARE_PX4` / `PLAN_VEHICLE_FIXED_WING` | `airdrop.mission.plan_file` | `12` / `1`（QGC `.plan` 的 `firmwareType` / `vehicleType`） |
 | `MISSION_TYPE_MISSION` | `airdrop.telemetry.controller` | `0`（MAVLink `mission_type`） |
 | `SUPPORTED_QUERY_MODES` | `airdrop.telemetry.broker`、`airdrop.video.align` | `{'interpolate', 'nearest'}` |
