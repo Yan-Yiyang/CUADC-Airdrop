@@ -17,7 +17,7 @@ import concurrent.futures
 import contextlib
 import logging
 import threading
-from collections.abc import AsyncIterable, Coroutine
+from collections.abc import AsyncGenerator, AsyncIterable, Coroutine
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from mavsdk import System
@@ -542,6 +542,7 @@ class MavsdkThread:
         """
         try:
             async with asyncio.TaskGroup() as tg:
+                tg.create_task(self._guarded("connection_state", self._watch_connection(drone)))
                 tg.create_task(self._guarded("position", self._stream_position(drone)))
                 tg.create_task(self._guarded("home", self._stream_home(drone)))
                 tg.create_task(
@@ -571,6 +572,19 @@ class MavsdkThread:
                 tg.create_task(self._optional_stream("in_air", self._stream_in_air(drone)))
         except* Exception as group:  # noqa: BLE001 - 任务组里任一核心流断掉即视为会话结束
             LOGGER.warning("遥测采集中断：%s", group.exceptions[0])
+
+    async def _watch_connection(self, drone: System) -> None:
+        """持续监视 MAVSDK 核心连接状态，并在退出时关闭订阅。"""
+        stream = cast(AsyncGenerator[Any], drone.core.connection_state())
+        try:
+            async with contextlib.aclosing(stream):
+                async for state in stream:
+                    if not state.is_connected:
+                        self._ready.clear()
+                        raise RuntimeError("飞控连接已断开")
+            raise RuntimeError("飞控连接状态订阅已结束")
+        finally:
+            self._ready.clear()
 
     @staticmethod
     async def _guarded(name: str, stream: Coroutine[Any, Any, None]) -> None:
@@ -639,6 +653,8 @@ class MavsdkThread:
         except Exception as exc:  # noqa: BLE001 - 原点可能尚未就绪，返回 False 保留旧值
             LOGGER.debug("获取 GPS 全局原点失败：%s", exc)
             return False
+        if self._drone is not drone:
+            return False
         self.broker.update_gps_global_origin(origin)
         return True
 
@@ -654,6 +670,8 @@ class MavsdkThread:
             origin = await drone.telemetry.get_gps_global_origin()
         except Exception as exc:
             raise RuntimeError("无法获取 NED 原点（GPS_GLOBAL_ORIGIN）") from exc
+        if self._drone is not drone:
+            raise RuntimeError("原点查询所属连接已结束")
         self.broker.update_gps_global_origin(origin)
         return origin
 

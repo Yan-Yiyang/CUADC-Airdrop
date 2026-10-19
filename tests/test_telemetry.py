@@ -10,7 +10,7 @@ import math
 import threading
 import time
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -281,6 +281,90 @@ def test_wall_clock_regression_does_not_freeze_or_corrupt_history(
     assert stamps == sorted(stamps), f"历史乱序：{stamps}"
     # 关键：即使墙钟仍处于回退状态，节流也必须照常推进（用单调钟）
     assert len(broker._history) > 5, "墙钟回退后历史停写了（节流判据用错了时钟）"
+
+
+def test_late_origin_results_cannot_overwrite_a_new_connection() -> None:
+    import asyncio
+
+    async def scenario() -> None:
+        from airdrop.telemetry.mavsdk_thread import MavsdkThread
+
+        broker = TelemetryBroker()
+        mav = MavsdkThread(broker=broker)
+        origin_a = Fake()
+        origin_a.latitude_deg = 1.0
+        origin_a.longitude_deg = 2.0
+        origin_a.altitude_m = 3.0
+        origin_a_late_publish = Fake()
+        origin_a_late_publish.latitude_deg = 11.0
+        origin_a_late_publish.longitude_deg = 12.0
+        origin_a_late_publish.altitude_m = 13.0
+        origin_a_late_query = Fake()
+        origin_a_late_query.latitude_deg = 21.0
+        origin_a_late_query.longitude_deg = 22.0
+        origin_a_late_query.altitude_m = 23.0
+        origin_b = Fake()
+        origin_b.latitude_deg = 31.0
+        origin_b.longitude_deg = 32.0
+        origin_b.altitude_m = 33.0
+
+        drone_a = Fake()
+        drone_a.telemetry = Fake()
+
+        async def initial_origin() -> Fake:
+            return origin_a
+
+        drone_a.telemetry.get_gps_global_origin = initial_origin
+        mav._drone = cast(Any, drone_a)
+        # 初次查询发生在连接已创建、就绪标志尚未置位的阶段。
+        assert not mav.connected
+        assert await mav._publish_origin(cast(Any, drone_a))
+        assert broker.get_snapshot().origin_latitude_deg == 1.0
+
+        started = [asyncio.Event(), asyncio.Event()]
+        releases = [asyncio.Event(), asyncio.Event()]
+        late_results = [origin_a_late_publish, origin_a_late_query]
+        call_index = 0
+
+        async def delayed_origin() -> Fake:
+            nonlocal call_index
+            index = call_index
+            call_index += 1
+            started[index].set()
+            await releases[index].wait()
+            return late_results[index]
+
+        drone_a.telemetry.get_gps_global_origin = delayed_origin
+        old_publish = asyncio.create_task(mav._publish_origin(cast(Any, drone_a)))
+        old_query = asyncio.create_task(mav._query_origin())
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), timeout=1.0)
+
+        # 模拟 A 会话结束、缓存清空，再建立全新的 B 会话。
+        mav._drone = None
+        broker.reset()
+        drone_b = Fake()
+        drone_b.telemetry = Fake()
+
+        async def current_origin() -> Fake:
+            return origin_b
+
+        drone_b.telemetry.get_gps_global_origin = current_origin
+        mav._drone = cast(Any, drone_b)
+        assert await mav._publish_origin(cast(Any, drone_b))
+        assert await mav._query_origin() is origin_b
+        assert broker.get_snapshot().origin_latitude_deg == 31.0
+
+        releases[0].set()
+        releases[1].set()
+        assert await old_publish is False
+        with pytest.raises(RuntimeError, match="原点查询所属连接已结束"):
+            await old_query
+        snapshot = broker.get_snapshot()
+        assert snapshot.origin_latitude_deg == 31.0
+        assert snapshot.origin_longitude_deg == 32.0
+        assert snapshot.origin_altitude_m == 33.0
+
+    asyncio.run(scenario())
 
 
 def test_stop_takes_the_supervisor_lock_that_connect_holds() -> None:

@@ -10,7 +10,7 @@ from typing import Any, cast
 import pytest
 from mavsdk.mission_raw import MissionRawError, MissionRawResult
 
-from airdrop.telemetry import TelemetryBroker
+from airdrop.telemetry import TelemetryBroker, TelemetrySnapshot
 from airdrop.telemetry._mission_sync import MissionSync
 
 
@@ -87,6 +87,76 @@ async def _eventually(predicate: Any) -> None:
             return
         await asyncio.sleep(0.001)
     pytest.fail("异步状态未在预期时间内更新")
+
+
+class FakeConnectionCore:
+    """握手后持续提供可控连接状态，并记录核心订阅是否关闭。"""
+
+    def __init__(self, terminal: str = "hold", *, skip_handshake: bool = False) -> None:
+        self.terminal = terminal
+        self.disconnect = asyncio.Event()
+        self.watch_started = asyncio.Event()
+        self.watch_closed = asyncio.Event()
+        self._subscriptions = int(skip_handshake)
+
+    async def connection_state(self) -> AsyncIterator[Any]:
+        self._subscriptions += 1
+        if self._subscriptions == 1:
+            yield SimpleNamespace(is_connected=True)
+            return
+
+        try:
+            self.watch_started.set()
+            yield SimpleNamespace(is_connected=True)
+            if self.terminal == "eof":
+                return
+            if self.terminal == "error":
+                raise RuntimeError("模拟连接状态流失败")
+            await self.disconnect.wait()
+            if self.terminal == "false":
+                yield SimpleNamespace(is_connected=False)
+            else:
+                yield SimpleNamespace(is_connected=False)
+        finally:
+            self.watch_closed.set()
+
+
+def _hold_session_streams(
+    mav: Any,
+    broker: TelemetryBroker,
+    position_started: asyncio.Event | None = None,
+) -> None:
+    """让非任务遥测流保持打开，以验证连接状态独立结束会话。"""
+    blocker = asyncio.Event()
+
+    async def idle(_drone: Any) -> None:
+        await blocker.wait()
+
+    async def position(_drone: Any) -> None:
+        broker.publish(TelemetrySnapshot(timestamp=100.0, north_m=1.0))
+        broker.publish(TelemetrySnapshot(timestamp=100.1, north_m=2.0))
+        if position_started is not None:
+            position_started.set()
+        await blocker.wait()
+
+    for name in (
+        "_stream_home",
+        "_stream_position_velocity_ned",
+        "_stream_attitude_euler",
+        "_stream_attitude_quaternion",
+        "_refresh_origin_loop",
+        "_stream_wind",
+        "_stream_flight_mode",
+        "_stream_in_air",
+    ):
+        setattr(mav, name, idle)
+    mav._stream_position = position
+
+    async def no_op(_drone: Any) -> None:
+        return None
+
+    mav._apply_telemetry_rates = no_op
+    mav._publish_origin = no_op
 
 
 def test_initial_sync_counts_mission_and_ignores_old_terminal_progress() -> None:
@@ -432,14 +502,152 @@ def test_mavsdk_collector_starts_mission_sync_for_connected_drone() -> None:
                 if False:
                     yield None
 
-        drone = SimpleNamespace(telemetry=FakeTelemetry(), mission_raw=raw)
+        core = FakeConnectionCore(skip_handshake=True)
+        drone = SimpleNamespace(telemetry=FakeTelemetry(), mission_raw=raw, core=core)
         task = asyncio.create_task(mav._collect_telemetry(cast(Any, drone)))
         try:
             await _eventually(lambda: broker.get_snapshot().mission_total == 2)
+            assert core.watch_started.is_set()
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+        assert core.watch_closed.is_set()
         assert raw.upload_calls == raw.clear_calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_disconnected_core_ends_session_clears_progress_and_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        import airdrop.telemetry.mavsdk_thread as mt
+
+        raw = FakeMissionRaw()
+        raw.download_results.put_nowait([_item(), _item()])
+        core = FakeConnectionCore("false")
+        broker = TelemetryBroker(history_interval=0.0)
+        mav = mt.MavsdkThread(broker=broker, reconnect=False)
+        position_started = asyncio.Event()
+        _hold_session_streams(mav, broker, position_started)
+
+        async def connect(system_address: str) -> None:
+            return None
+
+        drone = SimpleNamespace(core=core, mission_raw=raw, connect=connect)
+        monkeypatch.setattr(mt, "System", lambda: drone)
+        session = asyncio.create_task(mav._run_session("udpin://127.0.0.1:1"))
+        try:
+            await asyncio.wait_for(core.watch_started.wait(), timeout=1.0)
+            await _eventually(lambda: broker.get_snapshot().mission_total == 2)
+            raw.progress.put_nowait(SimpleProgress(current=1, total=2))
+            await _eventually(lambda: broker.get_snapshot().mission_current == 1)
+            await asyncio.wait_for(position_started.wait(), timeout=1.0)
+            assert broker.history_span() is not None
+            assert mav.connected
+
+            core.disconnect.set()
+            await asyncio.wait_for(session, timeout=1.0)
+            await asyncio.wait_for(core.watch_closed.wait(), timeout=1.0)
+        finally:
+            if not session.done():
+                core.disconnect.set()
+                session.cancel()
+                await asyncio.gather(session, return_exceptions=True)
+
+        snapshot = broker.get_snapshot()
+        assert not mav.connected
+        assert broker.history_span() is None
+        assert snapshot.mission_current is None and snapshot.mission_total is None
+        assert raw.upload_calls == raw.clear_calls == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("terminal", ["eof", "error"])
+def test_connection_state_eof_or_error_closes_subscription_and_session(
+    monkeypatch: pytest.MonkeyPatch, terminal: str
+) -> None:
+    async def scenario() -> None:
+        import airdrop.telemetry.mavsdk_thread as mt
+
+        core = FakeConnectionCore(terminal)
+        raw = FakeMissionRaw()
+        broker = TelemetryBroker(history_interval=0.0)
+        broker.publish(TelemetrySnapshot(timestamp=10.0, north_m=4.0))
+        broker.publish(TelemetrySnapshot(timestamp=10.1, north_m=5.0))
+        broker.update_mission_progress(1, 3)
+        mav = mt.MavsdkThread(broker=broker, reconnect=False)
+        _hold_session_streams(mav, broker)
+
+        async def connect(system_address: str) -> None:
+            return None
+
+        drone = SimpleNamespace(core=core, mission_raw=raw, connect=connect)
+        monkeypatch.setattr(mt, "System", lambda: drone)
+        await asyncio.wait_for(mav._run_session("udpin://127.0.0.1:1"), timeout=1.0)
+        await asyncio.wait_for(core.watch_closed.wait(), timeout=1.0)
+
+        snapshot = broker.get_snapshot()
+        assert not mav.connected
+        assert broker.history_span() is None
+        assert snapshot.mission_current is None and snapshot.mission_total is None
+
+    asyncio.run(scenario())
+
+
+def test_reconnect_uses_new_core_and_resynchronizes_mission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        import airdrop.telemetry.mavsdk_thread as mt
+
+        first_raw = FakeMissionRaw()
+        first_raw.download_results.put_nowait([_item()])
+        second_raw = FakeMissionRaw()
+        second_raw.download_results.put_nowait([_item(), _item()])
+        first_core = FakeConnectionCore("false")
+        second_core = FakeConnectionCore("hold")
+
+        async def connect(system_address: str) -> None:
+            return None
+
+        drones = iter(
+            (
+                SimpleNamespace(core=first_core, mission_raw=first_raw, connect=connect),
+                SimpleNamespace(core=second_core, mission_raw=second_raw, connect=connect),
+            )
+        )
+        monkeypatch.setattr(mt, "System", lambda: next(drones))
+        broker = TelemetryBroker(history_interval=0.0)
+        mav = mt.MavsdkThread(broker=broker, reconnect=True, reconnect_delay=0.001)
+        _hold_session_streams(mav, broker)
+        serving = asyncio.create_task(mav._serve("udpin://127.0.0.1:1"))
+        try:
+            await asyncio.wait_for(first_core.watch_started.wait(), timeout=1.0)
+            await _eventually(lambda: broker.get_snapshot().mission_total == 1)
+            first_raw.progress.put_nowait(SimpleProgress(current=0, total=1))
+            await _eventually(lambda: broker.get_snapshot().mission_current == 0)
+            first_core.disconnect.set()
+
+            await asyncio.wait_for(second_core.watch_started.wait(), timeout=1.0)
+            await _eventually(lambda: broker.get_snapshot().mission_total == 2)
+            assert len(first_raw.downloads) == 1
+            assert len(second_raw.downloads) == 1
+            second_raw.progress.put_nowait(SimpleProgress(current=1, total=2))
+            await _eventually(lambda: broker.get_snapshot().mission_current == 1)
+        finally:
+            second_core.disconnect.set()
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)
+
+        await asyncio.wait_for(first_core.watch_closed.wait(), timeout=1.0)
+        await asyncio.wait_for(second_core.watch_closed.wait(), timeout=1.0)
+        snapshot = broker.get_snapshot()
+        assert broker.history_span() is None
+        assert snapshot.mission_current is None and snapshot.mission_total is None
+        assert first_raw.upload_calls == first_raw.clear_calls == 0
+        assert second_raw.upload_calls == second_raw.clear_calls == 0
 
     asyncio.run(scenario())
