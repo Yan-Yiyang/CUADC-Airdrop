@@ -32,14 +32,20 @@ SnapshotCallback = Callable[[TelemetrySnapshot], None]
 SUPPORTED_QUERY_MODES = frozenset({"interpolate", "nearest"})
 
 # 时间估计时不参与数值内插的时间类字段
-_SKIP_INTERP_FIELDS = {"timestamp", "attitude_timestamp_us"}
+_SKIP_INTERP_FIELDS = {
+    "timestamp",
+    "attitude_timestamp_us",
+    "position_velocity_received_at",
+}
 
 # 离散量字段：不是连续量，内插出来的是无意义的小数。**必须显式排除**——
 # 下面那道 isinstance(a, (int, float)) 闸门拦不住它们，因为 bool 是 int 的子类：
 #   in_air: True → False 会内插出 0.5（真值）⇒ "等起飞"判据把过渡窗口判成在空中
 #   mission_current: 2 → 4 会内插出 3.0 ⇒ int(3.0) 让任务完成判定提前一格
 # 取 copy_from 那一端的原值（内插取 left、外推取 right），语义与"只有一端有值"一致。
-_DISCRETE_FIELDS = frozenset({"in_air", "mission_current", "mission_total"})
+_DISCRETE_FIELDS = frozenset(
+    {"in_air", "mission_current", "mission_total", "position_velocity_received_at"}
+)
 
 # 欧拉角字段：混合时必须走"最短弧"，否则 179° → -179° 会错误地经过 0°
 _ANGULAR_FIELDS = frozenset({"roll_deg", "pitch_deg", "yaw_deg"})
@@ -284,7 +290,10 @@ class TelemetryBroker:
         self, position_ned: Any, velocity_ned: Any
     ) -> TelemetrySnapshot:
         """发布一个 MAVSDK 本地位置 + 速度更新。"""
-        return self._update(lambda s: s.update_local_position_velocity(position_ned, velocity_ned))
+        return self._update(
+            lambda s: s.update_local_position_velocity(position_ned, velocity_ned),
+            position_velocity_received=True,
+        )
 
     def update_attitude_euler(self, euler: Any) -> TelemetrySnapshot:
         """发布一个 MAVSDK 欧拉角姿态更新。"""
@@ -340,6 +349,18 @@ class TelemetryBroker:
         """把整条快照作为最新值 + 历史写入，时间戳原样保留。"""
         with self._condition:
             record = copy.copy(snapshot)
+            if record.position_velocity_received_at is None and all(
+                value is not None and math.isfinite(value)
+                for value in (
+                    record.north_m,
+                    record.east_m,
+                    record.down_m,
+                    record.vx_m_s,
+                    record.vy_m_s,
+                    record.vz_m_s,
+                )
+            ):
+                record.position_velocity_received_at = record.timestamp
             self._latest = record
             self._history.append(record)
             self._last_history_timestamp = record.timestamp
@@ -358,11 +379,15 @@ class TelemetryBroker:
     def _update(
         self,
         mutator: Callable[[TelemetrySnapshot], None],
+        *,
+        position_velocity_received: bool = False,
     ) -> TelemetrySnapshot:
         with self._condition:
             snapshot = copy.copy(self._latest)
             mutator(snapshot)
             snapshot.timestamp = time.time()
+            if position_velocity_received:
+                snapshot.position_velocity_received_at = snapshot.timestamp
             self._latest = snapshot
             # 墙钟回退 ⇒ 历史不再是升序，而内插的正确性完全建立在升序上
             # （_evaluate_snapshot_locked 用 history[0]/history[-1] 当最小/最大）。

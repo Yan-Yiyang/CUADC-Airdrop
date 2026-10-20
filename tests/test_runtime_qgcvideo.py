@@ -279,3 +279,99 @@ def test_runtime_uses_real_display_state_without_consuming_results_or_stale_pose
     assert snapshot.observed_at == 100.0
     assert snapshot.replay_mode
     assert worker.queued_results == 1
+
+
+def test_runtime_owns_live_prediction_thread_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    from airdrop.qgcvideo import publisher
+
+    class FakePublisher:
+        def __init__(self, config, supplier, *, on_event=None) -> None:
+            del config, supplier, on_event
+            self.running = False
+
+        def start(self):
+            self.running = True
+            return self
+
+        def stop(self, timeout=None):
+            del timeout
+            self.running = False
+
+    class Source:
+        def latest(self):
+            return None
+
+    monkeypatch.setattr(publisher, "QgcVideoPublisher", FakePublisher)
+    config = replace(Config(), qgc_video=replace(QgcVideoConfig(), enabled=True))
+    runtime = QgcVideoRuntime(config, Source(), TelemetryBroker(), None, None)
+    assert runtime.start() is runtime.publisher
+    assert runtime.predictor._thread is not None and runtime.predictor._thread.is_alive()
+    runtime._snapshot()
+    runtime.stop()
+    assert runtime.predictor._thread is None
+    assert runtime.state.snapshot().live_prediction is None
+
+
+def test_runtime_rolls_back_predictor_when_publisher_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from airdrop.qgcvideo import publisher
+
+    class BrokenPublisher:
+        def __init__(self, config, supplier, *, on_event=None) -> None:
+            del config, supplier, on_event
+
+        def start(self):
+            raise RuntimeError("publisher failed")
+
+    class Source:
+        def latest(self):
+            return None
+
+    monkeypatch.setattr(publisher, "QgcVideoPublisher", BrokenPublisher)
+    config = replace(Config(), qgc_video=replace(QgcVideoConfig(), enabled=True))
+    runtime = QgcVideoRuntime(config, Source(), TelemetryBroker(), None, None)
+    with pytest.raises(RuntimeError, match="publisher failed"):
+        runtime.start()
+    assert runtime.predictor._thread is None
+
+
+def test_runtime_continues_publisher_cleanup_after_predictor_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from airdrop.qgcvideo import publisher
+
+    class FakePublisher:
+        def __init__(self, config, supplier, *, on_event=None) -> None:
+            del config, supplier, on_event
+            self.stopped = False
+            instances.append(self)
+
+        def start(self):
+            return self
+
+        def stop(self, timeout=None):
+            del timeout
+            self.stopped = True
+
+    instances: list[FakePublisher] = []
+
+    class Source:
+        def latest(self):
+            return None
+
+    monkeypatch.setattr(publisher, "QgcVideoPublisher", FakePublisher)
+    config = replace(Config(), qgc_video=replace(QgcVideoConfig(), enabled=True))
+    runtime = QgcVideoRuntime(config, Source(), TelemetryBroker(), None, None)
+    # 本测试只验证 stop 的异常清理路径，不需要启动真实非守护预测线程。
+    monkeypatch.setattr(runtime.predictor, "start", lambda: None)
+    runtime.start()
+
+    def interrupt(*args, **kwargs):
+        del args, kwargs
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runtime.predictor, "stop", interrupt)
+    with pytest.raises(BaseExceptionGroup):
+        runtime.stop()
+    assert instances[0].stopped

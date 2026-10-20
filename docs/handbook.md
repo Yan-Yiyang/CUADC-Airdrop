@@ -1977,7 +1977,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `restart_delay_s` | float | `1.0` | 编码器失败重启退避 |
 | `max_restarts` | int | `3` | 编码器重启上限 |
 
-状态与数据隔离、QGC 接收配置、几何来源及测试边界见 [QGC 视频说明](qgc_video.md)。`airdrop.qgcvideo` 按需导出 `DisplayState`、`DisplaySnapshot`、`FrameComposer`、`QgcVideoPublisher`。空间反投影使用 `ned_to_pixel` 和 `ProjectedPoint`，不会推进任务或投放判据。
+状态与数据隔离、QGC 接收配置、几何来源及测试边界见 [QGC 视频说明](qgc_video.md)。`airdrop.qgcvideo` 按需导出 `DisplayState`、`DisplaySnapshot`、`FrameComposer`、`QgcVideoPublisher`。实时弹道显示由独立 `LiveImpactPredictor` 只读计算；位置速度接收时间与普通遥测快照时间分开维护，不调用投放判据。空间反投影使用 `ned_to_pixel` 和 `ProjectedPoint`，不会推进任务或投放判据。
 
 ### 4.17 模块级常量与枚举
 

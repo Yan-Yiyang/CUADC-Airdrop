@@ -30,6 +30,7 @@ from .models import (
     PanelEntry,
     ProgressSnapshot,
 )
+from .prediction import LiveImpactPrediction
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -94,6 +95,25 @@ class DisplayState:
         self._impact_error_m: float | None = None
         self._impact_flight_time_s: float | None = None
         self._impact_prediction_timestamp: float | None = None
+        self._release_impact_ned: tuple[float, float, float] | None = None
+        self._release_error_m: float | None = None
+        self._release_flight_time_s: float | None = None
+        self._release_prediction_timestamp: float | None = None
+        self._release_candidate: (
+            tuple[
+                int,
+                int | None,
+                tuple[float, float, float] | None,
+                float | None,
+                float | None,
+                float | None,
+            ]
+            | None
+        ) = None
+        self._plan_generation = 0
+        self._live_prediction: LiveImpactPrediction | None = None
+        self._live_prediction_token = -1
+        self._lifecycle_token = 0
         self._release_command_status = "not_sent"
         self._release_command_timestamp: float | None = None
         self._released = False
@@ -106,6 +126,29 @@ class DisplayState:
         self._flypast_confirmed = False
         self._flypast_armed = False
         self._flypast_completed = False
+
+    @property
+    def stage(self) -> str | None:
+        with self._lock:
+            return self._stage
+
+    @property
+    def target_ned(self) -> tuple[float, float, float] | None:
+        with self._lock:
+            return self._target_ned
+
+    def prediction_context(self) -> tuple[int, tuple[float, float, float] | None, str | None]:
+        """原子读取弹道显示所属生命周期、目标和阶段。"""
+        with self._lock:
+            return self._lifecycle_token, self._target_ned, self._stage
+
+    def invalidate_live_prediction(self) -> int:
+        """使正在进行的预测和已取出的快照都不能再写回状态。"""
+        with self._lock:
+            self._lifecycle_token += 1
+            self._live_prediction = None
+            self._live_prediction_token = -1
+            return self._lifecycle_token
 
     def on_frame(self, frame: ProcessedFrame) -> None:
         """收下处理帧，包括零检测帧；只保存有界历史。"""
@@ -173,7 +216,7 @@ class DisplayState:
                 _ObservationRecord(serial, item, bool(identity_trusted and thumbnail is not None))
             )
 
-    def on_event(self, kind: str, data: Mapping[str, object]) -> None:  # noqa: PLR0915
+    def on_event(self, kind: str, data: Mapping[str, object]) -> None:  # noqa: PLR0912, PLR0915
         """旁路接收事件；只复制必要标量，不保留事件字典引用。"""
         now = float(self._clock())
         frozen_data = tuple(sorted((str(key), _freeze(value)) for key, value in data.items()))
@@ -188,6 +231,9 @@ class DisplayState:
                 if previous is not None and next_stage not in {None, "ABORT", previous}:
                     self._completed_stages.add(previous)
                 self._stage = next_stage
+                if next_stage != previous:
+                    self._lifecycle_token += 1
+                    self._live_prediction = None
                 stamp = values.get("timestamp")
                 event_time = float(stamp) if isinstance(stamp, (int, float)) else now
                 self._stage_started_at = event_time
@@ -198,6 +244,12 @@ class DisplayState:
                     self._impact_error_m = None
                     self._impact_flight_time_s = None
                     self._impact_prediction_timestamp = None
+                    self._release_impact_ned = None
+                    self._release_error_m = None
+                    self._release_flight_time_s = None
+                    self._release_prediction_timestamp = None
+                    self._release_candidate = None
+                    self._live_prediction = None
                     self._released = False
                     self._release_timestamp = None
                     self._release_simulated = self._simulated_release
@@ -210,7 +262,20 @@ class DisplayState:
                     self._flypast_armed = False
                     self._flypast_completed = False
             elif kind == "drop_plan":
+                self._lifecycle_token += 1
+                self._plan_generation += 1
                 self._target_ned = _triple(values.get("target_ned"))
+                self._release_impact_ned = None
+                self._release_error_m = None
+                self._release_flight_time_s = None
+                self._release_prediction_timestamp = None
+                self._release_candidate = None
+                self._live_prediction = None
+                self._released = False
+                self._release_timestamp = None
+                self._release_simulated = self._simulated_release
+                self._release_command_status = "not_sent"
+                self._release_command_timestamp = None
                 self._flypast_item_count = _positive_int(values.get("items"))
                 self._flypast_exit_seq = _nonnegative_int(values.get("overfly_exit_seq"))
                 overfly_count = _positive_int(values.get("overfly_item_count"))
@@ -247,11 +312,37 @@ class DisplayState:
                     if isinstance(evaluated_at, (int, float)) and math.isfinite(evaluated_at)
                     else now
                 )
+                if kind == "release":
+                    self._release_candidate = (
+                        self._plan_generation,
+                        None,
+                        self._predicted_impact_ned,
+                        self._impact_error_m,
+                        self._impact_flight_time_s,
+                        self._impact_prediction_timestamp,
+                    )
             elif kind in {"gripper_release", "drop_dry_run"}:
                 self._release_command_status = "sent"
                 self._release_command_timestamp = now
                 self._release_simulated = kind == "drop_dry_run"
             elif kind == "drop_released":
+                release_count = _positive_int(values.get("count"))
+                if (
+                    self._release_candidate is not None
+                    and release_count is not None
+                    and self._release_candidate[0] == self._plan_generation
+                    and self._release_candidate[1] is not None
+                    and self._release_candidate[1] == release_count
+                ):
+                    (
+                        _,
+                        _,
+                        self._release_impact_ned,
+                        self._release_error_m,
+                        self._release_flight_time_s,
+                        self._release_prediction_timestamp,
+                    ) = self._release_candidate
+                self._release_candidate = None
                 self._released = True
                 timestamp = values.get("timestamp")
                 self._release_timestamp = (
@@ -282,6 +373,15 @@ class DisplayState:
                     self._release_command_timestamp = (
                         float(timestamp) if isinstance(timestamp, (float, int)) else now
                     )
+                if kind == "drop_command_pending" and self._release_candidate is not None:
+                    candidate = self._release_candidate
+                    self._release_candidate = (
+                        candidate[0],
+                        _positive_int(values.get("count")),
+                        *candidate[2:],
+                    )
+                elif kind in {"drop_command_failed", "drop_command_unknown"}:
+                    self._release_candidate = None
 
     def update_progress(
         self,
@@ -342,6 +442,17 @@ class DisplayState:
             elif not self._flypast_completed:
                 self._flypast_armed = False
 
+    def set_live_prediction(
+        self, prediction: LiveImpactPrediction | None, lifecycle_token: int
+    ) -> bool:
+        """保存计算线程的不可变结果，不参与弹道计算。"""
+        with self._lock:
+            if lifecycle_token != self._lifecycle_token:
+                return False
+            self._live_prediction = prediction
+            self._live_prediction_token = lifecycle_token
+            return True
+
     def _estimate_progress(self, progress: ProgressSnapshot, now: float) -> ProgressSnapshot:
         hold_elapsed = None
         hold_remaining = None
@@ -375,7 +486,7 @@ class DisplayState:
             ),
         )
 
-    def snapshot(self, frame: ProcessedFrame | None = None) -> DisplaySnapshot:
+    def snapshot(self, frame: ProcessedFrame | None = None) -> DisplaySnapshot:  # noqa: PLR0915
         """复制有界状态并按当前帧姿态投影；锁内不做几何计算。"""
         with self._lock:
             history = tuple(self._history.values())
@@ -392,6 +503,13 @@ class DisplayState:
             impact_error = self._impact_error_m
             impact_flight_time = self._impact_flight_time_s
             impact_prediction_timestamp = self._impact_prediction_timestamp
+            live_prediction = self._live_prediction
+            if self._live_prediction_token != self._lifecycle_token:
+                live_prediction = None
+            release_impact = self._release_impact_ned
+            release_error = self._release_error_m
+            release_flight_time = self._release_flight_time_s
+            release_prediction_timestamp = self._release_prediction_timestamp
             flypast_completed = self._flypast_completed
             released = self._released
             release_timestamp = self._release_timestamp
@@ -401,6 +519,14 @@ class DisplayState:
             geometry_error = self._geometry_error
 
         mode = _display_mode(stage, progress)
+        live_impact = (
+            live_prediction.impact_ned
+            if live_prediction is not None
+            and live_prediction.valid
+            and stage in {"OVERFLY", "LAND"}
+            else None
+        )
+        impact = live_impact
         if mode in {"hold_live", "drop"} and frame is not None:
             selected = replace(frame, detections=())
         elif history:
@@ -490,6 +616,11 @@ class DisplayState:
             completed_stages=completed_stages,
             impact_prediction_timestamp=impact_prediction_timestamp,
             flypast_completed=flypast_completed,
+            live_prediction=live_prediction,
+            release_impact_ned=release_impact,
+            release_error_m=release_error,
+            release_flight_time_s=release_flight_time,
+            release_prediction_timestamp=release_prediction_timestamp,
         )
 
     def _solve_detection(

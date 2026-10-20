@@ -8,6 +8,7 @@ import numpy as np
 
 from ..georef.project import ProjectedPoint
 from ..perception.models import DetectionSnapshot, ProcessedFrame
+from .prediction import LiveImpactPrediction
 
 __all__ = [
     "DisplayEvent",
@@ -110,3 +111,8 @@ class DisplaySnapshot:
     completed_stages: tuple[str, ...] = ()
     impact_prediction_timestamp: float | None = None
     flypast_completed: bool = False
+    live_prediction: LiveImpactPrediction | None = None
+    release_impact_ned: tuple[float, float, float] | None = None
+    release_error_m: float | None = None
+    release_flight_time_s: float | None = None
+    release_prediction_timestamp: float | None = None

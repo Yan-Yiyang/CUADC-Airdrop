@@ -14,6 +14,7 @@ from airdrop.perception.models import (
     readonly_image,
     snapshot_detection,
 )
+from airdrop.qgcvideo.prediction import LiveImpactPrediction
 from airdrop.qgcvideo.state import DisplayState
 from airdrop.telemetry.models import TelemetrySnapshot
 
@@ -64,7 +65,7 @@ def test_impact_details_are_read_from_existing_decision_event() -> None:
         },
     )
     snapshot = state.snapshot()
-    assert snapshot.predicted_impact_ned == (1.0, 2.0, 0.0)
+    assert snapshot.predicted_impact_ned is None
     assert snapshot.impact_error_m == 1.4
     assert snapshot.impact_flight_time_s == 3.2
     assert snapshot.impact_prediction_timestamp == 8.5
@@ -74,6 +75,103 @@ def test_impact_prediction_timestamp_falls_back_to_event_clock() -> None:
     state = DisplayState(Config(), None, clock=lambda: 17.0)
     state.on_event("drop_check", {"impact_ned": [1.0, 2.0, 0.0]})
     assert state.snapshot().impact_prediction_timestamp == 17.0
+
+
+def test_released_prediction_freezes_only_matching_successful_release_event() -> None:
+    state = DisplayState(Config(), None, clock=lambda: 100.0)
+    state.on_event(
+        "release",
+        {
+            "impact_ned": [10.0, 20.0, 0.0],
+            "horizontal_error_m": 2.0,
+            "flight_time_s": 3.0,
+            "evaluated_at": 90.0,
+        },
+    )
+    state.on_event("drop_check", {"impact_ned": [99.0, 99.0, 0.0], "horizontal_error_m": 90.0})
+    assert state.snapshot().release_impact_ned is None
+    state.on_event("drop_command_pending", {"count": 1})
+    state.on_event("drop_released", {"timestamp": 91.0, "count": 1})
+    state.on_event("drop_check", {"impact_ned": [80.0, 80.0, 0.0], "horizontal_error_m": 70.0})
+    snapshot = state.snapshot()
+    assert snapshot.release_impact_ned == (10.0, 20.0, 0.0)
+    assert snapshot.release_error_m == 2.0
+    assert snapshot.release_flight_time_s == 3.0
+    assert snapshot.release_prediction_timestamp == 90.0
+
+
+def test_live_prediction_is_projected_only_as_current_drop_stage_state() -> None:
+    state = DisplayState(Config(), None)
+    prediction = LiveImpactPrediction(
+        True,
+        "",
+        (10.0, 20.0, 0.0),
+        3.0,
+        2.0,
+        10.0,
+        1.0,
+        1,
+        False,
+        0.0,
+        (0.0, 0.0, -10.0),
+        (10.0, 0.0, 0.0),
+    )
+    state.on_event("state", {"to_state": "OVERFLY"})
+    token, _, _ = state.prediction_context()
+    state.set_live_prediction(prediction, token)
+    assert state.snapshot().predicted_impact_ned == (10.0, 20.0, 0.0)
+    state.on_event("state", {"to_state": "DONE"})
+    assert state.snapshot().predicted_impact_ned is None
+
+
+def test_stopped_prediction_context_rejects_late_snapshot_writeback() -> None:
+    state = DisplayState(Config(), None)
+    state.on_event("state", {"to_state": "OVERFLY"})
+    old_token, _, _ = state.prediction_context()
+    stopped_token = state.invalidate_live_prediction()
+    late = LiveImpactPrediction(
+        True,
+        "",
+        (1.0, 2.0, 0.0),
+        3.0,
+        2.0,
+        10.0,
+        1.0,
+        1,
+        True,
+        0.0,
+        (0.0, 0.0, -10.0),
+        (10.0, 0.0, 0.0),
+    )
+    assert stopped_token > old_token
+    assert not state.set_live_prediction(late, old_token)
+    assert state.snapshot().live_prediction is None
+
+
+def test_release_candidate_requires_matching_pending_and_released_count() -> None:
+    state = DisplayState(Config(), None)
+    payload = {
+        "impact_ned": [1.0, 2.0, 0.0],
+        "horizontal_error_m": 1.0,
+        "flight_time_s": 2.0,
+        "evaluated_at": 3.0,
+    }
+    state.on_event("release", payload)
+    state.on_event("drop_released", {"count": 1})
+    assert state.snapshot().release_impact_ned is None
+
+    state.on_event("release", payload)
+    state.on_event("drop_command_pending", {"count": 2})
+    state.on_event("drop_released", {"count": 3})
+    assert state.snapshot().release_impact_ned is None
+
+    state.on_event("release", payload)
+    state.on_event("drop_command_pending", {"count": 4})
+    state.on_event("drop_released", {"count": 4})
+    assert state.snapshot().release_impact_ned == (1.0, 2.0, 0.0)
+
+    state.on_event("drop_released", {"count": 4})
+    assert state.snapshot().release_impact_ned == (1.0, 2.0, 0.0)
 
 
 def _set_mission_progress(state: DisplayState, current: int | None, total: int | None = 16) -> None:

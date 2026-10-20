@@ -14,6 +14,7 @@ from airdrop.qgcvideo.models import (
     PanelEntry,
     ProgressSnapshot,
 )
+from airdrop.qgcvideo.prediction import LiveImpactPrediction
 from airdrop.qgcvideo.render import FrameComposer, _fit_text_anchor, _font
 
 
@@ -281,7 +282,7 @@ def test_replay_uses_source_timeline_without_live_delay_claims(monkeypatch) -> N
     assert "回放不包含投放状态" in rendered
 
 
-def test_impact_error_is_labeled_as_decision_prediction_error(monkeypatch) -> None:
+def test_old_decision_event_is_never_substituted_for_live_prediction(monkeypatch) -> None:
     snapshot, _ = _snapshot("drop")
     snapshot = replace(snapshot, impact_error_m=1.4, impact_flight_time_s=3.2)
     rendered: list[str] = []
@@ -294,8 +295,8 @@ def test_impact_error_is_labeled_as_decision_prediction_error(monkeypatch) -> No
     monkeypatch.setattr(FrameComposer, "_draw_text_commands", capture)
     FrameComposer().compose(snapshot)
 
-    assert any("最近判据预测" in item and "误差 1.4 米" in item for item in rendered)
-    assert any("弹体预计飞行 3.2 秒" in item for item in rendered)
+    assert any("实时无效" in item for item in rendered)
+    assert any("投放时模型预测 · 未知" in item for item in rendered)
 
 
 def test_projected_labels_use_live_horizontal_range_without_changing_decision_error(
@@ -308,12 +309,30 @@ def test_projected_labels_use_live_horizontal_range_without_changing_decision_er
     frame = replace(frame, pose=pose)
     snapshot = replace(
         snapshot,
+        stage="OVERFLY",
         frame=frame,
         target_ned=(103.0, 204.0, -10.0),
         impact_error_m=1.4,
         impact_flight_time_s=3.2,
         impact_prediction_timestamp=8.0,
         observed_at=11.0,
+        live_prediction=LiveImpactPrediction(
+            True,
+            "",
+            (110.0, 212.0, 0.0),
+            6.7,
+            2.9,
+            10.9,
+            1.0,
+            1,
+            True,
+            0.0,
+            (100.0, 200.0, -50.0),
+            (10.0, 0.0, 0.0),
+        ),
+        release_error_m=1.4,
+        release_flight_time_s=3.2,
+        release_prediction_timestamp=8.0,
         target_projected=ProjectedPoint((103.0, 204.0, -10.0), (100.0, 100.0), True, True),
         impact_projected=ProjectedPoint((110.0, 212.0, 0.0), (200.0, 100.0), True, True),
     )
@@ -327,8 +346,9 @@ def test_projected_labels_use_live_horizontal_range_without_changing_decision_er
     monkeypatch.setattr(FrameComposer, "_draw_text_commands", capture)
     FrameComposer().compose(snapshot)
     assert any("目标 · 水平距离 5 米" in item for item in rendered)
-    assert any("最近预测落点 · 距该落点 16 米" in item for item in rendered)
-    assert any("最近判据预测 · 事件年龄 3.0 秒 · 误差 1.4 米" in item for item in rendered)
+    assert any("实时预测落点 · 距该落点 16 米" in item for item in rendered)
+    assert any("实时预测误差 6.7 米" in item for item in rendered)
+    assert any("投放时模型：误差 1.4 米" in item for item in rendered)
 
     moved_frame = replace(frame, pose=replace(pose, position_ned=(102.0, 202.0, -50.0)))
     moved = replace(snapshot, frame=moved_frame)
@@ -341,7 +361,8 @@ def test_projected_labels_use_live_horizontal_range_without_changing_decision_er
     monkeypatch.setattr(FrameComposer, "_draw_text_commands", capture_moved)
     FrameComposer().compose(moved)
     assert any("目标 · 水平距离 2 米" in item for item in moved_rendered)
-    assert any("误差 1.4 米" in item for item in moved_rendered)
+    assert any("实时预测误差 6.7 米" in item for item in moved_rendered)
+    assert any("投放时模型：误差 1.4 米" in item for item in moved_rendered)
 
 
 def test_edge_arrow_length_is_fixed_and_clipped_labels_fit_inside_letterboxed_viewport(
@@ -428,8 +449,7 @@ def test_overlapping_target_and_impact_labels_use_distinct_rows_at_viewport_corn
             captured.extend(
                 (text, origin, size, clip)
                 for text, origin, size, _, clip in self._text_commands
-                if clip is not None
-                and (text.startswith("目标 ·") or text.startswith("最近预测落点 ·"))
+                if clip is not None and (text.startswith("目标 ·") or text.startswith("预测落点 ·"))
             )
             original(self, canvas)
 
@@ -491,8 +511,8 @@ def test_flypast_latch_replaces_projection_arrows_and_uses_released_error_label(
     snapshot = replace(
         snapshot,
         released=True,
-        impact_error_m=1.4,
-        impact_flight_time_s=3.2,
+        release_error_m=1.4,
+        release_flight_time_s=3.2,
         target_projected=ProjectedPoint((1.0, 2.0, 3.0), (100.0, 100.0), True, True),
         impact_projected=ProjectedPoint((4.0, 5.0, 6.0), (200.0, 100.0), True, True),
     )
@@ -517,8 +537,8 @@ def test_flypast_latch_replaces_projection_arrows_and_uses_released_error_label(
 
     assert arrow_calls == 0
     assert any("已飞掠目标航段" in item for item in rendered)
-    assert any("投放时预测误差 1.4 米" in item for item in rendered)
-    assert any("弹体预计飞行 3.2 秒" in item for item in rendered)
+    assert any("投放时模型：误差 1.4 米" in item for item in rendered)
+    assert any("滞空 3.2 秒" in item for item in rendered)
     assert tuple(result[330, 200]) == (20, 40, 60)
     assert not np.array_equal(result[130:850, :1280], baseline[130:850, :1280])
 

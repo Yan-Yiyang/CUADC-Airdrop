@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from ..config import BallisticsConfig
@@ -223,6 +223,7 @@ class BallisticsModel:
         ground_z: float = 0.0,
         ground_altitude_m: float = 0.0,
         wind: Sequence[float] = (0.0, 0.0, 0.0),
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Impact:
         """从 ``position_ned``/``velocity_ned`` 起积分，返回落点与飞行时间。
 
@@ -234,6 +235,8 @@ class BallisticsModel:
         它是密度的基准——``air_density_isa=True`` 时按 ``ground_altitude_m + 离地
         高度`` 逐级求值；``False`` 时在**初始（投放）海拔** ``ground_altitude_m +
         初始离地高度`` 上求一次常密度，全弹道共用。
+
+        ``should_cancel`` 仅供可取消的只读显示计算检查；不给时保持完整积分行为。
         """
         if len(position_ned) != 3 or len(velocity_ned) != 3:
             raise ValueError("position_ned / velocity_ned 必须是 3 维 NED 矢量")
@@ -252,7 +255,10 @@ class BallisticsModel:
             initial_height = max(ground_z - p[2], 0.0)
             drag_scale = self._k * isa_air_density(baseline + initial_height)
         elapsed = 0.0
+        steps = 0
         while elapsed < MAX_FLIGHT_TIME_S:
+            if should_cancel is not None and steps % 256 == 0 and should_cancel():
+                return Impact(False, None, elapsed, 0.0, reason="cancelled")
             height = max(ground_z - p[2], 0.0)
             # RK4：k1..k4 分别是位置与速度的斜率
             if drag_scale is None:
@@ -298,6 +304,7 @@ class BallisticsModel:
                 )
             p = p_next
             elapsed += dt
+            steps += 1
 
         LOGGER.warning("弹道积分超过 %.0fs 仍未落地，判为失败", MAX_FLIGHT_TIME_S)
         return Impact(False, None, elapsed, 0.0, reason="timeout")

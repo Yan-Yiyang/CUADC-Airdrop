@@ -328,6 +328,8 @@ class FrameComposer:
             ("target_projected", (55, 220, 100), "目标"),
             ("impact_projected", (35, 80, 245), "落点"),
         ):
+            if getattr(snapshot, "flypast_completed", False):
+                continue
             projected = getattr(snapshot, name, None)
             if projected is None:
                 continue
@@ -452,7 +454,8 @@ class FrameComposer:
                 else f"距该落点 {horizontal:.0f} 米"
             )
         if label == "落点":
-            prefix = "投放时预测落点" if getattr(snapshot, "released", False) else "最近预测落点"
+            live = getattr(snapshot, "live_prediction", None)
+            prefix = "实时预测落点" if live is not None and live.valid else "预测落点"
         else:
             prefix = "目标"
         text = f"{prefix} · {distance}"
@@ -822,48 +825,43 @@ class FrameComposer:
             release_text = self._release_text(snapshot)
         self._text(canvas, route, (1185, 906), 0.36, (220, 225, 230))
         self._text(canvas, release_text, (1185, 936), 0.36, (220, 225, 230))
-        target = getattr(snapshot, "target_ned", None)
-        target_text = (
-            "目标坐标未知" if target is None else f"目标 N {target[0]:.1f} E {target[1]:.1f} 米"
-        )
-        error = getattr(snapshot, "impact_error_m", None)
-        flight_time = getattr(snapshot, "impact_flight_time_s", None)
-        error_text = "误差未知" if error is None else f"误差 {error:.1f} 米"
-        impact_timestamp = getattr(snapshot, "impact_prediction_timestamp", None)
+        live = getattr(snapshot, "live_prediction", None)
+        live_error = None if live is None or not live.valid else live.error_m
+        live_flight = None if live is None or not live.valid else live.flight_time_s
         observed_at = getattr(snapshot, "observed_at", None)
-        event_age = (
+        received_at = None if live is None else live.position_velocity_received_at
+        state_age = (
             None
-            if impact_timestamp is None or observed_at is None
-            else max(0.0, float(observed_at) - float(impact_timestamp))
+            if observed_at is None or received_at is None
+            else float(observed_at) - float(received_at)
         )
-        prediction_label = (
-            "投放时预测"
-            if getattr(snapshot, "released", False)
-            else f"最近判据预测 · 事件年龄 {event_age:.1f} 秒"
-            if event_age is not None
-            else "最近判据预测 · 事件年龄未知"
+        live_text = (
+            f"实时预测误差 {live_error:.1f} 米 · 预计滞空 {live_flight:.1f} 秒"
+            if live_error is not None and live_flight is not None
+            else f"实时无效 · {('未启动' if live is None else live.reason)}"
         )
-        impact_error_label = (
-            "投放时预测误差"
-            if getattr(snapshot, "released", False)
-            else f"{prediction_label} · 误差"
+        live_text += " · 状态龄 "
+        live_text += "未知" if state_age is None else f"{state_age:.2f} 秒"
+        if live is not None and live.valid and not live.wind_available:
+            live_text += " · 缺风按零风"
+        release_error = getattr(snapshot, "release_error_m", None)
+        release_time = getattr(snapshot, "release_flight_time_s", None)
+        release_stamp = getattr(snapshot, "release_prediction_timestamp", None)
+        release_text = (
+            f"投放时模型：误差 {release_error:.1f} 米 · 时刻 {_format_clock(release_stamp)}"
+            if release_error is not None and release_time is not None
+            else "投放时模型预测 · 未知（无匹配的成功投放预测）"
         )
+        if release_error is not None and release_time is not None:
+            release_text += f" · 滞空 {release_time:.1f} 秒"
         self._text(
             canvas,
-            "投放目标待任务统计确定"
-            if target is None and error is None and flight_time is None
-            else (
-                f"{target_text} · {impact_error_label} {error_text.removeprefix('误差 ')} · "
-                + (
-                    f"弹体预计飞行 {flight_time:.1f} 秒"
-                    if flight_time is not None
-                    else "弹体预计飞行时间未知"
-                )
-            ),
-            (1185, 966),
-            0.31,
+            live_text,
+            (1185, 953),
+            0.29,
             (190, 200, 210),
         )
+        self._text(canvas, release_text, (1185, 978), 0.29, (190, 200, 210))
 
     @staticmethod
     def _thumbnail(snapshot: DisplaySnapshot, entry: Any) -> np.ndarray | None:

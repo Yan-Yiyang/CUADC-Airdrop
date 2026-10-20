@@ -42,6 +42,7 @@ class QgcVideoRuntime:
         simulated_release: bool = False,
         replay_mode: bool = False,
     ) -> None:
+        from airdrop.qgcvideo.prediction import LiveImpactPredictor
         from airdrop.qgcvideo.publisher import QgcVideoPublisher
         from airdrop.qgcvideo.state import DisplayState
         from airdrop.video.align import FrameTelemetryAligner
@@ -62,6 +63,8 @@ class QgcVideoRuntime:
             on_timeout="drop",
         )
         self.state = DisplayState(config, camera, simulated_release=simulated_release)
+        self.predictor = LiveImpactPredictor(config)
+        self._predictor_enabled = False
         self.last_snapshot: DisplaySnapshot | None = None
         self.publisher = QgcVideoPublisher(
             config.qgc_video,
@@ -79,11 +82,25 @@ class QgcVideoRuntime:
         return self.publisher.running
 
     def start(self) -> object:
-        return self.publisher.start()
+        if not self.replay_mode:
+            self.predictor.start()
+        self._predictor_enabled = not self.replay_mode
+        try:
+            return self.publisher.start()
+        except BaseException:
+            self._predictor_enabled = False
+            self.predictor.stop()
+            raise
 
     def stop(self, timeout: float | None = None) -> None:
         """结束发布并断开旁路观察者，保留最后画面快照。"""
         errors: list[BaseException] = []
+        self._predictor_enabled = False
+        self.state.invalidate_live_prediction()
+        try:
+            self.predictor.stop(timeout=timeout if timeout is not None else 2.0)
+        except BaseException as exc:  # noqa: BLE001 - 中断也要继续停止其余资源
+            errors.append(exc)
         if self.worker is not None:
             try:
                 self.worker.remove_frame_observer(self._frame_observer)
@@ -123,8 +140,8 @@ class QgcVideoRuntime:
         else:
             live_frame = None
         worker = self.worker
+        telemetry = self.broker.get_snapshot()
         try:
-            telemetry = self.broker.get_snapshot()
             if worker is None:
                 self.state.update_progress(
                     lag_frames=0,
@@ -153,6 +170,14 @@ class QgcVideoRuntime:
                 )
         except Exception:
             LOGGER.exception("QGC 只读处理进度更新失败")
+        if self._predictor_enabled:
+            token, target, stage = self.state.prediction_context()
+            self.predictor.submit(telemetry, target, stage, lifecycle_token=token)
+            prediction = self.predictor.current()
+            if prediction is not None and prediction.lifecycle_token == token:
+                self.state.set_live_prediction(prediction, token)
+            else:
+                self.state.set_live_prediction(None, token)
         result = self.state.snapshot(live_frame)
         if self.replay_mode:
             result = replace(

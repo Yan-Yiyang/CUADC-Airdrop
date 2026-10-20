@@ -140,6 +140,39 @@ def test_in_air_survives_json_round_trip() -> None:
     assert restored.in_air is True
 
 
+def test_position_velocity_receive_time_is_only_refreshed_by_its_stream(
+    broker: TelemetryBroker,
+) -> None:
+    position = SimpleNamespace(north_m=1.0, east_m=2.0, down_m=-3.0)
+    velocity = SimpleNamespace(north_m_s=4.0, east_m_s=5.0, down_m_s=6.0)
+    received = broker.update_local_position_velocity(position, velocity)
+    assert received.position_velocity_received_at == received.timestamp
+
+    refreshed = broker.update_attitude_euler(make_euler(1.0, 2.0, 3.0))
+    assert refreshed.timestamp >= received.timestamp
+    assert refreshed.position_velocity_received_at == received.position_velocity_received_at
+    assert broker.get_snapshot_at(
+        refreshed.timestamp, mode="nearest"
+    ).position_velocity_received_at == (received.position_velocity_received_at)
+
+    broker.reset()
+    assert broker.get_snapshot().position_velocity_received_at is None
+
+
+def test_complete_offline_publish_infers_position_velocity_receive_time() -> None:
+    snapshot = TelemetrySnapshot(
+        timestamp=123.0,
+        north_m=1.0,
+        east_m=2.0,
+        down_m=3.0,
+        vx_m_s=4.0,
+        vy_m_s=5.0,
+        vz_m_s=6.0,
+    )
+    published = TelemetryBroker().publish(snapshot)
+    assert published.position_velocity_received_at == 123.0
+
+
 def test_broker_snapshot_interpolation_subscribe(broker: TelemetryBroker, received: list) -> None:
     s1 = broker.update_global_position(make_position(47.0, 8.0, 500.0, 10.0))
 
