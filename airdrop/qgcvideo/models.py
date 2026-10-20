@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from ..georef.project import ProjectedPoint
 from ..perception.models import DetectionSnapshot, ProcessedFrame
 
@@ -62,6 +64,8 @@ class PanelEntry:
     position_lla: tuple[float, float, float] | None
     thumbnail_frame_index: int | None
     thumbnail_box: tuple[float, float, float, float] | None
+    thumbnail: np.ndarray | None = None
+    thumbnail_capture_timestamp: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,3 +108,5 @@ class DisplaySnapshot:
     impact_flight_time_s: float | None = None
     replay_mode: bool = False
     completed_stages: tuple[str, ...] = ()
+    impact_prediction_timestamp: float | None = None
+    flypast_completed: bool = False

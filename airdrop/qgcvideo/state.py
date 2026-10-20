@@ -46,6 +46,14 @@ class _ObservationRecord:
     has_thumbnail: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _ThumbnailRecord:
+    frame_index: int
+    capture_timestamp: float
+    box: tuple[float, float, float, float]
+    image: np.ndarray
+
+
 class DisplayState:
     """用短锁维护显示自有的有限历史，不读取或推进任务统计器。"""
 
@@ -65,6 +73,11 @@ class DisplayState:
         self._history_max = int(video.history_frames)
         self._cloud_max = int(video.cloud_max)
         self._history: OrderedDict[int, ProcessedFrame] = OrderedDict()
+        self._pending_thumbnails: OrderedDict[
+            tuple[int, float, tuple[float, float], tuple[float, float, float, float]],
+            _ThumbnailRecord,
+        ] = OrderedDict()
+        self._thumbnails: dict[int, _ThumbnailRecord] = {}
         self._observations: deque[_ObservationRecord] = deque(maxlen=self._cloud_max)
         self._geometry_cache: dict[int, tuple[float, float, float] | None] = {}
         self._next_observation_serial = 0
@@ -80,12 +93,19 @@ class DisplayState:
         self._predicted_impact_ned: tuple[float, float, float] | None = None
         self._impact_error_m: float | None = None
         self._impact_flight_time_s: float | None = None
+        self._impact_prediction_timestamp: float | None = None
         self._release_command_status = "not_sent"
         self._release_command_timestamp: float | None = None
         self._released = False
         self._release_timestamp: float | None = None
         self._release_simulated = bool(simulated_release)
         self._geometry_error: str | None = None
+        self._flypast_item_count: int | None = None
+        self._flypast_exit_seq: int | None = None
+        self._flypast_start_seen = False
+        self._flypast_confirmed = False
+        self._flypast_armed = False
+        self._flypast_completed = False
 
     def on_frame(self, frame: ProcessedFrame) -> None:
         """收下处理帧，包括零检测帧；只保存有界历史。"""
@@ -96,6 +116,25 @@ class DisplayState:
                 return
             self._history[frame.frame_index] = frame
             self._history.move_to_end(frame.frame_index)
+            for detection in frame.detections:
+                if detection.frame_index != frame.frame_index or not math.isclose(
+                    detection.capture_timestamp,
+                    frame.capture_timestamp,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ):
+                    continue
+                record = _make_thumbnail(frame.image, detection)
+                if record is None:
+                    continue
+                identity = _detection_identity(detection)
+                if detection.code is None:
+                    self._pending_thumbnails[identity] = record
+                    self._pending_thumbnails.move_to_end(identity)
+                    while len(self._pending_thumbnails) > 128:
+                        self._pending_thumbnails.popitem(last=False)
+                else:
+                    self._store_thumbnail(detection.code, record)
             while len(self._history) > self._history_max:
                 self._history.popitem(last=False)
 
@@ -107,20 +146,34 @@ class DisplayState:
             matched = frame is not None and math.isclose(
                 frame.capture_timestamp, item.capture_timestamp, rel_tol=0.0, abs_tol=1e-6
             )
-            if matched and frame is not None:
+            identity = _detection_identity(item)
+            frame_contains_detection = frame is not None and any(
+                _detection_identity(value) == identity for value in frame.detections
+            )
+            thumbnail = self._pending_thumbnails.pop(identity, None)
+            identity_trusted = frame_contains_detection or thumbnail is not None
+            if matched and frame is not None and frame_contains_detection:
                 current = list(frame.detections)
                 key = (item.pixel, item.box)
                 current = [value for value in current if (value.pixel, value.box) != key]
                 current.append(item)
                 self._history[item.frame_index] = replace(frame, detections=tuple(current))
-            else:
+            elif not matched:
                 self._geometry_error = "结果没有匹配的在存历史帧"
+
+            if thumbnail is None and matched and frame is not None and frame_contains_detection:
+                thumbnail = _make_thumbnail(frame.image, item)
+                identity_trusted = thumbnail is not None
+            if item.code is not None and thumbnail is not None:
+                self._store_thumbnail(item.code, thumbnail)
 
             serial = self._next_observation_serial
             self._next_observation_serial += 1
-            self._observations.append(_ObservationRecord(serial, item, bool(matched)))
+            self._observations.append(
+                _ObservationRecord(serial, item, bool(identity_trusted and thumbnail is not None))
+            )
 
-    def on_event(self, kind: str, data: Mapping[str, object]) -> None:
+    def on_event(self, kind: str, data: Mapping[str, object]) -> None:  # noqa: PLR0915
         """旁路接收事件；只复制必要标量，不保留事件字典引用。"""
         now = float(self._clock())
         frozen_data = tuple(sorted((str(key), _freeze(value)) for key, value in data.items()))
@@ -139,8 +192,47 @@ class DisplayState:
                 event_time = float(stamp) if isinstance(stamp, (int, float)) else now
                 self._stage_started_at = event_time
                 self._hold_started_at = event_time if self._stage == "HOLD_PROCESS" else None
+                if next_stage in {"INIT", "PREFLIGHT", "WAIT_AIRBORNE"}:
+                    self._target_ned = None
+                    self._predicted_impact_ned = None
+                    self._impact_error_m = None
+                    self._impact_flight_time_s = None
+                    self._impact_prediction_timestamp = None
+                    self._released = False
+                    self._release_timestamp = None
+                    self._release_simulated = self._simulated_release
+                    self._release_command_status = "not_sent"
+                    self._release_command_timestamp = None
+                    self._flypast_item_count = None
+                    self._flypast_exit_seq = None
+                    self._flypast_start_seen = False
+                    self._flypast_confirmed = False
+                    self._flypast_armed = False
+                    self._flypast_completed = False
             elif kind == "drop_plan":
                 self._target_ned = _triple(values.get("target_ned"))
+                self._flypast_item_count = _positive_int(values.get("items"))
+                self._flypast_exit_seq = _nonnegative_int(values.get("overfly_exit_seq"))
+                overfly_count = _positive_int(values.get("overfly_item_count"))
+                if (
+                    self._flypast_item_count is None
+                    or self._flypast_exit_seq is None
+                    or overfly_count is None
+                    or self._flypast_exit_seq >= self._flypast_item_count
+                    or overfly_count != self._flypast_exit_seq + 1
+                ):
+                    self._flypast_item_count = None
+                    self._flypast_exit_seq = None
+                self._flypast_start_seen = False
+                self._flypast_confirmed = False
+                self._flypast_armed = False
+                self._flypast_completed = False
+            elif kind == "mission_start":
+                if self._flypast_exit_seq is not None:
+                    self._flypast_start_seen = True
+            elif kind == "mission_confirmed":
+                if self._flypast_start_seen and self._flypast_exit_seq is not None:
+                    self._flypast_confirmed = True
             elif kind in {"drop_check", "release"}:
                 prediction = values.get(
                     "predicted_impact_ned",
@@ -149,6 +241,12 @@ class DisplayState:
                 self._predicted_impact_ned = _triple(prediction)
                 self._impact_error_m = _finite_nonnegative(values.get("horizontal_error_m"))
                 self._impact_flight_time_s = _finite_nonnegative(values.get("flight_time_s"))
+                evaluated_at = values.get("evaluated_at")
+                self._impact_prediction_timestamp = (
+                    float(evaluated_at)
+                    if isinstance(evaluated_at, (int, float)) and math.isfinite(evaluated_at)
+                    else now
+                )
             elif kind in {"gripper_release", "drop_dry_run"}:
                 self._release_command_status = "sent"
                 self._release_command_timestamp = now
@@ -227,6 +325,22 @@ class DisplayState:
                     self._progress_samples.popleft()
             progress = self._estimate_progress(progress, now)
             self._progress = progress
+            if (
+                not self._flypast_completed
+                and self._flypast_confirmed
+                and self._flypast_exit_seq is not None
+                and self._flypast_item_count is not None
+                and progress.mission_total is not None
+                and progress.mission_total == self._flypast_item_count
+                and progress.mission_current is not None
+                and progress.mission_current <= progress.mission_total
+            ):
+                if progress.mission_current <= self._flypast_exit_seq:
+                    self._flypast_armed = True
+                elif self._flypast_armed:
+                    self._flypast_completed = True
+            elif not self._flypast_completed:
+                self._flypast_armed = False
 
     def _estimate_progress(self, progress: ProgressSnapshot, now: float) -> ProgressSnapshot:
         hold_elapsed = None
@@ -265,9 +379,11 @@ class DisplayState:
         """复制有界状态并按当前帧姿态投影；锁内不做几何计算。"""
         with self._lock:
             history = tuple(self._history.values())
+            thumbnails = dict(self._thumbnails)
             records = tuple(self._observations)
             geometry_cache = dict(self._geometry_cache)
-            progress = self._progress
+            snapshot_time = float(self._clock())
+            progress = self._estimate_progress(self._progress, snapshot_time)
             stage = self._stage
             completed_stages = tuple(sorted(self._completed_stages))
             events = tuple(self._events)
@@ -275,6 +391,8 @@ class DisplayState:
             impact = self._predicted_impact_ned
             impact_error = self._impact_error_m
             impact_flight_time = self._impact_flight_time_s
+            impact_prediction_timestamp = self._impact_prediction_timestamp
+            flypast_completed = self._flypast_completed
             released = self._released
             release_timestamp = self._release_timestamp
             release_simulated = self._release_simulated
@@ -283,7 +401,6 @@ class DisplayState:
             geometry_error = self._geometry_error
 
         mode = _display_mode(stage, progress)
-        snapshot_time = float(self._clock())
         if mode in {"hold_live", "drop"} and frame is not None:
             selected = replace(frame, detections=())
         elif history:
@@ -332,7 +449,9 @@ class DisplayState:
         projected: tuple[ProjectedPoint, ...] = ()
         target_projection = None
         impact_projection = None
-        panel = self._panel(counts, sums, latest, observations, selected, history)
+        panel = self._panel(
+            counts, sums, latest, observations, selected, history, thumbnails=thumbnails
+        )
         if selected is not None:
             projected = self._project_observations(observations, selected)
             target_projection = self._project_ned(target, selected)
@@ -347,10 +466,7 @@ class DisplayState:
             observations=observations,
             projected_observations=projected,
             panel=panel,
-            recent_codes=tuple(
-                code
-                for code, _ in sorted(latest.items(), key=lambda pair: pair[1], reverse=True)[:3]
-            ),
+            recent_codes=_recent_codes(latest, thumbnails),
             progress=progress,
             target_ned=target,
             predicted_impact_ned=impact,
@@ -372,6 +488,8 @@ class DisplayState:
             impact_error_m=impact_error,
             impact_flight_time_s=impact_flight_time,
             completed_stages=completed_stages,
+            impact_prediction_timestamp=impact_prediction_timestamp,
+            flypast_completed=flypast_completed,
         )
 
     def _solve_detection(
@@ -480,13 +598,15 @@ class DisplayState:
         observations: tuple[DisplayObservation, ...],
         frame: ProcessedFrame | None,
         history: tuple[ProcessedFrame, ...],
+        *,
+        thumbnails: dict[int, _ThumbnailRecord],
     ) -> tuple[PanelEntry, ...]:
-        if frame is None:
-            return ()
-        reference = None if frame.pose is None else frame.pose.origin_lla
+        reference = None if frame is None or frame.pose is None else frame.pose.origin_lla
         frame_indices = {item.frame_index for item in history}
         entries: list[PanelEntry] = []
-        for code, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0])):
+        codes = set(counts) | set(thumbnails)
+        for code in sorted(codes, key=lambda value: (-counts.get(value, 0), value)):
+            count = counts.get(code, 0)
             total = sums.get(code)
             position = None
             lla = None
@@ -504,10 +624,16 @@ class DisplayState:
                 if matching
                 else None
             )
-            thumbnail_index = None
-            thumbnail_box = None
+            thumbnail_record = thumbnails.get(code)
+            thumbnail_index = None if thumbnail_record is None else thumbnail_record.frame_index
+            thumbnail_box = None if thumbnail_record is None else thumbnail_record.box
+            thumbnail_image = None if thumbnail_record is None else thumbnail_record.image
+            thumbnail_timestamp = (
+                None if thumbnail_record is None else thumbnail_record.capture_timestamp
+            )
             if (
-                latest_item is not None
+                thumbnail_record is None
+                and latest_item is not None
                 and latest_item.has_thumbnail
                 and latest_item.frame_index in frame_indices
             ):
@@ -521,9 +647,25 @@ class DisplayState:
                     lla,
                     thumbnail_index,
                     thumbnail_box,
+                    thumbnail_image,
+                    thumbnail_timestamp,
                 )
             )
         return tuple(entries)
+
+    def _store_thumbnail(self, code: int, record: _ThumbnailRecord) -> None:
+        if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code <= 99:
+            return
+        previous = self._thumbnails.get(code)
+        if previous is not None:
+            if record.frame_index < previous.frame_index:
+                return
+            if (
+                record.frame_index == previous.frame_index
+                and record.capture_timestamp != previous.capture_timestamp
+            ):
+                return
+        self._thumbnails[code] = record
 
 
 def _display_mode(stage: str | None, progress: ProgressSnapshot) -> str:
@@ -537,7 +679,13 @@ def _display_mode(stage: str | None, progress: ProgressSnapshot) -> str:
         return "hold_follow" if busy else "hold_live"
     if stage in {"OVERFLY", "LAND"}:
         return "drop"
-    return "recon"
+    if stage == "RECON":
+        return "recon"
+    if stage == "DONE":
+        return "done"
+    if stage == "ABORT":
+        return "aborted"
+    return "standby"
 
 
 def _as_stage(value: object) -> str | None:
@@ -573,6 +721,18 @@ def _freeze(value: object) -> object:
 
 def _nonnegative_optional(value: int | None) -> int | None:
     return None if value is None else max(int(value), 0)
+
+
+def _nonnegative_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
 
 
 def _finite_nonnegative(value: object) -> float | None:
@@ -635,3 +795,55 @@ def _summarize(
                 number + 1,
             )
     return counts, sums, latest
+
+
+def _detection_identity(
+    detection: DetectionSnapshot,
+) -> tuple[int, float, tuple[float, float], tuple[float, float, float, float]]:
+    return (detection.frame_index, detection.capture_timestamp, detection.pixel, detection.box)
+
+
+def _make_thumbnail(image: np.ndarray, detection: DetectionSnapshot) -> _ThumbnailRecord | None:
+    values = (*detection.box, detection.capture_timestamp, *detection.pixel)
+    if not all(math.isfinite(float(value)) for value in values):
+        return None
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = (int(round(value)) for value in detection.box)
+    x1, x2 = max(0, x1), min(width, x2)
+    y1, y2 = max(0, y1), min(height, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = image[y1:y2, x1:x2]
+    scale = min(1.0, 128 / max(crop.shape[:2]))
+    if scale < 1.0:
+        size = (max(1, round(crop.shape[1] * scale)), max(1, round(crop.shape[0] * scale)))
+        crop = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
+    immutable = np.frombuffer(crop.tobytes(), dtype=crop.dtype).reshape(crop.shape)
+    immutable.flags.writeable = False
+    return _ThumbnailRecord(
+        detection.frame_index,
+        detection.capture_timestamp,
+        detection.box,
+        immutable,
+    )
+
+
+def _recent_codes(
+    latest: dict[int, tuple[float, int]], thumbnails: dict[int, _ThumbnailRecord]
+) -> tuple[int, ...]:
+    codes = set(latest) | set(thumbnails)
+    return tuple(
+        sorted(
+            codes,
+            key=lambda code: (
+                max(
+                    latest.get(code, (float("-inf"), -1)),
+                    (thumbnails[code].capture_timestamp, thumbnails[code].frame_index)
+                    if code in thumbnails
+                    else (float("-inf"), -1),
+                ),
+                code,
+            ),
+            reverse=True,
+        )[:3]
+    )

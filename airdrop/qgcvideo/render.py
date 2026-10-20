@@ -92,6 +92,42 @@ def _format_clock(timestamp: float | None) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
 
 
+def _fit_text_anchor(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    origin: tuple[int, int],
+    clip: tuple[int, int, int, int],
+) -> tuple[ImageFont.FreeTypeFont, tuple[int, int], tuple[int, int, int, int]] | None:
+    """按真实字形边界缩字并移动基线，使文字和底色留在视口内。"""
+    left, top, right, bottom = clip
+    if right - left < 24 or bottom - top < 16:
+        return None
+    size = font.size
+    bounds = draw.textbbox(origin, text, font=font, anchor="ls")
+    while (
+        bounds[2] - bounds[0] > right - left - 16 or bounds[3] - bounds[1] > bottom - top - 9
+    ) and size > 8:
+        size -= 1
+        font = _font(size)
+        bounds = draw.textbbox(origin, text, font=font, anchor="ls")
+    if bounds[2] - bounds[0] > right - left - 16 or bounds[3] - bounds[1] > bottom - top - 9:
+        return None
+    shift_x = round(max(left + 8 - bounds[0], min(0, right - 8 - bounds[2])))
+    shift_y = round(max(top + 4 - bounds[1], min(0, bottom - 5 - bounds[3])))
+    anchor = (origin[0] + shift_x, origin[1] + shift_y)
+    final_left, final_top, final_right, final_bottom = draw.textbbox(
+        anchor, text, font=font, anchor="ls"
+    )
+    final_bounds = (
+        round(final_left),
+        round(final_top),
+        round(final_right),
+        round(final_bottom),
+    )
+    return font, anchor, final_bounds
+
+
 @lru_cache(maxsize=12)
 def _font(size: int) -> ImageFont.FreeTypeFont:
     paths = (
@@ -114,6 +150,7 @@ class FrameComposer:
         self._text_commands: list[
             tuple[str, tuple[int, int], int, tuple[int, int, int], tuple[int, int, int, int] | None]
         ] = []
+        self._video_label_bounds: list[tuple[int, int, int, int]] = []
 
     def set_publisher_stats(self, stats: Any) -> None:
         """接收发布线程的只读统计快照。"""
@@ -122,6 +159,7 @@ class FrameComposer:
     def compose(self, snapshot: DisplaySnapshot) -> np.ndarray:
         """渲染单张画布，所有绘制都在新数组上完成。"""
         self._text_commands = []
+        self._video_label_bounds = []
         canvas = np.full((990, 1760, 3), BACKGROUND_COLOR, dtype=np.uint8)
         canvas[:130] = SURFACE_COLOR
         canvas[130:850, 1280:] = PANEL_COLOR
@@ -135,7 +173,7 @@ class FrameComposer:
         self._draw_text_commands(canvas)
         return canvas
 
-    def _render_video(self, canvas: np.ndarray, snapshot: DisplaySnapshot) -> None:
+    def _render_video(self, canvas: np.ndarray, snapshot: DisplaySnapshot) -> None:  # noqa: PLR0912
         current = getattr(snapshot, "frame", None)
         image = None if current is None else getattr(current, "image", None)
         if image is None:
@@ -177,7 +215,17 @@ class FrameComposer:
         if mode in {"recon", "hold_follow", "hold_live"}:
             self._render_observations(canvas, snapshot, (scale, out_w, out_h, ox, oy))
         if mode == "drop":
-            self._render_projected(canvas, snapshot, (scale, out_w, out_h, ox, oy))
+            if getattr(snapshot, "flypast_completed", False):
+                self._text(
+                    canvas,
+                    "已飞掠目标航段",
+                    (24, 166),
+                    0.48,
+                    (55, 220, 100),
+                    clip=(ox, 130 + oy, ox + out_w, 130 + oy + out_h),
+                )
+            else:
+                self._render_projected(canvas, snapshot, (scale, out_w, out_h, ox, oy))
         index = getattr(current, "frame_index", None)
         if index is not None:
             delay = getattr(snapshot, "capture_delay_s", None)
@@ -286,7 +334,10 @@ class FrameComposer:
             if not getattr(projected, "valid", False):
                 reason = str(getattr(projected, "reason", "")).lower()
                 if any(token in reason for token in ("behind", "rear", "后方")):
-                    self._text(canvas, f"{self._label_name(label)} 已掠过", (18, 162), 0.5, color)
+                    geometry_note = (
+                        "目标当前不在相机前方" if label == "目标" else "预测落点当前不在相机前方"
+                    )
+                    self._text(canvas, geometry_note, (18, 162), 0.43, color, clip=clip)
                 continue
             pixel = getattr(projected, "pixel", None)
             if pixel is None:
@@ -316,14 +367,8 @@ class FrameComposer:
             else:
                 cv2.circle(roi, (px - ox, py - 130 - oy), 15, color, 2, cv2.LINE_AA)
                 cv2.circle(roi, (px - ox, py - 130 - oy), 4, color, -1, cv2.LINE_AA)
-            self._text(
-                canvas,
-                "选定目标" if name == "target_projected" else "预计落点",
-                (px + 25, py - 16),
-                0.46,
-                color,
-                2,
-                clip=clip,
+            self._projected_label(
+                canvas, snapshot, projected, label, (px + 25, py - 16), color, clip
             )
 
     def _edge_arrow(
@@ -341,7 +386,8 @@ class FrameComposer:
             ox + float(pixel[0]) * scale - center_x,
             oy + float(pixel[1]) * scale - center_y,
         )
-        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        magnitude = math.hypot(dx, dy)
+        if not math.isfinite(magnitude) or magnitude < 1e-6:
             return
         bounds = (
             float(ox + 16),
@@ -362,9 +408,11 @@ class FrameComposer:
             else math.inf,
         )
         factor = min(value for value in factors if value >= 0)
+        if not math.isfinite(factor):
+            return
         tip = (round(center_x + dx * factor), 130 + round(center_y + dy * factor))
-        tail_factor = max(0.0, factor - 0.035)
-        tail = (round(center_x + dx * tail_factor), 130 + round(center_y + dy * tail_factor))
+        unit_x, unit_y = dx / magnitude, dy / magnitude
+        tail = (round(tip[0] - unit_x * 48), round(tip[1] - unit_y * 48))
         clip = (ox, 130 + oy, ox + out_w, 130 + oy + out_h)
         roi = canvas[clip[1] : clip[3], clip[0] : clip[2]]
         cv2.arrowedLine(
@@ -376,30 +424,64 @@ class FrameComposer:
             cv2.LINE_AA,
             tipLength=0.35,
         )
+        self._projected_label(
+            canvas, snapshot, projected, label, (tip[0] - 8, tip[1] - 10), color, clip
+        )
+
+    def _projected_label(  # noqa: PLR0917
+        self,
+        canvas: np.ndarray,
+        snapshot: DisplaySnapshot,
+        projected: Any,
+        label: str,
+        origin: tuple[int, int],
+        color: tuple[int, int, int],
+        clip: tuple[int, int, int, int],
+    ) -> None:
         ned = getattr(projected, "ned", None)
         frame = getattr(snapshot, "frame", None)
         pose = None if frame is None else getattr(frame, "pose", None)
         position = None if pose is None else getattr(pose, "position_ned", None)
-        distance = ""
-        if label == "落点":
-            error = getattr(snapshot, "impact_error_m", None)
-            flight_time = getattr(snapshot, "impact_flight_time_s", None)
-            error_text = "未知" if error is None else f"{error:.1f}米"
-            flight_text = "未知" if flight_time is None else f"{flight_time:.1f}秒"
-            distance = f" 误差 {error_text} · 飞行 {flight_text}"
-        elif ned is not None and position is not None:
+        if ned is None or position is None:
+            distance = "水平距离未知" if label == "目标" else "距该落点未知"
+        else:
+            horizontal = math.hypot(float(ned[0]) - position[0], float(ned[1]) - position[1])
             distance = (
-                f" {math.hypot(float(ned[0]) - position[0], float(ned[1]) - position[1]):.0f}米"
+                f"水平距离 {horizontal:.0f} 米"
+                if label == "目标"
+                else f"距该落点 {horizontal:.0f} 米"
             )
-        tip_label = "预测落点" if label == "落点" else label
-        self._text(
-            canvas,
-            tip_label + distance,
-            (tip[0] - 190, tip[1] - 10),
-            0.36,
-            color,
-            clip=clip,
-        )
+        if label == "落点":
+            prefix = "投放时预测落点" if getattr(snapshot, "released", False) else "最近预测落点"
+        else:
+            prefix = "目标"
+        text = f"{prefix} · {distance}"
+        draw = ImageDraw.Draw(Image.new("RGB", CANVAS_SIZE))
+        x, y = origin
+        if label == "落点":
+            candidates = ((x, y + 72), (x, y), (x, y - 72), (x - 160, y), (x + 160, y))
+        else:
+            candidates = ((x, y), (x, y - 72), (x, y + 72), (x - 160, y), (x + 160, y))
+        font = _font(14)
+        for candidate in candidates:
+            fitted = _fit_text_anchor(draw, text, font, candidate, clip)
+            if fitted is None:
+                continue
+            _, _, bounds = fitted
+            padded = (bounds[0] - 7, bounds[1] - 4, bounds[2] + 7, bounds[3] + 4)
+            overlaps = any(
+                padded[0] < occupied[2]
+                and padded[2] > occupied[0]
+                and padded[1] < occupied[3]
+                and padded[3] > occupied[1]
+                for occupied in self._video_label_bounds
+            )
+            if overlaps:
+                continue
+            self._video_label_bounds.append(padded)
+            self._text(canvas, text, candidate, 0.40, color, clip=clip)
+            return
+        self._text(canvas, text, origin, 0.40, color, clip=clip)
 
     def _render_status(self, canvas: np.ndarray, snapshot: DisplaySnapshot) -> None:
         stage = str(getattr(snapshot, "stage", None) or "")
@@ -455,11 +537,18 @@ class FrameComposer:
         )
         processed_frames = getattr(progress, "processed_frames", None)
         processed_text = "未知" if processed_frames is None else str(processed_frames)
+        preflight = stage in {"INIT", "PREFLIGHT", "WAIT_AIRBORNE"} or stage not in (
+            order.keys() | {"DONE", "ABORT"}
+        )
         summary = (
             "离线回放（原时间轴）"
             if replay
             else f"任务已中止 | {self._mode_name(mode)}"
             if stage == "ABORT"
+            else "任务已完成"
+            if stage == "DONE"
+            else "起飞前：仅实时预览 / 自检，侦查尚未开始"
+            if preflight
             else (
                 f"{self._mode_name(mode)}：{processing} | 积压 {lag} 帧 | "
                 f"排队 {queued} | 已处理 {processed_text} 帧"
@@ -493,6 +582,9 @@ class FrameComposer:
                 else f"侦查航线 {mission_current}/{mission_total}"
             )
             detail = f"已用时 {_format_duration(elapsed)}"
+        elif stage in {"INIT", "PREFLIGHT", "WAIT_AIRBORNE"} or stage not in dict(_STAGES):
+            route = "侦查尚未开始"
+            detail = "仅实时预览 / 自检"
         elif stage == "HOLD_PROCESS":
             remaining = getattr(progress, "hold_remaining_s", None)
             eta = getattr(progress, "eta_s", None)
@@ -622,6 +714,9 @@ class FrameComposer:
 
     @staticmethod
     def _thumbnail_age(snapshot: DisplaySnapshot, entry: Any, observed_at: float | None) -> str:
+        capture_timestamp = getattr(entry, "thumbnail_capture_timestamp", None)
+        if capture_timestamp is not None and observed_at is not None:
+            return f"{max(0.0, observed_at - float(capture_timestamp)):.1f}秒前"
         frame_index = getattr(entry, "thumbnail_frame_index", None)
         if frame_index is None or observed_at is None:
             return "时间未知"
@@ -734,12 +829,37 @@ class FrameComposer:
         error = getattr(snapshot, "impact_error_m", None)
         flight_time = getattr(snapshot, "impact_flight_time_s", None)
         error_text = "误差未知" if error is None else f"误差 {error:.1f} 米"
-        flight_text = "飞行时间未知" if flight_time is None else f"飞行 {flight_time:.1f} 秒"
+        impact_timestamp = getattr(snapshot, "impact_prediction_timestamp", None)
+        observed_at = getattr(snapshot, "observed_at", None)
+        event_age = (
+            None
+            if impact_timestamp is None or observed_at is None
+            else max(0.0, float(observed_at) - float(impact_timestamp))
+        )
+        prediction_label = (
+            "投放时预测"
+            if getattr(snapshot, "released", False)
+            else f"最近判据预测 · 事件年龄 {event_age:.1f} 秒"
+            if event_age is not None
+            else "最近判据预测 · 事件年龄未知"
+        )
+        impact_error_label = (
+            "投放时预测误差"
+            if getattr(snapshot, "released", False)
+            else f"{prediction_label} · 误差"
+        )
         self._text(
             canvas,
             "投放目标待任务统计确定"
             if target is None and error is None and flight_time is None
-            else f"{target_text} · 落点{error_text} · {flight_text}",
+            else (
+                f"{target_text} · {impact_error_label} {error_text.removeprefix('误差 ')} · "
+                + (
+                    f"弹体预计飞行 {flight_time:.1f} 秒"
+                    if flight_time is not None
+                    else "弹体预计飞行时间未知"
+                )
+            ),
             (1185, 966),
             0.31,
             (190, 200, 210),
@@ -747,6 +867,9 @@ class FrameComposer:
 
     @staticmethod
     def _thumbnail(snapshot: DisplaySnapshot, entry: Any) -> np.ndarray | None:
+        cached = getattr(entry, "thumbnail", None)
+        if isinstance(cached, np.ndarray):
+            return cached
         frame_index = getattr(entry, "thumbnail_frame_index", None)
         if frame_index is None:
             return None
@@ -807,18 +930,18 @@ class FrameComposer:
             left, top, right, bottom = clip
             if right <= left or bottom <= top:
                 continue
-            layer = Image.new("RGBA", (right - left, bottom - top), (0, 0, 0, 0))
-            layer_draw = ImageDraw.Draw(layer)
-            bounds = layer_draw.textbbox(
-                (origin[0] - left, origin[1] - top), text, font=font, anchor="ls"
-            )
-            layer_draw.rounded_rectangle(
+            draw = ImageDraw.Draw(image)
+            fitted = _fit_text_anchor(draw, text, font, origin, clip)
+            if fitted is None:
+                continue
+            font, anchor, bounds = fitted
+            draw.rounded_rectangle(
                 (bounds[0] - 7, bounds[1] - 4, bounds[2] + 7, bounds[3] + 4),
                 radius=4,
-                fill=(12, 20, 28, 210),
+                fill=(12, 20, 28),
             )
-            layer_draw.text(
-                (origin[0] - left, origin[1] - top),
+            draw.text(
+                anchor,
                 text,
                 font=font,
                 anchor="ls",
@@ -826,8 +949,6 @@ class FrameComposer:
                 stroke_width=1,
                 stroke_fill=stroke,
             )
-            image.paste(layer, (left, top), layer)
-            draw = ImageDraw.Draw(image)
         canvas[:] = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
         self._text_commands.clear()
 
@@ -835,9 +956,12 @@ class FrameComposer:
     def _mode_name(mode: str) -> str:
         return {
             "recon": "侦查",
+            "standby": "起飞前预览",
             "hold_follow": "盘旋跟随处理画面",
             "hold_live": "盘旋实时画面",
             "drop": "投放实时画面",
+            "done": "任务完成",
+            "aborted": "任务中止",
         }.get(mode, mode or "等待")
 
     @staticmethod

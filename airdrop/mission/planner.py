@@ -102,6 +102,8 @@ class DropMissionPlan:
             "exit": _waypoint_dict(self.exit),
             "items": len(self.items),
             "landing_items": self.landing_count,
+            "overfly_exit_seq": self.overfly_count - 1,
+            "overfly_item_count": self.overfly_count,
         }
 
 

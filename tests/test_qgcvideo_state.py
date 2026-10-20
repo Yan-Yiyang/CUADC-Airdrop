@@ -34,20 +34,144 @@ def test_display_timers_use_state_event_and_telemetry_timestamps() -> None:
     assert snapshot.progress.telemetry_age_s == 2.0
 
 
+def test_recon_timer_starts_at_recon_not_during_preflight() -> None:
+    now = [100.0]
+    state = DisplayState(Config(), None, clock=lambda: now[0])
+    state.on_event("state", {"to_state": "WAIT_AIRBORNE", "timestamp": 1.0})
+    waiting = state.snapshot()
+    assert waiting.mode == "standby"
+    assert waiting.progress.stage_elapsed_s == 99.0
+
+    now[0] = 203.0
+    state.on_event("state", {"to_state": "RECON", "timestamp": 200.0})
+    recon = state.snapshot()
+    assert recon.mode == "recon"
+    assert recon.progress.stage_elapsed_s == 3.0
+
+    state.on_event("state", {"to_state": "UNRECOGNIZED_STAGE", "timestamp": 202.0})
+    assert state.snapshot().mode == "standby"
+
+
 def test_impact_details_are_read_from_existing_decision_event() -> None:
-    state = DisplayState(Config(), None)
+    state = DisplayState(Config(), None, clock=lambda: 10.0)
     state.on_event(
         "drop_check",
         {
             "impact_ned": [1.0, 2.0, 0.0],
             "horizontal_error_m": 1.4,
             "flight_time_s": 3.2,
+            "evaluated_at": 8.5,
         },
     )
     snapshot = state.snapshot()
     assert snapshot.predicted_impact_ned == (1.0, 2.0, 0.0)
     assert snapshot.impact_error_m == 1.4
     assert snapshot.impact_flight_time_s == 3.2
+    assert snapshot.impact_prediction_timestamp == 8.5
+
+
+def test_impact_prediction_timestamp_falls_back_to_event_clock() -> None:
+    state = DisplayState(Config(), None, clock=lambda: 17.0)
+    state.on_event("drop_check", {"impact_ned": [1.0, 2.0, 0.0]})
+    assert state.snapshot().impact_prediction_timestamp == 17.0
+
+
+def _set_mission_progress(state: DisplayState, current: int | None, total: int | None = 16) -> None:
+    state.update_progress(
+        lag_frames=0,
+        processing=False,
+        ocr_pending=0,
+        queued_results=0,
+        mission_current=current,
+        mission_total=total,
+    )
+
+
+def _drop_plan_event() -> dict[str, object]:
+    return {
+        "target_ned": [10.0, 20.0, 0.0],
+        "items": 16,
+        "overfly_exit_seq": 1,
+        "overfly_item_count": 2,
+    }
+
+
+def test_flypast_requires_new_plan_start_confirmed_matching_progress_then_latches() -> None:
+    state = DisplayState(Config(), None)
+    _set_mission_progress(state, 16)
+    assert not state.snapshot().flypast_completed  # 侦查任务的旧 16/16 不继承
+
+    state.on_event("drop_plan", _drop_plan_event())
+    _set_mission_progress(state, 16)
+    state.on_event("mission_start", {})
+    state.on_event("mission_confirmed", {"mode": "MISSION"})
+    _set_mission_progress(state, 16)
+    assert not state.snapshot().flypast_completed  # 新任务同项数已完成进度也不算通过出口
+
+    _set_mission_progress(state, 0)
+    _set_mission_progress(state, 1)
+    assert not state.snapshot().flypast_completed
+    _set_mission_progress(state, 2)
+    assert state.snapshot().flypast_completed
+
+    state.on_event("state", {"to_state": "LAND"})
+    _set_mission_progress(state, None, None)
+    assert state.snapshot().flypast_completed  # 后续返航进度变化不撤销锁存
+
+
+def test_flypast_lost_or_invalid_progress_clears_precompletion_armed_state() -> None:
+    state = DisplayState(Config(), None)
+    state.on_event("drop_plan", _drop_plan_event())
+    state.on_event("mission_start", {})
+    state.on_event("mission_confirmed", {"mode": "MISSION"})
+    _set_mission_progress(state, 0)
+    _set_mission_progress(state, None, None)
+    _set_mission_progress(state, 16, 16)
+    _set_mission_progress(state, 2, 16)
+    assert not state.snapshot().flypast_completed
+
+    _set_mission_progress(state, 1, 16)
+    _set_mission_progress(state, 16, 15)
+    _set_mission_progress(state, 2, 16)
+    assert not state.snapshot().flypast_completed
+
+    _set_mission_progress(state, 1, 16)
+    _set_mission_progress(state, 2, 16)
+    assert state.snapshot().flypast_completed
+
+
+def test_flypast_is_not_inferred_from_release_land_or_missing_plan_metadata() -> None:
+    state = DisplayState(Config(), None)
+    state.on_event("drop_plan", {"items": 16, "target_ned": [1.0, 2.0, 0.0]})
+    state.on_event("mission_start", {})
+    state.on_event("mission_confirmed", {"mode": "MISSION"})
+    _set_mission_progress(state, 2)
+    assert not state.snapshot().flypast_completed
+
+    state.on_event("drop_released", {"simulated": True})
+    state.on_event("state", {"to_state": "LAND"})
+    assert not state.snapshot().flypast_completed
+
+    state.on_event("drop_plan", _drop_plan_event())
+    assert not state.snapshot().flypast_completed
+    _set_mission_progress(state, 2)
+    assert not state.snapshot().flypast_completed
+
+
+def test_new_lifecycle_clears_old_target_and_flypast_state() -> None:
+    state = DisplayState(Config(), None)
+    state.on_event("drop_plan", _drop_plan_event())
+    state.on_event("mission_start", {})
+    state.on_event("mission_confirmed", {"mode": "MISSION"})
+    _set_mission_progress(state, 1)
+    _set_mission_progress(state, 2)
+    assert state.snapshot().flypast_completed
+
+    state.on_event("state", {"to_state": "INIT"})
+    snapshot = state.snapshot()
+    assert snapshot.mode == "standby"
+    assert snapshot.target_ned is None
+    assert not snapshot.flypast_completed
 
 
 def test_inflight_detection_cannot_report_zero_remaining_time() -> None:
@@ -151,15 +275,19 @@ def test_zero_detection_frame_updates_and_history_is_bounded() -> None:
 
 def test_result_observer_matches_historical_frame_and_rejects_wrong_timestamp() -> None:
     state = _state()
+    original = snapshot_detection(_detection(4, None))
     state.on_frame(
-        _frame(
-            4,
-            pose=PoseSnapshot(
-                position_ned=(0, 0, -100),
-                quaternion_wxyz=(1, 0, 0, 0),
-                euler_deg=(0, 0, 0),
-                origin_lla=(121, 31, 10),
+        replace(
+            _frame(
+                4,
+                pose=PoseSnapshot(
+                    position_ned=(0, 0, -100),
+                    quaternion_wxyz=(1, 0, 0, 0),
+                    euler_deg=(0, 0, 0),
+                    origin_lla=(121, 31, 10),
+                ),
             ),
+            detections=(original,),
         )
     )
     state.on_detection(_detection(4, 12))
@@ -185,6 +313,131 @@ def test_late_result_after_frame_eviction_keeps_counts_without_wrong_thumbnail()
     assert not snapshot.observations[0].has_thumbnail
     assert snapshot.panel[0].thumbnail_frame_index is None
     assert snapshot.recent_codes == (7,)
+
+
+def test_panel_keeps_latest_thumbnail_after_frame_history_and_observation_cloud_expire() -> None:
+    state = _state(history_frames=2, cloud_max=2)
+    source = np.zeros((720, 1280, 3), dtype=np.uint8)
+    source[358:362, 638:642] = (10, 80, 220)
+    first = _detection(1, None)
+    state.on_frame(replace(_frame(1, image=source), detections=(snapshot_detection(first),)))
+    state.on_detection(replace(snapshot_detection(first), code=56))
+    for index in range(2, 12):
+        state.on_frame(_frame(index))
+    state.on_detection(replace(snapshot_detection(_detection(10, 12)), code=12))
+    state.on_detection(replace(snapshot_detection(_detection(11, 94)), code=94))
+
+    snapshot = state.snapshot()
+    entry = next(item for item in snapshot.panel if item.code == 56)
+    assert all(item.code != 56 for item in snapshot.observations)
+    assert entry.count == 0
+    assert entry.thumbnail_frame_index == 1
+    assert entry.thumbnail is not None
+    assert entry.thumbnail.shape[0] <= 128 and entry.thumbnail.shape[1] <= 128
+    assert not np.shares_memory(entry.thumbnail, source)
+    assert not entry.thumbnail.flags.writeable
+    assert 56 in snapshot.recent_codes
+
+    from airdrop.qgcvideo.render import FrameComposer
+
+    assert FrameComposer._thumbnail(snapshot, entry) is entry.thumbnail
+    assert snapshot.observed_at is not None
+    assert FrameComposer._thumbnail_age(snapshot, entry, snapshot.observed_at) == (
+        f"{max(0.0, snapshot.observed_at - 1.0):.1f}秒前"
+    )
+    composed = FrameComposer().compose(snapshot)
+    assert np.any(np.all(composed[226:306, 1306:1744] == (10, 80, 220), axis=2))
+
+
+def test_newest_code_thumbnail_wins_and_delayed_old_result_cannot_replace_it() -> None:
+    state = _state(history_frames=1)
+    first = _detection(1, None)
+    second = _detection(2, None)
+    state.on_frame(replace(_frame(1), detections=(snapshot_detection(first),)))
+    state.on_detection(replace(snapshot_detection(first), code=12))
+    state.on_frame(replace(_frame(2), detections=(snapshot_detection(second),)))
+    state.on_detection(replace(snapshot_detection(second), code=12))
+    state.on_detection(replace(snapshot_detection(first), code=12))
+
+    entry = next(item for item in state.snapshot().panel if item.code == 12)
+    assert entry.thumbnail_frame_index == 2
+
+
+def test_late_ocr_uses_exact_bounded_pending_thumbnail_and_new_state_is_empty() -> None:
+    state = _state(history_frames=1)
+    detections = []
+    for index in range(1, 131):
+        detection = _detection(index, None)
+        detections.append(detection)
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        color = (7, 180, 33) if index == 129 else (200, 20, 90)
+        image[358:362, 638:642] = color
+        state.on_frame(
+            replace(
+                _frame(index, image=image),
+                detections=(snapshot_detection(detection),),
+            )
+        )
+    assert len(state._pending_thumbnails) == 128
+    assert 129 not in state._history
+
+    delayed = snapshot_detection(detections[-2])
+    state.on_detection(replace(delayed, code=94))
+    entry = next(item for item in state.snapshot().panel if item.code == 94)
+    assert entry.thumbnail_frame_index == 129
+    assert entry.count == 1
+    assert entry.thumbnail is not None
+    assert tuple(entry.thumbnail[0, 0]) == (7, 180, 33)
+    assert _state().snapshot().panel == ()
+
+
+def test_invalid_or_unidentified_thumbnail_does_not_replace_valid_code_image() -> None:
+    state = _state()
+    first = _detection(1, None)
+    state.on_frame(replace(_frame(1), detections=(snapshot_detection(first),)))
+    state.on_detection(replace(snapshot_detection(first), code=17))
+    wrong_time = snapshot_detection(_detection(1, None, timestamp=10.0))
+    state.on_detection(replace(wrong_time, code=17))
+    invalid = replace(snapshot_detection(_detection(2, None)), box=(float("nan"), 0, 4, 4))
+    state.on_frame(replace(_frame(2), detections=(invalid,)))
+    state.on_detection(replace(invalid, code=17))
+    state.on_detection(replace(snapshot_detection(_detection(3, None)), code=None))
+
+    entry = next(item for item in state.snapshot().panel if item.code == 17)
+    assert entry.thumbnail_frame_index == 1
+
+
+def test_same_frame_wrong_detection_identity_cannot_replace_thumbnail() -> None:
+    state = _state()
+    source = np.zeros((720, 1280, 3), dtype=np.uint8)
+    source[358:362, 638:642] = (10, 80, 220)
+    original = snapshot_detection(_detection(1, None))
+    state.on_frame(replace(_frame(1, image=source), detections=(original,)))
+    state.on_detection(replace(original, code=17))
+
+    wrong_identity = replace(original, pixel=(700.0, 400.0), box=(698.0, 398.0, 702.0, 402.0))
+    state.on_detection(replace(wrong_identity, code=17))
+
+    entry = next(item for item in state.snapshot().panel if item.code == 17)
+    assert entry.thumbnail_frame_index == 1
+    assert entry.thumbnail is not None
+    assert tuple(entry.thumbnail[0, 0]) == (10, 80, 220)
+
+
+def test_repeated_wrong_identity_cannot_self_certify_a_new_thumbnail() -> None:
+    state = _state()
+    original = snapshot_detection(_detection(1, None))
+    state.on_frame(replace(_frame(1), detections=(original,)))
+    wrong_identity = replace(original, pixel=(700.0, 400.0), box=(698.0, 398.0, 702.0, 402.0))
+    state.on_detection(replace(wrong_identity, code=18))
+    state.on_detection(replace(wrong_identity, code=18))
+
+    entry = next(item for item in state.snapshot().panel if item.code == 18)
+    assert entry.count == 2
+    assert entry.thumbnail is None
+    from airdrop.qgcvideo.render import FrameComposer
+
+    assert FrameComposer._thumbnail(state.snapshot(), entry) is None
 
 
 def test_hold_mode_uses_published_business_progress() -> None:

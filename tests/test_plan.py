@@ -401,6 +401,8 @@ def test_build_drop_mission_puts_overfly_before_the_plan(workdir: Path) -> None:
     ]
     assert plan.items[2].alt_m == 40.0, "降落段原样使用（plan 里的项没有被改写）"
     assert plan.as_dict()["tail_source"].startswith("plan:")
+    assert plan.as_dict()["overfly_exit_seq"] == 1
+    assert plan.as_dict()["overfly_item_count"] == 2
 
 
 def test_build_drop_mission_refuses_a_plan_px4_would_reject(workdir: Path) -> None:
