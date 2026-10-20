@@ -7,7 +7,7 @@
      → 感知（YOLO 检测 + OCR 读编号）→ 像素→NED 坐标解算 → 目标统计（聚类 + 选唯一）
      ├─ 有结果 → 生成飞掠航点（航向/高度/段长按配置）+ 降落航线，合并上传
      └─ 无结果 → 以备用点为目标生成同样航点
-     → 飞掠段：弹道实时预测落点，距目标 ≤R 触发 gripper 投放；飞过目标未投则强制投放
+     → 飞掠段：预测沿向过零且横向合格时优先投；过零后进入 5m 目标圈可近靶投放，沿向超过 5m 可兜底
      → 沿降落航线返航降落
 全程：飞行目录（文本/遥测/检测/事件/投放/视频帧）写入磁盘，飞后可回放迭代
 投放后：量出实际落点 → 反演弹道参数（质量/阻力/延迟），下一架次用标定过的模型
@@ -20,7 +20,7 @@
 | `airdrop.perception` | YOLO 检测 + 五边形转正 + RapidOCR 读编号（或 12 类直出） | `test_perception.py` |
 | `airdrop.georef` | 像素 → NED（视线与地面求交）→ WGS84（pyproj） | `test_georef.py` |
 | `airdrop.targeting` | DBSCAN 聚类 + 类内编号众数 + 跨类 median/max 选唯一 | `test_targeting.py` |
-| `airdrop.ballistics` | 二次阻力 RK4 落点预测 + 投放判据（越过目标后强制投放判据 `force_after_pass` + 锁存）+ **投放记录与参数反演** | `test_ballistics.py`、`test_fit.py` |
+| `airdrop.ballistics` | 二次阻力 RK4 落点预测 + 沿向过零正常投放（横向 `radius_m` 容限）+ 过零后近靶/距离兜底 + 锁存 + **投放记录与参数反演** | `test_ballistics.py`、`test_fit.py` |
 | `airdrop.mission` | 状态机 + 飞掠/降落航线拼接 + 候选类→坐标 + 主循环 | `test_mission.py`、`test_e2e.py` |
 | `airdrop.record` | 飞行记录（五个记录文件 + 投放记录）+ 按原时间轴回放 | `test_recorder/replay.py` |
 | `airdrop_calibration.calibrate` | 三步标定：内参 → 画面/遥测时间差 → 手眼外参 | `test_calibrate.py` |
@@ -103,7 +103,7 @@ python -m airdrop.run fit-ballistics --help
 | `camera` | `calib_file` | `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 产出的 `camera_calib.json` |
 | `ground` | 地面点 GPS | `ground_z` = 原点海拔 − 地面点海拔（平地假设） |
 | `targeting` | `eps_m`、`min_samples`、`selection_rule` | `median`/`max` **起飞前二选一** |
-| `ballistics`/`drop` | 质量/Cd/面积、`radius_m`、`force_after_pass`、`delay_s` | **质量按实测称重填入**；Cd 用投放试验反演（`tools/fit_ballistics.py`）；`delay_s` 也可反演后回填 |
+| `ballistics`/`drop` | 质量/Cd/面积、沿航向过零、横向 `radius_m`、过零近靶 `post_cross_radius_m`、距离兜底 `force_after_pass`/`fallback_after_m`、`delay_s` | **质量按实测称重填入**；Cd 用投放试验反演（`tools/fit_ballistics.py`）；`delay_s` 也可反演后回填 |
 | `overfly`/`gripper`/`routes` | 航向/高度/段长、gripper 实例、三条航线 | 高度是**相对起飞点**的高度 |
 | `mission` | 各状态超时、`abort_action`、起飞/降落项开关 | 见下"状态机" |
 
@@ -137,7 +137,7 @@ python -m airdrop.run fit-ballistics --help
 - `HOLD_PROCESS`：`hold()` 盘旋，等 targeting 出结果；处理完且无结果就提前结束，
   上限 `hold_process_max_s`（默认 10s），超时取当前已有结果。
 - `OVERFLY`：结果坐标（无则备用点）→ `[entry, exit]` 飞掠航点 + 降落航线**拼成一条任务**上传，
-  激活投放判据（每拍预测落点，≤`radius_m` 即投；越过目标后强制投放；**一次投放即锁存**）。
+  激活投放判据（连续预测沿航向过零且横向误差≤`radius_m` 优先投；本轮过零后，当前预测落点进入 `post_cross_radius_m` 水平半径可近靶投放，或沿向误差>`fallback_after_m` 时距离兜底；**一次投放即锁存**）。
 - `LAND`：沿降落航线返航，任务飞完 → `DONE`。
 - `ABORT`：只下**一条**安全动作（`abort_action`：`hold` 默认 / `rtl` / `none`）——
   链路断了这条指令也发不出去，那种情况交给飞控自己的 failsafe。

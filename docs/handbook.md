@@ -42,7 +42,7 @@
      → 感知（YOLO 检测 + OCR 读编号）→ 像素→NED 坐标解算 → 目标统计（聚类 + 选唯一）
      ├─ 有结果 → 飞掠航点（航向/高度/段长按配置）+ 降落航线，合并上传
      └─ 无结果 → 以备用点为目标生成同样航点
-     → 飞掠段：弹道实时预测落点，距目标 ≤R 触发 gripper 投放；飞过目标未投则强制投放
+     → 飞掠段：预测沿向过零且横向合格时优先投；过零后进入近靶半径或沿向距离兜底
      → 沿降落航线返航降落
 全程：飞行目录（文本日志/遥测/检测/事件/投放/视频帧）写入磁盘，飞后可回放迭代
 投放后：量出实际落点 → 反演弹道参数（质量是称出来的，反演识别的是 κ=Cd·A/m）
@@ -179,7 +179,7 @@
         │ mission.MissionRunner（INIT→PREFLIGHT→WAIT_AIRBORNE→RECON→…→DONE）│
         │  · mission.planner: 侦查航线 / 飞掠 [entry,exit] + 降落航线合并上传 │
         │  · telemetry.controller.DroneController: 上传/启动/hold/rtl/投放   │
-        │  · ballistics.ReleaseJudge: 每拍预测落点 ≤R 即投；越过目标则强制投  │
+        │  · ballistics.ReleaseJudge: 沿向过零且横向合格优先；过零后近靶或距离兜底 │
         │  · on_drop → record.DropWriter: drops.jsonl（投放瞬间状态）        │
         └───────────────────────────────────────────────────────────────┘
                         │ （事后）
@@ -1130,15 +1130,16 @@ update(snapshot, target_ned, *, ground_z=None, ground_altitude_m=None,
 reset()
 ```
 
-`ReleaseDecision` 字段：`should_release`、`reason`、`timestamp`、`predicted`（预测落点）、`horizontal_error_m`、`passed_target`、`approached`、`release_position`、`delay_s`。
+`ReleaseDecision` 字段：`should_release`、`reason`、`timestamp`、`predicted`（预测落点）、`horizontal_error_m`（预测落点到目标的二维水平距离）、`along_track_error_m`、`cross_track_error_m`、`passed_target`、`approached`、`prediction_crossed_target`、`release_position`、`delay_s`。QGC 的“实时预测误差”显示这个二维距离；正常投放按沿向过零和横向容限判断，过零后的近靶分支则使用二维距离门限。`passed_target` 与 `approached` 保持旧的飞机位置诊断语义，不驱动新兜底；`prediction_crossed_target` 才表示本轮有效预测曾从负沿向误差过零。
 
 判定逻辑：
 
-1. 每拍用当前快照预测落点，**水平误差 ≤ `radius_m` 即投**（`reason='predict'`）；
-2. **本次飞掠里先从目标前方接近过**（`approached=True`）且已越过目标、`force_after_pass=True` 时，执行强制投放（`reason='fallback'`）。⚠ "越过"只看沿航向的投影符号，没有 `approached` 前提的话，进入飞掠时飞机投影已在目标后方（例如刚结束盘旋、还在飞往入场点）会在第一拍假触发；
-3. **一次投放即锁存**：投过之后不再触发，`reset()` 才能重新武装（`approached` 也一并清零，每次飞掠各自重新计）；
-4. `delay_s` 的状态前推是一阶近似（位置 += 速度 × 延迟），不做加速度二次项；
-5. 摘要按 `SUMMARY_HZ`（5 Hz）落事件日志，触发瞬间写完整预测（落点/飞行时间/水平误差/前推后位置）。`on_event` 签名 `(kind, data)`，接 recorder 的标准写法是 `lambda kind, data: recorder.events.emit(kind, **data)`；事件写盘失败**不影响判据**。
+1. 投影坐标固定使用配置飞掠航向：`u=(cosψ,sinψ)`，`r=(-sinψ,cosψ)`。预测落点与目标的水平差为 `e`，沿向 `s=e·u`、横向 `c=e·r`。正常投放优先：连续新鲜样本从 `s<0` 过零到 `s>=0` 且 `abs(c)<=radius_m` 时以 `reason='predict'` 投放；`radius_m` 是横向容限，不是圆形半径。过零前第一样本已为正不会投，恰为零的首样本可作为正常投放；重复位置速度时间戳不会消费过零样本；
+2. 本轮已真实观测预测沿向误差从负值过零到非负后，当前有效预测落点进入 `post_cross_radius_m`（默认 5 米，含边界）水平半径内时执行 `reason='near_target'`。这项近靶兜底独立于 `force_after_pass`；首样为零或已在正侧都不会武装它；
+3. `force_after_pass=True` 时，已锁存本轮预测沿向过零后，当前有效预测 `s>fallback_after_m` 执行 `reason='fallback'`。默认阈值为 5 米，严格大于；该距离兜底不根据飞机当前位置或 `passed_target` 触发。输入无效、逆向、时间倒退或间隔超过 0.5 秒、目标/原点/航向/地面变化会清除连续性与过零锁存。在线位置速度时间使用独立接收时间，离线完整快照缺该字段时使用快照 `timestamp`；二者必须与 `now` 同单位。回放素材若没有位置速度专属接收时间，必须提供按原时间轴递增且与评估时钟一致的 `timestamp`；
+4. **一次投放即锁存**：投过之后不再触发，`reset()` 才能重新武装，预测过零状态也一并清零；
+5. `delay_s` 的状态前推是一阶近似（位置 += 速度 × 延迟），不做加速度二次项；
+6. 摘要按 `SUMMARY_HZ`（5 Hz）落事件日志，触发瞬间写完整预测（落点/飞行时间/二维水平误差/沿向误差/横向误差/前推后位置）。`on_event` 签名 `(kind, data)`，接 recorder 的标准写法是 `lambda kind, data: recorder.events.emit(kind, **data)`；事件写盘失败**不影响判据**。
 
 #### 3.7.3 `drops` —— 投放记录与实测落点
 
@@ -1188,7 +1189,7 @@ FIT_PARAMETERS = ('drag_coefficient', 'cross_area_m2', 'release_delay_s', 'wind_
 运行入口：`python -m airdrop.run fit-ballistics`（见 §6.2；`tools/fit_ballistics.py` 里的常量就是默认值）。
 
 ```python
-"""弹道 + 投放判据：预测落点、越过目标后强制投放。"""
+"""弹道 + 投放判据：沿向过零时正常投放，另保留距离兜底。"""
 
 import time
 from airdrop import BallisticsModel, Config, DropConfig, ReleaseJudge, TelemetrySnapshot
@@ -1198,17 +1199,22 @@ impact = model.predict_impact((0.0, 0.0, -20.0), (18.0, 0.0, 0.0), ground_z=0.0)
 print("落点 %s，飞行时间 %.2fs" % (impact.ned, impact.flight_time_s))
 
 judge = ReleaseJudge(DropConfig(radius_m=2.0), model, overfly_heading_deg=90.0)
-snapshot = TelemetrySnapshot(timestamp=time.time())
-snapshot.north_m, snapshot.east_m, snapshot.down_m = 0.0, -35.0, -20.0
+target = (0.0, 0.0, 0.0)
+before = TelemetrySnapshot(timestamp=time.time())
+before.north_m, before.east_m, before.down_m = 0.0, -36.0, -20.0
+before.vx_m_s, before.vy_m_s, before.vz_m_s = 0.0, 18.0, 0.0
+judge.update(before, target, now=before.timestamp)  # 预测落点仍在目标前方
+snapshot = TelemetrySnapshot(timestamp=before.timestamp + 0.1)
+snapshot.north_m, snapshot.east_m, snapshot.down_m = 0.0, -34.0, -20.0
 snapshot.vx_m_s, snapshot.vy_m_s, snapshot.vz_m_s = 0.0, 18.0, 0.0
-decision = judge.update(snapshot, (0.0, 0.0, 0.0), now=snapshot.timestamp)
+decision = judge.update(snapshot, target, now=snapshot.timestamp)  # 新鲜预测从负值过零
 print(
     "判据: should_release=%s reason=%s 误差 %.2f m"
     % (decision.should_release, decision.reason, decision.horizontal_error_m or -1.0)
 )
 ```
 
-实测输出：`落点 (34.5662493172948, 0.0, 0.0)，飞行时间 2.07s`；`判据: should_release=True reason=predict 误差 0.43 m`（同时 stderr 会有一条"遥测里没有风估计…按零风预测"的提示，属预期）。
+实测输出：`落点 (34.5662493172948, 0.0, 0.0)，飞行时间 2.07s`；第二拍预测落点约为 `(0, 0.57, 0)`，沿向从负值过零，`reason='predict'`（同时 stderr 会有一条"遥测里没有风估计…按零风预测"的提示，属预期）。
 
 ```python
 """投放记录 + 反演：合成两条样本，反演出 Cd。"""
@@ -1860,9 +1866,11 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `radius_m` | float | `2.0` | 投放半径：预测落点水平误差 ≤ 它就投（需 > 0） |
+| `radius_m` | float | `2.0` | 正常投放在沿向过零时的横向容限 `abs(c)`（需 > 0） |
 | `delay_s` | float | `0.0` | 从判据触发到弹离开的延迟（状态前推用） |
-| `force_after_pass` | bool | `True` | 越过目标后的强制投放（前提：本次飞掠里先从目标前方接近过，见 `ReleaseDecision.approached`） |
+| `force_after_pass` | bool | `True` | 过零后沿向距离兜底开关；近靶兜底始终启用 |
+| `fallback_after_m` | float | `5.0` | 沿向距离兜底阈值：本轮真实过零后，预测沿向误差严格大于该值时触发（需有限正数） |
+| `post_cross_radius_m` | float | `5.0` | 本轮真实过零后启用的近靶兜底水平半径，边界包含在内（需有限正数） |
 | `evaluation_hz` | float | `20.0` | 评估节拍口径（实际节拍来自 `MissionConfig.tick_hz`，默认也是 20 Hz） |
 
 ### 4.10 `OverflyConfig` —— 飞掠段
@@ -2070,7 +2078,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `origin` | `MissionRunner` | `lat_deg`/`lon_deg`/`alt_m`：NED 原点就绪 |
 | `targeting` | `MissionRunner` | `reason`（`result`/`timeout`/`no_target`）、`elapsed_s`、`targeting`（`TargetingResult.as_dict()`） |
 | `drop_plan` | `MissionRunner` | `DropMissionPlan.as_dict()`：任务项、目标 NED、来源（`target`/`backup`）、飞掠 entry/exit |
-| `drop_check` | `ReleaseJudge` | 判据摘要，**按 5Hz 节流**（`SUMMARY_HZ`）：`should_release`、`reason`、`horizontal_error_m`、`impact_ned`、`release_position`… |
+| `drop_check` | `ReleaseJudge` | 判据摘要，**按 5Hz 节流**（`SUMMARY_HZ`）：`should_release`、`reason`、二维 `horizontal_error_m`、`along_track_error_m`、`cross_track_error_m`、`prediction_crossed_target`、`impact_ned`、`release_position`… |
 | `release` | `ReleaseJudge` | 触发瞬间的完整预测（含 `flight_time_s`、`impact_speed_m_s`） |
 | `drop` | `MissionRunner` | 判据给的决策 + `target_ned` + `target_source`（**在发投放指令之前**记） |
 | `drop_record` | `MissionRunner` | `DropRecord.as_dict()` 全量（与 `drops.jsonl` 同一份数据，进时间线） |

@@ -1,12 +1,13 @@
-"""投放判据：实时预测落点 → 触发投放；飞过目标后强制投放（计划 4.6）。
+"""投放判据：实时预测航向过零投放；过零后距离兜底（计划 4.6）。
 
-两条判据（都在同一个入口里，实飞与回放走同一条路）：
+三层判据（都在同一个入口里，实飞与回放走同一条路）：
 
-1. 预测判据：把飞机状态前推 ``delay_s``（补偿"指令→离机"延迟），用
-   :class:`~airdrop.ballistics.model.BallisticsModel` 预测落点，落点与目标的水平距离
-   ≤ ``radius_m`` 就投；
-2. 强制投放判据（越过目标后）：``dot(飞机位置 − 目标, 飞掠航向) > 0``——已经沿飞掠方向越过目标却还没投，
-   立刻投。目标点与备用点用同一套判据。
+1. 预测判据：预测落点相对目标的沿航向误差 ``s`` 连续从负值穿过零，且横向误差
+   ``abs(c) <= radius_m`` 时投放；
+2. 近靶兜底：本轮已观测到预测沿向过零后，当前有效预测落点进入 ``post_cross_radius_m``
+   水平半径内时投放；
+3. 距离兜底：本轮已观测到预测沿向过零后，当前有效预测 ``s > fallback_after_m`` 时投放。
+距离兜底由 ``force_after_pass`` 控制；近靶兜底始终启用。所有投放判断均不依赖飞机瞬时位置。
 
 一次投放即锁存（一次性防抖）：之后任何调用都只回 ``already_released``，绝不重复投。
 
@@ -61,13 +62,18 @@ class ReleaseDecision:
     predicted: Impact | None = None
     horizontal_error_m: float | None = None
     passed_target: bool = False
-    #: 本次飞掠里是否出现过"还在目标前方"——``force_after_pass`` 的前提。
-    #: 没从前面接近过就不算"越过"（见 :meth:`ReleaseJudge.update`）。
+    #: 兼容保留的飞机位置诊断：本次飞掠里是否出现过飞机投影位于目标前方；不参与投放判据。
     approached: bool = False
     #: 前推 ``delay_s`` 之后用于预测的位置（NED，米）
     release_position: tuple[float, float, float] | None = None
     #: 这一拍用的前推量（秒）
     delay_s: float = 0.0
+    #: 预测落点相对目标的沿航向误差（米），正值表示已越过目标断面。
+    along_track_error_m: float | None = None
+    #: 预测落点相对目标的横向误差（米）。
+    cross_track_error_m: float | None = None
+    #: 本轮是否已观测预测沿向误差从负值过零到非负；首样为零不锁存。
+    prediction_crossed_target: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -75,10 +81,15 @@ class ReleaseDecision:
             "reason": self.reason,
             "passed_target": self.passed_target,
             "approached": self.approached,
+            "prediction_crossed_target": self.prediction_crossed_target,
             "delay_s": float(self.delay_s),
         }
         if self.horizontal_error_m is not None:
             data["horizontal_error_m"] = round(self.horizontal_error_m, 3)
+        if self.along_track_error_m is not None:
+            data["along_track_error_m"] = round(self.along_track_error_m, 3)
+        if self.cross_track_error_m is not None:
+            data["cross_track_error_m"] = round(self.cross_track_error_m, 3)
         if self.release_position is not None:
             data["release_position"] = [round(v, 3) for v in self.release_position]
         if self.predicted is not None and self.predicted.ok:
@@ -108,7 +119,11 @@ class ReleaseJudge:
     _last_summary: float = field(default=0.0, init=False)
     _evaluations: int = field(default=0, init=False)
     _wind_warned: bool = field(default=False, init=False)
-    #: 本次飞掠里见过"在目标前方"（即使方向不对也算"接近过"）——见 ``force_after_pass``
+    _prediction_context: tuple[object, ...] | None = field(default=None, init=False)
+    _prediction_prev_s: float | None = field(default=None, init=False)
+    _prediction_prev_time: float | None = field(default=None, init=False)
+    _prediction_crossed: bool = field(default=False, init=False)
+    #: 飞机位置诊断字段，保留既有语义；不参与新的预测兜底。
     _approached: bool = field(default=False, init=False)
 
     # ------------------------------------------------------------------
@@ -126,6 +141,7 @@ class ReleaseJudge:
         self._released = False
         self._last_summary = 0.0
         self._evaluations = 0
+        self._clear_prediction_track()
         self._approached = False
 
     # ------------------------------------------------------------------
@@ -153,6 +169,7 @@ class ReleaseJudge:
         position = self._position(snapshot)
         velocity = self._velocity(snapshot)
         if position is None or velocity is None:
+            self._clear_prediction_track()
             return self._decide(ReleaseDecision(False, "unknown_position", stamp), stamp)
         if len(target_ned) != 3:
             raise ValueError("target_ned 必须是 3 维 NED 矢量")
@@ -166,38 +183,132 @@ class ReleaseJudge:
             position[2] + velocity[2] * delay,
         )
 
+        effective_ground_z = self.ground_z if ground_z is None else ground_z
+        effective_ground_altitude = (
+            self.ground_altitude_m if ground_altitude_m is None else ground_altitude_m
+        )
         wind = self._resolve_wind(snapshot, wind_ned)
+        inputs = (
+            *release_position,
+            *velocity,
+            *target_ned,
+            self.overfly_heading_deg,
+            snapshot.position_velocity_received_at,
+            snapshot.timestamp,
+            snapshot.origin_latitude_deg,
+            snapshot.origin_longitude_deg,
+            snapshot.origin_altitude_m,
+        )
+        if not all(value is None or math.isfinite(float(value)) for value in inputs) or not all(
+            math.isfinite(float(value))
+            for value in (*wind, effective_ground_z, effective_ground_altitude)
+        ):
+            self._clear_prediction_track()
+            return self._decide(
+                ReleaseDecision(
+                    False,
+                    "no_prediction:non_finite_input",
+                    stamp,
+                    passed_target=False,
+                    approached=self._approached,
+                    release_position=release_position,
+                    delay_s=delay,
+                ),
+                stamp,
+            )
         impact = self.ballistics.predict_impact(
             release_position,
             velocity,
-            ground_z=self.ground_z if ground_z is None else ground_z,
-            ground_altitude_m=(
-                self.ground_altitude_m if ground_altitude_m is None else ground_altitude_m
-            ),
+            ground_z=effective_ground_z,
+            ground_altitude_m=effective_ground_altitude,
             wind=wind,
         )
 
         target = (float(target_ned[0]), float(target_ned[1]))
         error = None
+        along_error = None
+        cross_error = None
+        crossed_now = False
+        sample_fresh = False
         if impact.ok and impact.ned is not None:
-            error = math.hypot(impact.ned[0] - target[0], impact.ned[1] - target[1])
+            delta_n = impact.ned[0] - target[0]
+            delta_e = impact.ned[1] - target[1]
+            error = math.hypot(delta_n, delta_e)
+            north, east = heading_unit_vector(self.overfly_heading_deg)
+            along_error = delta_n * north + delta_e * east
+            cross_error = delta_n * -east + delta_e * north
+            sample_fresh, crossed_now = self._observe_prediction(
+                snapshot,
+                target_ned=target_ned,
+                ground_z=effective_ground_z,
+                ground_altitude_m=effective_ground_altitude,
+                along_error=along_error,
+                velocity=velocity,
+                now=stamp,
+            )
+        else:
+            self._clear_prediction_track()
 
-        # 2) 强制投放判据：沿飞掠航向已经越过目标
+        # 既有飞机位置诊断维持兼容，仅供 passed_target / approached 解释。
         north, east = heading_unit_vector(self.overfly_heading_deg)
         passed = (
             (release_position[0] - target[0]) * north + (release_position[1] - target[1]) * east
         ) > 0.0
         if not passed:
-            # "越过"的前提是**本次飞掠里真的从目标前方接近过**。没有这道门槛时，
-            # 飞机进入 OVERFLY 的瞬间只要投影已在目标后方（例如刚结束盘旋、还在
-            # 飞往入场点的路上）就会在第一拍强制投放——实测 r2 世界架次
-            # 20260929-193034：OVERFLY 第一拍以 113 m 误差假触发。
             self._approached = True
-
-        if error is not None and error <= self.config.radius_m:
-            return self._release("predict", stamp, impact, error, passed, release_position, delay)
-        if passed and self._approached and self.config.force_after_pass:
-            return self._release("fallback", stamp, impact, error, passed, release_position, delay)
+        # 正常判据优先：只在首次连续过零的有效新样本上检查横向容限。
+        if (
+            sample_fresh
+            and crossed_now
+            and cross_error is not None
+            and abs(cross_error) <= self.config.radius_m
+        ):
+            return self._release(
+                "predict",
+                stamp,
+                impact,
+                error,
+                passed,
+                release_position,
+                delay,
+                along_error,
+                cross_error,
+            )
+        if (
+            sample_fresh
+            and self._prediction_crossed
+            and error is not None
+            and error <= self.config.post_cross_radius_m
+        ):
+            return self._release(
+                "near_target",
+                stamp,
+                impact,
+                error,
+                passed,
+                release_position,
+                delay,
+                along_error,
+                cross_error,
+            )
+        if (
+            sample_fresh
+            and self.config.force_after_pass
+            and self._prediction_crossed
+            and along_error is not None
+            and along_error > self.config.fallback_after_m
+        ):
+            return self._release(
+                "fallback",
+                stamp,
+                impact,
+                error,
+                passed,
+                release_position,
+                delay,
+                along_error,
+                cross_error,
+            )
 
         reason = "waiting" if impact.ok else f"no_prediction:{impact.reason}"
         return self._decide(
@@ -211,6 +322,9 @@ class ReleaseJudge:
                 approached=self._approached,
                 release_position=release_position,
                 delay_s=delay,
+                along_track_error_m=along_error,
+                cross_track_error_m=cross_error,
+                prediction_crossed_target=self._prediction_crossed,
             ),
             stamp,
         )
@@ -244,6 +358,84 @@ class ReleaseJudge:
     def _position(self, snapshot: TelemetrySnapshot) -> tuple[float, float, float] | None:
         return as_float_triple((snapshot.north_m, snapshot.east_m, snapshot.down_m))
 
+    def _clear_prediction_track(self) -> None:
+        """清除沿向过零历史，避免跨任务、断档或无效预测复用旧样本。"""
+        self._prediction_context = None
+        self._prediction_prev_s = None
+        self._prediction_prev_time = None
+        self._prediction_crossed = False
+
+    def _observe_prediction(
+        self,
+        snapshot: TelemetrySnapshot,
+        *,
+        target_ned: Sequence[float],
+        ground_z: float,
+        ground_altitude_m: float,
+        along_error: float,
+        velocity: tuple[float, float, float],
+        now: float,
+    ) -> tuple[bool, bool]:
+        """记录连续新鲜预测，并返回（新样本，当前拍首次过零）。"""
+        north, east = heading_unit_vector(self.overfly_heading_deg)
+        speed_along = velocity[0] * north + velocity[1] * east
+        received = snapshot.position_velocity_received_at
+        timestamp = snapshot.timestamp if received is None else received
+        values = (
+            timestamp,
+            now,
+            along_error,
+            speed_along,
+            ground_z,
+            ground_altitude_m,
+            *target_ned,
+            snapshot.origin_latitude_deg,
+            snapshot.origin_longitude_deg,
+            snapshot.origin_altitude_m,
+            self.overfly_heading_deg,
+        )
+        if not all(value is None or math.isfinite(float(value)) for value in values):
+            self._clear_prediction_track()
+            return False, False
+        timestamp = float(timestamp)
+        now = float(now)
+        if not 0.0 <= now - timestamp <= 0.5 or speed_along <= 0.0:
+            self._clear_prediction_track()
+            return False, False
+
+        context = (
+            *(float(v) for v in target_ned),
+            snapshot.origin_latitude_deg,
+            snapshot.origin_longitude_deg,
+            snapshot.origin_altitude_m,
+            self.overfly_heading_deg,
+            float(ground_z),
+            float(ground_altitude_m),
+        )
+        if context != self._prediction_context:
+            self._clear_prediction_track()
+            self._prediction_context = context
+
+        previous_s = self._prediction_prev_s
+        previous_time = self._prediction_prev_time
+        if previous_time is not None:
+            interval = timestamp - previous_time
+            if interval == 0.0:
+                # 重复的新鲜位置速度样本不消费负向前样本，也不触发判据。
+                return False, False
+            if interval < 0.0 or interval > 0.5:
+                self._clear_prediction_track()
+                self._prediction_context = context
+                previous_s = None
+
+        true_crossing = previous_s is not None and previous_s < 0.0 and along_error >= -1e-9
+        crossed_now = true_crossing or (previous_s is None and abs(along_error) <= 1e-9)
+        if true_crossing:
+            self._prediction_crossed = True
+        self._prediction_prev_s = along_error
+        self._prediction_prev_time = timestamp
+        return True, crossed_now
+
     def _velocity(self, snapshot: TelemetrySnapshot) -> tuple[float, float, float] | None:
         return as_float_triple((snapshot.vx_m_s, snapshot.vy_m_s, snapshot.vz_m_s))
 
@@ -256,6 +448,8 @@ class ReleaseJudge:
         passed: bool,
         release_position: tuple[float, float, float],
         delay: float = 0.0,
+        along_error: float | None = None,
+        cross_error: float | None = None,
     ) -> ReleaseDecision:
         """锁存并记录完整预测。"""
         self._released = True
@@ -269,6 +463,9 @@ class ReleaseJudge:
             approached=self._approached,
             release_position=release_position,
             delay_s=delay,
+            along_track_error_m=along_error,
+            cross_track_error_m=cross_error,
+            prediction_crossed_target=self._prediction_crossed,
         )
         LOGGER.warning(
             "投放触发（%s）：落点误差 %s m，飞行时间 %.2fs，前推后位置 (%.2f, %.2f, %.2f)",
@@ -298,6 +495,8 @@ class ReleaseJudge:
         payload = decision.as_dict()
         payload["overfly_heading_deg"] = self.overfly_heading_deg
         payload["radius_m"] = self.config.radius_m
+        payload["fallback_after_m"] = self.config.fallback_after_m
+        payload["post_cross_radius_m"] = self.config.post_cross_radius_m
         payload["evaluated_at"] = stamp
         try:
             self.on_event(kind, payload)

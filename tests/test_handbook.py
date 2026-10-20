@@ -155,7 +155,7 @@ def ex_targeting() -> None:
 
 # ----------------------------------------------------------------------
 def ex_ballistics() -> None:
-    """弹道 + 投放判据：预测落点、越过目标后强制投放。"""
+    """弹道 + 投放判据：沿向过零优先投放，过零后保留距离兜底。"""
     model = BallisticsModel(Config().ballistics)
     impact = model.predict_impact((0.0, 0.0, -20.0), (18.0, 0.0, 0.0), ground_z=0.0)
     print("  落点 %s，飞行时间 %.2fs" % (impact.ned, impact.flight_time_s))
@@ -163,10 +163,15 @@ def ex_ballistics() -> None:
     from airdrop import ReleaseJudge
 
     judge = ReleaseJudge(DropConfig(radius_m=2.0), model, overfly_heading_deg=90.0)
-    snapshot = TelemetrySnapshot(timestamp=time.time())
-    snapshot.north_m, snapshot.east_m, snapshot.down_m = 0.0, -35.0, -20.0
+    target = (0.0, 0.0, 0.0)
+    before = TelemetrySnapshot(timestamp=time.time())
+    before.north_m, before.east_m, before.down_m = 0.0, -36.0, -20.0
+    before.vx_m_s, before.vy_m_s, before.vz_m_s = 0.0, 18.0, 0.0
+    judge.update(before, target, now=before.timestamp)
+    snapshot = TelemetrySnapshot(timestamp=before.timestamp + 0.1)
+    snapshot.north_m, snapshot.east_m, snapshot.down_m = 0.0, -34.0, -20.0
     snapshot.vx_m_s, snapshot.vy_m_s, snapshot.vz_m_s = 0.0, 18.0, 0.0
-    decision = judge.update(snapshot, (0.0, 0.0, 0.0), now=snapshot.timestamp)
+    decision = judge.update(snapshot, target, now=snapshot.timestamp)
     print(
         "  判据: should_release=%s reason=%s 误差 %.2f m"
         % (decision.should_release, decision.reason, decision.horizontal_error_m or -1.0)

@@ -2,8 +2,8 @@
 
 * :mod:`~airdrop.ballistics.model`：RK4 定步长积分 → 落点与飞行时间（含 ISA 空气密度、
   风平移）；
-* :mod:`~airdrop.ballistics.release`：:class:`ReleaseJudge`——每拍预测落点，距离 ≤ 半径
-  即投；越过目标后强制投放；一次投放即锁存。
+* :mod:`~airdrop.ballistics.release`：:class:`ReleaseJudge`——预测落点沿航向过零且横向误差
+  在容限内时优先投放；本轮过零后依次检查近靶与沿向距离兜底；一次投放即锁存。
 * :mod:`~airdrop.ballistics.drops`：:class:`DropRecord`——投放瞬间的位置/速度/姿态/
   风/预测落点（事后无法重建，所以实飞必须写入磁盘），以及实测落点的读取与配对；
 * :mod:`~airdrop.ballistics.fit`：:func:`fit_ballistics`——用投放试验的"投放状态 +

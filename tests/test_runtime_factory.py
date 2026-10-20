@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,6 +57,8 @@ class _Controller:
         self.calls = calls
         self.uploads: list[tuple[MissionItem, ...]] = []
         self.polls = 0
+        self.mission_starts = 0
+        self.after_mission_poll: Callable[[int], None] | None = None
 
     def upload_mission(self, items: Sequence[MissionItem], /) -> int:
         self.calls.append("upload")
@@ -66,9 +68,12 @@ class _Controller:
     def start_mission(self) -> None:
         self.calls.append("start")
         self.polls = 0
+        self.mission_starts += 1
 
     def mission_finished(self) -> bool:
         self.polls += 1
+        if self.after_mission_poll is not None:
+            self.after_mission_poll(self.mission_starts)
         return self.polls > 1
 
     def in_mission_mode(self) -> bool:
@@ -240,17 +245,33 @@ def test_entry_runs_selected_stages_with_actual_runner_and_preflight(
     calls: list[str] = []
     controller = _Controller(calls)
     created = []
+    brokers: list[TelemetryBroker] = []
 
     class TelemetryInput:
         @classmethod
         def from_config(cls, config, *, broker):
             del config
+            brokers.append(broker)
             return _FlightInput(broker, calls)
 
     class ControllerInput:
         @classmethod
         def from_config(cls, *args, **kwargs):
             del args, kwargs
+            drop_start = 2 if mode == "real" and drop_stage else 1
+            updated = False
+
+            def progress(mission_start: int) -> None:
+                nonlocal updated
+                if updated or not drop_stage or mission_start != drop_start:
+                    return
+                updated = True
+                brokers[0].update_local_position_velocity(
+                    SimpleNamespace(north_m=20.0, east_m=0.0, down_m=-50.0),
+                    SimpleNamespace(north_m_s=15.0, east_m_s=0.0, down_m_s=0.0),
+                )
+
+            controller.after_mission_poll = progress
             return controller
 
     def forbidden(*args, **kwargs):
@@ -273,18 +294,21 @@ def test_entry_runs_selected_stages_with_actual_runner_and_preflight(
         created.append(components)
         return components
 
+    from airdrop.georef.geo import ned_to_wgs84
+
     base = Config()
+    backup_lon, backup_lat, _ = ned_to_wgs84((60.0, 0.0, 0.0), (8.0, 47.0, 500.0))
     config = replace(
         base,
         routes=replace(
             base.routes,
             recon_route=(Waypoint(lat=47.0, lon=8.0, alt_m=50.0),),
-            backup_point=Waypoint(lat=47.0, lon=8.0, alt_m=0.0),
+            backup_point=Waypoint(lat=backup_lat, lon=backup_lon, alt_m=0.0),
             land_plan="this-must-not-be-read.plan",
         ),
         mission=replace(base.mission, tick_hz=200.0, hold_process_min_s=0.0),
         ground=replace(base.ground, ground_point_alt=500.0),
-        drop=replace(base.drop, radius_m=10000.0),
+        drop=replace(base.drop, radius_m=2.0),
     )
 
     assert (

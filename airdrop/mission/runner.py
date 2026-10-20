@@ -628,7 +628,9 @@ class MissionRunner:
                     self._plan.target_ned,
                     ground_z=self._ground_z(),
                     ground_altitude_m=self._ground_altitude(),
-                    now=now,
+                    # 判据使用的遥测可能在本拍开始后才收到；用快照读取之后的同一注入时钟，
+                    # 避免把刚到的位置速度样本误判为“来自未来”。状态机超时仍使用本拍 now。
+                    now=float(self._clock()),
                 )
             except Exception as exc:  # noqa: BLE001 - 判据异常按任务失败处理，不让主循环带崩
                 self._fail("release_judge", exc)

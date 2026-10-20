@@ -12,6 +12,7 @@ import pytest
 
 from airdrop.ballistics import (
     BallisticsModel,
+    Impact,
     ReleaseJudge,
     heading_unit_vector,
     isa_air_density,
@@ -31,16 +32,34 @@ def _snapshot(
     velocity: tuple[float, float, float] = (10.0, 0.0, 0.0),
     *,
     drop_velocity: bool = False,
+    timestamp: float = 100.0,
+    position_velocity_received_at: float | None = None,
 ) -> TelemetrySnapshot:
     return TelemetrySnapshot(
-        timestamp=0.0,
+        timestamp=timestamp,
         north_m=position[0],
         east_m=position[1],
         down_m=position[2],
         vx_m_s=None if drop_velocity else velocity[0],
         vy_m_s=None if drop_velocity else velocity[1],
         vz_m_s=None if drop_velocity else velocity[2],
+        position_velocity_received_at=position_velocity_received_at,
     )
+
+
+def _stub_impacts(
+    monkeypatch: pytest.MonkeyPatch,
+    judge: ReleaseJudge,
+    points: list[tuple[float, float, float] | None],
+) -> None:
+    remaining = iter(points)
+
+    def predict(*args, **kwargs) -> Impact:
+        del args, kwargs
+        point = next(remaining)
+        return Impact(point is not None, point, 1.0, reason="test failure" if point is None else "")
+
+    monkeypatch.setattr(judge.ballistics, "predict_impact", predict)
 
 
 # ----------------------------------------------------------------------
@@ -313,49 +332,363 @@ def test_judge_passes_ground_altitude_into_the_prediction() -> None:
     assert override.predicted.ned[0] == pytest.approx(plateau.predicted.ned[0])
 
 
-def test_fallback_after_passing_target() -> None:
-    """从目标前方飞过来、沿航向越过却还没投 → 强制投放（落点判据够不着时）。"""
-    judge, _, events = _judge(force_after_pass=True)
-    # 先在目标前方（还没越过）：判据只等待
-    before = judge.update(
-        _snapshot(position=(-100.0, 0.0, -50.0), velocity=(12.0, 0.0, 0.0)),
-        (0.0, 300.0, 0.0),
-        now=99.0,
-    )
-    assert not before.should_release and not before.passed_target
+def test_predict_requires_continuous_negative_to_nonnegative_crossing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=False)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 0.0, 0.0), (-0.1, 0.0, 0.0)])
+    before = judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    inside_circle = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
 
-    snapshot = _snapshot(position=(100.0, 0.0, -50.0), velocity=(12.0, 0.0, 0.0))
-    target = (0.0, 300.0, 0.0)  # 已经越过（北向 100 > 0），但横向很远
-
-    decision = judge.update(snapshot, target, now=100.0)
-    assert decision.should_release and decision.reason == "fallback"
-    assert decision.passed_target and decision.approached
-    kinds = [kind for kind, _ in events]
-    assert "release" in kinds
-
-
-def test_fallback_waits_until_the_target_is_really_passed() -> None:
-    """进入飞掠时已在目标后方（**没从前面接近过**）不算"越过"——不许假触发。
-
-    实测（r2 世界架次 20260929-193034）：OVERFLY 开始时飞机刚结束盘旋、还在飞往
-    入场点，投影已在目标后方 ⇒ 旧口径在第一拍就强制投放，误差 113 m。
-    """
-    judge, _, _ = _judge(force_after_pass=True)
-    snapshot = _snapshot(position=(100.0, 0.0, -50.0), velocity=(12.0, 0.0, 0.0))
-    decision = judge.update(snapshot, (0.0, 300.0, 0.0), now=100.0)
-
-    assert not decision.should_release, "没接近过就投 = 实测 113 m 级误差"
-    assert decision.passed_target and not decision.approached
+    assert before.horizontal_error_m == pytest.approx(1.0)
+    assert inside_circle.horizontal_error_m == pytest.approx(0.1)
+    assert not before.should_release and not inside_circle.should_release
     assert not judge.released
 
 
-def test_fallback_can_be_disabled() -> None:
+@pytest.mark.parametrize("cross", [-2.0, 2.0])
+def test_predict_accepts_inclusive_cross_track_boundary(
+    monkeypatch: pytest.MonkeyPatch, cross: float
+) -> None:
     judge, _, _ = _judge(force_after_pass=False)
-    snapshot = _snapshot(position=(100.0, 0.0, -50.0), velocity=(12.0, 0.0, 0.0))
-    decision = judge.update(snapshot, (0.0, 300.0, 0.0), now=100.0)
+    _stub_impacts(monkeypatch, judge, [(-1.0, cross, 0.0), (0.0, cross, 0.0)])
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    decision = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
 
+    assert decision.should_release and decision.reason == "predict"
+    assert decision.along_track_error_m == pytest.approx(0.0)
+    assert decision.cross_track_error_m == pytest.approx(cross)
+    assert decision.horizontal_error_m == pytest.approx(2.0)
+    assert decision.prediction_crossed_target
+
+
+def test_predict_logs_actual_nonzero_crossing_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge, _, events = _judge(force_after_pass=False)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 1.5, 0.0), (0.4, 1.5, 0.0)])
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    decision = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+
+    assert decision.should_release and decision.reason == "predict"
+    assert decision.along_track_error_m == pytest.approx(0.4)
+    assert decision.cross_track_error_m == pytest.approx(1.5)
+    payload = next(data for kind, data in events if kind == "release")
+    assert payload["along_track_error_m"] == pytest.approx(0.4)
+    assert payload["cross_track_error_m"] == pytest.approx(1.5)
+
+
+def test_normal_predict_takes_priority_over_distance_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """横向合格时，即使沿向一步跨过兜底阈值也走正常投放。"""
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 1.0, 0.0), (6.0, 1.0, 0.0)])
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    decision = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    assert decision.should_release and decision.reason == "predict"
+    assert decision.along_track_error_m == pytest.approx(6.0)
+
+
+def test_first_positive_does_not_release_but_first_zero_can_predict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(monkeypatch, judge, [(10.0, 3.0, 0.0)])
+    positive = judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    assert not positive.should_release and not positive.prediction_crossed_target
+
+    zero_judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(monkeypatch, zero_judge, [(0.0, 0.0, 0.0)])
+    zero = zero_judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    assert zero.should_release and zero.reason == "predict"
+    assert zero.along_track_error_m == 0.0
+    assert not zero.prediction_crossed_target, "首样为零允许 predict，但不伪造负到正历史"
+
+
+def test_crossed_outside_radius_falls_back_only_above_configured_distance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(
+        monkeypatch,
+        judge,
+        [(-1.0, 6.0, 0.0), (0.0, 6.0, 0.0), (5.0, 6.0, 0.0), (5.001, 6.0, 0.0)],
+    )
+    decisions = [
+        judge.update(_snapshot(timestamp=100.0 + i * 0.1), (0.0, 0.0, 0.0), now=100.0 + i * 0.1)
+        for i in range(4)
+    ]
+
+    assert all(not item.should_release for item in decisions[:3])
+    fallback = decisions[3]
+    assert fallback.should_release and fallback.reason == "fallback"
+    assert fallback.along_track_error_m == pytest.approx(5.001)
+    assert fallback.cross_track_error_m == pytest.approx(6.0)
+    assert fallback.prediction_crossed_target
+
+
+def test_crossing_fallback_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge, _, _ = _judge(force_after_pass=False)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 6.0, 0.0), (0.0, 6.0, 0.0), (6.0, 6.0, 0.0)])
+    decisions = [
+        judge.update(_snapshot(timestamp=100.0 + i * 0.1), (0.0, 0.0, 0.0), now=100.0 + i * 0.1)
+        for i in range(3)
+    ]
+    assert all(not item.should_release for item in decisions)
+    assert decisions[-1].prediction_crossed_target
+
+
+def test_post_cross_near_target_fallback_triggers_inside_horizontal_radius(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 3.0, 0.0), (0.0, 3.0, 0.0)])
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    decision = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    assert decision.should_release and decision.reason == "near_target"
+    assert decision.prediction_crossed_target
+    assert decision.horizontal_error_m == pytest.approx(3.0)
+
+
+def test_post_cross_near_target_does_not_depend_on_distance_fallback_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=False)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 3.0, 0.0), (0.0, 3.0, 0.0)])
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    decision = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    assert decision.should_release and decision.reason == "near_target"
+
+
+def test_post_cross_near_target_fallback_can_trigger_after_crossing_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(
+        monkeypatch,
+        judge,
+        [(-1.0, 6.0, 0.0), (0.0, 6.0, 0.0), (3.0, 4.0, 0.0)],
+    )
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    crossed = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    near = judge.update(_snapshot(timestamp=100.2), (0.0, 0.0, 0.0), now=100.2)
+    assert not crossed.should_release and crossed.prediction_crossed_target
+    assert near.should_release and near.reason == "near_target"
+    assert near.horizontal_error_m == pytest.approx(5.0)
+
+
+def test_post_cross_near_target_boundary_is_inclusive_and_outside_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(
+        monkeypatch,
+        judge,
+        [(-1.0, 6.0, 0.0), (0.0, 6.0, 0.0), (3.0, 4.001, 0.0), (3.0, 4.0, 0.0)],
+    )
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    outside = judge.update(_snapshot(timestamp=100.2), (0.0, 0.0, 0.0), now=100.2)
+    boundary = judge.update(_snapshot(timestamp=100.3), (0.0, 0.0, 0.0), now=100.3)
+    assert not outside.should_release and outside.prediction_crossed_target
+    assert boundary.should_release and boundary.reason == "near_target"
+    assert boundary.horizontal_error_m == pytest.approx(5.0)
+
+
+def test_near_target_fallback_requires_a_true_prior_crossing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(monkeypatch, judge, [(1.0, 0.0, 0.0), (4.0, 0.0, 0.0)])
+    first = judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    second = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    assert not first.should_release and not second.should_release
+    assert not first.prediction_crossed_target and not second.prediction_crossed_target
+
+
+@pytest.mark.parametrize("heading", [0.0, 90.0, 37.0, 213.0])
+def test_crossing_projection_works_for_arbitrary_heading(
+    monkeypatch: pytest.MonkeyPatch, heading: float
+) -> None:
+    judge, _, _ = _judge(force_after_pass=False)
+    judge.overfly_heading_deg = heading
+    u = heading_unit_vector(heading)
+    r = (-u[1], u[0])
+    points: list[tuple[float, float, float] | None] = [
+        (-1.0 * u[0] + 0.5 * r[0], -1.0 * u[1] + 0.5 * r[1], 0.0),
+        (0.2 * u[0] + 0.5 * r[0], 0.2 * u[1] + 0.5 * r[1], 0.0),
+    ]
+    _stub_impacts(monkeypatch, judge, points)
+    velocity = (15.0 * u[0], 15.0 * u[1], 0.0)
+    judge.update(_snapshot(velocity=velocity, timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    decision = judge.update(
+        _snapshot(velocity=velocity, timestamp=100.1), (0.0, 0.0, 0.0), now=100.1
+    )
+    assert decision.should_release and decision.reason == "predict"
+    assert decision.along_track_error_m == pytest.approx(0.2)
+    assert decision.cross_track_error_m == pytest.approx(0.5)
+
+
+def test_duplicate_position_timestamp_preserves_negative_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=False)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 0.0, 0.0), (0.2, 0.0, 0.0), (0.2, 0.0, 0.0)])
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    duplicate = judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.1)
+    assert not duplicate.should_release and not duplicate.prediction_crossed_target
+    crossed = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    assert crossed.should_release and crossed.reason == "predict"
+
+
+@pytest.mark.parametrize("bad_time", [99.9, 100.6])
+def test_time_reversal_or_gap_resets_crossing(
+    monkeypatch: pytest.MonkeyPatch, bad_time: float
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 3.0, 0.0), (6.0, 3.0, 0.0)])
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    decision = judge.update(_snapshot(timestamp=bad_time), (0.0, 0.0, 0.0), now=bad_time)
     assert not decision.should_release
-    assert decision.passed_target, "越过了但配置禁止强制投放"
+    assert not decision.prediction_crossed_target
+
+
+def test_failed_prediction_clears_crossing(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 6.0, 0.0), (0.0, 6.0, 0.0), None, (6.0, 6.0, 0.0)])
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    crossed = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    assert crossed.prediction_crossed_target
+    failed = judge.update(_snapshot(timestamp=100.2), (0.0, 0.0, 0.0), now=100.2)
+    after = judge.update(_snapshot(timestamp=100.3), (0.0, 0.0, 0.0), now=100.3)
+    assert not failed.should_release and not after.should_release
+    assert not after.prediction_crossed_target
+
+
+@pytest.mark.parametrize("break_kind", ["stale", "future", "gap", "reverse_time", "unknown"])
+def test_invalid_sample_after_crossing_clears_fallback_latch(
+    monkeypatch: pytest.MonkeyPatch, break_kind: str
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(
+        monkeypatch,
+        judge,
+        [(-1.0, 6.0, 0.0), (0.0, 6.0, 0.0), (6.0, 6.0, 0.0), (6.0, 6.0, 0.0)],
+    )
+    before = judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    crossed = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    assert not before.should_release and crossed.prediction_crossed_target
+
+    if break_kind == "stale":
+        broken_snapshot = _snapshot(timestamp=100.2, position_velocity_received_at=99.6)
+        broken_now = 100.2
+    elif break_kind == "future":
+        broken_snapshot = _snapshot(timestamp=100.2, position_velocity_received_at=100.3)
+        broken_now = 100.2
+    elif break_kind == "gap":
+        broken_snapshot = _snapshot(timestamp=100.7)
+        broken_now = 100.7
+    elif break_kind == "reverse_time":
+        broken_snapshot = _snapshot(timestamp=99.9)
+        broken_now = 99.9
+    else:
+        broken_snapshot = _snapshot(drop_velocity=True, timestamp=100.2)
+        broken_now = 100.2
+
+    broken = judge.update(broken_snapshot, (0.0, 0.0, 0.0), now=broken_now)
+    after = judge.update(_snapshot(timestamp=100.8), (0.0, 0.0, 0.0), now=100.8)
+    assert not broken.should_release and not broken.prediction_crossed_target
+    assert not after.should_release and not after.prediction_crossed_target
+
+
+@pytest.mark.parametrize("change", ["target", "origin", "ground", "heading", "reset"])
+def test_crossing_latch_clears_when_context_changes(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    third_point = (6.0, 6.0, 0.0)
+    if change == "heading":
+        third_point = (3.0, 6.0, 0.0)
+    if change == "target":
+        third_point = (7.0, 6.0, 0.0)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 6.0, 0.0), (0.0, 6.0, 0.0), third_point])
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    crossed = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    assert crossed.prediction_crossed_target
+
+    target = (1.0, 0.0, 0.0) if change == "target" else (0.0, 0.0, 0.0)
+    snapshot = _snapshot(timestamp=100.2)
+    ground_z = None
+    if change == "origin":
+        snapshot.origin_altitude_m = 501.0
+    elif change == "ground":
+        ground_z = -0.1
+    elif change == "heading":
+        judge.overfly_heading_deg = 90.0
+    elif change == "reset":
+        judge.reset()
+    decision = judge.update(snapshot, target, ground_z=ground_z, now=100.2)
+    assert not decision.should_release
+    assert not decision.prediction_crossed_target
+
+
+def test_reverse_velocity_clears_prediction_crossing(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 6.0, 0.0), (0.0, 6.0, 0.0), (6.0, 6.0, 0.0)])
+    judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    crossed = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    reverse = judge.update(
+        _snapshot(velocity=(-10.0, 0.0, 0.0), timestamp=100.2),
+        (0.0, 0.0, 0.0),
+        now=100.2,
+    )
+    assert crossed.prediction_crossed_target
+    assert not reverse.should_release and not reverse.prediction_crossed_target
+
+
+def test_first_zero_outside_radius_does_not_arm_distance_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(monkeypatch, judge, [(0.0, 3.0, 0.0), (6.0, 3.0, 0.0)])
+    zero = judge.update(_snapshot(timestamp=100.0), (0.0, 0.0, 0.0), now=100.0)
+    after = judge.update(_snapshot(timestamp=100.1), (0.0, 0.0, 0.0), now=100.1)
+    assert not zero.should_release and not zero.prediction_crossed_target
+    assert not after.should_release and not after.prediction_crossed_target
+
+
+def test_non_finite_inputs_are_rejected_before_model_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge, model, _ = _judge(force_after_pass=True)
+    called = False
+
+    def forbidden(*args, **kwargs):
+        nonlocal called
+        called = True
+        return model.predict_impact(*args, **kwargs)
+
+    monkeypatch.setattr(model, "predict_impact", forbidden)
+    snapshot = _snapshot(timestamp=100.0)
+    snapshot.north_m = math.nan
+    decision = judge.update(snapshot, (0.0, 0.0, 0.0), now=100.0)
+    assert not decision.should_release
+    assert not called
+
+
+def test_fallback_does_not_depend_on_aircraft_passed_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, _, _ = _judge(force_after_pass=True)
+    _stub_impacts(monkeypatch, judge, [(-1.0, 6.0, 0.0), (0.0, 6.0, 0.0), (6.0, 6.0, 0.0)])
+    judge.update(
+        _snapshot(position=(-100.0, 0.0, -50.0), timestamp=100.0), (0.0, 0.0, 0.0), now=100.0
+    )
+    judge.update(
+        _snapshot(position=(-100.0, 0.0, -50.0), timestamp=100.1), (0.0, 0.0, 0.0), now=100.1
+    )
+    decision = judge.update(
+        _snapshot(position=(-100.0, 0.0, -50.0), timestamp=100.2), (0.0, 0.0, 0.0), now=100.2
+    )
+    assert decision.should_release and decision.reason == "fallback"
+    assert not decision.passed_target and decision.approached
 
 
 def test_release_is_latched_once() -> None:

@@ -317,6 +317,8 @@ def config_snippet(result: FitResult) -> str:
             "DropConfig("
             f"radius_m={base.radius_m!r}, delay_s={result.release_delay_s!r}, "
             f"force_after_pass={base.force_after_pass!r}, "
+            f"fallback_after_m={base.fallback_after_m!r}, "
+            f"post_cross_radius_m={base.post_cross_radius_m!r}, "
             f"evaluation_hz={base.evaluation_hz!r})"
         )
     if "wind_scale" in result.fitted:

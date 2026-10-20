@@ -12,6 +12,7 @@ from airdrop import (
     AlignConfig,
     BallisticsConfig,
     Config,
+    DropConfig,
     GripperConfig,
     MissionConfig,
     PerceptionConfig,
@@ -31,6 +32,9 @@ def test_default_config_is_valid() -> None:
     assert cfg.align.max_wait == 1.0
     assert cfg.align.on_timeout == "drop"
     assert cfg.drop.radius_m == 2.0
+    assert cfg.drop.force_after_pass is True
+    assert cfg.drop.fallback_after_m == 5.0
+    assert cfg.drop.post_cross_radius_m == 5.0
     assert cfg.overfly.altitude_m == 20.0
     assert cfg.video.telemetry_lag > 0
 
@@ -79,6 +83,10 @@ def test_replace_derives_new_config() -> None:
         ({"preflight": PreflightConfig(max_s=-1.0)}, "max_s"),
         ({"gripper": GripperConfig(instance=-1)}, "gripper.instance"),
         ({"gripper": GripperConfig(release_settle_s=-0.5)}, "release_settle_s"),
+        ({"drop": DropConfig(fallback_after_m=0.0)}, "fallback_after_m"),
+        ({"drop": DropConfig(fallback_after_m=float("nan"))}, "fallback_after_m"),
+        ({"drop": DropConfig(post_cross_radius_m=0.0)}, "post_cross_radius_m"),
+        ({"drop": DropConfig(post_cross_radius_m=float("nan"))}, "post_cross_radius_m"),
     ],
 )
 def test_invalid_values_rejected(changes: dict, message: str) -> None:

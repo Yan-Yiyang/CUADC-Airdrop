@@ -1960,10 +1960,18 @@ def test_runner_drops_with_the_real_ballistics_judge() -> None:
     ]
     result = analyze(target_points, TargetingConfig(eps_m=0.75, min_samples=2))
     events: list[tuple[str, dict[str, Any]]] = []
+
+    class DelayedSnapshotBroker(MovingBroker):
+        """模拟本拍开始后才收到位置速度样本，验证判据使用快照之后的时钟。"""
+
+        def get_snapshot(self) -> TelemetrySnapshot:
+            clock.advance(0.001)
+            return super().get_snapshot()
+
     runner = _runner(
         clock,
         controller,
-        broker=MovingBroker(clock),
+        broker=DelayedSnapshotBroker(clock),
         judge=judge,
         target_result=lambda: result,
         target_busy=lambda: False,
@@ -1987,6 +1995,63 @@ def test_runner_drops_with_the_real_ballistics_judge() -> None:
     # 投放点应当落在"落点前推量"附近：20m 高、18m/s、二次阻力 → 约 35~40m 提前量
     release_east = drop["release_position"][1]
     assert -45.0 <= release_east <= -25.0, release_east
+
+
+def test_runner_crossing_then_fallback_uses_post_snapshot_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """遥测晚于本拍起点到达时，runner 仍保留过零并执行距离兜底。"""
+    from airdrop.ballistics import Impact
+
+    clock = FakeClock()
+    controller = FakeController()
+    judge = ReleaseJudge(
+        DropConfig(radius_m=2.0, force_after_pass=True, fallback_after_m=5.0),
+        BallisticsModel(BallisticsConfig()),
+        overfly_heading_deg=90.0,
+        ground_z=0.0,
+    )
+    samples = iter(
+        [
+            Impact(True, (6.0, -1.0, 0.0), 1.0),
+            Impact(True, (6.0, 0.0, 0.0), 1.0),
+            Impact(True, (6.0, 6.0, 0.0), 1.0),
+        ]
+    )
+    monkeypatch.setattr(judge.ballistics, "predict_impact", lambda *args, **kwargs: next(samples))
+
+    class DelayedSnapshotBroker(MovingBroker):
+        def get_snapshot(self) -> TelemetrySnapshot:
+            clock.advance(0.001)
+            return super().get_snapshot()
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    test_config = _config()
+    test_config = replace(
+        test_config,
+        routes=replace(
+            test_config.routes,
+            backup_point=Waypoint(lat=ORIGIN.lat_deg, lon=ORIGIN.lon_deg, alt_m=0.0),
+        ),
+    )
+    runner = _runner(
+        clock,
+        controller,
+        config=test_config,
+        broker=DelayedSnapshotBroker(clock),
+        judge=judge,
+        target_busy=lambda: False,
+        events=events,
+    )
+    _drive(runner, clock, ticks=2)
+    controller.finish_mission()
+    _drive_until(runner, clock, MissionState.OVERFLY)
+    _drive_until(runner, clock, MissionState.LAND, step=0.1, limit=20)
+
+    assert runner.state is MissionState.LAND
+    drop = _events_of(events, "drop")[0]
+    assert drop["reason"] == "fallback"
+    assert drop["prediction_crossed_target"] is True
 
 
 def test_runner_records_the_drop_state_for_the_ballistics_fit() -> None:

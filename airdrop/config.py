@@ -293,12 +293,14 @@ class BallisticsConfig:
 
 @dataclass(frozen=True, slots=True)
 class DropConfig:
-    """投放判据：预测落点距目标 ≤ radius 即投；飞过点后保底投放。"""
+    """正常投放优先，预测过零后按近靶和沿向距离两级兜底。"""
 
     radius_m: float = 2.0
     delay_s: float = 0.0  # 指令→离机延迟（状态前推补偿）
     force_after_pass: bool = True
     evaluation_hz: float = 20.0
+    fallback_after_m: float = 5.0  # 预测沿航向误差超过该距离后兜底
+    post_cross_radius_m: float = 5.0  # 预测确认过零后，当前落点进入该半径则近靶兜底
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,7 +557,7 @@ class Config:
     record: RecordConfig = field(default_factory=RecordConfig)
     qgc_video: QgcVideoConfig = field(default_factory=QgcVideoConfig)
 
-    def validated(self) -> Config:  # noqa: PLR0912 - 逐片段的取值域检查，串行铺开最直观
+    def validated(self) -> Config:  # noqa: PLR0912, PLR0915 - 逐片段取值域检查保持串行可读
         """取值域检查：不合法就抛错，别等飞到一半才发现。"""
         if self.perception.mode not in PERCEPTION_MODES:
             raise ValueError(
@@ -601,6 +603,12 @@ class Config:
             raise ValueError(f"targeting.eps_m 必须为正: {self.targeting.eps_m}")
         if self.drop.radius_m <= 0:
             raise ValueError(f"drop.radius_m 必须为正: {self.drop.radius_m}")
+        if not math.isfinite(self.drop.fallback_after_m) or self.drop.fallback_after_m <= 0:
+            raise ValueError(f"drop.fallback_after_m 必须是有限正数: {self.drop.fallback_after_m}")
+        if not math.isfinite(self.drop.post_cross_radius_m) or self.drop.post_cross_radius_m <= 0:
+            raise ValueError(
+                f"drop.post_cross_radius_m 必须是有限正数: {self.drop.post_cross_radius_m}"
+            )
         if self.mission.abort_action not in ABORT_ACTIONS:
             raise ValueError(
                 f"mission.abort_action 只支持 {sorted(ABORT_ACTIONS)}: "
