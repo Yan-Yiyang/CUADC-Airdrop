@@ -502,7 +502,7 @@ def test_replay_missing_frames_are_counted_but_not_log_spammed(
 ) -> None:
     """裁剪过的素材（索引仍列着已删帧号）：非严格模式跳过并计数，但**不逐条刷日志**。
 
-    实测架次 20260929-201431 的裁剪目录曾刷 3568 行 ERROR；现在只逐条打前
+    实测架次 某架次 的裁剪目录曾刷 3568 行 ERROR；现在只逐条打前
     ``SKIP_LOG_LIMIT`` 条，收尾给一条"共跳过 N 帧"的汇总。
     """
     from airdrop.record.replay import SKIP_LOG_LIMIT

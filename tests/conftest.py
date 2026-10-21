@@ -1,4 +1,25 @@
-'pytest 公共装置（fixture）与本地测试流。\n\n常用命令::\n\n    ./.venv/Scripts/python.exe -m pytest                     # fast（默认）\n    ./.venv/Scripts/python.exe -m pytest --test-tier offline\n    ./.venv/Scripts/python.exe -m pytest --test-tier platform\n    ./.venv/Scripts/python.exe -m pytest --test-tier all     # 所有层级\n    ./.venv/Scripts/python.exe -m pytest --test-tier all -m realdata\n    ./.venv/Scripts/python.exe -m pytest -k alignment -v     # 只跑对齐相关'
+"""pytest 公共装置（fixture）与本地测试流。
+
+默认 ``fast`` 层不启动外部工具、WSL、GPU 或飞控；需要 pytest 文件/目录临时 fixture
+的用例自动标为 ``integration``，由 ``offline`` 层运行。该分类读取 fixture 依赖，
+不根据测试文件名猜测；纯配置、数学和受控线程用例仍可留在 ``fast``。
+``offline`` 也包含显式标记的跨仓集成，
+``platform`` 再包含 ffmpeg/UDP 与 WSL，``all`` 还包含真实素材和 SITL。要用到"图传"的
+用例，由 :class:`StreamSender` 用 ffmpeg 把 ``testsrc`` 编成 H.264/MPEG-TS 推到
+本地 UDP，再让 :mod:`airdrop.video` 去拉——路径与真实 RTSP 完全一致（同一套
+解复用、同一套低延迟 flag、同一套断流判定与重连逻辑）。
+
+常用命令::
+
+    ./.venv/Scripts/python.exe -m pytest                     # fast（默认）
+    ./.venv/Scripts/python.exe -m pytest --test-tier offline
+    ./.venv/Scripts/python.exe -m pytest --test-tier platform
+    ./.venv/Scripts/python.exe -m pytest --test-tier all     # 所有层级
+    ./.venv/Scripts/python.exe -m pytest --test-tier all -m realdata
+    ./.venv/Scripts/python.exe -m pytest -k alignment -v     # 只跑对齐相关
+
+注意：``stream`` 标记的用例会选择一个本地临时 UDP 端口，发送端和接收端使用同一端口。
+"""
 
 from __future__ import annotations
 
@@ -149,7 +170,7 @@ def ffmpeg_exe() -> str:
 
 @pytest.fixture
 def stream_url() -> str:
-    '运行接口与行为以当前实现及测试为准。'
+    """为单个测试选择一个当前可用的本地 UDP 端口。"""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]

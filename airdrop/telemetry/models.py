@@ -72,7 +72,7 @@ class TelemetrySnapshot:
     flight_mode: str | None = None
     #: 是否在空中（MAVSDK ``in_air``）：状态机的"等起飞"门用它
     in_air: bool | None = None
-    #: 本机接收位置/速度合流消息的墙钟时刻；不代表飞控采样时间。
+    #: 本地接收位置/速度合流消息的墙钟时刻；不代表飞控采样时间。
     position_velocity_received_at: float | None = None
 
     def update_global_position(self, position: Any) -> None:

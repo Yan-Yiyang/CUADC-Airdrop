@@ -1,6 +1,6 @@
 [project]
 name = "airdrop"
-version = "3.0.0"
+version = "0.2.0"
 authors = [{ name = "太原理工大学航模协会" }, { name = "燕羿洋" }]
 requires-python = ">=3.14"
 dependencies = [
@@ -238,7 +238,7 @@ addopts = [
     "--strict-config",
 ]
 markers = [
-    "stream: 需要 ffmpeg 与本机 UDP 端口（会起子进程）",
+    "stream: 需要 ffmpeg 与本地 UDP 端口（会起子进程）",
     "network: 走网络错误路径，需要等超时或连接被拒",
     "integration: 跨模块、跨仓库或真实子进程集成回归",
     "wsl: 需要 WSL 或 ext4 行为，仅平台 tier 运行",

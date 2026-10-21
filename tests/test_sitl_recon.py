@@ -398,7 +398,7 @@ def test_report_origin_survives_broker_reset(workdir: Path) -> None:
     origin_lla = sitl_analysis._origin_lla(outcome, analysis)
 
     assert origin_lla == pytest.approx((8.5461637, 47.3979710, 0.177))
-    # 报告真正用到它的地方：把天井真值换算到本机 NED（原来就是在这里炸的）
+    # 报告真正用到它的地方：把天井真值换算到本地 NED（原来就是在这里炸的）
     north, east = sitl_analysis._well_truth_ned(56, origin_lla)
     assert abs(north) < 1e4 and abs(east) < 1e4
 
@@ -519,7 +519,7 @@ def test_reverse_diagnostic_refuses_mismatched_bearings() -> None:
 
     回归的是一条会误导人的输出：``Δeast/(2v)`` 只在两遍沿**同一条轴反向**通过时成立。
     侦查航线的反向观测来自西南向对角线（差 40~50°），只按东向速度符号分组会把它算进
-    "-east" 组，于是 Δeast 主要反映**切向差**。实测（架次 20260930-151637）就这样算出
+    "-east" 组，于是 Δeast 主要反映**切向差**。实测（架次 某架次）就这样算出
     ``implied_lag = -0.349 s``——比真实延时大一个数量级且**符号相反**。
 
     口径：这种输入下**不给数**，只给"两遍不同轴"和两个航迹角。
@@ -549,10 +549,10 @@ def test_circular_mean_deg_does_not_flip_at_180() -> None:
 
 @pytest.mark.realdata
 def test_reverse_diagnostic_on_a_recorded_flight(tmp_path: Path) -> None:
-    """真跑一遍：拿架次 20260930-151637 的记录验同轴校验真的会拦住那条误导输出。"""
+    """真跑一遍：拿架次 某架次 的记录验同轴校验真的会拦住那条误导输出。"""
     from airdrop.runtime import sitl_analysis, sitl_geometry
 
-    flight = REPO_ROOT / "flights/20260930-151637"
+    flight = REPO_ROOT / "flights/<架次>"
     if not (flight / "telemetry.jsonl").is_file():
         pytest.skip(f"没有架次记录：{flight}")
     detail = sitl_analysis._load_detail(flight / "detections.jsonl")
@@ -879,7 +879,11 @@ def test_recon_route_waypoints_are_built() -> None:
 
 
 def test_lag_sweep_runs_off_a_recorded_flight(workdir: Path) -> None:
-    'lag 扫描要能从记录里查出历史——它本来就是离线分析，不依赖会话还活着。'
+    """lag 扫描要能从记录里查出历史——它本来就是离线分析，不依赖会话还活着。
+
+    顺带钉住"原点不在某个运行时目录也能算"：天井真值是按本地 NED 比的，
+    原点一旦拿不到，整节精度分析就作废。
+    """
     from airdrop.runtime import sitl_analysis
 
     flight = workdir / "flight"

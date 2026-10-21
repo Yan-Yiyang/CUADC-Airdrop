@@ -15,6 +15,7 @@ from typing import Any, cast
 import pytest
 
 from airdrop import Config, TelemetryBroker, load_camera_model
+from airdrop.mission.plan_file import load_plan
 from airdrop.run import resolve_kwargs
 
 pytest.importorskip("airdrop_sim", reason="跨仓契约需要仿真子模块")
@@ -112,16 +113,54 @@ def test_manifest_drives_camera_truth_and_report(tmp_path: Path) -> None:
     )
 
 
-def test_scene_is_local_and_default_assembly_uses_packaged_route(tmp_path: Path) -> None:
+def test_scene_is_local_and_default_assembly_uses_operator_route_path(tmp_path: Path) -> None:
     scene = _custom_scene(tmp_path)
     baseline = load_recon_scene()
+    default_config = sitl_geometry.build_config()
+    local_plan = tmp_path / "local-land.plan"
+    local_plan.write_text(
+        json.dumps(
+            {
+                "fileType": "Plan",
+                "mission": {
+                    "items": [
+                        {
+                            "type": "SimpleItem",
+                            "command": 16,
+                            "frame": 3,
+                            "params": [0, 0, 0, 0, 35.0, 112.0, 30.0],
+                            "autoContinue": True,
+                            "doJumpId": 1,
+                        }
+                    ],
+                    "plannedHomePosition": [35.0, 112.0, 0.0],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     config = sitl_geometry.build_config(
         scene=scene,
         route=sitl_geometry.recon_route(scene=scene),
-        land_plan=str(tmp_path / "local.plan"),
+        land_plan=str(local_plan),
     )
-    assert Path(config.routes.land_plan).is_absolute()
-    assert Path(sitl_geometry.build_config().routes.land_plan).is_file()
+    explicit_default_scene = sitl_geometry.build_config(land_plan=str(local_plan))
+    default_plan = Path(default_config.routes.land_plan)
+    assert default_plan.is_absolute()
+    assert default_plan == (
+        Path(sitl_geometry.__file__).resolve().parents[2] / "routes" / "land.plan"
+    )
+    assert Path(explicit_default_scene.routes.land_plan) == local_plan
+    assert load_plan(explicit_default_scene.routes.land_plan).items[0].lat == pytest.approx(35.0)
+    assert (
+        replace(
+            explicit_default_scene,
+            routes=replace(
+                explicit_default_scene.routes, land_plan=default_config.routes.land_plan
+            ),
+        )
+        == default_config
+    )
     assert config.routes.backup_point is not None
     assert config.routes.backup_point.lat == pytest.approx(35.0, abs=0.01)
     assert load_recon_scene() == baseline

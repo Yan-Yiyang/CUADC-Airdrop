@@ -139,7 +139,7 @@ def test_doc_hygiene_scans_public_text_not_runtime_strings(tmp_path: Path) -> No
     _git(root, "init", "-q")
     (root / "README.md").write_text(
         "示意 C:/...；平台路径 `/usr/bin/python`、`/tmp/generated`；协议 `udp://127.0.0.1:5602`。\n"
-        "生成记录 `flights/20261021-120000/frames/000001.jpg`；素材 D:/captures/flight.mp4。\n",
+        "生成记录 `flights/<架次>/frames/000001.jpg`；素材 D:/captures/flight.mp4。\n",
         encoding="utf-8",
     )
     (root / "module.py").write_text(
@@ -149,7 +149,7 @@ def test_doc_hygiene_scans_public_text_not_runtime_strings(tmp_path: Path) -> No
         encoding="utf-8",
     )
     (root / "notes.md").write_text(
-        "旧资料曾叫 2024v2；本机素材在 `C:/Users/someone/Videos/flight.mp4`。\n",
+        "旧资料曾叫 2024v2；本地素材在 `C:/Users/someone/Videos/flight.mp4`。\n",
         encoding="utf-8",
     )
     _commit_all(root)

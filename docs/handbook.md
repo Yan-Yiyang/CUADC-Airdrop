@@ -2244,6 +2244,50 @@ config = Config(
 ⚠ 命令行的 `-m` 是**覆盖** `addopts` 里的默认表达式，不是追加：写 `-m "not stream"` 会把 `realdata` 与 `sitl`
 一起放进来（`sitl` 那条要 SITL 真在跑，否则只是白等一轮探活）。
 
+| 测试文件 | 覆盖什么 | 需要硬件/GPU |
+| --- | --- | --- |
+| `tests/test_config.py` | `Config` 默认值与 `validated()` 取值域（非法值必须在启动前抛错） | 否 |
+| `tests/test_telemetry.py` | broker 订阅推送、内插/外推、历史节流、遥测速率下发 | 否 |
+| `tests/test_alignment.py` | 对齐器 lag 语义、等待上限、外推标记、超时策略 | 否 |
+| `tests/test_buffer.py` | 环形缓冲容量/驱逐、复用缓冲区必须拷贝、`AlignmentWriter` 逐帧入库 | 否 |
+| `tests/test_runtime_factory.py` | 真实组件装配阶段开关与任务视频 writer 起飞门控 | 否 |
+| `tests/test_video.py` | ffmpeg 拉流：无效地址显式报错、sink 每帧不落、`stats.dropped` 语义 | 起 ffmpeg 子进程 |
+| `tests/test_recorder.py` | 飞行目录七个文件齐全、帧零重编码、事件/检测/投放写入、幂等启停 | 否（**沙箱里挂 `tmp_path`**） |
+| `tests/test_replay.py` | 回放对齐结果与"直接从日志查询"的参考 broker 完全一致 | 否 |
+| `tests/test_perception.py` | pipeline 逻辑（假 detector / 假 OCR 池）、去重、编号不被覆盖 | 否 |
+| `tests/test_camera_pipeline.py` | 原图与 remap 视线一致性、尺寸不匹配拦截、显式缩放模型与旧记录兼容 | 否 |
+| `tests/test_capture_entry.py` | 标定采集入口正常/中断/视频未就绪/零帧的返回码、摘要、文件与资源清理 | 否 |
+| `tests/test_perception_realdata.py` | 真 YOLO + 真 OCR 的外部素材回归（素材不随仓库提供） | ✅ GPU + 素材绝对路径 |
+| `tests/test_georef.py` | 相机模型加载/回退、像素→NED、边长法交叉验证（**沙箱里挂 `tmp_path`**） | 否 |
+| `vendor/airdrop-calibration/tests/test_calibrate.py` | 标定三步合成链路（含整个 `calibrate()` 的输出契约） | 否 |
+| `tests/test_calibration_contract.py` | 标定自有 DTO、飞行 JSONL、坏帧配对、独立导入与相机文件兼容 | 否 |
+| `vendor/airdrop-sim/tests/test_simulation_contract.py` | 配置与 SDF/相机文件/manifest 的一致性、默认机型和路径独立性 | 否 |
+| `tests/test_sim_integration.py` | manifest → 主仓场景/报告/几何链路、CLI 及非法场景提前拒绝 | 否 |
+| `tests/test_targeting.py` | DBSCAN 语义（eps 闭区间、样本权重是绝对权重）、众数、median/max | 否 |
+| `tests/test_ballistics.py` | 无阻力/有阻力对照解析解、终端速度、风平移、判据触发/越过目标后的强制投放/锁存 | 否 |
+| `tests/test_mission.py` | 状态机、航线规划、主循环（假控制器 + 假时钟，分钟级任务毫秒级跑完）；起飞前自检（真 `Preflight` 的四项检查/装配错误/视频帧数/分辨率核对）与等起飞 | 否 |
+| `tests/test_plan.py` | QGC `.plan` 解析与复杂项展开、固定翼降落预检逐条判据、plan↔配置航点二选一 | 否 |
+| `tests/test_e2e.py` | 回放驱动全链路：帧 → 感知 → 坐标 → 统计 → 航线（另有 `realdata` 变体） | 否（变体需 GPU） |
+| `tests/test_fit.py` | 投放记录读写、反演真值回收、退化/不可辨识必拒、工具现场流程 | 否 |
+| `tests/test_examples.py` | 统一运行参数与共享装配的导入、轻量帮助及阶段组合回归 | 否 |
+| `tests/test_runtime_factory.py` | real/SITL 入口的真实组件装配、状态机、自检、投放开关与阶段组合 | 否 |
+| `tests/test_runtime_session.py` | 组件工厂、被动采集、阶段组合与失败时独立收尾 | 否 |
+| `tests/test_runtime_sitl.py` | SITL 真实协调入口的离线 I/O 替身、阶段参数、报告与参数恢复 | 否 |
+| `tests/test_qgcvideo_geometry.py` | 原始/去畸变几何往返、姿态/杆臂、无效及出界点 | 否 |
+| `tests/test_qgcvideo_observers.py` | 同帧处理观察、零目标、只读快照与异常隔离 | 否 |
+| `tests/test_qgcvideo_state.py` | 历史帧、乱序 OCR、编号板、有界观测与阶段切换 | 否 |
+| `tests/test_qgcvideo_render.py` | 合成布局、同帧框、标记与输入数组保持 | 否 |
+| `tests/test_qgcvideo_publisher.py` | 编码器写阻塞、退出、短写、重启与有界队列 | 否 |
+| `tests/test_qgcvideo_stream.py` | 独立 UDP 端口的真实 RTP/MPEG-TS 编解码及晚加入（`stream`） | 本地 ffmpeg/UDP |
+| `tests/test_qgcvideo_config.py` | 显示配置合法性与端口约束 | 否 |
+| `tests/test_runtime_qgcvideo.py` | 统一入口与回放装配、显示隔离和完整收尾 | 否 |
+| `tests/test_mission_transfer.py` | 上传/激活的取消竞态、一次恢复及关闭等待 | 否 |
+| `tests/test_sitl_recon.py` | **SITL 侦查精度（可选，标 `sitl`；仅 `--test-tier all -m sitl` 才跑）**：驱动 `airdrop/runtime/sitl.py` 跑完整标准流程，断言状态机 `DONE`、三个编号全识别、任务选中 56、误差与留一验证都 < 2 m；探活用**裸 UDP 听 14540 心跳**（不建 MAVSDK 会话），没在跑就 skip | 否（要 WSL 里已起 PX4 SITL） |
+| `tests/test_cli.py` | 集中式入口：子命令注册表（parser + handler）、`--help`/`check-docs` **不加载重库**（干净子进程实测）、参数不合法退出码 2、选项覆盖真的进了 `build_config()` | 否 |
+| `tests/test_handbook.py` | **本手册 §3 的 11 段示例逐条真跑**（文档里的代码必须能运行） | 否 |
+| `vendor/airdrop-sim/tests/test_world.py` | CUADC 赛区世界：**生成结果 == 入库文件**、目标区在起飞线两端（±200, 0）、天井区内随机摆放且间距 > 20m、五边形环壁（厚 5mm、高 400mm）、**规则里只是示意的东西不许出现**（4m/6m 打击圈、天井箭头）、同区天井同色、贴地标线不共面重叠（防 z-fighting）、两轮靶标摆位（第二轮中位数落在第 3 座）、演练航线对准中位数天井、目标区底色（常见路面色 + 少量纹理）、周边航拍底图（不压跑道/目标区、互不重叠）、底图生成器（可复现/离线校验）、俯视预览图（尺寸/可复现/参数校验）、资产逐级存在、数字板必须是**白底黑字** | 否 |
+| `vendor/airdrop-sim/tests/test_sim_scripts.py` | WSL/ext4 临时假构建：资产软链、幂等、启动参数/插件配置、卸载保留日志、拒绝覆盖实体或在 PX4 树内创建运行目录，比较假 PX4 树前后不变 | 否 |
+
 ### 6.6 一次真实任务的推荐顺序
 
 1. **标定**：`mission --no-mission-control --no-recognize --record` 录素材 → `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 出 `camera_calib.json`
@@ -2461,5 +2505,7 @@ config = Config(
 ## 10. 性能诊断与文档检查
 
 `python -m airdrop.run benchmark-perception --images-dir input/frames --out output/detector.json` 在同一图像样本上分别计时读取、解码、去畸变、predict和完整检测；`--calib`提供匹配标定，`--threads`设置主进程OpenCV线程数。它只测单检测器，不代表完整任务吞吐。
+
+`python -m airdrop.run qgc-video-benchmark --out output/rtp.json` 用本地动态端口比较正常和慢合成时的RTP到达时间、媒体时间与序列缺口，不加载模型或飞控。两个工具拒绝覆盖已有输出，方法和限制见[性能诊断](performance.md)。实现位于`tools/benchmark_perception.py`、`tools/qgc_video_benchmark.py`，共享统计位于`tools/performance.py`；`tests/test_diagnostics.py`覆盖统计、参数、输出保护与异常清理。
 
 `check-docs`同时核验手册字段/API/入口及产物名称，并按三仓Git索引检查Markdown内部链接、私有路径与过期命名。生成文件的结构用文字或代码块描述，不链接未入库的本地输出。文档和注释的职责约定见[AGENTS.md](../AGENTS.md)。

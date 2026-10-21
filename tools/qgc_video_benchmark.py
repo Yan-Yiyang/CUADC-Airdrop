@@ -1,4 +1,4 @@
-'运行接口与行为以当前实现及测试为准。'
+"""使用生产 QGC 发布器测量本地 RTP 时钟和 UDP 包序列。"""
 
 from __future__ import annotations
 
@@ -146,7 +146,7 @@ def main(
     fps: float = 12.0,
     compose_delay: float = 0.125,
 ) -> int:
-    '运行接口与行为以当前实现及测试为准。'
+    """依次测量正常与慢合成；仅在本地回环发送，无模型和飞控连接。"""
     if output_path is None:
         raise ValueError("必须指定 --out")
     if output_path.exists():
@@ -161,7 +161,7 @@ def main(
 
     result = {
         "format_version": 1,
-        "description": "生产 RTP 发布器的本机回环诊断，不连接飞控或外部视频接收器",
+        "description": "生产 RTP 发布器的本地回环诊断，不连接飞控或外部视频接收器",
         "cases": [
             _measure(seconds=seconds, fps=fps, compose_delay=0.0),
             _measure(seconds=seconds, fps=fps, compose_delay=compose_delay),

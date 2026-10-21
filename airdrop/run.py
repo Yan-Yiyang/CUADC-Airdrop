@@ -301,7 +301,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
     "qgc-video-benchmark": Subcommand(
         name="qgc-video-benchmark",
         module="tools.qgc_video_benchmark",
-        help="比较正常与慢画面合成时的 QGC RTP 时钟和本机包序列",
+        help="比较正常与慢画面合成时的 QGC RTP 时钟和本地包序列",
         options=(
             Option(
                 ("--out",), "output_path", "新建 JSON 结果路径", kind="path", source="OUTPUT_PATH"

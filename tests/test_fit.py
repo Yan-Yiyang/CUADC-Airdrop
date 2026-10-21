@@ -715,7 +715,7 @@ def _flight_dir(workdir: Path, *, with_impacts: bool, rows: int = 4) -> Path:
     """造一个（够真的）飞行目录：只有 drops.jsonl 与 impacts.jsonl。"""
     records = _spread_campaign()[:rows]
     samples = _measure(records)
-    flight = workdir / "20260901-101010"
+    flight = workdir / "某架次"
     flight.mkdir(parents=True, exist_ok=True)
     for record in records:
         append_drop(flight / DROPS_NAME, record)
@@ -744,7 +744,7 @@ def test_fit_tool_runs_the_whole_field_workflow(workdir: Path, capsys) -> None:
     )
     printed = capsys.readouterr().out
     assert code == 0
-    assert "20260901-101010#1" in printed
+    assert "某架次#1" in printed
     assert "结论：ok=True reliable=True" in printed
     assert "BallisticsConfig(" in printed
 
@@ -792,7 +792,7 @@ def test_fit_tool_reports_an_unreliable_fit(workdir: Path, capsys) -> None:
 
     records = _flat_campaign()
     samples = _measure(records)
-    flight = workdir / "20260901-202020"
+    flight = workdir / "某架次"
     flight.mkdir()
     for record in records:
         append_drop(flight / DROPS_NAME, record)

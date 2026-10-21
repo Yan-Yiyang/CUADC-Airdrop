@@ -59,7 +59,7 @@ def calibrate_lag(
 def _well_truth_ned(
     code: int, origin_lla: tuple[float, float, float], *, scene: ReconScene | None = None
 ) -> tuple[float, float]:
-    '运行接口与行为以当前实现及测试为准。'
+    """天井中心在**本地 NED** 里的真值（原点 = EKF 原点）。"""
     from airdrop import ned_to_wgs84, wgs84_to_ned
 
     context = scene or _DEFAULT_SCENE
@@ -600,7 +600,7 @@ def _origin_lla(outcome: _RunOutcome, broker: TelemetryBroker) -> tuple[float, f
     if outcome.origin is not None:
         return outcome.origin
     raise RuntimeError(
-        "拿不到 EKF 原点，无法把天井真值换算到本机 NED：记录里没有原点遥测，runner 也没记到 origin"
+        "拿不到 EKF 原点，无法把天井真值换算到本地 NED：记录里没有原点遥测，runner 也没记到 origin"
     )
 
 
