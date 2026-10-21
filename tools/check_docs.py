@@ -25,16 +25,20 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import dataclasses
 import importlib
 import inspect
+import io
 import json
 import re
 import subprocess
 import sys
+import tokenize
 from dataclasses import dataclass, replace
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 # ----------------------------------------------------------------------
 # 配置（改这里）
@@ -92,12 +96,185 @@ REQUIRED_ENTRIES: tuple[str, ...] = (
     "tests/test_plan.py",
     "tests/test_cli.py",
     "tests/test_tool_repositories.py",
+    "tests/test_diagnostics.py",
     "tests/test_calibration_contract.py",
     "tests/test_sim_integration.py",
 )
 
 #: 手册必须覆盖的主题关键词
 REQUIRED_TOPICS: tuple[str, ...] = ("目录", "模块", "参数", "输出", "流程", "审查")
+
+_MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\(\s*(<[^>]+>|[^\s)]+)(?:\s+[^)]*)?\s*\)")
+_REFERENCE_LINK_RE = re.compile(r"^\s*\[[^\]]+\]:\s*(<[^>]+>|\S+)", re.MULTILINE)
+_LOCAL_PATH_PATTERNS = (
+    re.compile(
+        r"(?i)(?<![\w])[a-z]:[\\/](?!\.\.\.(?:[\\/]|$|[^\w]))"
+        r"(?!(?:Windows|Program Files(?: \(x86\))?|ProgramData|Python\d*)(?:[\\/]|$))"
+        r"[^\\/\s`<>\"']+(?:[\\/][^\\/\s`<>\"']+)*"
+    ),
+    re.compile(
+        r"(?i)(?<![\w])/(?:home/[^/\s`<>\"']+|Users/[^/\s`<>\"']+|"
+        r"mnt/[a-z]/[^/\s`<>\"']+|workspace/[^/\s`<>\"']+|"
+        r"Volumes/[^/\s`<>\"']+)(?:/[^/\s`<>\"']+)*"
+    ),
+)
+_LEGACY_NAME_RE = re.compile(r"(?i)2024v2")
+_LEGACY_ENTRY_RE = re.compile(
+    r"(?i)(?<![\w.])airdrop\.(?:alignment|buffer)(?!\w)|"
+    r"(?<![\w./\\])(?:examples[/\\]sitl_mission\.py|tools[/\\]sitl_recon\.py|"
+    r"drone[/\\](?:coordinates|target|cvproc)\.py)(?![\w.])"
+)
+
+
+def _git_index(root: Path) -> tuple[set[str], set[str]]:
+    """读取仓库索引中的文件路径与 gitlink 路径。"""
+    result = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--stage", "-z"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.decode("utf-8", "replace").strip())
+    files: set[str] = set()
+    gitlinks: set[str] = set()
+    for entry in result.stdout.split(b"\0"):
+        if not entry:
+            continue
+        metadata, raw_path = entry.split(b"\t", 1)
+        mode = metadata.split(b" ", 1)[0]
+        path = raw_path.decode("utf-8", "surrogateescape").replace("\\", "/")
+        files.add(path)
+        if mode == b"160000":
+            gitlinks.add(path)
+    return files, gitlinks
+
+
+def _tracked_documents(indexes: dict[Path, set[str]]) -> list[tuple[Path, str]]:
+    """返回各仓库索引中跟踪的 Markdown 文档。"""
+    documents: list[tuple[Path, str]] = []
+    for repo, paths in indexes.items():
+        for relative in sorted(paths):
+            name = Path(relative).name.lower()
+            if relative.lower().endswith(".md") or name in {"readme", "agents"}:
+                path = repo / relative
+                if path.is_file():
+                    documents.append((path, path.read_text(encoding="utf-8", errors="replace")))
+    return documents
+
+
+def _markdown_body(text: str) -> str:
+    """剔除围栏代码，避免把示例语法当作公开链接或路径声明。"""
+    return re.sub(r"(?ms)^\s*(```|~~~).*?^\s*\1\s*$", "", text)
+
+
+def _document_link_issues(
+    indexes: dict[Path, set[str]], gitlinks: dict[Path, set[str]]
+) -> list[str]:
+    """检查跟踪文档链接是否指向 Git 索引中的发布内容。"""
+    roots = sorted(indexes, key=lambda path: len(path.parts), reverse=True)
+    issues: list[str] = []
+    for document, raw_text in _tracked_documents(indexes):
+        text = _markdown_body(raw_text)
+        targets = [match.group(1).strip("<>") for match in _MARKDOWN_LINK_RE.finditer(text)]
+        targets.extend(match.group(1).strip("<>") for match in _REFERENCE_LINK_RE.finditer(text))
+        for target in targets:
+            parsed = urlsplit(target)
+            windows_absolute = re.match(r"^[A-Za-z]:[\\/]", target) is not None
+            if (parsed.scheme and not windows_absolute) or parsed.netloc or not parsed.path:
+                continue
+            decoded = unquote(target if windows_absolute else parsed.path).replace("\\", "/")
+            if decoded.startswith("/") or re.match(r"^[A-Za-z]:/", decoded):
+                resolved = Path(decoded)
+            else:
+                resolved = (document.parent / decoded).resolve()
+            repo = next(
+                (root for root in roots if resolved == root or root in resolved.parents), None
+            )
+            if repo is None:
+                issues.append(f"{document}: 链接目标不属于已索引仓库：{target}")
+                continue
+            relative = resolved.relative_to(repo).as_posix()
+            indexed = indexes[repo]
+            if (
+                relative in indexed
+                or relative == "."
+                or any(path.startswith(f"{relative.rstrip('/')}/") for path in indexed)
+            ):
+                continue
+            # 主仓内的 gitlink 是可发布入口；子仓内目标必须由子仓自己的索引证明。
+            if relative in gitlinks.get(repo, set()):
+                continue
+            issues.append(f"{document}: 链接目标未被 Git 跟踪：{target}")
+    return issues
+
+
+def _python_public_text(path: Path) -> list[str]:
+    """仅提取 Python 注释和 AST docstring，不扫描普通运行时字符串。"""
+    source = path.read_text(encoding="utf-8", errors="replace")
+    snippets = [
+        token.string
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.COMMENT
+    ]
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return snippets
+    nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    snippets.extend(doc for node in nodes if (doc := ast.get_docstring(node, clean=False)))
+    return snippets
+
+
+def _privacy_issues(indexes: dict[Path, set[str]]) -> list[str]:
+    """检查文档及 Python 注释/docstring 中的本地路径和过期入口。"""
+    issues: list[str] = []
+    for path, text in _tracked_documents(indexes):
+        if any(pattern.search(text) for pattern in _LOCAL_PATH_PATTERNS):
+            issues.append(f"{path}: 包含本地绝对路径")
+        if _LEGACY_NAME_RE.search(text):
+            issues.append(f"{path}: 包含过期 2024v2 命名")
+        if _LEGACY_ENTRY_RE.search(text):
+            issues.append(f"{path}: 包含旧包/入口")
+    for repo, paths in indexes.items():
+        for relative in sorted(paths):
+            if not relative.lower().endswith(".py"):
+                continue
+            path = repo / relative
+            if not path.is_file():
+                continue
+            for snippet in _python_public_text(path):
+                if any(pattern.search(snippet) for pattern in _LOCAL_PATH_PATTERNS):
+                    issues.append(f"{path}: Python 注释/docstring 包含本地绝对路径")
+                if _LEGACY_NAME_RE.search(snippet):
+                    issues.append(f"{path}: Python 注释/docstring 包含过期 2024v2 命名")
+                if _LEGACY_ENTRY_RE.search(snippet):
+                    issues.append(f"{path}: Python 注释/docstring 包含旧包/入口")
+    return issues
+
+
+def _repository_hygiene(root: Path) -> tuple[list[str], list[str]]:
+    """收集主仓及当前已初始化子仓的跟踪索引并执行公开文档检查。"""
+    root = root.resolve()
+    files, submodules = _git_index(root)
+    indexes = {root: files}
+    gitlinks = {root: submodules}
+    errors: list[str] = []
+    for relative in sorted(submodules):
+        child = root / relative
+        if not child.is_dir() or not (child / ".git").exists():
+            continue
+        try:
+            child_files, child_links = _git_index(child)
+        except RuntimeError as exc:
+            errors.append(f"子仓索引无法读取 {relative}: {exc}")
+            continue
+        indexes[child.resolve()] = child_files
+        gitlinks[child.resolve()] = child_links
+    return _document_link_issues(indexes, gitlinks), [*_privacy_issues(indexes), *errors]
 
 
 def _config_dataclasses() -> dict[str, type]:
@@ -260,6 +437,14 @@ def main(**overrides) -> int:
             if token.endswith(suffixes) and token not in known:
                 suspects.append(f"{token}  ← {line.strip()[:90]}")
     report("可疑参数名（形似 config 字段但 config 里没有）", sorted(set(suspects)))
+
+    # 8) 发布文档链接必须落在仓库索引中，公开文本不得泄露私人路径/旧入口。
+    try:
+        link_issues, privacy_issues = _repository_hygiene(Path(__file__).resolve().parents[1])
+    except RuntimeError as exc:
+        link_issues, privacy_issues = [], [f"Git 索引读取失败：{exc}"]
+    report("跟踪文档内部链接指向已跟踪发布文件", link_issues)
+    report("公开文档与 Python 注释/docstring 无私人路径或旧命名", privacy_issues)
 
     print(
         f"\n手册：{doc_path} — {len(text.encode('utf-8'))} 字节 / {len(text.splitlines())} 行 / "

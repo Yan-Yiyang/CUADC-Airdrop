@@ -22,9 +22,7 @@ SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
 _DEFAULT_SCENE = load_recon_scene()
 WORLD_ORIGIN_LLA = _DEFAULT_SCENE.origin_lla
 
-#: r2 世界（seed 0）A 区三座天井的真值：编号 → 中心 (east_m, north_m)（ENU 米）。
-#: 与 ``vendor/airdrop-sim/airdrop_sim/make_world.py`` 的布局一致（``vendor/airdrop-sim/tests/test_world.py`` 核验过这一批坐标），
-#: 误差口径 = "解算坐标到天井中心"。
+#: 目标中心坐标（ENU 米）由所选仿真场景提供。
 WELLS_A_ENU = _DEFAULT_SCENE.wells_enu
 
 #: 起飞爬升点高度（任务首项 = 起飞项，固定翼由它承担起飞）
@@ -39,7 +37,7 @@ RECON_ALT_M = 15.0
 # ----------------------------------------------------------------------
 #: 侦查段的沿迹速度（m/s），**转弯半径的输入**。固定翼过弯靠倾角扛离心力，
 #: ``R = v² / (g·tanφ)``——速度一高半径就跟着涨，转弯就做不出来。
-#: 2026-09-30 实测沿迹速度 14.84 m/s（反向诊断里的 ``speed_m_s``），取整留余量。
+#: 该值应结合仿真机型的转弯能力与目标覆盖要求配置。
 RECON_SPEED_M_S = 15.0
 #: 相机模型（与 ``vendor/airdrop-sim/airdrop_sim/assets/vehicles/rc_cessna_down_cam`` 一致）
 CAMERA_WIDTH = _DEFAULT_SCENE.camera.width_px
@@ -49,10 +47,9 @@ CAMERA_HFOV_RAD = _DEFAULT_SCENE.camera.hfov_rad
 TURN_MAX_BANK_DEG = 45.0
 #: **观测段**的倾角预算（度）——不是转弯允许的倾角，是"算覆盖还够不够"用的那个。
 #: 相机是机体固连下视（``CameraJoint`` pitch 90°），横滚 φ 时光轴偏离天底，地面覆盖
-#: 点横向挪 ``h·tanφ``：15 m 高时 5°→1.3 m、10°→2.7 m、**15°→4.0 m**、27°→7.6 m。
+#: 点横向偏移随高度和倾角增大，覆盖规划需为机体姿态变化留出余量。
 #: 坐标解算本身用姿态四元数把这点补偿掉了（所以误差不受影响），但**覆盖**会白掉一块：
-#: 靶标被推到画幅边缘甚至出框，就根本检不出来。实测带编号检出的 |roll| 最大 16.85°
-#: （旧航线 49.29°，它原地掉头压得更狠），所以按 15° 预算、并留一点余量。
+#: 靶标若被推到画幅边缘甚至出框，就无法检测；观测航线因此限制倾角预算。
 OBS_ROLL_BUDGET_DEG = 15.0
 
 
@@ -121,50 +118,31 @@ RECON_LEGS_ENU: tuple[tuple[tuple[float, float], tuple[float, float]], ...] = (
 )
 #: 无目标时的**备用点**（ENU 米）——三个靶标真值的形心。
 #:
-#: ⚠ 不配它就没有"无目标"这条分支：:func:`~airdrop.mission.planner.build_drop_mission`
-#: 在"既没有目标坐标、也没有备用点"时抛 :class:`PlanningError`，状态机直接
-#: ``ABORT(plan_drop_failed)``，整架次 0 上传 0 投放。实测踩过（架次
-#: 20260930-145929）：SITL 里感知比图传慢（缓冲落后 ~2000 帧 ≈ 70 s），编号在
-#: ``HOLD_PROCESS`` 60 s 窗口的最后几秒才聚类出来，状态机已经放弃——而**事后离线分析
-#: 这架次的精度是合格的**（12 → 0.364 m、94 → 1.268 m，都 < 2 m）。也就是说整轮测试
-#: 被一个**时序竞争**作废了。配了备用点就会走 Q11 那条设计好的分支（照常飞掠投放，
-#: 报告里 ``source="backup"``），时序 unlucky 也不会把整轮作废。
+#: 当观测未产生可用目标坐标时，由规划器使用该备用点继续构造任务；
+#: 未提供目标坐标且未配置备用点时，规划器会返回明确失败，不能生成投放任务。
 BACKUP_POINT_ENU = _DEFAULT_SCENE.backup_point_enu
 
-#: 降落段：操作手在 QGC 画好、入库的 ``routes/land.plan``（已对准本赛区跑道）。
+#: SITL 降落航线配置入口；航线内容必须与当前仿真场景和机型相匹配。
 LAND_PLAN = str(Path(__file__).resolve().parents[2] / "routes" / "land.plan")
 MANIFEST_PATH = None
 
 #: RECON 段的上限（秒）：状态机在这一段等"侦查航线飞完"（生产默认 600 s）。
 RECON_TIMEOUT_S = 600.0
-#: 起飞前自检的上限（秒）：SITL 里 OCR 进程池第一次加载要 15~20 s，给宽一点。
+#: 起飞前自检的最长等待时间（秒），应覆盖所选模型的初始化时间。
 PREFLIGHT_MAX_S = 180.0
 #: HOLD_PROCESS 的等待上限（秒）。
 #:
-#: ⚠ **必须覆盖感知积压**，否则会在"其实已经读出编号"的时候放弃。实测（架次
-#: 20260930-145929）：检测 ~17.6 fps 而相机 30 fps，缓冲**只涨不落**，
-#: ``lag_frames_max = 2188`` 帧 ≈ **73 s**；而 60 s 的窗口在编号聚类出来的前几秒就到期
-#: → ``ABORT(plan_drop_failed)``，整架次 0 上传 0 投放。**事后离线分析这架次精度是
-#: 合格的**（12 → 0.364 m、94 → 1.268 m），所以那不是精度问题、纯粹是时序竞争。
-#:
-#: 积压消不掉、只能等：``imgsz`` 不能降（15 m 高数字牌只有 ~14 px，降到 640 就 7 px，
-#: OCR 直接读不出来），OCR 侧也不是瓶颈（``ocr_in_per_s ≈ 0.1``，2 个 worker 闲着），
-#: 而队列**不许丢帧**。所以这里给 150 s：
-#: 73 s 积压 + 侦查段本身 ~65 s + 聚类余量。
+#: 后处理最长等待时间（秒）。该时限需覆盖感知队列排空与目标聚类，
+#: 应根据部署平台的输入帧率、处理吞吐和任务航线持续时间配置。
 HOLD_WAIT_S = 150.0
 #: 跨帧去重的窗口（秒 / 像素）——**OCR 吞吐阀**。
-#: 30 fps × 最多 3 个目标时，OCR 的原始需求可达 30~90 次/s；2 个 worker 的实测服务
-#: 能力 ≈8.5 次/s，不去重时积压无界增长（请求不丢，但内存与结果延时都涨）。
-#: 目标像素漂移实测 ≈500 px/s（15 m 高、~20 m/s 平飞）：250 px 窗口 ≈ 每 0.5 s
-#: 一次请求/目标 ⇒ 3 个目标 ≈6 次/s，落在服务能力内；被挡下的送检计入
-#: ``PerceptionStats.deduped``，所以"不开去重的原始需求"在报告里仍可还原。
+#: 跨帧去重降低同一目标重复送检造成的 OCR 队列增长；被跳过的请求计入
+#: ``PerceptionStats.deduped``，便于区分输入帧数与实际识别任务数。
 OCR_DEDUPE_S = 1.5
 OCR_DEDUPE_PX = 250.0
 
-#: 图传链路延时（秒）**默认值 = SITL 实测**（2026-09，本机 Gazebo→GStreamer→RTP→ffmpeg：
-#: ≈0.49 s；x264 编码未开零延迟时会缓冲几十帧）。⚠ 这是**链路属性**，与真机 HM30 的
-#: ≈0.15 s 完全不同（`VideoConfig.telemetry_lag`）——报告里会给"自标定 + 延时扫描"
-#: 作证据：自标定用已知的世界真值把本架次的链路延时解出来（留一个天井只做验证）。
+#: 场景提供的 SITL 图传链路延时（秒）；实际值取决于仿真编码、传输与接收配置。
+#: 该参数不代表真实 HM30 链路延时，部署时应使用对应设备的标定值。
 TELEMETRY_LAG_S = _DEFAULT_SCENE.camera.telemetry_lag_s
 LAG_OVERRIDE_S = None
 #: 相机系 → 机体系（OpenCV 相机系 → NED 机体系）：绕机体 z +90°

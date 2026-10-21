@@ -4,18 +4,18 @@
 --------------
 图传链路从"机载相机曝光"到"本进程从管道里切出一帧"之间有一段固定的处理
 延时：H.264 编码（相机侧）、无线链路传输、解码、以及 ffmpeg 输出管道的缓冲。
-实测这段约为 150ms（见 :mod:`airdrop.video` 开头的实测数据）。
+链路延时由配置提供，并应针对实际相机与接收链路标定。
 
 这个延时不改变数据的含义，但如果不处理，做视觉引导时就会拿"现在的遥测"
-去解释"150ms 前的画面"。无人机以 10 m/s 平飞时，150ms 对应 1.5 米的位移——
+去解释"之前的画面"。飞行速度与链路延时会共同形成位置偏差——
 对精准空投来说这是不能忽略的系统性偏差，而且它会随着速度变化伪装成"算法
 不准"。
 
 因此每拿到一帧后，先把它收到的时间减掉这段固定延时，得到画面真正的
-拍摄时刻，再用这个时刻去 :class:`~airdrop.broker.TelemetryBroker` 取那一刻
+拍摄时刻，再用这个时刻去 :class:`~airdrop.telemetry.broker.TelemetryBroker` 取那一刻
 的遥测（默认在历史之间线性内插）::
 
-    aligner = FrameTelemetryAligner(broker)          # 默认扣 150ms
+    aligner = FrameTelemetryAligner(broker)          # 使用配置中的链路延时
     sample = aligner.align(source.read(timeout=1.0))
     if sample is not None and not sample.extrapolated:
         aim_at(sample.image, sample.snapshot.latitude_deg, sample.snapshot.yaw_deg)
@@ -149,7 +149,7 @@ class FrameTelemetryAligner:
     参数
     ----
     broker:
-        同进程的 :class:`~airdrop.broker.TelemetryBroker`。
+        同进程的 :class:`~airdrop.telemetry.broker.TelemetryBroker`。
     lag:
         链路固定延时（秒）。``None``（默认）表示采用帧自带的
         :attr:`VideoFrame.lag`（通常来自 ``VideoConfig.telemetry_lag``，

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,8 +61,133 @@ from airdrop import (
     pixel_to_ned,
 )
 from airdrop.perception import OpenCvPostProcess, PerceptionConfigLike, PerceptionWorker
+from tools.check_docs import _repository_hygiene
 
 pytestmark = pytest.mark.integration
+
+
+def _git(cwd: Path, *args: str) -> str:
+    """在隔离临时仓库中执行 Git 命令。"""
+    result = subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True, encoding="utf-8"
+    )
+    return result.stdout.strip()
+
+
+def _commit_all(root: Path) -> str:
+    """提交临时仓库文件并返回提交号。"""
+    _git(root, "add", "-A")
+    _git(
+        root,
+        "-c",
+        "user.name=Docs Test",
+        "-c",
+        "user.email=docs@example.invalid",
+        "commit",
+        "-m",
+        "fixture",
+    )
+    return _git(root, "rev-parse", "HEAD")
+
+
+def test_doc_hygiene_uses_git_index_and_submodule_index(tmp_path: Path) -> None:
+    """现存未跟踪文件不能掩盖死链，子仓目标由子仓索引确认。"""
+    root = tmp_path / "main"
+    root.mkdir()
+    _git(root, "init", "-q")
+    (root / "docs").mkdir()
+    (root / "docs" / "guide.md").write_text("# guide\n", encoding="utf-8")
+    (root / "docs" / "untracked.md").write_text("# local only\n", encoding="utf-8")
+
+    child = root / "vendor" / "tool"
+    child.mkdir(parents=True)
+    _git(child, "init", "-q")
+    (child / "README.md").write_text("# tool\n", encoding="utf-8")
+    child_head = _commit_all(child)
+
+    (root / "README.md").write_text(
+        "[tracked](docs/guide.md) [untracked](docs/untracked.md) "
+        "[child](vendor/tool/README.md) [site](https://example.invalid) [top](#top) "
+        "[local](C:/Users/name/file.md)\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", "README.md", "docs/guide.md")
+    _git(root, "update-index", "--add", "--cacheinfo", f"160000,{child_head},vendor/tool")
+    _git(
+        root,
+        "-c",
+        "user.name=Docs Test",
+        "-c",
+        "user.email=docs@example.invalid",
+        "commit",
+        "-m",
+        "fixture",
+    )
+
+    link_issues, privacy_issues = _repository_hygiene(root)
+    assert len(link_issues) == 2
+    assert any("untracked.md" in issue for issue in link_issues)
+    assert any("C:/Users/name/file.md" in issue for issue in link_issues)
+    assert len(privacy_issues) == 1
+    assert "本地绝对路径" in privacy_issues[0]
+
+
+def test_doc_hygiene_scans_public_text_not_runtime_strings(tmp_path: Path) -> None:
+    """私人路径和旧命名会被发现，示意路径、协议地址和运行时字符串不会误报。"""
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    (root / "README.md").write_text(
+        "示意 C:/...；平台路径 `/usr/bin/python`、`/tmp/generated`；协议 `udp://127.0.0.1:5602`。\n"
+        "生成记录 `flights/20261021-120000/frames/000001.jpg`；素材 D:/captures/flight.mp4。\n",
+        encoding="utf-8",
+    )
+    (root / "module.py").write_text(
+        "# C:\\Users\\someone\\private.txt\n"
+        '"""旧入口 2024v2。"""\n'
+        'PRIVATE = "C:\\\\Users\\\\someone\\\\secret.mp4"\n',
+        encoding="utf-8",
+    )
+    (root / "notes.md").write_text(
+        "旧资料曾叫 2024v2；本机素材在 `C:/Users/someone/Videos/flight.mp4`。\n",
+        encoding="utf-8",
+    )
+    _commit_all(root)
+
+    _, privacy_issues = _repository_hygiene(root)
+    assert len(privacy_issues) == 5
+    assert sum("notes.md" in issue for issue in privacy_issues) == 2
+    assert sum("module.py" in issue for issue in privacy_issues) == 2
+    assert sum("README.md" in issue for issue in privacy_issues) == 1
+    assert any("本地绝对路径" in issue for issue in privacy_issues)
+    assert any("2024v2" in issue for issue in privacy_issues)
+
+
+def test_doc_hygiene_rejects_retired_packages_and_entries(tmp_path: Path) -> None:
+    """旧包/入口在公开文本中报错，当前模块路径和运行时字符串保持有效。"""
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    (root / "README.md").write_text(
+        "旧引用：`airdrop.alignment`、`airdrop.alignment.FrameTelemetryAligner`、"
+        "`airdrop.buffer`、`airdrop.buffer.AlignmentWriter`、`examples/sitl_mission.py`、"
+        "`tools/sitl_recon.py`、`drone/coordinates.py`、`drone/target.py`、`drone/cvproc.py`。\n"
+        "当前引用：`airdrop.video.buffer`、`airdrop.video.align`。\n",
+        encoding="utf-8",
+    )
+    (root / "module.py").write_text(
+        '"""旧注释入口为 drone/cvproc.py。"""\n'
+        'RUNTIME_TEXT = "airdrop.alignment examples/sitl_mission.py"\n',
+        encoding="utf-8",
+    )
+    _commit_all(root)
+
+    _, issues = _repository_hygiene(root)
+    legacy_issues = [issue for issue in issues if "旧包/入口" in issue]
+    assert len(legacy_issues) == 2
+    assert any("README.md" in issue for issue in legacy_issues)
+    assert any("module.py" in issue for issue in legacy_issues)
+
 
 CAMERA = default_camera_model(320, 180)
 

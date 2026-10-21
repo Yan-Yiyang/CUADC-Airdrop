@@ -28,7 +28,7 @@
 | `docs/calibration_opencv.md` | 三步标定与 OpenCV 5.0 问题与易错点全记录（实测表、方程、判据） | **实测口径** |
 | `docs/video_hm30_ffmpeg.md` | 图传链路为什么只有 ffmpeg 一个后端 + 逐项实测 | **实测口径** |
 | `docs/perception_ocr.md` | 检测/OCR 细节：转正形态门限、Cls 权重命名、onnxruntime 前提 | **实测口径** |
-| `docs/ballistics_fit.md` | P12 投放记录与反演：可辨识性判据、σ、留一验证 | **实测口径** |
+| `docs/ballistics_fit.md` | 投放记录与反演：可辨识性判据、σ、留一验证 | **实测口径** |
 
 **冲突时的优先级**：当前代码、配置与测试 > 相关专题文档 > 本手册 > `AGENTS.md`/`README.md` 的概述性描述。
 本文档刻意**不复制**专题笔记里的长篇实测结论，只给一行指针——要动那条链路前先读笔记。
@@ -58,15 +58,15 @@
 | --- | --- | --- | --- |
 | `airdrop/` | 唯一的运行时代码包（9 个子包，见 §3） | `__init__.py`（171 个公开名）、`config.py`（全部参数） | 是 |
 | `airdrop/config.py` | **全部参数的唯一集中处**（frozen dataclass + 取值域校验） | `Config`、`Config.validated` | 是 |
-| `tools/` | 一次性离线工具（**纯库模块**：文件内常量 = 默认值，暴露 `build_config(**覆盖)` / `main(**kwargs)`；命令行解析归 §6.2 的 `airdrop/run.py`） | `fetch_models.py`、`calibrate.py`、`fit_ballistics.py`、`make_world.py`、`dump_api.py`、`check_docs.py` | 是 |
+| `tools/` | 一次性离线工具（**纯库模块**：文件内常量 = 默认值，暴露 `build_config(**覆盖)` / `main(**kwargs)`；命令行解析归 §6.2 的 `airdrop/run.py`） | `fetch_models.py`、`fit_ballistics.py`、`dump_api.py`、`check_docs.py`、性能诊断工具 | 是 |
 | `airdrop/runtime/` | real/SITL 在线任务、运行参数、共享组件与生命周期；离线回放复用感知组件 | `options.py`、`components.py`、`session.py` | 是 |
 | `airdrop/run.py` | **主仓命令行入口**：argparse 子命令 → 关键字覆盖到各入口的 `build_config`/`main`（见 §6.2） | `run.py`、`airdrop/_lazy.py`（PEP 562 惰性导出） | 是 |
-| `tests/` | pytest 套件，按 fast/offline/platform/all 分层选择 | `conftest.py`、`test_e2e.py`、`test_fit.py`、`test_plan.py`、`test_world.py`、`test_sim_scripts.py` | 是 |
-| `docs/` | 专题笔记（5 篇实测记录）+ 本手册 | `handbook.md`、`simulation_world.md`、`calibration_opencv.md`、`video_hm30_ffmpeg.md`、`perception_ocr.md`、`ballistics_fit.md` | 是 |
+| `tests/` | pytest 套件，按 fast/offline/platform/all 分层选择 | `conftest.py`、`test_e2e.py`、`test_fit.py`、`test_plan.py`、`test_tool_repositories.py` | 是 |
+| `docs/` | 按职责组织的专题说明与本手册 | `handbook.md`、`simulation_world.md`、`calibration_opencv.md`、`video_hm30_ffmpeg.md`、`perception_ocr.md`、`ballistics_fit.md` | 是 |
 | `vendor/airdrop-sim/` | **仿真模块**：世界（生成产物：两个 `.sdf` + 网格/贴图）+ 带下视相机的机型 + PX4 airframe + 装机/启动脚本；生成器是 `vendor/airdrop-sim/airdrop_sim/make_world.py`，布局与启动见 [`simulation_world.md`](simulation_world.md)，模块说明见 [`../vendor/airdrop-sim/README.md`](../vendor/airdrop-sim/README.md) | `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/cuadc_recon_strike_r1.sdf`、`r2.sdf` | 是 |
-| `routes/` | **操作手在 QGC 里画好的 `.plan` 航线**（`recon.plan` / `land.plan`），由配置按需导入 | `land.plan` | 是（航线是飞行输入，跟着版本走） |
+| `routes/` | 操作手本地 `.plan` 航线，按配置导入 | `recon.plan`、`land.plan`（由使用者准备） | 说明文件入库；航线忽略 |
 | `models/` | 本地模型权重与字典（**字典入库、权重不入库**） | `best2.pt`、`ppocr/*.pth`、`ppocr/ppocrv6_dict.txt` | 字典是；权重否 |
-| `.venv/` | 项目虚拟环境（uv 创建，Python 3.14.6，**里面没有 pip**） | — | 否 |
+| `.venv/` | 项目虚拟环境（由 uv 管理） | — | 否 |
 | `PX4-Autopilot-1.17.0/` | PX4 固件源码，**仅供查阅，禁止当项目代码修改** | — | 否 |
 | `qgroundcontrol-master/` | QGC 地面站源码，同上（`MissionManager/LandingComplexItem.cc` 是 `.plan` 复杂项展开的权威依据） | — | 否 |
 | `flights/` | **运行期产物**：`record.dir` 默认值，每次飞行一个子目录 | 见 §5.1 | 否（已 ignore） |
@@ -113,7 +113,7 @@
   是否入库由使用方决定（本仓库默认不入库、也不忽略）。
 
 `flights/` 曾长期未被 ignore（`git status` 会列出整个飞行目录），现在已进 `.gitignore`；
-`routes/` 相反是**要入库**的：`.plan` 是飞行输入，审查时要能看到"这次飞的是哪条航线"。
+`.plan` 是操作手本地输入，默认忽略；应随具体任务记录其版本或散列，仓库不分发实际场地航线。
 
 ### 1.4 `models/` 目录与模型文件（文件是否可用以实际安装为准）
 
@@ -354,11 +354,7 @@ MAVSDK 提供的变化通知与进度没有任务 ID，因此程序无法证明�
 哪一条任务。新回读后的首条完成进度会保守保持未知，直到观察到非终态进度；这能挡住常见的旧
 完成状态残留，但不能识别所有同长度任务切换后的缓存序列。
 
-**实测边界**：SIH/QGC 已验证任务从 0 项到 3 项、再到 4 项，以及同为 4 项但坐标变化时任务 ID
-更新、旧进度清空并回读 4 项；专用 MAVLink 断连时 `connected=False` 且 broker 数据清空，恢复后新会话
-再次回读 4 项。操作手在 QGC 中执行任务上传、替换与启动；只读观察器未上传、启动或清空飞控任务。任务进度
-已从 1/24 到 24/24，随后检测到仿真落地并自动上锁。此结果覆盖 SIH/QGC 任务同步和仿真任务落地，不代表
-完整 Gazebo 相机/感知/投放链路或真实设备已验收。
+**验证边界**：只读任务同步需要覆盖初次下载、不同项数及同项数替换、断连重建与任务进度。历史仿真结果不代替当前版本现场通信和真实任务验收。
 
 #### 3.1.3 `DroneController`（任务级控制）
 
@@ -2260,7 +2256,7 @@ config = Config(
 3. **拆桨/演练**：`--no-real-release` 跑 `mission --mode real`，或先在 SITL 跑 `mission --mode sitl`。
 4. **投放试验**：飞几次投放 → 量落点填 `impacts.jsonl` → `tools/fit_ballistics.py` →
    只把 `reliable=True` 的那组参数回填 `BallisticsConfig`。
-5. **装弹实飞**：`DRY_RUN=False`，确认 PX4 侧 gripper 输出与 `abort_action` 符合空域要求；
+5. **真实释放**：使用`python -m airdrop.run mission --mode real --real-release`并启用挂架配置，确认 PX4 侧 gripper 输出与 `abort_action` 符合空域要求；
    起飞当天的现场次序照 §6.3 的"现场执行顺序"走（链路先就绪 → 连接/原点 → 自检通过 →
    操作手 QGC 上传并启动侦查航线 → 程序自动进 `RECON`）。
 
@@ -2379,7 +2375,7 @@ config = Config(
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| pytest 报 `PermissionError: [WinError 5]`（20 个 error） | 受限沙箱里 pytest basetemp 目录不可枚举/删除 | 环境限制，不是代码问题；忽略这 20 个 error，其余用例有效（§5.6） |
+| pytest 报 `PermissionError` | 可能受临时目录、进程或 socket 权限影响 | 按现场错误逐项确认权限原因，使用可写临时目录或正常权限环境复验；未复验的失败不能忽略 |
 | 图传一帧都没有，`stats.last_error` 有 ffmpeg 输出 | 地址/网络不对（HM30 网段 `192.168.144.0/24`，相机 `192.168.144.25`） | `ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f null -` 手工核对；地址**不探测**，写错就报错 |
 | 断了流仍在读旧画面 / `read()` 阻塞不返回 | ffmpeg 后端靠 `-timeout` 判死链路；cv2 后端 `read()` 30s 不可中断 | 用 `Hm30VideoSource`（可杀子进程）；`VideoConfig.read_timeout` 调小；详见 `docs/video_hm30_ffmpeg.md` |
 | 新会话连不上飞控 / 端口 50051 被占 | 旧 mavsdk_server 僵尸进程 | 必须走 `MavsdkThread.stop()`（内部 `_release_drone()`）；必要时手动结束残留进程 |
@@ -2420,12 +2416,12 @@ config = Config(
 | 飞掠段长/高度/航向 | `leg_length_m=200`、`altitude_m=20` 待实验验证 |
 | 相机标定 | 只在合成链路上验证过；真实素材复测与 `telemetry_lag` 实测值待一次真实采集 |
 | SITL 演练 | 旧演练使用合成目标，未覆盖真实感知或实机投放精度；历史单次结果不代表当前完整链路已验收 |
-| `.plan` 航线 | 解析与复杂项展开在 `tests/test_plan.py`（现场造的样例）+ 入库的 `routes/land.plan` 上验证过；真实任务航线由运营方在 QGC 里提供，**只支持 `fwLandingPattern`**（VTOL 降落、测绘/结构航线显式报错） |
+| `.plan` 航线 | 解析回归使用 `tests/test_plan.py` 中生成的合成任务；实际航线由操作手在 QGC 提供，不随仓库分发。复杂项仅支持 `fwLandingPattern` |
 | 生成航点的接受半径 | `DEFAULT_WAYPOINT_ACCEPTANCE_M = 3.0` 对固定翼偏紧——SITL 里出现过飞机绕着末航点转、迟迟不"到点"（进度停在 `current=2/total=3`）；QGC `.plan` 的航点自带 `param2`，不受这条影响。真机前建议按机型确认 `NAV_ACC_RAD` 与此值 |
 | `cls12` 模式 | 无 12 类权重（`best2.pt` 单类）→ 编号恒为 1，代码路径可跑但无实际意义 |
 | 方向分类交叉验证（**诊断用，默认关**，不参与识别） | 旧样本出现过误报，不能据此保证其他素材上的判定可靠性 |
 | PX4 侧配置 | gripper 输出、起飞项航点动作、任务结束后是否 RTL 都不在本包范围内 |
-| 仿真世界 | `vendor/airdrop-sim/airdrop_sim/assets/worlds/cuadc/` 的两个赛区世界已按规则（2026 版第 19–25 页）搭好并做离屏渲染核对（几何/尺寸/贴图方向，见 [`simulation_world.md`](simulation_world.md)）；天井位置与朝向按规则随机（`--seed` 复现，入库 = seed 0）；**未验证**：把 Gazebo 相机接进感知闭环、真机与世界的差异 |
+| 仿真世界 | 已提供世界、下视相机与主仓感知接入，布局可由seed复现；仿真与历史验收不能保证当前版本真机精度，现场相机、网络和挂架仍需验证 |
 | 工程设施 | 无 CI（pytest/ruff/pyright 在本地运行）；覆盖率以当前测试报告为准；沙箱权限问题须与代码失败分别核实 |
 | 声明但尚未接入的参数 | 见 §4.18 的表（`save_crops`/`crop_dir`/`max_crops`/`lag_warn_frames`/相机 `undistort`/`flat`+经纬度/记录 `video`/`event_eval_hz`） |
 
@@ -2461,3 +2457,9 @@ config = Config(
 工具代码和资产仅保存在两个 Git 子模块，详见 [初始化与升级](tool_repositories.md)。主仓 `check-docs` 只核对主包 API、配置、记录文件和主 CLI（含兼容转发）；工具 API、算法、资产与 CLI 的契约由各子仓测试负责。跨仓文件契约保留在 `tests/test_calibration_contract.py`、`tests/test_sim_integration.py`，缺少工具时显式跳过。
 
 `tests/test_tool_repositories.py` 验证缺失子模块时的主仓导入/帮助及兼容转发；子模块 gitlink 与 `.gitmodules` 不参与发布工具的平面文件同步。
+
+## 10. 性能诊断与文档检查
+
+`python -m airdrop.run benchmark-perception --images-dir input/frames --out output/detector.json` 在同一图像样本上分别计时读取、解码、去畸变、predict和完整检测；`--calib`提供匹配标定，`--threads`设置主进程OpenCV线程数。它只测单检测器，不代表完整任务吞吐。
+
+`check-docs`同时核验手册字段/API/入口及产物名称，并按三仓Git索引检查Markdown内部链接、私有路径与过期命名。生成文件的结构用文字或代码块描述，不链接未入库的本地输出。文档和注释的职责约定见[AGENTS.md](../AGENTS.md)。

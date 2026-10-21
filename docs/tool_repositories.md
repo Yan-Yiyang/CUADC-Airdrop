@@ -2,11 +2,11 @@
 
 主仓只保留任务、记录采集及跨仓演练。`vendor/airdrop-sim` 包含世界/机型/相机生成和资产，`vendor/airdrop-calibration` 包含离线内参/延时/手眼标定。两者不导入 `airdrop`，主仓生产包也不导入工具内部实现。
 
-## 初始化与本地镜像
+## 初始化与远端
 
-父仓以 gitlink 固定提交，`.gitmodules` 的相对 URL 约定两个工具仓与父仓为同级仓库。尚未配置远端；可将本地 URL 指向工具的独立克隆或本地镜像。分发到其它机器前需一并提供两个工具仓（或 Git bundle），或由维护者设置可访问的远端 URL。单独复制父仓不能携带子模块对象。
+父仓以 gitlink 固定两个工具仓的提交，远端位于 [airdrop-sim](https://github.com/Yan-Yiyang/airdrop-sim) 与 [airdrop-calibration](https://github.com/Yan-Yiyang/airdrop-calibration)。克隆时初始化子模块；单独复制父仓目录不能携带子模块对象。
 
-常规同级远端可直接：
+使用已配置远端：
 
 ```bash
 git clone --recurse-submodules <主仓地址>

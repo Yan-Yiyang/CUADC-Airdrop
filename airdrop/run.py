@@ -298,6 +298,52 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(("--ffmpeg",), "ffmpeg_executable", "FFmpeg 可执行文件"),
         ),
     ),
+    "qgc-video-benchmark": Subcommand(
+        name="qgc-video-benchmark",
+        module="tools.qgc_video_benchmark",
+        help="比较正常与慢画面合成时的 QGC RTP 时钟和本机包序列",
+        options=(
+            Option(
+                ("--out",), "output_path", "新建 JSON 结果路径", kind="path", source="OUTPUT_PATH"
+            ),
+            Option(("--seconds",), "seconds", "每种情况的时长", kind="float", source="SECONDS"),
+            Option(("--fps",), "fps", "发布目标帧率", kind="float", source="FPS"),
+            Option(
+                ("--compose-delay",),
+                "compose_delay",
+                "慢合成每帧延迟秒数",
+                kind="float",
+                source="COMPOSE_DELAY",
+            ),
+        ),
+    ),
+    "benchmark-perception": Subcommand(
+        name="benchmark-perception",
+        module="tools.benchmark_perception",
+        help="对 JPEG 目录抽样，分段测量生产 YOLO 检测性能",
+        options=(
+            Option(
+                ("--images-dir",), "images_dir", "JPEG 图像目录", kind="path", source="IMAGES_DIR"
+            ),
+            Option(
+                ("--out",), "output_path", "新建 JSON 结果路径", kind="path", source="OUTPUT_PATH"
+            ),
+            Option(
+                ("--calib",), "calib_file", "可选相机标定 JSON", kind="path", source="CALIB_FILE"
+            ),
+            Option(("--model",), "model_path", "YOLO 权重路径", kind="path", source="MODEL_PATH"),
+            Option(("--device",), "device", "YOLO 设备，例如 0 或 cpu", source="DEVICE"),
+            Option(("--imgsz",), "imgsz", "YOLO 输入尺寸", kind="int", source="IMGSZ"),
+            Option(("--threads",), "threads", "OpenCV 主进程线程数", kind="int", source="THREADS"),
+            Option(
+                ("--sample-count",),
+                "sample_count",
+                "均匀抽样数量",
+                kind="int",
+                source="SAMPLE_COUNT",
+            ),
+        ),
+    ),
 }
 
 

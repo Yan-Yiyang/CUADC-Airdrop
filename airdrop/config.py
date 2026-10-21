@@ -10,7 +10,7 @@
 
 字段来源与现状
 --------------
-- ``video.telemetry_lag``：ffmpeg 后端实测 ≈0.15s；**标定流程步骤二会给出实测值并覆盖**
+- ``video.telemetry_lag``：按具体相机与接收链路标定；**标定流程步骤二会给出实测值并覆盖**
   （标定用**收到帧的时刻**测量，给的是绝对对齐量 = 视频链路延时 − 遥测链路延时，可直接回填）；
 - ``ballistics``：350ml 矿泉水瓶的占位参数，**需投放试验微调**；
 - ``overfly.leg_length_m``：保证平飞的段长，**需实验验证**；
@@ -125,10 +125,10 @@ class PerceptionConfig:
     model_path: str = "models/best2.pt"
     device: str = "0"
     conf_threshold: float = 0.25
-    imgsz: int = 1280  # 权重按 640 训练；实测 640/1280 检出数一致
+    imgsz: int = 1280  # YOLO 推理输入尺寸
     opencv_threads: int = 4  # YOLO 导入后恢复 OpenCV 线程数
 
-    # OCR 引擎（TORCH，本地权重；P5 复测：medium ~97ms/帧 @RTX3060Laptop）
+    # OCR 引擎及本地权重配置。
     models_dir: str = "models/ppocr"
     det_model: str = "PP-OCRv6_det_medium.pth"
     rec_model: str = "PP-OCRv6_rec_medium.pth"
@@ -260,7 +260,7 @@ class TargetingConfig:
     **起飞前按任务选定**，代码不做隐式回退。结果坐标 = 类内成员坐标均值。
     """
 
-    eps_m: float = 1.5  # 聚类半径：同一目标的重复观测散布（实测 0.2~1.0 m），远小于目标间距 20~40 m
+    eps_m: float = 1.5  # 聚类半径；应结合目标间距与观测误差配置
     min_samples: int = 2  # 噪声点（label=-1）剔除
     selection_rule: str = "median"
     weight_by_confidence: bool = False  # 开时按置信度加权（聚类与均值同时加权）
@@ -681,9 +681,8 @@ class Config:
     def _validated_ballistics(self) -> None:
         """弹道参数的取值域检查（单独一个方法，好让 ``validated`` 保持扁平）。
 
-        重点是 ``gravity``：取 0 或负数时弹道永远不穿过地面，于是每次
-        ``predict_impact`` 都要跑满 120s 超时上限（实测 67.8ms/次——20Hz 的
-        投放判据就是每秒烧掉 1.36s CPU）并且**静默永不投放**。
+        ``gravity`` 必须为正值；否则弹道不会按预期穿过地面，预测会持续到达
+        积分时限并且投放判据无法获得有效结果。
         """
         b = self.ballistics
         if b.mass_kg <= 0:

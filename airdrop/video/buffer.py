@@ -247,7 +247,7 @@ class AlignmentBuffer:
     def put(self, sample: AlignedSample, *, materialize: bool = True) -> BufferedFrame | None:
         """把一条对齐结果存入缓冲，可选返回解码后的入库记录。
 
-        传入 :meth:`airdrop.alignment.FrameTelemetryAligner.align` 的返回值即可；
+        传入 :meth:`airdrop.video.align.FrameTelemetryAligner.align` 的返回值即可；
         若 ``sample`` 为 None（对齐失败/无遥测）会抛 ``ValueError``，调用方应先
         自己判断。
         """
@@ -483,10 +483,8 @@ class AlignmentBuffer:
                         if remaining <= 0:
                             return None
                     self._condition.wait(remaining)
-            # ⚠ 解码必须在**锁外**：jpeg 模式下 cv2.imdecode 要几毫秒，而这把锁
-            # 采集线程的 put() 也要拿。在锁内解码等于让采集线程替读者的解码买单
-            # ——实测 30fps 下 put() 从 0.00ms 涨到平均 11.7ms（720p），
-            # 30% 左右的帧周期被白占。latest()/at() 同样在锁外解码。
+            # 解码必须在**锁外**：jpeg 模式下的解码与采集线程的 put() 共用这把锁。
+            # 在锁内解码会阻塞新帧入库；latest()/at() 同样在锁外解码。
             frame = self._materialize(stored)
             if cancel_event is not None and cancel_event.is_set():
                 return None

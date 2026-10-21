@@ -182,8 +182,8 @@ def test_find_apex_by_parallel_rejects_non_pentagon() -> None:
 def _square_with_noise_corner() -> np.ndarray:
     """近方形五边形：正方形边上插一个顶点（饱和度过严时掩码只圈住编号底板）。
 
-    这就是实测帧 1840 在 ``s_min=100`` 上撞到的情形——``approxPolyDP`` 把一块
-    编号底板凑成 5 个顶点，`_find_apex_by_parallel` 照样能找出一对平行边。
+    这个构造样例模拟近方形掩码被 ``approxPolyDP`` 误拟合成五边形的情况；
+    旧判据只看平行边时会接受该候选。
     """
     return np.array([[0, 0], [30, 3], [60, 0], [60, 60], [0, 60]], dtype=np.float64).reshape(
         -1, 1, 2
@@ -203,7 +203,7 @@ def test_is_house_pentagon_rejects_square_like_pentagon() -> None:
     """近方形必须判负：它有平行边、能凑出 5 个顶点，但顶角不是 60°。
 
     这一条是**真实缺陷**的回归——缺了这道门限时，这种假房子会给出任意角度的
-    "转正"，而 OCR 还能读出一个自信的错编号（帧 1840 把 56 读成 95）。
+    "转正"，而 OCR 仍可能读出高置信度的错误编号。
     """
     approx = _square_with_noise_corner()
     apex, pair, _ = OpenCvPostProcess._find_apex_by_parallel(approx)
@@ -507,10 +507,8 @@ def test_cls_engine_selects_engine_and_model() -> None:
 def test_cls_is_diagnostic_only_by_default() -> None:
     """方向分类默认**不参与识别**：正式流程靠几何转正，cls 只作诊断/交叉验证。
 
-    实测依据（2026-10，旧版 三帧 + 把裁剪图整体转 180° 的样例）：``cls_autorotate``
-    开/关**读号逐位相同**（56/56/56，置信度也一致），关掉每帧约省一成耗时；而
-    ``cls_thresh=0.9`` 本来就挡不住真实倒立条（判定分只有 0.19–0.86），自动转正的
-    保护力有限。所以默认关；但引擎与方向 API 都保留，复盘时仍可
+    方向分类默认关闭，不参与正式链路；仅在任务数据验证后，才应启用自动转正。
+    引擎与方向 API 都保留，复盘时仍可
     ``classify_orientation()`` 核对方向（真要连会话都不建就设 ``cls_engine="off"``）。
     """
     default = OcrEngineConfig()

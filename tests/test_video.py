@@ -73,7 +73,7 @@ def test_stream_scaling(live_source) -> None:
 
 @pytest.mark.stream
 def test_frame_carries_telemetry_lag(live_source) -> None:
-    """帧必须携带链路延时——帧-遥测时间对齐的前提（见 airdrop.alignment）。"""
+    """帧必须携带链路延时——帧-遥测时间对齐的前提（见 airdrop.video.align）。"""
     source = live_source(telemetry_lag=0.2)
     frames = read_some(source, 3)
     assert frames

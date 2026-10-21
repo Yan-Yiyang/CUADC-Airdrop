@@ -58,8 +58,8 @@ def zero_test_params(
     * ``NAV_DLL_ACT``：SITL 里没有操作手盯数据链，置 0 免得"数据链丢失"的 failsafe
       在飞行中途抢控制；
     * ``NAV_RCL_ACT``：SITL 里**没有遥控**（ulog 的 ``manual_control_signal_lost``
-      恒 true），默认动作是 Return——实测架次 20260929-200316 在盘旋时被 RC-loss
-      失控保护拉成 RTL（"Failsafe activated: entering Hold for 5 seconds" → RTL）。
+      恒 true），默认动作是 Return；因此仿真测试应明确处理 RC-loss failsafe，
+      避免它在任务过程中接管飞行。
 
     ⚠ "起飞项/降落项是否必需"那条检查（``MIS_TKO_LAND_REQ``）**不在这里改**：
     它已经在仿真机型里永久置 0（``vendor/airdrop-sim/airdrop_sim/assets/airframes/4007_gz_rc_cessna_down_cam``，附了原因）

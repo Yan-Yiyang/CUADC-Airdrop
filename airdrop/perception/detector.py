@@ -1,4 +1,15 @@
-'YOLO 检测：把一帧画面变成若干 :class:`Detection`。'
+"""YOLO 检测：把一帧画面变成若干 :class:`Detection`。
+
+设计要点
+--------
+* **device 通过配置显式指定**，避免部署环境的自动设备选择变化造成不可预期的性能差异。
+* **预计算 remap 去畸变**：标定文件给出内参与畸变系数后，在
+  :meth:`Detector.prepare_undistort` 里计算映射表，之后每帧复用映射表校正图像。
+* **帧尺寸与标定不一致就拒绝检测**：仅跳过去畸变仍会让下游使用错误内参。
+  检查在模型加载/推理前完成；尺寸错误抛异常，由入口终止本次运行。
+* 重依赖（``ultralytics`` / ``torch``）**惰性导入**：本模块要被离线测试导入，
+  不能因为环境里没有 GPU 栈就连 ``import airdrop.perception`` 都失败。
+"""
 
 from __future__ import annotations
 
@@ -128,8 +139,7 @@ class Detector:
     def warmup(self, width: int, height: int) -> bool:
         """按目标分辨率跑一次空推理，把 CUDA 上下文/内核编译开销挪到起飞前。
 
-        ``ultralytics`` 首次推理要 80ms+（含上载与 cuDNN 选核），后续 20~30ms；
-        起飞前预热能避免第一帧的卡顿。底层失败只记录日志并返回 ``False``，
+        起飞前预热可把首次推理初始化开销移出任务航线。底层失败只记录日志并返回 ``False``，
         任务会话必须据此中止启动，不能把权重加载成功当作预热成功。
         """
         try:

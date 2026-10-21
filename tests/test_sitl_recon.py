@@ -86,7 +86,7 @@ def test_sitl_recon_accuracy(tmp_path: Path) -> None:
     assert exit_code in (0, 7), f"退出码 {exit_code}"
     report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
 
-    # ⚠ 键名是 "mission"（tools/sitl_recon.py 写的就是它）；曾经这里读的是
+    # ⚠ 键名是 "mission"（运行时分析模块 写的就是它）；曾经这里读的是
     # "runner_stats"——那个名字只是 _RunOutcome 的字段名，report.json 里根本没有，
     # 于是 runner 恒为 {}，这条唯一的端到端验收用例**永远失败**（它带 sitl 标记
     # 默认跳过，所以从没被发现）。

@@ -1,11 +1,10 @@
 """裁剪图后处理：五边形定位 → 几何转正 → 整图 OCR 读编号。
 
-移植自旧版实现 ``drone/cvproc.py``（久经实测的目标形态与参数）。目标形态：
-五边形 = 正方形 + 等边三角形（边长 1m），编号印在正方形中心的白底方块上
+目标形态：五边形 = 正方形 + 等边三角形（边长 1m），编号印在正方形中心的白底方块上
 （0.6m，黑字）。
 
-流水线（顺序不可随意改动，每一步都在旧版实现里有实测理由）
---------------------------------------------------------
+流水线
+---
 1. JPEG 往返去噪：DVR 图传的细颗粒噪点会干扰轮廓提取，编解码一次即可抹平；
 2. 等比放大到短边 300px（上限 10 倍）：小目标识别率显著提升。``side_px``
    最后要除回去，还原成原始像素边长（坐标解算用原始尺度）；
@@ -17,7 +16,7 @@
    顶角是唯一不与任一平行边共享端点的顶点），失败回退最小内角法（40~130° 门限，
    斜视角会把 60° 投影到这个区间）；
 6. 转正图整图 OCR。注意用彩图——PP-OCRv6 的 det 对灰度图检不出文本框
-   （旧版实测易错点，P5 未复测，保守沿用）；
+   （使用彩图输入以保留文本检测所需的颜色信息）；
 7. 候选合并：单数字框按行聚类拼成两位数；两位结果置信度加权（×1.15）、
    单位 ×0.6，防止把 ``"7"`` 误报成 ``07``；
 8. 编号交给 :func:`~airdrop.perception.number.correct_ocr_number` 纠错。
@@ -34,9 +33,8 @@
   - ``rec_batch_num`` 走 ``Rec.rec_batch_num`` 配置。
 * 方向分类（Cls）**只作诊断/交叉验证，不参与正式流程**：正式链路的方向由几何转正
   （平行边法 + 顶角 ``60°±15°`` 门限）决定，``cls_autorotate`` 默认 ``False``，省掉逐帧
-  分类计算。依据（2026-10 实测）：旧版 三帧 + 把裁剪图整体转 180° 的样例，cls 开/关
-  **读号逐位相同**（56/56/56，置信度也一致），关掉每帧约省一成耗时。要让它参与识别
-  就显式设 ``cls_autorotate=True``。
+  分类计算。分类器默认不参与正式流程；需要其参与方向判定时应基于任务数据验证后
+  显式启用 ``cls_autorotate=True``。
 * 方向分类（Cls）的权重文件名保持 RapidOCR 原样（TORCH 版是
   ``ch_ptocr_mobile_v2.0_cls_mobile.pth``，引擎按文件名 stem 查架构）；
   用哪个引擎由 :class:`OcrEngineConfig` 的 ``cls_engine`` 决定（默认 ONNX）。
@@ -78,7 +76,11 @@ _MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
 # ----------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class OcrEngineConfig:
-    'RapidOCR（TORCH 引擎）参数。'
+    """RapidOCR（TORCH 引擎）参数。
+
+    默认值对应 PP-OCRv6 medium 检测与识别模型；推理耗时受设备、驱动、输入图像与运行时
+    版本影响，应在目标部署环境测量。
+    """
 
     model_dir: str = "models/ppocr"
     det_model: str = "PP-OCRv6_det_medium.pth"
@@ -88,8 +90,7 @@ class OcrEngineConfig:
     #: ⚠ 只在**启用方向分类**时才有意义（诊断/交叉验证，或显式打开 ``cls_autorotate``）：
     #: 正式流程不用它，方向由几何转正保证。想连会话都不建（进一步省 onnxruntime/GPU
     #: 开销）就设 ``"off"``——代价是 ``classify_orientation()`` 会明确拒绝（不是静默给值）。
-    #: 默认 ONNX：实测（同权重、6 张一批）ONNX-CUDA 0.96ms/张、ONNX-CPU 1.28、
-    #: TORCH-CUDA 2.28、TORCH-CPU 4.14，而三者判定逐位相同（同分数 0.9801/0.9799）。
+    #: 默认 ONNX；可按部署环境选择方向分类引擎。
     cls_engine: str = "onnx"
     cls_onnx_model: str = "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
     #: 文件名保持 RapidOCR 原拼写（``ptocr``），不要规范化
@@ -105,9 +106,7 @@ class OcrEngineConfig:
     #: 几何转正保证（平行边法 + 顶角 ``60°±15°`` 门限，见 ``OpenCvPostProcess``），
     #: 关掉它省下逐帧的分类计算；方向判别本身仍可用
     #: （:meth:`OcrEngine.classify_orientation`），复盘时照样能核对方向。
-    #: 依据（2026-10 实测）：旧版 三帧 + 把裁剪图整体转 180° 的样例，开/关**读号逐位
-    #: 相同**（56/56/56，置信度也一致），关掉每帧约省一成耗时；而 ``cls_thresh=0.9``
-    #: 本来就挡不住真实倒立条（实测判定分只有 0.19–0.86），自动转正的保护力有限。
+    #: 默认关闭；方向分类只作诊断或交叉验证，任务需要时应先使用对应数据验证。
     cls_autorotate: bool = False
     use_cuda: bool = True
     device_id: int = 0
@@ -166,7 +165,7 @@ class OcrEngine:
 
     为什么不用库的自动下载：起飞前必须固定模型版本（否则某次飞行前悄悄换了
     模型，识别率变化无法归因），而 ``default_models.yaml`` 里没有 ``torch`` 段，
-    TORCH 引擎只能靠显式 ``model_path`` 指定本地权重（P5 复测结论）。
+    TORCH 引擎需要通过 ``model_path`` 显式指定本地权重。
     """
 
     def __init__(self, config: OcrEngineConfig | None = None) -> None:
@@ -217,7 +216,7 @@ class OcrEngine:
     def ensure(self) -> Any:
         """惰性初始化引擎；失败抛出（调用方决定是否降级）。
 
-        首次初始化约 2s（加载 .pth 到 GPU），应该由 :meth:`warmup` 在起飞前完成。
+        模型加载与初始化应在任务开始处理图像前完成。
         """
         if self._engine is not None:
             return self._engine
@@ -663,8 +662,8 @@ class OpenCvPostProcess:
         平行边法只验证"存在一对平行边"，而掩码偏严时圈到的可能只是编号底板
         （近方形），approxPolyDP 照样能凑出 5 个顶点、也照样有一对平行边，
         于是算出一个任意角度的"转正"，OCR 还可能读出一个自信的错编号：
-        实测帧 1840 的 s_min=100 就是这样把 56 转成了 95（同一帧其余三级都读出
-        正确的 56）。顶角是房子特有的、且与旋转无关的量，正好拿来当门限。
+        某些掩码会把编号底板误拟合成五边形，使几何转正产生错误方向并得到高置信度
+        错号。顶角是目标形态特有且与旋转无关的量，可用于拒绝这类错误候选。
         """
         points = np.asarray(approx, dtype=np.float64).reshape(-1, 2)
         target = np.asarray(apex, dtype=np.float64).reshape(2)
@@ -694,9 +693,8 @@ class OpenCvPostProcess:
         """把与 ``s_min`` **无关**的计算做一次：模糊 + BGR→HSV，返回 ``(blurred, hsv)``。
 
         饱和度回退最多试 4 档，而 ``GaussianBlur`` 与 ``cvtColor(BGR2HSV)`` 的结果
-        **逐档完全相同**（只有 ``inRange`` 的阈值随 ``s_min`` 变）。原来逐档各算一遍：
-        实测 300px 裁剪图上 cvtColor 约 0.14ms、GaussianBlur 约 0.03ms，4 档就是
-        白扔约 0.7ms/图——而这段本来就不该随档位重做。
+        **逐档完全相同**（只有 ``inRange`` 的阈值随 ``s_min`` 变化）。因此按档位重复计算
+        没有必要，可缓存预处理结果供同一张裁剪图的各档复用。
 
         按**数组身份**缓存（``is`` 比较，不比内容）：``self.image`` 每张新图换一次
         引用，同一张图的 4 个档位命中同一份缓存。
@@ -837,8 +835,7 @@ class OpenCvPostProcess:
         补成 ``07``，但那种"猜出来"的结果不该压过真正的两位读数。
 
         形态成立的候选优先，其次才比置信度：几何不成立的"转正"再自信也不能
-        压过真正的房子——实测帧 1840 里错转正读出的 ``95`` 加权分（1.15）确实
-        高于正确转正读出的 ``56``，只看置信度就会选错。
+        压过真实目标。若仅比较 OCR 置信度，错误的几何转正仍可能胜出。
         """
         for _, _, raw, conf in candidates:
             if not raw or conf < self.ocr_conf_threshold:
@@ -959,9 +956,8 @@ class OpenCvPostProcess:
                 stage=stage,
                 house_ok=house_ok,
             )
-            # ⚠ 只有形态成立的结果才提前返回。形态不成立时继续往下试更宽松的
-            # 饱和度：真正的房子常常在那些级别才露出来（帧 1840 就是这样——严格
-            # 级别给出假的"95"并一度抢先返回，真房子在 s_min=60 给出正确的 56）。
+            # 只有形态成立的结果才提前返回。形态不成立时继续尝试更宽松的饱和度，
+            # 避免严格阈值下的错误候选遮蔽后续档位找到的真实目标。
             if best.number is not None and best.house_ok:
                 return best
         if not found_pentagon:

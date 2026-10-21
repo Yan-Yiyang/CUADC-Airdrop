@@ -9,8 +9,7 @@
   直接落盘，避免再走一遍编码损失画质 + 多花 CPU。
 * 遥测（``telemetry.jsonl``）：每条历史快照单独一行，回放时按原时间轴
   注入 broker，与视频帧在同一条时间线上对得上。
-* 检测（``detections.jsonl``）：每条 Detection 与当时的 TargetPoint；P3
-  只留接口，P5 PerceptionWorker 接入。
+* 检测（``detections.jsonl``）：按需记录 Detection 与当时的 TargetPoint。
 * 投放（``drops.jsonl``）：**每一次实际投放**记一条
   :class:`~airdrop.ballistics.drops.DropRecord`——投放瞬间的位置/速度/姿态/风、
   目标点、判据的前推位置与预测落点。这份数据事后**无法重建**（飞机当时怎么飞的、
@@ -191,9 +190,7 @@ class EventLog(_JsonlWriter):
 class DetectionWriter(_JsonlWriter):
     """检测结果写入器（``detections.jsonl``）。
 
-    P3 阶段只把接口落好；``record`` 是任意 Mapping（含 Detection dataclass
-    的 ``as_dict()`` 即可）。P5 PerceptionWorker 接入时建议传 dataclass
-    实例，本写入器会自动通过 ``as_dict()`` 落盘。
+    ``record`` 可为 Mapping 或提供 ``as_dict()`` 方法的数据对象；写入器会将其转换为映射。
 
     写入字段完全由调用方决定——本类不臆造额外字段。
     """

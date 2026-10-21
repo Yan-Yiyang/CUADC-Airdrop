@@ -135,8 +135,7 @@ class BallisticsModel:
             raise ValueError(f"积分步长必须为正: {config.rk_dt}")
         if config.gravity <= 0:
             # gravity<=0 时弹道永远不穿过地面 ⇒ 每次 predict_impact 都要跑满 120s
-            # 超时上限（实测 67.8ms/次，20Hz 判据就是每秒 1.36s CPU）且静默
-            # 永不投放。这是配置错误，要在装配期就喊出来。
+            # 超时上限且无法得到有效投放预测。这是配置错误，应在装配期拒绝。
             raise ValueError(f"重力加速度必须为正: {config.gravity}")
         if config.drag_coefficient < 0:
             raise ValueError(f"阻力系数不能为负: {config.drag_coefficient}")

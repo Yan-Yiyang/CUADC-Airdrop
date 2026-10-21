@@ -2,15 +2,13 @@
 
 用法（集中式入口在 airdrop/run.py）::
 
-    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/20260913-185512
+    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/example-flight
     ./.venv/Scripts/python.exe -m airdrop.run replay --speed 2.0
 
-    # SITL 架次（模拟标定文件在 .sitl-recon-tmp/）：
-    #   --calib     要用录这段素材时同一份标定，否则退回粗估模型、坐标不可信
-    #   --land-plan 要规划"飞掠+降落"才需要；不给就只打印飞掠段
-    #   --no-strict 帧被裁剪过的目录（索引里留着已删帧号）必须关严格模式
-    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/20260929-201431 \
-        --calib .sitl-recon-tmp/camera_calib_sim.json --land-plan routes/land.plan --no-strict
+    # 按素材目录重放；需要坐标解算时提供与该素材匹配的相机标定。
+    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/example-flight --calib camera_calib.json
+    # 被裁剪过且索引仍包含缺帧记录的素材，可按需关闭严格模式。
+    ./.venv/Scripts/python.exe -m airdrop.run replay --flight flights/example-flight --no-strict
 
 本文件是纯库模块：顶部常量是默认值，build_config(**覆盖) / main(**kwargs) 可按需传值；
 命令行由 airdrop/run.py 解析，重依赖都在函数体内导入（--help 不加载它们）。
@@ -48,7 +46,7 @@ from airdrop import Config
 # ----------------------------------------------------------------------
 # 配置（改这里）
 # ----------------------------------------------------------------------
-FLIGHT_DIR = Path("flights")  # 指向具体某次 flights/20260913-185512，或 flights/ 取最新
+FLIGHT_DIR = Path("flights")  # 指向某次飞行目录，或指向包含多次飞行的目录以选取最新记录
 SPEED = 0.0  # 0=全速 / 1.0=原速 / 2.0=两倍速
 BUFFER_SECONDS = 180.0
 BUFFER_FPS = 30.0
