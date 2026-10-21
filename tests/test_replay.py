@@ -719,9 +719,11 @@ def test_replay_strict_raises_on_missing_frame(workdir: Path) -> None:
         source.stop()
 
 
-def test_replay_keyboard_interrupt_during_source_stop_still_cleans_display(
+@pytest.mark.parametrize("failure_stage", [None, "load", "threads"])
+def test_replay_setup_and_keyboard_interrupt_still_clean_all_components(
     monkeypatch: pytest.MonkeyPatch,
     workdir: Path,
+    failure_stage: str | None,
 ) -> None:
     import airdrop
     import airdrop.runtime.components as runtime_components
@@ -760,8 +762,16 @@ def test_replay_keyboard_interrupt_during_source_stop_still_cleans_display(
     class Worker:
         stats = object()
 
+        class Detector:
+            def load(self) -> None:
+                calls.append("detector.load")
+                if failure_stage == "load":
+                    raise RuntimeError("detector load failed")
+
+        detector = Detector()
+
         def start(self) -> None:
-            return
+            calls.append("worker.start")
 
         def raise_if_failed(self) -> None:
             return
@@ -818,10 +828,28 @@ def test_replay_keyboard_interrupt_during_source_stop_still_cleans_display(
     )
     monkeypatch.setattr(runtime_qgc, "QgcVideoRuntime", Display)
 
+    def set_threads(threads: int) -> None:
+        calls.append(f"threads:{threads}")
+        if failure_stage == "threads":
+            raise RuntimeError("thread configuration failed")
+
+    monkeypatch.setattr(cv2, "setNumThreads", set_threads)
+
     with pytest.raises(KeyboardInterrupt, match="stop interrupted"):
         replay_runtime.main(flight_dir=workdir)
 
-    assert calls == ["source.stop", "worker.drain", "worker.stop", "targets.pump", "display.stop"]
+    expected_setup = ["detector.load"]
+    if failure_stage != "load":
+        expected_setup.append("threads:4")
+    if failure_stage is None:
+        expected_setup.append("worker.start")
+    assert calls == expected_setup + [
+        "source.stop",
+        "worker.drain",
+        "worker.stop",
+        "targets.pump",
+        "display.stop",
+    ]
 
 
 def test_replay_rejects_bad_params(workdir: Path) -> None:

@@ -126,6 +126,7 @@ class PerceptionConfig:
     device: str = "0"
     conf_threshold: float = 0.25
     imgsz: int = 1280  # 权重按 640 训练；实测 640/1280 检出数一致
+    opencv_threads: int = 4  # YOLO 导入后恢复 OpenCV 线程数
 
     # OCR 引擎（TORCH，本地权重；P5 复测：medium ~97ms/帧 @RTX3060Laptop）
     models_dir: str = "models/ppocr"
@@ -589,6 +590,11 @@ class Config:
         if self.perception.ocr_queue_size < 1:
             raise ValueError(
                 f"perception.ocr_queue_size 至少为 1: {self.perception.ocr_queue_size}"
+            )
+        if type(self.perception.opencv_threads) is not int or self.perception.opencv_threads < 1:
+            raise ValueError(
+                "perception.opencv_threads 必须是至少为 1 的整数: "
+                f"{self.perception.opencv_threads!r}"
             )
         if self.perception.imgsz < 32:
             raise ValueError(f"perception.imgsz 太小: {self.perception.imgsz}")

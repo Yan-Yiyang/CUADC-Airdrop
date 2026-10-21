@@ -561,6 +561,85 @@ def test_cls_providers_is_empty_before_loading() -> None:
     assert OcrEngine(OcrEngineConfig()).cls_providers() == ()
 
 
+def test_ocr_warmup_runs_det_rec_and_enabled_cls_even_without_text_boxes() -> None:
+    calls: list[tuple[str, tuple[int, ...]]] = []
+
+    class Engine:
+        def __call__(self, image):
+            raise AssertionError("预热不得依赖整图流水线是否检出文本框")
+
+        def text_det(self, image):
+            calls.append(("det", image.shape))
+            return []
+
+        def recognize_txt(self, images):
+            calls.append(("rec", images[0].shape))
+            return []
+
+        def text_cls(self, images):
+            calls.append(("cls", images[0].shape))
+            return []
+
+    config = OcrEngineConfig(cls_engine="onnx", cls_autorotate=False)
+    ocr = OcrEngine(config)
+    ocr._engine = Engine()
+
+    assert ocr.warmup()
+    assert calls == [
+        ("det", (320, 320, 3)),
+        ("rec", (48, 320, 3)),
+        ("cls", (48, 320, 3)),
+    ]
+    assert config.cls_engine == "onnx" and config.cls_autorotate is False
+
+
+@pytest.mark.parametrize("failed_stage", ["det", "rec", "cls"])
+def test_ocr_warmup_fails_when_any_model_branch_raises(failed_stage: str) -> None:
+    class Engine:
+        def text_det(self, image):
+            if failed_stage == "det":
+                raise RuntimeError("det failed")
+            return []
+
+        def recognize_txt(self, images):
+            if failed_stage == "rec":
+                raise RuntimeError("rec failed")
+            return []
+
+        def text_cls(self, images):
+            if failed_stage == "cls":
+                raise RuntimeError("cls failed")
+            return []
+
+    ocr = OcrEngine(OcrEngineConfig(cls_engine="onnx"))
+    ocr._engine = Engine()
+
+    assert not ocr.warmup()
+
+
+def test_ocr_warmup_skips_disabled_cls() -> None:
+    calls: list[str] = []
+
+    class Engine:
+        def text_det(self, image):
+            calls.append("det")
+            return []
+
+        def recognize_txt(self, images):
+            calls.append("rec")
+            return []
+
+        def text_cls(self, images):
+            calls.append("cls")
+            return []
+
+    ocr = OcrEngine(OcrEngineConfig(cls_engine="off"))
+    ocr._engine = Engine()
+
+    assert ocr.warmup()
+    assert calls == ["det", "rec"]
+
+
 def test_ocr_orientation_flipped_flag() -> None:
     assert OcrOrientation(label="0", score=0.98).flipped is False
     assert OcrOrientation(label="180", score=0.98).flipped is True

@@ -129,8 +129,8 @@ class Detector:
         """按目标分辨率跑一次空推理，把 CUDA 上下文/内核编译开销挪到起飞前。
 
         ``ultralytics`` 首次推理要 80ms+（含上载与 cuDNN 选核），后续 20~30ms；
-        起飞前预热能避免第一帧的卡顿。返回是否成功（失败只记日志不抛出——
-        预热失败不该拦住任务，真正的错误会在 :meth:`detect` 里暴露）。
+        起飞前预热能避免第一帧的卡顿。底层失败只记录日志并返回 ``False``，
+        任务会话必须据此中止启动，不能把权重加载成功当作预热成功。
         """
         try:
             self.load()
@@ -146,7 +146,7 @@ class Detector:
             )
             return True
         except Exception:
-            LOGGER.exception("YOLO 预热失败（不影响后续真实检测）")
+            LOGGER.exception("YOLO 预热失败")
             return False
 
     # ------------------------------------------------------------------

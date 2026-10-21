@@ -379,14 +379,18 @@ class OcrEngine:
         return OcrOrientation(label=str(label), score=float(score))
 
     def warmup(self, size: int = 320) -> bool:
-        """跑一次空图，把模型加载/CUDA 上下文开销挪到起飞前。"""
+        """分别执行检测、识别和已启用的分类推理，确认整条 OCR 模型链路就绪。"""
         try:
             engine = self.ensure()
             blank = np.full((size, size, 3), 255, np.uint8)
-            engine(blank)
+            text_line = np.full((48, 320, 3), 255, np.uint8)
+            engine.text_det(blank)
+            engine.recognize_txt([text_line])
+            if self._config.cls_enabled():
+                engine.text_cls([text_line])
             return True
         except Exception:
-            LOGGER.exception("OCR 预热失败（不影响后续识别，但首帧会变慢）")
+            LOGGER.exception("OCR 模型预热失败")
             return False
 
     def read_text(self, image: np.ndarray) -> list[OcrText]:

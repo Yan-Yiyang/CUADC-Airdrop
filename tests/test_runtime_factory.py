@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 
+import cv2
 import numpy as np
 import pytest
 
@@ -28,6 +29,128 @@ from airdrop.runtime.mission import build_live_components, main
 from airdrop.runtime.options import RunOptions
 from airdrop.telemetry.broker import TelemetryBroker
 from airdrop.video.source import VideoFrame
+
+
+def test_live_components_prepare_detector_with_video_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class TelemetryInput:
+        @classmethod
+        def from_config(cls, *args, **kwargs):
+            del args, kwargs
+            return SimpleNamespace()
+
+    class Source:
+        def __init__(self, config) -> None:
+            del config
+
+    class Detector:
+        def load(self):
+            calls.append(("load",))
+            return self
+
+        def warmup(self, width: int, height: int) -> bool:
+            calls.append(("warmup", width, height))
+            return True
+
+    monkeypatch.setattr(cv2, "setNumThreads", lambda count: calls.append(("threads", count)))
+
+    worker = SimpleNamespace(detector=Detector())
+    camera = SimpleNamespace(image_size=(1920, 1080))
+    monkeypatch.setattr(airdrop, "MavsdkThread", TelemetryInput)
+    monkeypatch.setattr(airdrop, "Hm30VideoSource", Source)
+    monkeypatch.setattr(
+        "airdrop.runtime.components.build_perception_components",
+        lambda *args, **kwargs: SimpleNamespace(
+            camera=camera, writer=None, worker=worker, targets=None
+        ),
+    )
+    config = replace(Config(), video=replace(Config().video, width=1920, height=1080))
+    components = build_live_components(
+        RunOptions(
+            mode="real",
+            run_mission=False,
+            capture=True,
+            recognize=True,
+            record=False,
+        ),
+        config,
+    )
+
+    assert components.prepare_perception is not None
+    components.prepare_perception()
+    components.prepare_perception()
+    assert calls == [("load",), ("threads", 4), ("warmup", 1920, 1080)]
+
+
+@pytest.mark.parametrize(
+    ("image_size", "warmup_result", "error"),
+    [
+        ((1280, 720), True, "标定尺寸"),
+        ((1920, 1080), False, "YOLO"),
+    ],
+)
+def test_live_components_reject_invalid_detector_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+    image_size: tuple[int, int],
+    warmup_result: bool,
+    error: str,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class TelemetryInput:
+        @classmethod
+        def from_config(cls, *args, **kwargs):
+            del args, kwargs
+            return SimpleNamespace()
+
+    class Source:
+        def __init__(self, config) -> None:
+            del config
+
+    class Detector:
+        def load(self):
+            calls.append(("load",))
+            return self
+
+        def warmup(self, width: int, height: int) -> bool:
+            calls.append(("warmup", width, height))
+            return warmup_result
+
+    monkeypatch.setattr(cv2, "setNumThreads", lambda count: calls.append(("threads", count)))
+
+    monkeypatch.setattr(airdrop, "MavsdkThread", TelemetryInput)
+    monkeypatch.setattr(airdrop, "Hm30VideoSource", Source)
+    monkeypatch.setattr(
+        "airdrop.runtime.components.build_perception_components",
+        lambda *args, **kwargs: SimpleNamespace(
+            camera=SimpleNamespace(image_size=image_size),
+            writer=None,
+            worker=SimpleNamespace(detector=Detector()),
+            targets=None,
+        ),
+    )
+    base = Config()
+    config = replace(base, video=replace(base.video, width=1920, height=1080))
+    components = build_live_components(
+        RunOptions(
+            mode="real",
+            run_mission=False,
+            capture=True,
+            recognize=True,
+            record=False,
+        ),
+        config,
+    )
+
+    assert components.prepare_perception is not None
+    with pytest.raises(RuntimeError, match=error):
+        components.prepare_perception()
+    assert calls == (
+        [] if image_size != (1920, 1080) else [("load",), ("threads", 4), ("warmup", 1920, 1080)]
+    )
 
 
 class _FlightInput:
@@ -157,6 +280,7 @@ def test_mission_capture_writer_waits_for_airborne_and_seals_on_abort(
         drop_stage=False,
     )
     components = build_live_components(options, Config())
+    assert components.prepare_perception is None
     assert components.writer is not None
     assert components.runner is not None
     assert isinstance(components.runner, MissionRunner)

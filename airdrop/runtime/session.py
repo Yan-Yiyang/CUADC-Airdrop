@@ -139,6 +139,7 @@ class LiveComponents:
     buffer: AlignmentBuffer | None = None
     on_start: Callable[[], int | None] | None = None
     on_finish: Callable[[], None] | None = None
+    prepare_perception: Callable[[], None] | None = None
 
 
 class LiveSession:
@@ -147,6 +148,7 @@ class LiveSession:
     def __init__(self, options: RunOptions, components: LiveComponents) -> None:
         self.options = options.validated()
         self.components = components
+        self._worker_start_attempted = False
         if not self.options.run_mission and components.runner is not None:
             raise ValueError("被动采集模式不得创建任务状态机")
 
@@ -167,15 +169,18 @@ class LiveSession:
             status = self._cleanup(status)
         return status
 
-    def _start_components(self) -> None:
+    def _start_components(self) -> None:  # noqa: PLR0912 - 资源启动顺序需显式保持
         """按数据依赖顺序启动遥测、记录、感知和视频。"""
         c = self.components
         c.thread.connect()
+        if c.prepare_perception is not None:
+            c.prepare_perception()
         if c.recorder is not None:
             if c.broker is None or c.buffer is None:
                 raise RuntimeError("启用记录时必须提供遥测代理和帧缓冲")
             c.recorder.start(broker=c.broker, buffer=c.buffer)
         if c.worker is not None:
+            self._worker_start_attempted = True
             c.worker.start()
         if c.source is not None:
             if c.writer is not None:
@@ -256,7 +261,9 @@ class LiveSession:
             attempt("runner.close", runner.close)
         worker = c.worker
         if worker is not None:
-            if source_stopped:
+            if not self._worker_start_attempted:
+                LOGGER.debug("感知工作器尚未启动，跳过排空")
+            elif source_stopped:
                 attempt("worker.drain", lambda: _require_drain(worker))
             else:
                 errors.append(RuntimeError("视频源未确认停止，跳过感知排空确认"))

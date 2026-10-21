@@ -178,6 +178,97 @@ def test_stuck_video_source_fails_and_still_releases_everything() -> None:
     assert "worker.stop" in calls
 
 
+def test_prepare_perception_runs_before_worker_and_video() -> None:
+    calls: list[str] = []
+    components = LiveComponents(
+        thread=_Thread(calls),
+        source=_Source(calls),
+        worker=_Worker(calls),
+        prepare_perception=lambda: calls.append("perception.prepare"),
+    )
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
+
+    assert LiveSession(options, components).run() == 0
+    assert calls.index("thread.connect") < calls.index("perception.prepare")
+    assert calls.index("perception.prepare") < calls.index("worker.start")
+    assert calls.index("worker.start") < calls.index("source.start")
+
+
+def test_prepare_perception_failure_rolls_back_without_worker_drain() -> None:
+    calls: list[str] = []
+
+    def fail_prepare() -> None:
+        calls.append("perception.prepare")
+        raise RuntimeError("预热失败")
+
+    components = LiveComponents(
+        thread=_Thread(calls),
+        source=_Source(calls),
+        worker=_Worker(calls),
+        prepare_perception=fail_prepare,
+    )
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
+
+    assert LiveSession(options, components).run() == 1
+    assert "worker.start" not in calls
+    assert "worker.drain" not in calls
+    assert "source.start" not in calls
+    assert "worker.stop" in calls
+    assert calls[-1] == "thread.stop"
+
+
+def test_worker_exit_after_start_still_requires_successful_drain() -> None:
+    calls: list[str] = []
+
+    class ExitedWorker(_Worker):
+        def start(self) -> None:
+            super().start()
+            self.running = False
+
+        def drain(self, timeout: float = 120.0) -> bool:
+            del timeout
+            calls.append("worker.drain")
+            return False
+
+    components = LiveComponents(
+        thread=_Thread(calls), source=_Source(calls), worker=ExitedWorker(calls)
+    )
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
+
+    assert LiveSession(options, components).run() == 1
+    assert "worker.drain" in calls
+    assert "worker.stop" in calls
+    assert calls[-1] == "thread.stop"
+
+
+def test_prepare_perception_interrupt_rolls_back_before_worker_and_video() -> None:
+    calls: list[str] = []
+
+    def interrupt_prepare() -> None:
+        calls.append("perception.prepare")
+        raise KeyboardInterrupt
+
+    components = LiveComponents(
+        thread=_Thread(calls),
+        source=_Source(calls),
+        worker=_Worker(calls),
+        prepare_perception=interrupt_prepare,
+    )
+
+    assert (
+        LiveSession(
+            RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001),
+            components,
+        ).run()
+        == 130
+    )
+    assert "worker.start" not in calls
+    assert "worker.drain" not in calls
+    assert "source.start" not in calls
+    assert "worker.stop" in calls
+    assert calls[-1] == "thread.stop"
+
+
 def test_non_done_runner_state_is_failure_and_closes_runner() -> None:
     calls: list[str] = []
     components = LiveComponents(

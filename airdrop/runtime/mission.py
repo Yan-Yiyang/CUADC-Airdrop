@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -75,7 +76,7 @@ def build_config(
     ).validated()
 
 
-def build_live_components(options: RunOptions, config: Config) -> LiveComponents:
+def build_live_components(options: RunOptions, config: Config) -> LiveComponents:  # noqa: PLR0915 - 阶段资源按依赖顺序装配
     """按阶段开关创建真实任务组件；测试可传入替代组件工厂。"""
     from airdrop import (
         AlignmentBuffer,
@@ -92,7 +93,7 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         capacity_for,
     )
 
-    from .components import build_perception_components
+    from .components import build_perception_components, configure_opencv_threads
     from .session import LiveComponents
 
     broker = TelemetryBroker(
@@ -151,6 +152,34 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         perception.worker,
         perception.targets,
     )
+    prepare_perception: Callable[[], None] | None = None
+    if worker is not None:
+        selected_worker = worker
+        output_size = (int(config.video.width), int(config.video.height))
+        warmup_lock = threading.Lock()
+        warmed = False
+
+        def prepare_selected_perception() -> None:
+            nonlocal warmed
+            with warmup_lock:
+                if warmed:
+                    return
+                if camera is not None and camera.image_size is not None:
+                    calib_size = tuple(int(value) for value in camera.image_size)
+                    if calib_size != output_size:
+                        raise RuntimeError(
+                            f"相机标定尺寸 {calib_size} 与视频输出尺寸 {output_size} 不一致"
+                        )
+                configure_opencv_threads(
+                    selected_worker,
+                    config.perception.opencv_threads,
+                )
+                if not selected_worker.detector.warmup(*output_size):
+                    raise RuntimeError(f"YOLO 按视频输出尺寸 {output_size} 预热失败")
+                warmed = True
+
+        prepare_perception = prepare_selected_perception
+
     if config.qgc_video.enabled:
         if source is None:
             raise ValueError("QGC 视频发布需要开启视频采集")
@@ -222,6 +251,7 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         controller=None if runner is None else controller,
         broker=broker,
         buffer=buffer,
+        prepare_perception=prepare_perception,
     )
 
 

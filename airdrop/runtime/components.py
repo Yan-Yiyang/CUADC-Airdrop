@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
     from airdrop.telemetry.broker import TelemetryBroker
     from airdrop.video.buffer import AlignmentBuffer, AlignmentWriter
 
+LOGGER = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class PerceptionComponents:
@@ -26,6 +29,19 @@ class PerceptionComponents:
     worker: PerceptionWorker | None = None
     tracker: TargetTracker | None = None
     targets: PerceptionTargetSource | None = None
+
+
+def configure_opencv_threads(worker: PerceptionWorker, threads: int) -> None:
+    """加载 YOLO 后设置主进程 OpenCV 线程数。"""
+    worker.detector.load()
+    import cv2
+
+    cv2.setNumThreads(threads)
+    LOGGER.info(
+        "OpenCV 主进程线程数：请求 %d，实际 %d",
+        threads,
+        cv2.getNumThreads(),
+    )
 
 
 def build_perception_components(

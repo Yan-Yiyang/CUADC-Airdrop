@@ -28,6 +28,7 @@ def test_default_config_is_valid() -> None:
     """默认配置必须直接可用（默认值即"能跑"的那一组）。"""
     cfg = Config().validated()
     assert cfg.perception.mode == "ocr"
+    assert cfg.perception.opencv_threads == 4
     assert cfg.targeting.selection_rule == "median"
     assert cfg.align.max_wait == 1.0
     assert cfg.align.on_timeout == "drop"
@@ -68,6 +69,10 @@ def test_replace_derives_new_config() -> None:
         ({"targeting": TargetingConfig(selection_rule="mode")}, "selection_rule"),
         ({"targeting": TargetingConfig(eps_m=0.0)}, "eps_m"),
         ({"perception": PerceptionConfig(ocr_workers=0)}, "ocr_workers"),
+        ({"perception": PerceptionConfig(opencv_threads=0)}, "opencv_threads"),
+        ({"perception": PerceptionConfig(opencv_threads=-1)}, "opencv_threads"),
+        ({"perception": PerceptionConfig(opencv_threads=2.0)}, "opencv_threads"),
+        ({"perception": PerceptionConfig(opencv_threads=True)}, "opencv_threads"),
         ({"perception": PerceptionConfig(imgsz=16)}, "imgsz"),
         ({"align": AlignConfig(on_timeout="skip")}, "on_timeout"),
         ({"ballistics": BallisticsConfig(wind_source="manual")}, "wind_source"),

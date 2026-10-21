@@ -177,7 +177,7 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
 
     # 3) 与实飞一致：对齐 → 环形缓冲 → 感知 → 坐标解算 → 目标统计
     buffer = AlignmentBuffer(capacity_for(buffer_fps, buffer_seconds), storage="jpeg")
-    from .components import build_perception_components
+    from .components import build_perception_components, configure_opencv_threads
 
     perception = build_perception_components(
         config,
@@ -220,6 +220,7 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
     ready = False
     source_failed = False
     try:
+        configure_opencv_threads(worker, config.perception.opencv_threads)
         worker.start()
         if display is not None:
             try:

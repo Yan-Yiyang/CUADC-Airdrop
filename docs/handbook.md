@@ -1799,6 +1799,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `device` | str | `'0'` | YOLO 设备，显式指定 |
 | `conf_threshold` | float | `0.25` | 检测置信度门限 |
 | `imgsz` | int | `1280` | 推理尺寸（校验要求 ≥ 32） |
+| `opencv_threads` | int | `4` | YOLO 导入后主进程 OpenCV 线程数（≥ 1）；不传入 OCR 子进程 |
 | `models_dir` | str | `'models/ppocr'` | OCR 权重目录 |
 | `det_model` | str | `'PP-OCRv6_det_medium.pth'` | 文本检测权重 |
 | `rec_model` | str | `'PP-OCRv6_rec_medium.pth'` | 文本识别权重 |
