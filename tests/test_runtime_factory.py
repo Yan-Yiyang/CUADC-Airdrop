@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -29,6 +30,35 @@ from airdrop.runtime.mission import build_live_components, main
 from airdrop.runtime.options import RunOptions
 from airdrop.telemetry.broker import TelemetryBroker
 from airdrop.video.source import VideoFrame
+
+
+def _write_qgc_plan(path: Path, *, lat: float = 47.0, lon: float = 8.001) -> Path:
+    """写入包含单个位置项的有效 QGC 航线。"""
+    path.write_text(
+        json.dumps(
+            {
+                "fileType": "Plan",
+                "mission": {
+                    "firmwareType": 12,
+                    "vehicleType": 1,
+                    "plannedHomePosition": [47.0, 8.0, 500.0],
+                    "items": [
+                        {
+                            "type": "SimpleItem",
+                            "command": 16,
+                            "frame": 3,
+                            "doJumpId": 1,
+                            "autoContinue": True,
+                            "Altitude": 50.0,
+                            "params": [0.0, 0.0, 0.0, None, lat, lon, 50.0],
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_live_components_prepare_detector_with_video_dimensions(
@@ -474,15 +504,21 @@ def test_entry_runs_selected_stages_with_actual_runner_and_preflight(
 
 @pytest.mark.parametrize("mode", ["real", "sitl"])
 def test_cli_preserves_environment_defaults_at_actual_factory_boundary(
-    tmp_path: Path, mode: str
+    tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """真实解析与适配器一起运行，在连接前检查最终地址和航线，避免默认值串用。"""
     if mode == "sitl":
         pytest.importorskip("airdrop_sim", reason="SITL 集成需要仿真子模块")
     arguments = ["--mode", mode, "--no-recognize", "--no-record"]
     if mode == "real":
-        arguments += ["--land-plan", "routes/land.plan", "--backup-point", "47,8,0"]
+        land_plan = tmp_path / "land.plan"
+        _write_qgc_plan(land_plan)
+        arguments += ["--land-plan", str(land_plan), "--backup-point", "47,8,0"]
     else:
+        from airdrop.runtime import sitl
+
+        land_plan = _write_qgc_plan(tmp_path / "sitl-land.plan")
+        monkeypatch.setattr(sitl, "LAND_PLAN", str(land_plan))
         arguments += ["--work-dir", str(tmp_path)]
     keywords = resolve_kwargs("mission", arguments)
     configs: list[Config] = []
@@ -501,11 +537,12 @@ def test_cli_preserves_environment_defaults_at_actual_factory_boundary(
     if mode == "real":
         assert config.telemetry.system_address == Config().telemetry.system_address
         assert config.video.url == airdrop.HM30_DEFAULT_RTSP
-        assert config.routes.land_plan == "routes/land.plan"
+        assert config.routes.land_plan == str(land_plan)
     else:
         from airdrop.runtime import sitl_geometry
 
         assert config.telemetry.system_address == sitl_geometry.SYSTEM_ADDRESS
         assert config.video.url == str(tmp_path / sitl_geometry.STREAM_SDP_NAME)
-        assert config.routes.land_plan == sitl_geometry.LAND_PLAN
+        assert config.routes.land_plan == str(land_plan)
         assert Path(config.routes.land_plan).is_file()
+        assert config.mission.auto_land

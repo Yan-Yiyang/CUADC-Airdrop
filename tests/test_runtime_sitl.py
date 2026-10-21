@@ -36,6 +36,43 @@ class _Thread:
         self.stopped = True
 
 
+def _write_recon_plan(path: Path) -> Path:
+    """写入一条有效的 QGC 固定翼侦查航线。"""
+    path.write_text(
+        json.dumps(
+            {
+                "fileType": "Plan",
+                "mission": {
+                    "firmwareType": 12,
+                    "vehicleType": 1,
+                    "plannedHomePosition": [47.0, 8.0, 500.0],
+                    "items": [
+                        {
+                            "type": "SimpleItem",
+                            "command": 178,
+                            "frame": 2,
+                            "doJumpId": 1,
+                            "autoContinue": True,
+                            "params": [1.0, 15.0, 0.0, None, 0.0, 0.0, 0.0],
+                        },
+                        {
+                            "type": "SimpleItem",
+                            "command": 16,
+                            "frame": 3,
+                            "doJumpId": 2,
+                            "autoContinue": True,
+                            "Altitude": 50.0,
+                            "params": [0.0, 0.0, 0.0, None, 47.001, 8.002, 50.0],
+                        },
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 class _Source:
     running = False
     stats = SimpleNamespace(frames=1, dropped=0, reconnects=0, last_error=None)
@@ -282,8 +319,8 @@ else:
     assert result.returncode == 0, result.stderr
 
 
-def test_takeoff_bootstrap_uses_first_positional_item_from_recon_plan() -> None:
-    plan = Path(__file__).resolve().parents[1] / "routes" / "land.plan"
+def test_takeoff_bootstrap_uses_first_positional_item_from_recon_plan(tmp_path: Path) -> None:
+    plan = _write_recon_plan(tmp_path / "recon.plan")
     base = sitl_geometry.build_config(land_plan="")
     config = replace(
         base,
@@ -300,7 +337,7 @@ def test_takeoff_bootstrap_uses_first_positional_item_from_recon_plan() -> None:
 def test_sitl_main_accepts_custom_recon_plan_without_inline_route(
     tmp_path: Path, monkeypatch
 ) -> None:
-    plan = Path(__file__).resolve().parents[1] / "routes" / "land.plan"
+    plan = _write_recon_plan(tmp_path / "recon.plan")
     monkeypatch.setattr(
         sitl_operations,
         "zero_test_params",
