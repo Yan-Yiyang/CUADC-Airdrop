@@ -36,7 +36,7 @@ uv run python -m airdrop.run mission --help
 - QGC 视频设置见 [视频说明](docs/qgc_video.md)，性能比较方法见 [性能诊断](docs/performance.md)。
 - AI 执行约束和按需阅读索引见 [AGENTS.md](AGENTS.md)。
 
-开发与发布共用本仓库，流程见[开发与发布](docs/development.md)，待完成的工程验证见[验证计划](docs/validation.md)。
+开发流程见[开发与发布](docs/development.md)，待完成的工程验证见[验证计划](docs/validation.md)。
 
 ## 验证与边界
 
