@@ -5,15 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import airdrop
-from airdrop import Config, FlightRecorder, TelemetryBroker
+from airdrop import Config, FlightRecorder, TelemetryBroker, TelemetrySnapshot
 from airdrop.run import resolve_kwargs
 from airdrop.runtime.mission import main as run_mission
 from airdrop.video.source import VideoConfig, VideoFrame, VideoStats
@@ -49,14 +49,32 @@ def test_capture_entry_records_and_closes_resources(
 
         def connect(self) -> None:
             calls.append("connect")
-            brokers[0].update_global_position(
-                SimpleNamespace(
-                    latitude_deg=0.0,
-                    longitude_deg=0.0,
-                    absolute_altitude_m=10.0,
-                    relative_altitude_m=10.0,
+            base = time.time()
+            for index in range(2):
+                stamp = base + index * 0.1
+                brokers[0]._update_from_snapshot(
+                    TelemetrySnapshot(
+                        timestamp=stamp,
+                        latitude_deg=0.0,
+                        longitude_deg=0.0,
+                        absolute_altitude_m=10.0,
+                        relative_altitude_m=10.0,
+                        north_m=0.0,
+                        east_m=0.0,
+                        down_m=-10.0,
+                        vx_m_s=0.0,
+                        vy_m_s=0.0,
+                        vz_m_s=0.0,
+                        quaternion_w=1.0,
+                        quaternion_x=0.0,
+                        quaternion_y=0.0,
+                        quaternion_z=0.0,
+                        quaternion_timestamp_us=1_000_000 + index * 100_000,
+                        quaternion_received_at=stamp,
+                        position_timestamp_us=1_000_000 + index * 100_000,
+                        position_velocity_received_at=stamp,
+                    )
                 )
-            )
 
         def stop(self, timeout: float = 5.0) -> None:
             del timeout

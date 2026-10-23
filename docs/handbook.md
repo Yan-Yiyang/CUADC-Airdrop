@@ -1755,7 +1755,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `position_rate_hz` | float | `10.0` | 位置流请求频率 |
 | `position_velocity_ned_rate_hz` | float | `10.0` | 位置+速度流请求频率 |
 | `attitude_rate_hz` | float | `30.0` | 姿态流请求频率 |
-| `source_time_alignment` | bool | `False` | 按位置与四元数各自的飞控源时标内插；用四元数接收时轴建立局部钟域映射。需 MAVSDK MavlinkDirect，不依赖相机曝光时间；改变此项后重新标定 `telemetry_lag` |
+| `source_time_alignment` | bool | `True` | 按位置与四元数各自的飞控源时标内插；用四元数接收时轴建立局部钟域映射。需 MAVSDK MavlinkDirect，不依赖相机曝光时间；改变此项后重新标定 `telemetry_lag` |
 | `history_interval` | float | `0.1` | 历史入库节流（10 Hz；最新快照不节流） |
 | `history_maxlen` | int | `1200` | 历史容量（≈2 分钟） |
 
@@ -2234,7 +2234,7 @@ config = Config(
 
 真实素材视频由环境变量 `AIRDROP_REALDATA_VIDEO` 指定；已记录架次的反向诊断由 `AIRDROP_REALDATA_FLIGHT` 指定包含 `telemetry.jsonl` 和 `detections.jsonl` 的目录。输入不随仓库提供，缺少输入时对应测试会跳过；完整验收必须实际提供输入并核对执行结果。
 
-SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并按接收链路标定的 manifest；设置 `AIRDROP_SITL_SOURCE_TIME_ALIGNMENT=1` 时，该用例启用 `TelemetryConfig.source_time_alignment`，未设置或其它值均关闭。manifest 的 `camera.telemetry_lag_s` 与 `vehicle.camera.telemetry_lag_s` 必须一致；CPU/GPU 编码或接收路径改变后重新标定，不能套用另一链路的默认延时。运行前固定标定输入，再用独立航次核对在线目标和留一误差；不能把本航次离线调参的结果代替在线验收。项目和测试仍在 Windows，WSL 只运行仿真及其环境配置。
+SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并按接收链路标定的 manifest；`AIRDROP_SITL_SOURCE_TIME_ALIGNMENT` 默认为 `1`；显式设为 `0` 仅复现旧接收时刻对齐缺陷。manifest 的 `camera.telemetry_lag_s` 与 `vehicle.camera.telemetry_lag_s` 必须一致；CPU/GPU 编码或接收路径改变后重新标定，不能套用另一链路的默认延时。运行前固定标定输入，再用独立航次核对在线目标和留一误差；不能把本航次离线调参的结果代替在线验收。项目和测试仍在 Windows，WSL 只运行仿真及其环境配置。
 
 ```bash
 ./.venv/Scripts/python.exe -m pytest --test-tier fast

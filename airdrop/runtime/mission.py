@@ -375,6 +375,40 @@ def _apply_qgc_video_overrides(
     return replace(config, qgc_video=replace(config.qgc_video, **updates)).validated()
 
 
+def _apply_calibrated_lag(options: RunOptions, config: Config) -> Config:
+    """实飞识别使用文件中的同参照标定量；SITL 和录制回放各自保留显式时间轴。"""
+    import json
+    import math
+    from dataclasses import replace
+
+    if options.mode != "real" or not options.capture or not options.recognize:
+        return config
+    path = Path(config.camera.calib_file)
+    if not path.is_file():
+        return config
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    lag = payload.get("telemetry_lag")
+    if lag is None:
+        return config
+    timing = payload.get("meta", {}).get("time_offset", {})
+    if (
+        timing.get("telemetry_reference") != "quaternion_received_at"
+        or timing.get("pose_alignment") != "source_timestamp_us"
+    ):
+        raise ValueError("相机标定延迟缺少一致的源时标参照，请重新标定")
+    if not config.telemetry.source_time_alignment:
+        raise ValueError("源时标标定不能用于存在接收时刻混合缺陷的遥测路径")
+    if (
+        isinstance(lag, bool)
+        or not isinstance(lag, (int, float))
+        or not math.isfinite(lag)
+        or lag < 0
+    ):
+        raise ValueError("标定 telemetry_lag 必须是有限、非负秒数")
+    LOGGER.info("应用源时标标定延迟 %.6f s：%s", lag, path)
+    return replace(config, video=replace(config.video, telemetry_lag=float(lag)))
+
+
 def prepare_config(
     options: RunOptions,
     config: Config,
@@ -387,6 +421,7 @@ def prepare_config(
     if not isinstance(options, RunOptions):
         raise TypeError("options 必须是 RunOptions")
     options.validated()
+    config = _apply_calibrated_lag(options, config)
     if options.qgc_video is True and not options.capture:
         raise ValueError("开启 QGC 视频发布必须同时开启视频采集")
     if options.qgc_video is not None:

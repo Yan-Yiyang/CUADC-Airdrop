@@ -85,7 +85,7 @@ def test_sitl_recon_accuracy(tmp_path: Path) -> None:
         work_dir=str(tmp_path),
         qgc_video=True,
         manifest_path=os.environ.get("AIRDROP_SITL_MANIFEST") or None,
-        source_time_alignment=os.environ.get("AIRDROP_SITL_SOURCE_TIME_ALIGNMENT") == "1",
+        source_time_alignment=os.environ.get("AIRDROP_SITL_SOURCE_TIME_ALIGNMENT", "1") == "1",
     )
     # 先断言退出码：否则退出码非 0 时下面读 report 会先抛 FileNotFoundError /
     # JSONDecodeError，把真正的失败原因盖掉

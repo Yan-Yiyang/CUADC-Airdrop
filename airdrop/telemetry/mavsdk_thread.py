@@ -119,7 +119,11 @@ class MavsdkThread:
         thread_name: str = "mavsdk-thread",
     ) -> None:
         if broker is None:
-            broker = TelemetryBroker(source_time_alignment=bool(source_time_alignment))
+            broker = TelemetryBroker(
+                source_time_alignment=True
+                if source_time_alignment is None
+                else source_time_alignment
+            )
         elif (
             source_time_alignment is not None
             and source_time_alignment != broker.source_time_alignment

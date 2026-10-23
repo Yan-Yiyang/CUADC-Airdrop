@@ -37,3 +37,11 @@ UDP 没有流结束标志。接收器被有界停止时，容器可能未写出�
 墙钟/VFR 语义见 [FFmpeg 格式选项](https://ffmpeg.org/ffmpeg-formats.html#Format-Options)及[同步选项](https://ffmpeg.org/ffmpeg.html#Advanced-options)。长时间运行中的系统时钟跳变、外部网络抖动和不同编码器仍需分别验收。
 
 排查QGC窗口异常时，应将同次编码流的本地文件与窗口录屏按画面编号匹配，再结合接收日志判断问题位于合成、RTP接收、解码、显示还是屏幕录制。发布邮箱丢弃为零不证明UDP接收零丢包；容器FPS也不证明实际发布速度。历史素材回放不验证真实设备和现场网络端到端延迟。
+
+## 姿态订阅评估
+
+当前仍同时请求和订阅 Euler 与 Quaternion，本轮只完成评估。当前 PX4 的 `ATTITUDE` 和 `ATTITUDE_QUATERNION` 都来自同一 `vehicle_attitude`，Euler 由原四元数换算，并非独立姿态估计。对本项目固定翼的姿态、投影、标定和显示用途，可以收敛为只获取四元数。
+
+实施时保留 `roll_deg/pitch_deg/yaw_deg` 业务字段，在最新快照和源时标插值后都从归一化四元数派生，统一时间参照。当前源时标插值已会派生 Euler，但最新快照仍依赖独立 Euler 流，因此只删订阅会让部分业务字段停更；须一并调整字段来源与姿态时标命名。验收覆盖 q/−q、非单位四元数、航向跨界及接近俯仰奇异点时的旋转等价性。
+
+移除本程序的 Euler 请求/订阅可以减少重复处理；只有飞控实际减少 `ATTITUDE` 发布时才有链路带宽收益。共享链路上的 QGC 可能仍需该消息，须按实际发送频率验证，不能直接把客户端少一个订阅当作串口节省。四元数和消息坐标约定见 [MAVLink 姿态定义](https://mavlink.io/en/messages/common.html#ATTITUDE_QUATERNION)。

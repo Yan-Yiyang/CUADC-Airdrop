@@ -15,6 +15,80 @@ pytestmark = pytest.mark.integration
 pytest.importorskip("airdrop_calibration", reason="跨仓契约需要标定子模块")
 
 
+@pytest.mark.parametrize("position_delay", [0.0, 0.18])
+def test_calibration_pose_uses_the_same_source_time_as_runtime(position_delay: float) -> None:
+    """异步位置和变速源钟下，标定配对须与在线查询保持同一位姿。"""
+    from airdrop_calibration.models import Telemetry
+    from airdrop_calibration.source_timeline import SourceTimeline
+
+    from airdrop import Config, TelemetryBroker
+    from airdrop.georef import quaternion_to_matrix
+    from airdrop.telemetry.models import TelemetrySnapshot
+
+    assert Config().telemetry.source_time_alignment
+    events = []
+    for index in range(9):
+        source = 10 + index * 0.1
+        received = 100 + min(index, 4) * 0.1 + max(index - 4, 0) * 0.2
+        angle = source * 0.3
+        events.extend(
+            [
+                (
+                    received,
+                    {
+                        "quaternion_timestamp_us": round(source * 1e6),
+                        "quaternion_received_at": received,
+                        "quaternion_w": math.cos(angle / 2),
+                        "quaternion_x": 0.0,
+                        "quaternion_y": 0.0,
+                        "quaternion_z": math.sin(angle / 2),
+                    },
+                ),
+                (
+                    received + position_delay,
+                    {
+                        "position_timestamp_us": round(source * 1e6),
+                        "position_velocity_received_at": received + position_delay,
+                        "north_m": source**2,
+                        "east_m": source * 2,
+                        "down_m": -20.0,
+                        "vx_m_s": source * 2,
+                        "vy_m_s": 2.0,
+                        "vz_m_s": 0.0,
+                    },
+                ),
+            ]
+        )
+    broker = TelemetryBroker(history_interval=0, source_time_alignment=True)
+    state = {}
+    rows = []
+    fields = Telemetry.__dataclass_fields__
+    for received, update in sorted(events, key=lambda item: item[0]):
+        state.update(update)
+        snapshot = TelemetrySnapshot(timestamp=received, **state)
+        broker._update_from_snapshot(snapshot)
+        rows.append(
+            Telemetry(**{key: value for key, value in snapshot.as_dict().items() if key in fields})
+        )
+    timeline = SourceTimeline(rows)
+    for stamp in (100.05, 100.25, 100.45, 100.7, 101.05):
+        online = broker.get_snapshot_at(stamp)
+        offline = timeline.pose_at(stamp)
+        assert online is not None and offline is not None
+        assert offline[:3, 3] == pytest.approx((online.north_m, online.east_m, online.down_m))
+        quaternion = (
+            online.quaternion_w,
+            online.quaternion_x,
+            online.quaternion_y,
+            online.quaternion_z,
+        )
+        assert all(value is not None for value in quaternion)
+        rotation = quaternion_to_matrix(
+            *(float(value) for value in quaternion if value is not None)
+        )
+        assert offline[:3, :3] == pytest.approx(rotation, abs=1e-10)
+
+
 def test_handwritten_flightrecorder_files_and_camera_model_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

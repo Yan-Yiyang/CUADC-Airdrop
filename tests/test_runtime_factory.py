@@ -32,6 +32,44 @@ from airdrop.telemetry.broker import TelemetryBroker
 from airdrop.video.source import VideoFrame
 
 
+@pytest.mark.parametrize("lag", [0.0, 0.28])
+def test_real_runtime_applies_calibrated_lag_to_video_config(tmp_path: Path, lag: float) -> None:
+    """标定输出须真正覆盖视频源和记录器使用的配置，不能只留在相机模型。"""
+    from airdrop.runtime.mission import prepare_config
+
+    path = tmp_path / "camera.json"
+    path.write_text(
+        json.dumps(
+            {
+                "telemetry_lag": lag,
+                "meta": {
+                    "time_offset": {
+                        "telemetry_reference": "quaternion_received_at",
+                        "pose_alignment": "source_timestamp_us",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    base = Config()
+    config = replace(base, camera=replace(base.camera, calib_file=str(path)))
+    prepared = prepare_config(RunOptions(mode="real", run_mission=False), config)
+    assert prepared.video.telemetry_lag == lag
+    assert prepared.telemetry.source_time_alignment
+
+
+def test_real_runtime_rejects_unknown_calibration_time_reference(tmp_path: Path) -> None:
+    from airdrop.runtime.mission import prepare_config
+
+    path = tmp_path / "camera.json"
+    path.write_text(json.dumps({"telemetry_lag": 0.28}), encoding="utf-8")
+    base = Config()
+    config = replace(base, camera=replace(base.camera, calib_file=str(path)))
+    with pytest.raises(ValueError, match="重新标定"):
+        prepare_config(RunOptions(mode="real", run_mission=False), config)
+
+
 def _write_qgc_plan(path: Path, *, lat: float = 47.0, lon: float = 8.001) -> Path:
     """写入包含单个位置项的有效 QGC 航线。"""
     path.write_text(

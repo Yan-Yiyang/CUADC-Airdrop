@@ -81,8 +81,8 @@ class TelemetryConfig:
     position_rate_hz: float = 10.0
     position_velocity_ned_rate_hz: float = 10.0
     attitude_rate_hz: float = 30.0
-    # 只改遥测字段之间的对齐；相机始终使用接收时间减标定延时，可关闭。
-    source_time_alignment: bool = False
+    # 正式路径按字段源时标对齐；False 仅用于复现旧接收时刻混合的缺陷。
+    source_time_alignment: bool = True
 
     # 历史缓冲：按固定间隔入库（0 = 每次更新都入库）
     history_interval: float = 0.1

@@ -695,7 +695,9 @@ def test_apply_telemetry_rates_calls_set_rate_with_configured_hz() -> None:
         position_velocity_ned_rate_hz=12.0,
         attitude_rate_hz=33.0,
     )
-    mav = mt.MavsdkThread.from_config(config, broker=TelemetryBroker())
+    mav = mt.MavsdkThread.from_config(
+        config, broker=TelemetryBroker(source_time_alignment=config.source_time_alignment)
+    )
     asyncio.run(mav._apply_telemetry_rates(FakeDrone()))  # pyright: ignore[reportArgumentType] - 替身只实现被调到的那几个 setter
 
     assert calls["position"] == 10.0
@@ -762,6 +764,8 @@ def test_apply_telemetry_rates_swallows_individual_failures() -> None:
         position_velocity_ned_rate_hz=10.0,
         attitude_rate_hz=30.0,
     )
-    mav = mt.MavsdkThread.from_config(config, broker=TelemetryBroker())
+    mav = mt.MavsdkThread.from_config(
+        config, broker=TelemetryBroker(source_time_alignment=config.source_time_alignment)
+    )
     asyncio.run(mav._apply_telemetry_rates(FakeDrone()))  # pyright: ignore[reportArgumentType] - 替身只实现被调到的那几个 setter  # 不应抛
     assert "position" in calls and "euler" in calls
