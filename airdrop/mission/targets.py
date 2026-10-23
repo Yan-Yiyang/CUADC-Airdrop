@@ -140,6 +140,19 @@ class TargetTracker:
             confidence=detection.confidence,
         )
         self._points.append(point)
+        self._emit(
+            "target_projection",
+            {
+                "frame_index": detection.frame_index,
+                "code": detection.code,
+                "capture_timestamp": detection.capture_timestamp,
+                "position_ned": position,
+                "attitude": attitude,
+                "ground_z": ground_z,
+                "target_ned": fix.ned,
+                "alignment_source_timestamp_us": snapshot.alignment_source_timestamp_us,
+            },
+        )
         return point
 
     def extend(self, detections: Iterable[Detection]) -> int:

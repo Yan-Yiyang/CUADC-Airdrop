@@ -99,6 +99,7 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
     broker = TelemetryBroker(
         history_interval=config.telemetry.history_interval,
         history_maxlen=config.telemetry.history_maxlen,
+        source_time_alignment=config.telemetry.source_time_alignment,
     )
     thread = MavsdkThread.from_config(config.telemetry, broker=broker)
     recorder = FlightRecorder(config) if options.record else None

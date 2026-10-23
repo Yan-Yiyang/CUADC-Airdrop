@@ -2024,7 +2024,15 @@ def test_detection_as_dict_includes_telemetry() -> None:
         box=PixelBox(5, 15, 15, 25),
         confidence=0.8,
         telemetry=TelemetrySnapshot(
-            timestamp=999.0, north_m=1.0, east_m=2.0, down_m=-20.0, yaw_deg=90.0
+            timestamp=999.0,
+            north_m=1.0,
+            east_m=2.0,
+            down_m=-20.0,
+            yaw_deg=90.0,
+            attitude_timestamp_us=100,
+            quaternion_timestamp_us=200,
+            position_timestamp_us=150,
+            alignment_source_timestamp_us=175,
         ),
         code=42,
         side_px=120.0,
@@ -2039,8 +2047,12 @@ def test_detection_as_dict_includes_telemetry() -> None:
     assert payload["box"]["x1"] == 5
     assert payload["telemetry"]["north_m"] == 1.0
     assert payload["telemetry"]["yaw_deg"] == 90.0
-    # 遥测只留关键字段，别把整条快照塞进去
-    assert "attitude_timestamp_us" not in payload["telemetry"]
+    # 保留独立时标供复算，但仍不复制任务进度等无关状态。
+    assert payload["telemetry"]["attitude_timestamp_us"] == 100
+    assert payload["telemetry"]["quaternion_timestamp_us"] == 200
+    assert payload["telemetry"]["position_timestamp_us"] == 150
+    assert payload["telemetry"]["alignment_source_timestamp_us"] == 175
+    assert "mission_current" not in payload["telemetry"]
 
 
 # ----------------------------------------------------------------------

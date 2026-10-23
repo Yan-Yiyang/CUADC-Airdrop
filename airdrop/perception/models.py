@@ -128,6 +128,19 @@ class Detection:
                 "roll_deg": tlm.roll_deg,
                 "pitch_deg": tlm.pitch_deg,
                 "yaw_deg": tlm.yaw_deg,
+                "quaternion_w": tlm.quaternion_w,
+                "quaternion_x": tlm.quaternion_x,
+                "quaternion_y": tlm.quaternion_y,
+                "quaternion_z": tlm.quaternion_z,
+                "attitude_timestamp_us": tlm.attitude_timestamp_us,
+                "quaternion_timestamp_us": tlm.quaternion_timestamp_us,
+                "quaternion_received_at": tlm.quaternion_received_at,
+                "position_timestamp_us": tlm.position_timestamp_us,
+                "position_velocity_received_at": tlm.position_velocity_received_at,
+                "alignment_source_timestamp_us": tlm.alignment_source_timestamp_us,
+                "origin_latitude_deg": tlm.origin_latitude_deg,
+                "origin_longitude_deg": tlm.origin_longitude_deg,
+                "origin_altitude_m": tlm.origin_altitude_m,
                 # 速度：**姿态 yaw 的独立参照**。离线诊断
                 # ``runtime/sitl_analysis.py`` 的 ``_heading_consistency`` 用
                 # ``atan2(vy, vx)`` 的航迹角和 yaw 比——PX4 的 yaw 在起飞后有一段

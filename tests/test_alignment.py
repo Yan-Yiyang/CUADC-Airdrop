@@ -355,6 +355,67 @@ def test_align_waits_then_interpolates_when_telemetry_catches_up(
     assert s.max_wait_s >= 0.05
 
 
+def test_source_alignment_waits_for_late_position_history() -> None:
+    """merged history 已覆盖帧时，仍等待晚到的位置字段进入源历史。"""
+    from airdrop.telemetry.models import TelemetrySnapshot
+
+    broker = TelemetryBroker(history_interval=0, source_time_alignment=True)
+    base = 1000.0
+    for source_us, received in ((1_000_000, base), (1_200_000, base + 0.2)):
+        broker._update_from_snapshot(
+            TelemetrySnapshot(
+                timestamp=received,
+                quaternion_w=1.0,
+                quaternion_x=0.0,
+                quaternion_y=0.0,
+                quaternion_z=0.0,
+                quaternion_timestamp_us=source_us,
+                quaternion_received_at=received,
+            )
+        )
+    broker._update_from_snapshot(
+        TelemetrySnapshot(
+            timestamp=base,
+            north_m=0.0,
+            east_m=0.0,
+            down_m=-10.0,
+            vx_m_s=1.0,
+            vy_m_s=0.0,
+            vz_m_s=0.0,
+            position_timestamp_us=1_000_000,
+            position_velocity_received_at=base,
+        )
+    )
+    target = base + 0.1
+    frame = make_frame(target + DEFAULT_TELEMETRY_LAG)
+    aligner = FrameTelemetryAligner(broker, max_wait=0.5, on_timeout="drop")
+
+    def deliver_position() -> None:
+        time.sleep(0.05)
+        broker._update_from_snapshot(
+            TelemetrySnapshot(
+                timestamp=base + 0.2,
+                north_m=0.2,
+                east_m=0.0,
+                down_m=-10.0,
+                vx_m_s=1.0,
+                vy_m_s=0.0,
+                vz_m_s=0.0,
+                position_timestamp_us=1_200_000,
+                position_velocity_received_at=base + 0.2,
+            )
+        )
+
+    producer = threading.Thread(target=deliver_position, daemon=True)
+    producer.start()
+    sample = aligner.align(frame)
+    producer.join(timeout=1)
+
+    assert sample is not None
+    assert sample.snapshot.north_m == pytest.approx(0.1)
+    assert aligner.stats.wait_timeouts == 0
+
+
 def test_align_times_out_and_drops_when_telemetry_stalls(
     broker: TelemetryBroker,
 ) -> None:

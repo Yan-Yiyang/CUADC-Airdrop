@@ -459,6 +459,35 @@ def test_load_broker_from_log(workdir: Path) -> None:
     assert pacer.published == 0
 
 
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        ({}, "缺少 telemetry 配置"),
+        ({"telemetry": {}}, "source_time_alignment 必须为 bool"),
+        ({"telemetry": {"source_time_alignment": 1}}, "source_time_alignment 必须为 bool"),
+    ],
+)
+def test_load_broker_rejects_invalid_source_alignment_config(
+    workdir: Path, settings: dict[str, Any], message: str
+) -> None:
+    flight_dir, *_ = _write_flight(workdir, frames=2)
+    (flight_dir / "config_snapshot.json").write_text(json.dumps(settings), encoding="utf-8")
+
+    with pytest.raises(FlightLogError, match=message):
+        load_broker_from_log(flight_dir)
+
+
+def test_load_broker_reads_source_alignment_config(workdir: Path) -> None:
+    flight_dir, *_ = _write_flight(workdir, frames=2)
+    (flight_dir / "config_snapshot.json").write_text(
+        json.dumps({"telemetry": {"source_time_alignment": True}}), encoding="utf-8"
+    )
+
+    broker, _ = load_broker_from_log(flight_dir)
+
+    assert broker.source_time_alignment
+
+
 def test_load_broker_from_log_requires_telemetry(workdir: Path) -> None:
     flight_dir, *_ = _write_flight(workdir, frames=2, telemetry=False)
     with pytest.raises(FlightLogError, match="缺少遥测日志"):

@@ -444,12 +444,27 @@ def load_broker_from_log(
     """
     if history_maxlen < 0:
         raise ValueError(f"history_maxlen 不能为负: {history_maxlen}")
+    settings_path = Path(flight_dir) / "config_snapshot.json"
+    source_time_alignment = False
+    if settings_path.is_file():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise FlightLogError(f"配置快照无法读取: {settings_path}") from exc
+        telemetry_settings = settings.get("telemetry") if isinstance(settings, dict) else None
+        if not isinstance(telemetry_settings, dict):
+            raise FlightLogError("配置快照缺少 telemetry 配置")
+        alignment_value = telemetry_settings.get("source_time_alignment")
+        if not isinstance(alignment_value, bool):
+            raise FlightLogError("配置快照 telemetry.source_time_alignment 必须为 bool")
+        source_time_alignment = alignment_value
     target = (
         broker
         if broker is not None
         else TelemetryBroker(
             history_maxlen=history_maxlen or 100_000,
             history_interval=0.0,
+            source_time_alignment=source_time_alignment,
         )
     )
     log = FlightLog.open(flight_dir)

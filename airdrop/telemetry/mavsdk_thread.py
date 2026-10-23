@@ -15,9 +15,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import json
 import logging
 import threading
 from collections.abc import AsyncGenerator, AsyncIterable, Coroutine
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from mavsdk import System
@@ -113,9 +115,17 @@ class MavsdkThread:
         position_rate_hz: float | None = None,
         position_velocity_ned_rate_hz: float | None = None,
         attitude_rate_hz: float | None = None,
+        source_time_alignment: bool | None = None,
         thread_name: str = "mavsdk-thread",
     ) -> None:
-        self.broker = broker or TelemetryBroker()
+        if broker is None:
+            broker = TelemetryBroker(source_time_alignment=bool(source_time_alignment))
+        elif (
+            source_time_alignment is not None
+            and source_time_alignment != broker.source_time_alignment
+        ):
+            raise ValueError("MavsdkThread 与 TelemetryBroker 的 source_time_alignment 配置不一致")
+        self.broker = broker
         self.system_address = system_address
         self.connect_timeout = connect_timeout
         self.wait_for_health = wait_for_health
@@ -129,6 +139,7 @@ class MavsdkThread:
         self.position_rate_hz = position_rate_hz
         self.position_velocity_ned_rate_hz = position_velocity_ned_rate_hz
         self.attitude_rate_hz = attitude_rate_hz
+        self.source_time_alignment = self.broker.source_time_alignment
         self._thread_name = thread_name
 
         self._thread: threading.Thread | None = None
@@ -169,6 +180,7 @@ class MavsdkThread:
             position_rate_hz=config.position_rate_hz,
             position_velocity_ned_rate_hz=config.position_velocity_ned_rate_hz,
             attitude_rate_hz=config.attitude_rate_hz,
+            source_time_alignment=config.source_time_alignment,
             thread_name=thread_name,
         )
 
@@ -632,8 +644,23 @@ class MavsdkThread:
             self.broker.update_home_position(home)
 
     async def _stream_position_velocity_ned(self, drone: System) -> None:
+        if self.source_time_alignment:
+            await self._stream_source_position(drone)
+            return
         async for pv in cast(AsyncIterable[Any], drone.telemetry.position_velocity_ned()):
             self.broker.update_local_position_velocity(pv.position, pv.velocity)
+
+    async def _stream_source_position(self, drone: System) -> None:
+        """读取原始位置源时标；消息来自本 System，不额外占用 MAVLink UDP 端口。"""
+        async for message in drone.mavlink_direct.message("LOCAL_POSITION_NED"):
+            row = json.loads(message.fields_json)
+            stamp = int(row["time_boot_ms"])
+            self.broker.update_local_position_velocity(
+                SimpleNamespace(north_m=row["x"], east_m=row["y"], down_m=row["z"]),
+                SimpleNamespace(north_m_s=row["vx"], east_m_s=row["vy"], down_m_s=row["vz"]),
+                # 与 MAVSDK 四元数保持同一原始 boot 钟；32 位回绕按新钟段处理。
+                timestamp_us=stamp * 1000,
+            )
 
     async def _stream_attitude_euler(self, drone: System) -> None:
         async for euler in cast(AsyncIterable[Any], drone.telemetry.attitude_euler()):

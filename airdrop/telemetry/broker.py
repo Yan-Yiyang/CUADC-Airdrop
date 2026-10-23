@@ -22,6 +22,7 @@ from collections.abc import Callable
 from dataclasses import fields
 from typing import Any
 
+from ._source_history import SourceHistory
 from .models import TelemetrySnapshot
 
 LOGGER = logging.getLogger(__name__)
@@ -36,6 +37,10 @@ _SKIP_INTERP_FIELDS = {
     "timestamp",
     "attitude_timestamp_us",
     "position_velocity_received_at",
+    "position_timestamp_us",
+    "quaternion_timestamp_us",
+    "quaternion_received_at",
+    "alignment_source_timestamp_us",
 }
 
 # 离散量字段：不是连续量，内插出来的是无意义的小数。**必须显式排除**——
@@ -125,6 +130,7 @@ class TelemetryBroker:
         self,
         history_maxlen: int = 1200,
         history_interval: float = 0.1,
+        source_time_alignment: bool = False,
     ) -> None:
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -140,6 +146,8 @@ class TelemetryBroker:
         #: ⇒ 历史**彻底停止增长**，而 connected 仍是 True、align() 也不报错。
         self._last_history_mono = 0.0
         self._subscribers: list[SnapshotCallback] = []
+        self.source_time_alignment = source_time_alignment
+        self._source_history = SourceHistory(history_maxlen)
 
     # ------------------------------------------------------------------
     # 读取接口
@@ -169,6 +177,10 @@ class TelemetryBroker:
         ----
         对应时刻的快照；历史为空时返回 None。非法 ``mode`` 抛 ``ValueError``
         （与历史是否为空无关）。
+
+        启用 ``source_time_alignment`` 时，位置与姿态按各自源时标查询；钟域映射
+        仍以 Windows 四元数接收时轴为基准。缺源字段、超出源历史或间隔过大时
+        返回 None，不向旧的合并快照静默降级。视频延时仍需单独标定。
         """
         if mode not in SUPPORTED_QUERY_MODES:  # 先校验模式：错误语义不该随历史有无而变
             raise ValueError(f"不支持的查询模式: {mode}，可选 {sorted(SUPPORTED_QUERY_MODES)}")
@@ -177,9 +189,14 @@ class TelemetryBroker:
                 return None
 
             if mode == "nearest":
-                return copy.copy(self._nearest_snapshot_locked(timestamp))
-
-            return copy.copy(self._evaluate_snapshot_locked(timestamp))
+                result = copy.copy(self._nearest_snapshot_locked(timestamp))
+            else:
+                result = copy.copy(self._evaluate_snapshot_locked(timestamp))
+            if self.source_time_alignment:
+                return self._source_history.evaluate(
+                    timestamp, result, self._blend_locked, mode=mode
+                )
+            return result
 
     def history_span(self) -> tuple[float, float] | None:
         """返回历史覆盖的时间范围 ``(最早, 最新)``；历史为空时返回 None。
@@ -214,6 +231,25 @@ class TelemetryBroker:
             while True:
                 if self._history and self._history[-1].timestamp >= timestamp:
                     return True
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                self._condition.wait(remaining)
+
+    def wait_snapshot_at(self, timestamp: float, timeout: float | None = None) -> bool:
+        """等待源时标模式下该时刻的完整位置与姿态变得可查询。"""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while True:
+                if self._history:
+                    base = self._evaluate_snapshot_locked(timestamp)
+                    if (
+                        self._source_history.evaluate(timestamp, base, self._blend_locked)
+                        is not None
+                    ):
+                        return True
                 remaining = None
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -270,6 +306,7 @@ class TelemetryBroker:
         with self._condition:
             self._latest = TelemetrySnapshot()
             self._history.clear()
+            self._source_history.clear()
             self._last_history_timestamp = 0.0
             self._last_history_mono = 0.0
             self._condition.notify_all()
@@ -287,11 +324,16 @@ class TelemetryBroker:
         return self._update(lambda s: s.update_gps_global_origin(origin))
 
     def update_local_position_velocity(
-        self, position_ned: Any, velocity_ned: Any
+        self, position_ned: Any, velocity_ned: Any, *, timestamp_us: int | None = None
     ) -> TelemetrySnapshot:
         """发布一个 MAVSDK 本地位置 + 速度更新。"""
+
+        def update(snapshot: TelemetrySnapshot) -> None:
+            snapshot.update_local_position_velocity(position_ned, velocity_ned)
+            snapshot.position_timestamp_us = timestamp_us
+
         return self._update(
-            lambda s: s.update_local_position_velocity(position_ned, velocity_ned),
+            update,
             position_velocity_received=True,
         )
 
@@ -301,7 +343,9 @@ class TelemetryBroker:
 
     def update_attitude_quaternion(self, quaternion: Any) -> TelemetrySnapshot:
         """发布一个 MAVSDK 四元数姿态更新。"""
-        return self._update(lambda s: s.update_attitude_quaternion(quaternion))
+        return self._update(
+            lambda s: s.update_attitude_quaternion(quaternion), quaternion_received=True
+        )
 
     def update_wind(self, wind: Any) -> TelemetrySnapshot:
         """发布一个 MAVSDK 风估计更新（可选流；没有它时投放判据按零风降级）。"""
@@ -362,6 +406,7 @@ class TelemetryBroker:
             ):
                 record.position_velocity_received_at = record.timestamp
             self._latest = record
+            self._source_history.add(record)
             self._history.append(record)
             self._last_history_timestamp = record.timestamp
             # 锁内复制订阅者列表，避免遍历时与 subscribe/unsubscribe 竞态
@@ -381,28 +426,38 @@ class TelemetryBroker:
         mutator: Callable[[TelemetrySnapshot], None],
         *,
         position_velocity_received: bool = False,
+        quaternion_received: bool = False,
     ) -> TelemetrySnapshot:
         with self._condition:
+            previous_timestamp = self._latest.timestamp
             snapshot = copy.copy(self._latest)
             mutator(snapshot)
             snapshot.timestamp = time.time()
             if position_velocity_received:
                 snapshot.position_velocity_received_at = snapshot.timestamp
+            if quaternion_received:
+                snapshot.quaternion_received_at = snapshot.timestamp
             self._latest = snapshot
             # 墙钟回退 ⇒ 历史不再是升序，而内插的正确性完全建立在升序上
             # （_evaluate_snapshot_locked 用 history[0]/history[-1] 当最小/最大）。
             # 乱序历史没法信任，清掉比留着算错好；顺带把节流影子钟归零，
             # 免得又停写。
-            if snapshot.timestamp < self._last_history_timestamp:
+            if snapshot.timestamp < previous_timestamp:
                 LOGGER.warning(
                     "墙钟回退 %.3fs（%s → %s）：已清空遥测历史以免内插拿到乱序数据",
-                    self._last_history_timestamp - snapshot.timestamp,
-                    time.strftime("%H:%M:%S", time.localtime(self._last_history_timestamp)),
+                    previous_timestamp - snapshot.timestamp,
+                    time.strftime("%H:%M:%S", time.localtime(previous_timestamp)),
                     time.strftime("%H:%M:%S", time.localtime(snapshot.timestamp)),
                 )
                 self._history.clear()
+                self._source_history.clear()
                 self._last_history_timestamp = 0.0
                 self._last_history_mono = 0.0
+                if not position_velocity_received:
+                    snapshot.position_velocity_received_at = None
+                if not quaternion_received:
+                    snapshot.quaternion_received_at = None
+            self._source_history.add(snapshot)
             # 历史按固定采样率写入：各条高频遥测流在此合并成均匀序列。
             # 节流用单调钟，墙钟只负责打时间戳。
             mono = time.monotonic()

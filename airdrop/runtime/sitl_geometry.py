@@ -305,6 +305,7 @@ def build_config(
     land_plan: str = LAND_PLAN,
     recon_timeout_s: float = RECON_TIMEOUT_S,
     scene: ReconScene | None = None,
+    source_time_alignment: bool = False,
 ) -> Config:
     """装配测试配置：真航线（侦查 + 降落）、真感知参数、模拟相机标定、标准任务流程。"""
     context = scene or _DEFAULT_SCENE
@@ -314,7 +315,11 @@ def build_config(
         _validate_builtin_recon(context)
     base = Config()
     return Config(
-        telemetry=replace(base.telemetry, system_address=system_address),
+        telemetry=replace(
+            base.telemetry,
+            system_address=system_address,
+            source_time_alignment=source_time_alignment,
+        ),
         routes=replace(
             base.routes,
             recon_route=(

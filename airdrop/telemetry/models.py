@@ -65,6 +65,13 @@ class TelemetrySnapshot:
 
     # MAVSDK 时间戳（系统启动后的微秒数），仅在可用时填充
     attitude_timestamp_us: int | None = None
+    #: 四元数自身的源时标，不能用另一条 Euler 流的时标代替。
+    quaternion_timestamp_us: int | None = None
+    quaternion_received_at: float | None = None
+    #: LOCAL_POSITION_NED 的飞控启动时标。
+    position_timestamp_us: int | None = None
+    #: 字段内插使用的共同源时刻；不是相机曝光时间。
+    alignment_source_timestamp_us: int | None = None
     #: 任务进度（PX4 ``MISSION_CURRENT``）：``mission_current == mission_total`` 即飞完
     mission_current: int | None = None
     mission_total: int | None = None
@@ -167,6 +174,8 @@ class TelemetrySnapshot:
         self.quaternion_x = float(quaternion.x)
         self.quaternion_y = float(quaternion.y)
         self.quaternion_z = float(quaternion.z)
+        stamp = getattr(quaternion, "timestamp_us", None)
+        self.quaternion_timestamp_us = None if stamp is None else int(stamp)
 
     def is_valid(self) -> bool:
         """当至少存在一个位置/速度/姿态值时返回 True。"""

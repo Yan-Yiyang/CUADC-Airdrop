@@ -292,6 +292,14 @@ class FrameTelemetryAligner:
             # 本项目"一帧不落"要防的事）。交给下面的外推判据（max_extrapolation）
             # 决定放行还是丢弃，并单独计数便于复盘。
             self._bump("too_old")
+        elif self._broker.source_time_alignment and self._max_wait > 0:
+            if self._broker.get_snapshot_at(timestamp, mode=self._mode) is None:
+                self._wait_for_snapshot(timestamp)
+                if self._broker.get_snapshot_at(timestamp, mode=self._mode) is None:
+                    self._bump("wait_timeouts")
+                    self._warn_timeout(timestamp)
+                    if self._on_timeout == "drop":
+                        return None
         elif timestamp > span[1] and self._max_wait > 0:
             self._wait_for_coverage(timestamp)
             waited = self._broker.history_span()
@@ -339,6 +347,12 @@ class FrameTelemetryAligner:
         self._broker.wait_history_until(timestamp, timeout=self._max_wait)
         elapsed = time.monotonic() - started
         self._bump("waits", max_wait=elapsed)
+
+    def _wait_for_snapshot(self, timestamp: float) -> None:
+        """源时标模式等待完整字段可查询，和 merged history 共用等待预算。"""
+        started = time.monotonic()
+        self._broker.wait_snapshot_at(timestamp, timeout=self._max_wait)
+        self._bump("waits", max_wait=time.monotonic() - started)
 
     def _bump(
         self,
