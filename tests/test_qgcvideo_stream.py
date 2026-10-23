@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 import shutil
 import socket
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 import imageio_ffmpeg
 import numpy as np
@@ -124,3 +126,113 @@ def test_bundled_ffmpeg_udp_stream_decodes_full_frame_for_late_receiver(
     decoded = np.frombuffer(stdout, dtype=np.uint8).reshape((990, 1760, 3))
     assert float(decoded[:, :, 1].mean()) > 30
     assert publisher.stats.encoded > 10
+
+
+@pytest.mark.parametrize("compose_delay", [0.0, 0.2])
+def test_publisher_preserves_wall_time_and_finishes_complete_tail(
+    compose_delay: float, tmp_path: Path
+) -> None:
+    """真实编码器在慢合成时保留媒体时间，EOF 收尾后的末帧仍可严格解码。"""
+
+    class Composer(_SolidComposer):
+        def compose(self, snapshot: DisplaySnapshot) -> np.ndarray:
+            time.sleep(compose_delay)
+            return super().compose(snapshot)
+
+    output = tmp_path / "encoded.ts"
+    processes: list[subprocess.Popen] = []
+
+    def factory(command: list[str], **kwargs: Any) -> subprocess.Popen:
+        # 只替换最终输出地址，使用生产的输入时钟、同步模式和真实编码器。
+        process = subprocess.Popen([*command[:-1], str(output)], **kwargs)
+        processes.append(process)
+        return process
+
+    config = QgcVideoConfig(enabled=True, transport="mpegts", fps=12.0)
+    publisher = QgcVideoPublisher(config, _snapshot, Composer(), subprocess_factory=factory)
+    started = time.monotonic()
+    publisher.start()
+    try:
+        time.sleep(4.0)
+    finally:
+        publisher.stop(timeout=3.0)
+    elapsed = time.monotonic() - started
+
+    assert len(processes) == 1
+    assert processes[0].returncode == 0
+    assert publisher.stats.failures == 0
+    assert publisher.stats.encoded >= 10
+    decoded = subprocess.run(
+        [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-hide_banner",
+            "-xerror",
+            "-err_detect",
+            "explode",
+            "-i",
+            str(output),
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        check=False,
+        timeout=15.0,
+    )
+    log = decoded.stderr.decode("utf-8", errors="replace")
+    assert decoded.returncode == 0, log
+    duration = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", log)
+    assert duration is not None, log
+    media_seconds = int(duration[1]) * 3600 + int(duration[2]) * 60 + float(duration[3])
+    assert 0.8 <= media_seconds / elapsed <= 1.2, (media_seconds, elapsed, log)
+
+
+def test_real_encoder_failure_is_recorded_and_restart_finishes_cleanly(tmp_path: Path) -> None:
+    """真实编码器报错后有界重启；错误不因后续恢复而消失，正常末帧仍完整。"""
+    processes: list[subprocess.Popen] = []
+
+    def factory(command: list[str], **kwargs: Any) -> subprocess.Popen:
+        command = [*command[:-1], str(tmp_path / f"encoded-{len(processes)}.ts")]
+        if not processes:
+            command[command.index("libx264")] = "airdrop_intentional_invalid_encoder"
+        process = subprocess.Popen(command, **kwargs)
+        processes.append(process)
+        return process
+
+    publisher = QgcVideoPublisher(
+        QgcVideoConfig(
+            enabled=True, transport="mpegts", fps=12.0, restart_delay_s=0.05, max_restarts=1
+        ),
+        _snapshot,
+        _SolidComposer(),
+        subprocess_factory=factory,
+    )
+    publisher.start()
+    try:
+        deadline = time.monotonic() + 8.0
+        while publisher.stats.encoded < 12 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert publisher.stats.encoded >= 12
+    finally:
+        publisher.stop(timeout=3.0)
+    assert publisher.stats.restarts == 1
+    assert publisher.stats.failures >= 1
+    assert len(processes) == 2
+    assert processes[0].returncode != 0
+    assert processes[1].returncode == 0
+    result = subprocess.run(
+        [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-hide_banner",
+            "-xerror",
+            "-i",
+            str(tmp_path / "encoded-1.ts"),
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")

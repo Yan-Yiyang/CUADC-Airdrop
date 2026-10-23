@@ -148,7 +148,9 @@ class QgcVideoPublisher:
         return self
 
     def stop(self, timeout: float | None = None) -> None:
-        """先终止 FFmpeg 解开阻塞写，再有限等待两个工作线程。"""
+        """优先由编码线程关闭输入并排空末帧；超时才终止进程解开阻塞写。"""
+        budget = self.config.shutdown_timeout_s if timeout is None else max(0.0, timeout)
+        deadline = self._clock() + budget
         with self._lock:
             producer = self._producer
             encoder = self._encoder
@@ -157,10 +159,13 @@ class QgcVideoPublisher:
                 return
             self._running = False
             self._stop.set()
+        # 正常写入必须先完成整帧，直接 terminate 会截断末尾的 H.264 NAL。
+        # 留出少量强制清理预算；阻塞写仍由下方终止进程解除。
+        if encoder is not None:
+            encoder.join(max(0.0, budget * 0.8))
+            if encoder.is_alive() and self._process is not None:
+                self._record_error(TimeoutError("FFmpeg 正常收尾超时，强制结束编码进程"))
         self._terminate_process()
-        deadline = self._clock() + (
-            self.config.shutdown_timeout_s if timeout is None else max(0.0, timeout)
-        )
         for thread in (producer, encoder):
             if thread is not None:
                 thread.join(max(0.0, deadline - self._clock()))
@@ -193,8 +198,12 @@ class QgcVideoPublisher:
             f"{_WIDTH}x{_HEIGHT}",
             "-framerate",
             str(fps),
+            "-use_wallclock_as_timestamps",
+            "1",
             "-i",
             "pipe:0",
+            "-fps_mode",
+            "vfr",
             "-an",
             "-c:v",
             "libx264",
@@ -212,6 +221,8 @@ class QgcVideoPublisher:
             str(gop),
             "-sc_threshold",
             "0",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*1)",
             "-x264-params",
             "repeat-headers=1",
             "-b:v",
@@ -288,7 +299,7 @@ class QgcVideoPublisher:
             try:
                 item = self._frames.get(timeout=0.1)
             except queue.Empty:
-                if process is None or process.poll() is not None:
+                if self._process_unavailable(process):
                     if restarts_left <= 0:
                         self._record_error(RuntimeError("FFmpeg 重启次数已耗尽"))
                         break
@@ -298,7 +309,7 @@ class QgcVideoPublisher:
                 continue
             if item is None:
                 break
-            if process is None or process.poll() is not None:
+            if self._process_unavailable(process):
                 if restarts_left <= 0:
                     with self._lock:
                         self._dropped += 1
@@ -339,7 +350,10 @@ class QgcVideoPublisher:
                 self._record_error(exc)
                 self._terminate_process(process)
                 process = None
-        self._terminate_process(process)
+        if self._stop.is_set():
+            self._finish_process(process)
+        else:
+            self._terminate_process(process)
         self._stop.set()
         with self._lock:
             self._running = False
@@ -370,6 +384,32 @@ class QgcVideoPublisher:
 
     def _restart_delay(self) -> None:
         self._stop.wait(float(self.config.restart_delay_s))
+
+    def _process_unavailable(self, process: Any | None) -> bool:
+        """区分尚未创建与运行中异常退出，后者即使可重启也必须记为故障。"""
+        if process is None:
+            return True
+        code = process.poll()
+        if code is None:
+            return False
+        self._record_error(RuntimeError(f"FFmpeg 异常退出，退出码 {code}"))
+        return True
+
+    def _finish_process(self, process: Any | None) -> None:
+        """在编码线程内发送 EOF，让编码器完成末帧和封装后有界退出。"""
+        if process is None:
+            return
+        try:
+            code = process.poll()
+            if code is None:
+                process.stdin.close()
+                code = process.wait(timeout=self.config.shutdown_timeout_s)
+            if code:
+                self._record_error(RuntimeError(f"FFmpeg 收尾退出码 {code}"))
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            self._record_error(exc)
+        finally:
+            self._terminate_process(process)
 
     def _check_write_timeout(self) -> None:
         with self._lock:

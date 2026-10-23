@@ -21,6 +21,8 @@ class _Pipe:
         self.short = short
         self.broken = broken
         self.total = 0
+        self.closed = threading.Event()
+        self.on_close = lambda: None
 
     def write(self, data: memoryview) -> int:
         self.entered.set()
@@ -36,15 +38,21 @@ class _Pipe:
     def flush(self) -> None:
         return
 
+    def close(self) -> None:
+        self.closed.set()
+        self.on_close()
+
 
 class _Process:
-    def __init__(self, pipe: _Pipe) -> None:
+    def __init__(self, pipe: _Pipe, *, exit_code: int = 0) -> None:
         self.stdin = pipe
         self._ended = threading.Event()
         self.terminated = threading.Event()
+        self.exit_code = exit_code
+        pipe.on_close = self._ended.set
 
     def poll(self) -> int | None:
-        return 0 if self._ended.is_set() else None
+        return self.exit_code if self._ended.is_set() else None
 
     def terminate(self) -> None:
         self.terminated.set()
@@ -56,7 +64,7 @@ class _Process:
 
     def wait(self, timeout: float | None = None) -> int:
         self._ended.wait(timeout)
-        return 0
+        return self.exit_code
 
 
 class _ExitOnFlushPipe(_Pipe):
@@ -108,6 +116,19 @@ def test_partial_pipe_writes_are_completed_before_frame_count_advances() -> None
 
     assert publisher.stats.encoded >= 1
     assert pipe.total >= 1760 * 990 * 3
+    assert pipe.closed.is_set()
+    assert not process.terminated.is_set()
+    assert publisher.stats.failures == 0
+
+
+def test_finish_process_records_nonzero_code_when_already_exited() -> None:
+    process = _Process(_Pipe(), exit_code=7)
+    process._ended.set()
+    publisher = _publisher(lambda *_args, **_kwargs: process)
+
+    publisher._finish_process(process)
+
+    assert publisher.stats.last_error == "RuntimeError: FFmpeg 收尾退出码 7"
 
 
 def test_blocked_pipe_does_not_backpressure_supplier_and_stop_unblocks_it() -> None:
@@ -144,6 +165,7 @@ def test_blocked_pipe_does_not_backpressure_supplier_and_stop_unblocks_it() -> N
     assert publisher.stats.dropped >= 1
     assert process.terminated.is_set()
     assert not publisher.running
+    assert "正常收尾超时" in (publisher.stats.last_error or "")
 
 
 def test_write_watchdog_terminates_a_stalled_encoder() -> None:
@@ -203,7 +225,8 @@ def test_exhausted_restarts_clears_running_and_stops_render_thread() -> None:
 
     assert not publisher.running
     assert publisher._producer is not None and not publisher._producer.is_alive()
-    assert publisher.stats.last_error == "RuntimeError: FFmpeg 重启次数已耗尽"
+    assert publisher.stats.last_error == "RuntimeError: FFmpeg 异常退出，退出码 0"
+    assert publisher.stats.failures >= 2
 
 
 def test_second_stop_continues_cleanup_after_first_stop_timeout() -> None:
