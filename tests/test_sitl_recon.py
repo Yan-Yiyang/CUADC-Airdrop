@@ -32,6 +32,7 @@ import concurrent.futures
 import contextlib
 import json
 import math
+import os
 import socket
 import threading
 from pathlib import Path
@@ -80,10 +81,15 @@ def test_sitl_recon_accuracy(tmp_path: Path) -> None:
 
     from airdrop.runtime import sitl
 
-    exit_code = sitl.main(work_dir=str(tmp_path))
+    exit_code = sitl.main(
+        work_dir=str(tmp_path),
+        qgc_video=True,
+        manifest_path=os.environ.get("AIRDROP_SITL_MANIFEST") or None,
+        source_time_alignment=os.environ.get("AIRDROP_SITL_SOURCE_TIME_ALIGNMENT") == "1",
+    )
     # 先断言退出码：否则退出码非 0 时下面读 report 会先抛 FileNotFoundError /
     # JSONDecodeError，把真正的失败原因盖掉
-    assert exit_code in (0, 7), f"退出码 {exit_code}"
+    assert exit_code == 0, f"退出码 {exit_code}"
     report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
 
     # ⚠ 键名是 "mission"（运行时分析模块 写的就是它）；曾经这里读的是
@@ -99,7 +105,7 @@ def test_sitl_recon_accuracy(tmp_path: Path) -> None:
     assert selected["error_m"] < 2.0, f"误差超 2 m：{selected}"
     calibration = report.get("lag_calibration") or {}
     holdout = calibration.get("holdout_error_m")
-    assert holdout is None or holdout < 2.0, f"留一验证超 2 m：{calibration}"
+    assert holdout is not None and holdout < 2.0, f"留一验证缺失或超 2 m：{calibration}"
 
 
 def test_zero_test_params_keeps_original_value_when_write_fails(
@@ -325,6 +331,10 @@ def _flight_with_origin(flight_dir: Path, *, count: int = 5) -> None:
                 north_m=float(k),
                 east_m=float(k),
                 down_m=-20.0,
+                quaternion_w=1.0,
+                quaternion_x=0.0,
+                quaternion_y=0.0,
+                quaternion_z=0.0,
                 origin_longitude_deg=8.5461637,
                 origin_latitude_deg=47.3979710,
                 origin_altitude_m=0.177,
@@ -549,10 +559,13 @@ def test_circular_mean_deg_does_not_flip_at_180() -> None:
 
 @pytest.mark.realdata
 def test_reverse_diagnostic_on_a_recorded_flight(tmp_path: Path) -> None:
-    """真跑一遍：拿架次 某架次 的记录验同轴校验真的会拦住那条误导输出。"""
+    """用外部架次记录验证同轴校验，输入由 AIRDROP_REALDATA_FLIGHT 指定。"""
     from airdrop.runtime import sitl_analysis, sitl_geometry
 
-    flight = REPO_ROOT / "flights/<架次>"
+    raw = os.environ.get("AIRDROP_REALDATA_FLIGHT", "").strip()
+    if not raw:
+        pytest.skip("未用 AIRDROP_REALDATA_FLIGHT 指定完整架次目录")
+    flight = Path(raw).expanduser()
     if not (flight / "telemetry.jsonl").is_file():
         pytest.skip(f"没有架次记录：{flight}")
     detail = sitl_analysis._load_detail(flight / "detections.jsonl")
@@ -701,6 +714,8 @@ def test_observation_errors_split_by_heading_tolerance(workdir: Path) -> None:
     # 连"零误差"那一条都会算出 4 m 的假误差（实测踩过）。
     pose = (truth[0], truth[1] - 15.0, -20.0)
     euler = (0.0, 0.0, 0.0)
+    quaternion_yaw_0 = (1.0, 0.0, 0.0, 0.0)
+    quaternion_yaw_30 = (math.cos(math.radians(15.0)), 0.0, 0.0, math.sin(math.radians(15.0)))
 
     # 由真值反投影出"应该被检到"的像素；再用它构造检测 ⇒ 解算闭环、误差≈0
     rnb = _attitude_matrix(quaternion=None, euler_deg=euler)
@@ -713,8 +728,30 @@ def test_observation_errors_split_by_heading_tolerance(workdir: Path) -> None:
         cy + camera.focal_px * direction[1] / direction[2],
     ]
 
-    good = _det(_snap(yaw=0.0, course=2.0, pose=pose), pixel=pixel, code=56)
-    bad = _det(_snap(yaw=30.0, course=0.0, pose=pose), pixel=[pixel[0] + 300.0, pixel[1]], code=56)
+    good = _det(
+        {
+            **_snap(yaw=0.0, course=2.0, pose=pose),
+            "quaternion_w": quaternion_yaw_0[0],
+            "quaternion_x": quaternion_yaw_0[1],
+            "quaternion_y": quaternion_yaw_0[2],
+            "quaternion_z": quaternion_yaw_0[3],
+            "origin_altitude_m": origin[2],
+        },
+        pixel=pixel,
+        code=56,
+    )
+    bad = _det(
+        {
+            **_snap(yaw=30.0, course=0.0, pose=pose),
+            "quaternion_w": quaternion_yaw_30[0],
+            "quaternion_x": quaternion_yaw_30[1],
+            "quaternion_y": quaternion_yaw_30[2],
+            "quaternion_z": quaternion_yaw_30[3],
+            "origin_altitude_m": origin[2],
+        },
+        pixel=[pixel[0] + 300.0, pixel[1]],
+        code=56,
+    )
     stats = sitl_analysis._observation_errors([good, bad], origin_lla=origin, calib_file=str(calib))
 
     assert stats["all"]["n"] == 2
@@ -897,3 +934,34 @@ def test_lag_sweep_runs_off_a_recorded_flight(workdir: Path) -> None:
     assert pacer_broker.get_snapshot_at(1002.0, "interpolate") is not None, "历史没灌进去"
     origin_lla = sitl_analysis._origin_lla(outcome, analysis)
     assert sitl_analysis._well_truth_ned(56, origin_lla) == pytest.approx((-10.83, 200.29), abs=0.5)
+
+
+def test_recorded_projection_requires_current_pose_fields() -> None:
+    """投影只使用当前四元数和原点高程，缺字段时明确跳过。"""
+    from airdrop.runtime import sitl_analysis
+
+    snapshot = {
+        "quaternion_w": math.sqrt(0.5),
+        "quaternion_x": 0.0,
+        "quaternion_y": 0.0,
+        "quaternion_z": math.sqrt(0.5),
+        "origin_altitude_m": 12.0,
+        # 与四元数相反的欧拉角不能覆盖当前记录姿态。
+        "roll_deg": 0.0,
+        "pitch_deg": 0.0,
+        "yaw_deg": 0.0,
+    }
+    projection = sitl_analysis._recorded_projection(snapshot, None)
+    assert projection is not None
+    assert projection["quaternion"] == pytest.approx((math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)))
+    assert projection["ground_z"] == pytest.approx(
+        12.0 - sitl_analysis._DEFAULT_SCENE.origin_lla[2]
+    )
+    assert "euler_deg" not in projection
+    assert sitl_analysis._recorded_projection({**snapshot, "origin_altitude_m": None}, None) is None
+    assert (
+        sitl_analysis._recorded_projection(
+            {k: v for k, v in snapshot.items() if not k.startswith("quaternion_")}, None
+        )
+        is None
+    )

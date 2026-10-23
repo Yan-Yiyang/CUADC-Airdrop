@@ -23,6 +23,7 @@ from airdrop.mission.items import (
     MAV_CMD_IMAGE_STOP_CAPTURE,
     MAV_CMD_NAV_LAND,
     MAV_CMD_NAV_LOITER_TO_ALT,
+    MAV_CMD_NAV_TAKEOFF,
     MAV_CMD_NAV_WAYPOINT,
     MAV_CMD_VIDEO_STOP_CAPTURE,
     UNSET,
@@ -69,6 +70,9 @@ class _RoundTripDrone:
                         for name in ("param1", "param2", "param3"):
                             if math.isnan(float(fields[name])):
                                 fields[name] = 0.0
+                    if fields["command"] == MAV_CMD_NAV_TAKEOFF:
+                        for name in ("param1", "param2", "param3"):
+                            fields[name] = 0.0
                     if drone.mutate is not None:
                         drone.mutate(fields)
                     drone.stored.append(SimpleNamespace(**fields))
@@ -131,6 +135,43 @@ def _ten_item_drop_and_land_mission() -> tuple[MissionItem, ...]:
         )
     )
     return tuple(items)
+
+
+def test_sitl_takeoff_round_trips_through_px4() -> None:
+    """SITL 起飞项使用 PX4 实际保存的字段值，且位置和航向仍受严格校验。"""
+    from airdrop.runtime.sitl_operations import takeoff_items
+
+    base = Config()
+    config = replace(
+        base,
+        routes=replace(
+            base.routes,
+            recon_plan="",
+            recon_route=(Waypoint(lat=47.0, lon=8.0, alt_m=30.0),),
+        ),
+    )
+    items = takeoff_items(config)
+    count, drone = _upload(items)
+
+    assert count == 1
+    assert (drone.stored[0].param1, drone.stored[0].param2, drone.stored[0].param3) == (
+        0.0,
+        0.0,
+        0.0,
+    )
+    assert drone.stored[0].x == 470000000
+    assert drone.stored[0].y == 80000000
+    assert math.isnan(drone.stored[0].param4)
+    with pytest.raises(ControllerError, match="param4"):
+        _upload(items, lambda fields: fields.update(param4=90.0))
+    with pytest.raises(ControllerError, match="位置不符"):
+        _upload(items, lambda fields: fields.update(x=470010000))
+
+
+def test_generic_takeoff_pitch_loss_remains_rejected() -> None:
+    """通用任务显式起飞俯仰角被 PX4 丢弃时，校验仍然拒绝。"""
+    with pytest.raises(ControllerError, match="param1"):
+        _upload((MissionItem.takeoff(47.0, 8.0, 30.0, pitch_deg=15.0),))
 
 
 def test_px4_normalized_ten_item_drop_and_land_round_trip() -> None:

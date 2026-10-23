@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import Any
 
 from airdrop import Config, TelemetryBroker
@@ -119,7 +120,10 @@ def takeoff_items(config: Config) -> tuple[Any, ...]:
     first = next((item for item in build_recon_mission(config) if item.is_positional), None)
     if first is None:
         raise ValueError("SITL 起飞需要侦查计划中至少一个有位置的任务项")
-    return (MissionItem.takeoff(float(first.lat), float(first.lon), TAKEOFF_ALT_M),)
+    # PX4 的 NAV_TAKEOFF 存储和回读忽略 param1/2/3，统一返回 0。
+    # 在 SITL 适配层显式构造其规范值，避免无效字段触发严格回读校验。
+    item = MissionItem.takeoff(float(first.lat), float(first.lon), TAKEOFF_ALT_M, pitch_deg=0.0)
+    return (replace(item, param2=0.0, param3=0.0),)
 
 
 def operator_takeoff(

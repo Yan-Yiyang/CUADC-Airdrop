@@ -81,6 +81,20 @@ def _select_by_code(clusters, code: int):
     return same[0]
 
 
+def _recorded_projection(
+    snapshot: dict[str, Any], scene: ReconScene | None
+) -> dict[str, Any] | None:
+    """从当前记录字段构造投影参数；必要字段缺失时跳过该观测。"""
+    quaternion = tuple(snapshot.get("quaternion_" + k) for k in "wxyz")
+    origin_alt = snapshot.get("origin_altitude_m")
+    if any(value is None or not math.isfinite(float(value)) for value in quaternion):
+        return None
+    if origin_alt is None or not math.isfinite(float(origin_alt)):
+        return None
+    ground_z = float(origin_alt) - (scene or _DEFAULT_SCENE).origin_lla[2]
+    return {"ground_z": ground_z, "quaternion": quaternion}
+
+
 def lag_sweep(
     detections: list[dict[str, Any]],
     *,
@@ -106,14 +120,19 @@ def lag_sweep(
         for row in detections:
             stamp = float(row["capture_timestamp"]) + base_lag - lag
             snapshot = broker.get_snapshot_at(stamp, "interpolate")
-            if snapshot is None or snapshot.north_m is None or snapshot.roll_deg is None:
+            if snapshot is None or any(
+                value is None for value in (snapshot.north_m, snapshot.east_m, snapshot.down_m)
+            ):
+                continue
+            projection = _recorded_projection(snapshot.as_dict(), scene)
+            if projection is None:
                 continue
             fix = pixel_to_ned(
                 (row["pixel"][0], row["pixel"][1]),
                 camera=camera,
-                ground_z=0.0,
                 position_ned=(snapshot.north_m, snapshot.east_m, snapshot.down_m or 0.0),
-                euler_deg=(snapshot.roll_deg, snapshot.pitch_deg, snapshot.yaw_deg),
+                undistort=not bool(row.get("extra", {}).get("undistorted", True)),
+                **projection,
             )
             if not fix.ok or fix.ned is None:
                 continue
@@ -277,7 +296,7 @@ def _per_observation_errors(
 
     与 :func:`lag_sweep` 同一条解算路径（同一个 :func:`~airdrop.georef.pixel_to_ned`、
     同一份标定），只是**直接用检测自带的那份遥测**——省掉一次延时扫描，且和管线实际
-    用的输入完全一致。``ground_z`` 与 :func:`lag_sweep` 一样取 0（靶区地面在世界里 z=0）。
+    用的输入完全一致。优先使用记录的四元数，地面高程按 EKF 原点和场景地面计算。
     """
     from airdrop import load_camera_model, pixel_to_ned
 
@@ -288,14 +307,17 @@ def _per_observation_errors(
         if code is None or code not in (scene or _DEFAULT_SCENE).wells_enu:
             continue
         snap = row.get("telemetry") or {}
-        if snap.get("north_m") is None or snap.get("roll_deg") is None:
+        if any(snap.get(name) is None for name in ("north_m", "east_m", "down_m")):
+            continue
+        projection = _recorded_projection(snap, scene)
+        if projection is None:
             continue
         fix = pixel_to_ned(
             (row["pixel"][0], row["pixel"][1]),
             camera=camera,
-            ground_z=0.0,
             position_ned=(snap["north_m"], snap["east_m"], snap["down_m"] or 0.0),
-            euler_deg=(snap["roll_deg"], snap["pitch_deg"], snap["yaw_deg"]),
+            undistort=not bool(row.get("extra", {}).get("undistorted", True)),
+            **projection,
         )
         if not fix.ok or fix.ned is None:
             continue

@@ -73,6 +73,11 @@ def test_manifest_drives_camera_truth_and_report(tmp_path: Path) -> None:
                 "roll_deg": 0.0,
                 "pitch_deg": 0.0,
                 "yaw_deg": 0.0,
+                "quaternion_w": 1.0,
+                "quaternion_x": 0.0,
+                "quaternion_y": 0.0,
+                "quaternion_z": 0.0,
+                "origin_altitude_m": scene.origin_lla[2],
             },
         }
     ]
