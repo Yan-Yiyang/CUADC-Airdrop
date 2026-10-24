@@ -119,7 +119,7 @@ class BufferedFrame:
     capture_timestamp: float
     received_timestamp: float
     lag: float
-    snapshot: TelemetrySnapshot
+    snapshot: TelemetrySnapshot | None
     extrapolated: bool = False
     offset: float = 0.0
 
@@ -156,6 +156,8 @@ class BufferStats:
     #: 取出时 JPEG 解码失败的记录数（读取方跳过后计数）。正常情况下恒为 0：
     #: 载荷是本进程 :func:`cv2.imencode` 出来的，编码失败时还会退化成 ndarray 兜底。
     decode_failures: int = 0
+    #: 入库前编码或复制失败的帧数；失败帧尚无缓冲序号，不能用跳号检测。
+    encode_failures: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,7 +173,7 @@ class StoredFrame:
     capture_timestamp: float
     received_timestamp: float
     lag: float
-    snapshot: TelemetrySnapshot
+    snapshot: TelemetrySnapshot | None
     extrapolated: bool
     offset: float
     payload: bytes | np.ndarray
@@ -231,6 +233,7 @@ class AlignmentBuffer:
         self._put = 0
         self._evicted = 0
         self._decode_failures = 0
+        self._encode_failures = 0
         self._logged_estimate = False
 
     # ------------------------------------------------------------------
@@ -253,7 +256,12 @@ class AlignmentBuffer:
         """
         if sample is None:
             raise ValueError("sample 不能为 None；请先判断 align() 的返回值")
-        payload, nbytes = self._encode(sample.frame.image)
+        try:
+            payload, nbytes = self._encode(sample.frame.image)
+        except Exception:
+            with self._lock:
+                self._encode_failures += 1
+            raise
 
         with self._condition:
             self._next_index += 1
@@ -332,6 +340,7 @@ class AlignmentBuffer:
                 bytes=self._bytes,
                 last_index=self._next_index,
                 decode_failures=self._decode_failures,
+                encode_failures=self._encode_failures,
             )
 
     def latest(self) -> BufferedFrame | None:
@@ -627,6 +636,7 @@ class AlignmentWriter:
         aligner: FrameTelemetryAligner,
         *,
         defer_until_airborne: bool = False,
+        capture_only: bool = False,
     ) -> None:
         self._buffer = buffer
         self._aligner = aligner
@@ -635,6 +645,7 @@ class AlignmentWriter:
         self._skipped = 0
         self._accepting = not defer_until_airborne
         self._defer_until_airborne = defer_until_airborne
+        self._capture_only = capture_only
         self._source_cutoff: int | None = None
         self._sealed = False
 
@@ -648,7 +659,16 @@ class AlignmentWriter:
                 return
 
         # 对齐和 JPEG 编码可能等待；不占门锁，终态回调可以立即 seal。
-        sample = self._aligner.align(frame)
+        if self._capture_only:
+            sample = AlignedSample(
+                frame=frame,
+                snapshot=None,
+                timestamp=frame.capture_timestamp,
+                lag=frame.lag,
+                mode="capture_only",
+            )
+        else:
+            sample = self._aligner.align(frame)
         if sample is None:
             with self._lock:
                 self._skipped += 1

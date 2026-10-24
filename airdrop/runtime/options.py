@@ -22,6 +22,7 @@ class RunOptions:
     auto_land: bool = True
     max_seconds: float | None = None
     qgc_video: bool | None = None
+    calibration_capture: bool = False
 
     def validated(self) -> RunOptions:
         """检查互斥与模式约束，确保失败发生在任何资源创建之前。"""
@@ -37,6 +38,15 @@ class RunOptions:
             raise ValueError("真实投弹只允许 real 模式的任务投放阶段")
         if self.mode == "sitl" and self.real_release:
             raise ValueError("SITL 禁止真实投弹")
+        if self.calibration_capture and (
+            self.mode != "real"
+            or not self.capture
+            or not self.record
+            or self.recognize
+            or self.run_mission
+            or self.real_release
+        ):
+            raise ValueError("标定采集仅允许 real 被动采集并记录，必须关闭识别、任务控制和真实投弹")
         if self.max_seconds is not None and (
             not math.isfinite(self.max_seconds) or self.max_seconds <= 0
         ):

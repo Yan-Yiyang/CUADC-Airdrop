@@ -972,7 +972,7 @@ CameraModel(camera_matrix, dist_coeffs=<全零>, r_bc=<DEFAULT_R_BC>, t_bc=<零�
 两个构造入口：
 
 - `default_camera_model(width=1280, height=720)`：按视场角凑出的占位内参（`is_calibrated()` 为 `False`）。它只够"能跑通"，精度靠标定。
-- `load_camera_model(path, *, fallback_size=(1280, 720))`：读 `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 写出的标定文件；缺字段时用兜底尺寸补一个默认模型（不抛异常，便于缺标定也能起飞）。
+- `load_camera_model(path, *, fallback_size=(1280, 720))`：读标定工具写出的相机文件；有效标定必须包含 `R_bc`。文件缺失或无效时返回未标定的默认模型，`fallback_size` 指定该默认模型的尺寸。
 
 #### 3.5.2 像素 → 坐标
 
@@ -1755,6 +1755,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `position_rate_hz` | float | `10.0` | 位置流请求频率 |
 | `position_velocity_ned_rate_hz` | float | `10.0` | 位置+速度流请求频率 |
 | `attitude_rate_hz` | float | `30.0` | 姿态流请求频率 |
+| `quaternion_rate_hz` | float | `30.0` | 四元数流独立请求频率；欧拉角仍使用 `attitude_rate_hz` |
 | `source_time_alignment` | bool | `True` | 按位置与四元数各自的飞控源时标内插；用四元数接收时轴建立局部钟域映射。需 MAVSDK MavlinkDirect，不依赖相机曝光时间；改变此项后重新标定 `telemetry_lag` |
 | `history_interval` | float | `0.1` | 历史入库节流（10 Hz；最新快照不节流） |
 | `history_maxlen` | int | `1200` | 历史容量（≈2 分钟） |
@@ -1950,7 +1951,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | --- | --- | --- | --- |
 | `dir` | str | `'flights'` | 飞行目录根（**已进 .gitignore**，见 §1.3） |
 | `video` | bool | `True` | 是否记录视频（⚠ 当前无消费者，见 4.18） |
-| `telemetry_hz` | float | `10.0` | 遥测写入磁盘节流 |
+| `telemetry_hz` | float | `10.0` | 遥测写入磁盘节流；`0` 订阅并记录每次已接纳的快照更新，使用有界队列，溢出或写入失败会使 `stop()` 报错 |
 | `event_eval_hz` | float | `5.0` | ⚠ 当前无消费者（判据摘要频率实际取 `SUMMARY_HZ`） |
 
 ### 4.16 `Waypoint` —— 航点
@@ -2059,7 +2060,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | 文件 | 谁写 | 内容 / 关键字段 | 谁读 | 能手改吗 |
 | --- | --- | --- | --- | --- |
 | `flight.log` | root logger 上的 `FileHandler`（`start()` 挂、`stop()` 摘，期间 root level 临时降到 INFO，业务模块无感） | 所有模块的 `logging` 输出 | 人 | ✅ 纯文本 |
-| `telemetry.jsonl` | recorder 的 telemetry writer 线程，按 `RecordConfig.telemetry_hz`（默认 10Hz）节流；**只写有效快照** | 每行一份 `TelemetrySnapshot.as_dict()`（位置/速度/欧拉角/四元数/原点/风/**任务进度、飞行模式与是否在空中**…共 33 字段） | `record.replay.load_broker_from_log`、人 | ✅ 可删可裁；**别插乱时间戳**（回放按时间轴推进） |
+| `telemetry.jsonl` | recorder 的 telemetry writer 线程；默认按 10Hz 节流，`telemetry_hz=0` 时通过有界队列记录每次已接纳更新，并在 `recorder_stopped` 写计数 | 每行一份 `TelemetrySnapshot.as_dict()`（位置/速度/欧拉角/四元数/源时标/接收时刻/原点/风/**任务进度、飞行模式与是否在空中**等） | `record.replay.load_broker_from_log`、人、标定工具 | 默认记录可删可裁；标定全量记录需保留完整行数与收尾事件，不能编辑或裁剪 |
 | `detections.jsonl` | `PerceptionWorker` → `recorder.detections.append(Detection)` | `Detection.as_dict()`：`frame_index`、`capture_timestamp`、`pixel`、`box`、`confidence`、`code`、`side_px`、`raw_text`、`ocr_confidence`、`mode`、`extra`（含 `undistorted`/`ocr_stage`/`ocr_worker`）+ 精简遥测字段 | 人、脚本 | ✅ 追加字段不影响解析 |
 | `events.jsonl` | 各模块经 `recorder.events.emit(kind, **data)`（线程安全、写完即 flush） | `{timestamp, kind, ...}`，`kind` 目录见 §5.2 | 人、复盘脚本 | ⚠ 建议只读（这是任务时间线） |
 | `drops.jsonl` | `MissionRunner(on_drop=…)` → `recorder.drops.append(DropRecord)` | 投放瞬间**原始状态**：位置/速度/姿态（欧拉角+四元数）/风/离地高度/NED 原点/目标点/判据前推位置与预测落点（**数值不四舍五入**） | `tools/fit_ballistics.py`、人 | ⚠ 只读；实测落点写在 `impacts.jsonl`，别改这个文件 |
@@ -2102,11 +2103,12 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `camera_matrix`（3×3）、`dist_coeffs` | 步骤一：棋盘格多视图 `calibrateCamera` | ✅（质量看 `meta.intrinsics.rms_px`） |
 | `image_size` | 同上 | ✅ 标定分辨率——换分辨率要用 `CameraModel.scaled()` 换算 |
 | `R_bc` | 步骤三：手眼标定 `A X = X B` | ✅ 旋转以标定为准 |
-| `t_bc` | **尺量常量**（`vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 顶部 `MEASURED_T_BC`） | ✅ 平移以尺量为准；标定估计值只在 `meta.extrinsics.lever_arm` 里供对比（可采信与否看残差 **+** 遥测/画面位置跨度两条判据，见 `telemetry_span_ok`） |
+| `t_bc` | **尺量常量**（`vendor/airdrop-calibration/airdrop_calibration/settings.py` 的 `MEASURED_T_BC`） | ✅ 平移以尺量为准；固定主旋转求得的平移估计只在 `meta.translation_diagnostic` 中供人工对比，不判断位置质量 |
 | `telemetry_lag` | 步骤二：画面角速度 × 飞控角速度互相关（用**收到帧的时刻** `received_timestamp` 测） | ✅ 标定后回填 `VideoConfig.telemetry_lag`；它是**绝对对齐量** = 视频链路延时 − 遥测链路延时，与录制时配置的 lag 无关 |
 | `meta.intrinsics` | `rms_px`、`views`、`per_view_errors`、`pattern_size`、`square_size_m` | 诊断 |
 | `meta.time_offset` | `lag_s`（= 绝对对齐量，同 `telemetry_lag`）、`peak_correlation`、`samples`、`search_s`、`step_s`、`curve`；另加时间轴与互核：`time_base`（恒 `received`）、`lag_baseline_s`（录制时配置的 lag）、`lag_residual_on_capture_axis_s`、`cross_check_ok`、`cross_check_tolerance_s`、`note` | 诊断（相关系数低 → 激励不足，重采；`cross_check_ok=False` → 素材索引里的 lag 与录制配置不一致，只告警，结果仍以 received 轴为准） |
-| `meta.extrinsics` | `pairs`、`residual_rotation_deg`、`axis_spread_deg`、`t_bc_source`、`lever_arm`、`methods`、`note` | 诊断 |
+| `meta.extrinsics` | `pairs`、`residual_rotation_deg`、`axis_spread_deg`、`t_bc_source`、`methods`、`note` | 旋转诊断 |
+| `meta.translation_diagnostic` | 平移估计状态、跳过原因、尺量值、估计值、逐轴差、距离差与残差 | 人工对比；`--no-estimate-translation` 可关闭 |
 | `meta.source_dir` | 用了哪个飞行目录 | 追溯 |
 
 文件缺失/损坏时 `load_camera_model()` **不报错**，退回默认外参（`DEFAULT_R_BC` = 绕 z +90°）并 warning
@@ -2203,6 +2205,7 @@ uv sync                                                # 依赖（清华镜像�
 | `--mission-control` / `--no-mission-control` | 是否控制任务；关闭后只运行所选采集/识别/记录组件，不上传、不解锁、不下发 hold/RTL/投弹 |
 | `--capture` / `--no-capture` | 是否接收视频；识别开启时必须接收 |
 | `--record` / `--no-record` | 是否保存标准飞行目录，与视频采集和识别独立 |
+| `--calibration-capture` | 标定采集 profile；要求 real、被动采集、关闭识别并启用记录，四元数至少 100Hz、欧拉角 30Hz，位置请求沿用配置值，telemetry JSONL 记录每次已接纳更新；建议地面手持飞机绕多轴拍固定标靶 |
 | `--recognize` / `--no-recognize` | 是否运行检测、OCR 与坐标/目标统计；关闭时不加载对应模型或相机标定 |
 | `--drop-stage` / `--no-drop-stage` | 是否在侦查后规划飞掠投放；关闭时处理结束后盘旋完成，不走备用点飞掠 |
 | `--real-release` / `--no-real-release` | 是否执行真实挂架动作；默认关闭，仍可执行模拟投放判据与记录，SITL 拒绝实投 |
@@ -2295,7 +2298,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 
 ### 6.6 一次真实任务的推荐顺序
 
-1. **标定**：`mission --no-mission-control --no-recognize --record` 录素材 → `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 出 `camera_calib.json`
+1. **标定**：`mission --mode real --no-mission-control --no-recognize --record --calibration-capture` 录素材 → `vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 出 `camera_calib.json`
    → 把 `telemetry_lag` 回填 `VideoConfig`（标定用**收到帧的时刻**测量，输出就是可直接回填的
    绝对对齐量；一步同时解决相机外参与时间差）。
 2. **配置**：`RECON_ROUTE`/`BACKUP_POINT` + 降落段——**要么**用操作手在 QGC 里画好的

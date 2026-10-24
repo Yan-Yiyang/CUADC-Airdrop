@@ -56,6 +56,59 @@ def test_auto_land_is_required_only_for_selected_drop_stage() -> None:
         prepare_config(options, Config())
 
 
+def test_prepare_config_calibration_capture_profile() -> None:
+    """标定 profile 请求所需速率，不降低已配置的高速请求。"""
+    config = Config()
+    config = replace(
+        config,
+        telemetry=replace(
+            config.telemetry,
+            position_rate_hz=20.0,
+            position_velocity_ned_rate_hz=60.0,
+            quaternion_rate_hz=120.0,
+            attitude_rate_hz=30.0,
+            source_time_alignment=False,
+        ),
+    )
+    options = RunOptions(mode="real", run_mission=False, recognize=False, calibration_capture=True)
+    prepared = prepare_config(options, config)
+    assert prepared.telemetry.position_rate_hz == 20.0
+    assert prepared.telemetry.position_velocity_ned_rate_hz == 60.0
+    assert prepared.telemetry.quaternion_rate_hz == 120.0
+    assert prepared.telemetry.attitude_rate_hz == 30.0
+    assert prepared.telemetry.source_time_alignment
+    assert prepared.record.telemetry_hz == 0.0
+    assert prepared.record.video
+
+    defaults = prepare_config(
+        RunOptions(mode="real", run_mission=False, recognize=False, calibration_capture=True),
+        Config(),
+    )
+    assert defaults.telemetry.position_rate_hz == Config().telemetry.position_rate_hz
+    assert (
+        defaults.telemetry.position_velocity_ned_rate_hz
+        == Config().telemetry.position_velocity_ned_rate_hz
+    )
+    assert defaults.telemetry.quaternion_rate_hz == 100.0
+    assert defaults.telemetry.attitude_rate_hz == 30.0
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        RunOptions(mode="sitl", run_mission=False, recognize=False, calibration_capture=True),
+        RunOptions(mode="real", run_mission=False, recognize=True, calibration_capture=True),
+        RunOptions(mode="real", run_mission=True, recognize=False, calibration_capture=True),
+        RunOptions(
+            mode="real", run_mission=False, recognize=False, record=False, calibration_capture=True
+        ),
+    ],
+)
+def test_calibration_capture_rejects_invalid_modes(options: RunOptions) -> None:
+    with pytest.raises(ValueError, match="标定采集"):
+        options.validated()
+
+
 @pytest.mark.parametrize(
     ("options", "message"),
     [

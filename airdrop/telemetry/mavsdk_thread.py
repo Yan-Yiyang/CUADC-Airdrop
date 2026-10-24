@@ -115,6 +115,7 @@ class MavsdkThread:
         position_rate_hz: float | None = None,
         position_velocity_ned_rate_hz: float | None = None,
         attitude_rate_hz: float | None = None,
+        quaternion_rate_hz: float | None = None,
         source_time_alignment: bool | None = None,
         thread_name: str = "mavsdk-thread",
     ) -> None:
@@ -143,6 +144,7 @@ class MavsdkThread:
         self.position_rate_hz = position_rate_hz
         self.position_velocity_ned_rate_hz = position_velocity_ned_rate_hz
         self.attitude_rate_hz = attitude_rate_hz
+        self.quaternion_rate_hz = quaternion_rate_hz
         self.source_time_alignment = self.broker.source_time_alignment
         self._thread_name = thread_name
 
@@ -184,6 +186,7 @@ class MavsdkThread:
             position_rate_hz=config.position_rate_hz,
             position_velocity_ned_rate_hz=config.position_velocity_ned_rate_hz,
             attitude_rate_hz=config.attitude_rate_hz,
+            quaternion_rate_hz=config.quaternion_rate_hz,
             source_time_alignment=config.source_time_alignment,
             thread_name=thread_name,
         )
@@ -507,7 +510,7 @@ class MavsdkThread:
             ("attitude_euler", self.attitude_rate_hz, drone.telemetry.set_rate_attitude_euler),
             (
                 "attitude_quaternion",
-                self.attitude_rate_hz,
+                self.quaternion_rate_hz,
                 drone.telemetry.set_rate_attitude_quaternion,
             ),
         )

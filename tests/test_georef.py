@@ -604,10 +604,22 @@ def test_load_camera_model_reads_all_fields(tmp_path: Path) -> None:
     assert model.source == str(path)
 
 
-def test_load_camera_model_defaults_extrinsics_when_absent(tmp_path: Path) -> None:
+def test_load_camera_model_rejects_missing_extrinsics(tmp_path: Path) -> None:
     path = _write_calib(tmp_path / "camera_calib.json", R_bc=None, t_bc=None, telemetry_lag=None)
     model = load_camera_model(path)
+    assert not model.is_calibrated()
+    assert model.source is None
     assert np.allclose(model.r_bc, DEFAULT_R_BC)
+
+
+def test_load_camera_model_rejects_absent_r_bc(tmp_path: Path) -> None:
+    path = _write_calib(tmp_path / "camera_calib.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["R_bc"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    model = load_camera_model(path)
+    assert not model.is_calibrated()
+    assert model.source is None
     assert np.allclose(model.t_bc, np.zeros(3))
     assert model.telemetry_lag is None
 

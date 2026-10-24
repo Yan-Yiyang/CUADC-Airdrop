@@ -94,6 +94,12 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             ),
             Option(("--record",), "record", "写入标准飞行记录目录", kind="bool", source="RECORD"),
             Option(
+                ("--calibration-capture",),
+                "calibration_capture",
+                "启用标定专用全速遥测记录配置（仅 real 被动采集）",
+                kind="bool",
+            ),
+            Option(
                 ("--drop-stage",),
                 "drop_stage",
                 "运行投放判据与飞掠阶段",

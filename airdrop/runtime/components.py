@@ -55,6 +55,7 @@ def build_perception_components(
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
     side_check_tolerance: float | None = None,
     defer_until_airborne: bool = False,
+    calibration_capture: bool = False,
 ) -> PerceptionComponents:
     """按需构造共享感知链路；关闭识别时完全不加载相机或模型。"""
     if recognize and not capture:
@@ -76,6 +77,7 @@ def build_perception_components(
             max_extrapolation=config.align.max_extrapolation,
         ),
         defer_until_airborne=defer_until_airborne,
+        capture_only=calibration_capture,
     )
     if not recognize:
         return PerceptionComponents(writer=writer)

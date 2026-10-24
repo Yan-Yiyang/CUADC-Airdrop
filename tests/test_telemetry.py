@@ -693,7 +693,8 @@ def test_apply_telemetry_rates_calls_set_rate_with_configured_hz() -> None:
     config = TelemetryConfig(
         position_rate_hz=10.0,
         position_velocity_ned_rate_hz=12.0,
-        attitude_rate_hz=33.0,
+        attitude_rate_hz=30.0,
+        quaternion_rate_hz=100.0,
     )
     mav = mt.MavsdkThread.from_config(
         config, broker=TelemetryBroker(source_time_alignment=config.source_time_alignment)
@@ -702,8 +703,8 @@ def test_apply_telemetry_rates_calls_set_rate_with_configured_hz() -> None:
 
     assert calls["position"] == 10.0
     assert calls["pvn"] == 12.0
-    assert calls["euler"] == 33.0
-    assert calls["quat"] == 33.0  # 姿态用同一速率覆盖四元数与欧拉
+    assert calls["euler"] == 30.0
+    assert calls["quat"] == 100.0
 
 
 def test_apply_telemetry_rates_skips_when_rate_is_none() -> None:

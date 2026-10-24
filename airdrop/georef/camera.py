@@ -233,11 +233,7 @@ def load_camera_model(
         model = CameraModel(
             camera_matrix=np.asarray(payload["camera_matrix"], dtype=np.float64),
             dist_coeffs=np.asarray(payload.get("dist_coeffs", [0.0] * 5), dtype=np.float64),
-            r_bc=(
-                np.asarray(payload["R_bc"], dtype=np.float64)
-                if payload.get("R_bc") is not None
-                else DEFAULT_R_BC.copy()
-            ),
+            r_bc=np.asarray(payload["R_bc"], dtype=np.float64),
             t_bc=np.asarray(payload.get("t_bc", [0.0, 0.0, 0.0]), dtype=np.float64),
             image_size=(int(size[0]), int(size[1])) if size else None,
             telemetry_lag=(

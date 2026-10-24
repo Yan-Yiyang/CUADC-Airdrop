@@ -81,6 +81,7 @@ class TelemetryConfig:
     position_rate_hz: float = 10.0
     position_velocity_ned_rate_hz: float = 10.0
     attitude_rate_hz: float = 30.0
+    quaternion_rate_hz: float = 30.0
     # 正式路径按字段源时标对齐；False 仅用于复现旧接收时刻混合的缺陷。
     source_time_alignment: bool = True
 
@@ -453,7 +454,7 @@ class RecordConfig:
 
     dir: str = "flights"
     video: bool = True  # 落盘缓冲内的 jpeg（零重编码）
-    telemetry_hz: float = 10.0
+    telemetry_hz: float = 10.0  # 0 表示订阅并记录每次已接纳的快照更新
     event_eval_hz: float = 5.0  # 释放评估摘要频率
 
 
@@ -587,6 +588,17 @@ class Config:
                 f"{self.ballistics.wind_source!r}"
             )
         self._validated_ballistics()
+        for name in (
+            "position_rate_hz",
+            "position_velocity_ned_rate_hz",
+            "attitude_rate_hz",
+            "quaternion_rate_hz",
+        ):
+            value = getattr(self.telemetry, name)
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError(f"telemetry.{name} 必须为有限非负数: {value}")
+        if not math.isfinite(self.record.telemetry_hz) or self.record.telemetry_hz < 0:
+            raise ValueError(f"record.telemetry_hz 必须为有限非负数: {self.record.telemetry_hz}")
         if self.perception.ocr_workers < 1:
             raise ValueError(f"perception.ocr_workers 至少为 1: {self.perception.ocr_workers}")
         if self.perception.ocr_queue_size < 1:

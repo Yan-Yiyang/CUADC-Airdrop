@@ -121,10 +121,11 @@ class AlignedSample:
     ``timestamp`` 是对齐后的采样时刻，即画面拍摄时刻
     （``frame.timestamp - lag``），也是实际传给遥测代理的查询时间；它与
     ``frame.timestamp``（收到帧的时间）差一个 ``lag``，别混用。
+    ``mode="capture_only"`` 表示仅记录原始帧；此时 ``snapshot`` 为 ``None``，没有帧对齐遥测。
     """
 
     frame: VideoFrame
-    snapshot: TelemetrySnapshot
+    snapshot: TelemetrySnapshot | None
     timestamp: float
     lag: float
     mode: str

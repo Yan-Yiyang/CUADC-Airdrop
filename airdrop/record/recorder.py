@@ -33,7 +33,8 @@
   **跳号**：跳掉的帧计入 :attr:`RecorderStats.frames_skipped` 并发 WARNING
   ——绝不静默地少录；
 * **telemetry writer**：``broker.wait_next_snapshot`` 等到下一条快照 →
-  按 ``telemetry_hz`` 节流（默认 10Hz）→ 写盘。30Hz 原始流不必每条都留。
+  按 ``telemetry_hz`` 节流（默认 10Hz）→ 写盘；标定全量模式由订阅回调
+  送入有界 FIFO，writer 逐条排空并在停止时写完已接纳样本。
 
 事件和检测是同步 API：业务线程随时调 :attr:`FlightRecorder.events` /
 :attr:`FlightRecorder.detections` 的 ``emit/append``，内部用 ``RLock`` 串行
@@ -50,10 +51,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import queue
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +66,7 @@ import numpy as np
 from ..ballistics.drops import DROPS_NAME, DropRecord
 from ..config import Config, RecordConfig
 from ..telemetry.broker import TelemetryBroker
+from ..telemetry.models import TelemetrySnapshot
 from ..video.buffer import AlignmentBuffer, BufferedFrame
 
 LOGGER = logging.getLogger(__name__)
@@ -260,40 +264,24 @@ def _json_default(value: Any) -> Any:
 # ----------------------------------------------------------------------
 # Recorder 状态汇总
 # ----------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
 class RecorderStats:
     """Recorder 运行统计（线程安全地取）。"""
 
-    __slots__ = (
-        "detections",
-        "drops",
-        "events",
-        "flight_dir",
-        "frames_skipped",
-        "frames_written",
-        "raw_reencoded",
-        "telemetry_written",
-    )
-
-    def __init__(  # noqa: PLR0917 - 统计项本身就是这个数量，位置参数与字段一一对应
-        self,
-        flight_dir: Path,
-        frames_written: int,
-        telemetry_written: int,
-        events: int,
-        detections: int,
-        drops: int,
-        raw_reencoded: int,
-        frames_skipped: int = 0,
-    ) -> None:
-        self.flight_dir = flight_dir
-        self.frames_written = frames_written
-        self.telemetry_written = telemetry_written
-        self.events = events
-        self.detections = detections
-        self.drops = drops
-        self.raw_reencoded = raw_reencoded
-        #: 因缓冲驱逐/写盘落后而**没写进磁盘**的帧数（>0 说明录制不完整，日志里有 WARNING）
-        self.frames_skipped = frames_skipped
+    flight_dir: Path
+    frames_written: int
+    telemetry_written: int
+    events: int
+    detections: int
+    drops: int
+    raw_reencoded: int
+    frames_skipped: int = 0
+    frame_encode_errors: int = 0
+    telemetry_received: int = 0
+    telemetry_enqueued: int = 0
+    telemetry_write_errors: int = 0
+    telemetry_dropped: int = 0
+    telemetry_pending: int = 0
 
 
 # ----------------------------------------------------------------------
@@ -335,8 +323,11 @@ class FlightRecorder:
     def __init__(self, config: Config, *, base_dir: str | Path | None = None) -> None:
         self._config = config
         record = config.record
+        if not math.isfinite(record.telemetry_hz) or record.telemetry_hz < 0:
+            raise ValueError("record.telemetry_hz 必须为有限非负数")
         self._base_dir = Path(base_dir) if base_dir is not None else Path(record.dir)
-        self._telemetry_hz = max(float(record.telemetry_hz), 0.1)
+        self._full_update_telemetry = record.telemetry_hz == 0
+        self._telemetry_hz = float(record.telemetry_hz)
 
         self._flight_dir: Path | None = None
         self._frames_dir: Path | None = None
@@ -361,6 +352,15 @@ class FlightRecorder:
         self._frames_written = 0
         self._frames_skipped = 0
         self._telemetry_written = 0
+        self._telemetry_queue: queue.Queue[TelemetrySnapshot] = queue.Queue(maxsize=10_000)
+        self._telemetry_queue_lock = threading.Lock()
+        self._telemetry_accepting = False
+        self._telemetry_enqueued = 0
+        self._telemetry_write_errors = 0
+        self._finalize_errors = 0
+        self._telemetry_dropped = 0
+        self._telemetry_pending = 0
+        self._telemetry_callback = self._enqueue_full_update
         self._raw_reencoded = 0
         self._events_written = 0
         self._detections_written = 0
@@ -464,6 +464,10 @@ class FlightRecorder:
                 self._frame_thread.start()
                 self._telemetry_thread.start()
                 self._started = True
+                if self._full_update_telemetry:
+                    with self._telemetry_queue_lock:
+                        self._telemetry_accepting = True
+                    broker.subscribe(self._telemetry_callback)
 
                 self.events.emit(
                     "recorder_started",
@@ -483,7 +487,10 @@ class FlightRecorder:
                     self._log_handler.flush()
             except BaseException:
                 self._stop_event.set()
-                self.stop()
+                try:
+                    self.stop()
+                except Exception:
+                    LOGGER.exception("FlightRecorder 启动回滚时收尾失败")
                 raise
         return self
 
@@ -497,6 +504,10 @@ class FlightRecorder:
             return  # 从未启动过
         if self._stop_cutoff is None:
             self._stop_cutoff = self._buffer.latest_index() if self._buffer is not None else 0
+        if self._full_update_telemetry and self._broker is not None:
+            with self._telemetry_queue_lock:
+                self._telemetry_accepting = False
+            self._broker.unsubscribe(self._telemetry_callback)
         self._stop_event.set()
         deadline = time.monotonic() + max(timeout, 0.0)
         alive = False
@@ -512,23 +523,52 @@ class FlightRecorder:
         self._frame_thread = None
         self._telemetry_thread = None
 
-        # 顺序：先收尾事件、摘 handler、再关文件（避免 flush 时 handler 已被摘）
+        # 在收尾事件前 flush/close 遥测和帧索引，使 close 错误也写进完整性统计。
+        self._close_data_files()
+        frame_encode_errors = self._buffer.stats.encode_failures if self._buffer is not None else 0
+        # 顺序：先收尾事件、摘 handler、再关结构化日志文件。
+        stopped_event_ok = True
         if self._events is not None:
             try:
-                self._events.emit(
+                stopped_event_ok = self._events.emit(
                     "recorder_stopped",
                     frames_written=self._frames_written,
                     frames_skipped=self._frames_skipped,
+                    frame_encode_errors=frame_encode_errors,
                     telemetry_written=self._telemetry_written,
+                    telemetry_received=self._telemetry_enqueued + self._telemetry_dropped,
+                    telemetry_enqueued=self._telemetry_enqueued,
+                    telemetry_write_errors=self._telemetry_write_errors,
+                    finalize_errors=self._finalize_errors,
+                    telemetry_dropped=self._telemetry_dropped,
+                    telemetry_pending=self._telemetry_pending,
                     events=self._events.count,
                     detections=self._detections.count if self._detections else 0,
                     drops=self._drops.count if self._drops else 0,
                 )
             except Exception:
+                stopped_event_ok = False
                 LOGGER.exception("recorder_stopped 事件写入失败")
 
         self._uninstall_log_handler()
         self._close_files()
+        if self._full_update_telemetry and (
+            self._telemetry_dropped
+            or self._telemetry_write_errors
+            or self._frames_skipped
+            or frame_encode_errors
+            or self._finalize_errors
+            or not stopped_event_ok
+        ):
+            raise RuntimeError(
+                "标定全量记录不完整："
+                f"enqueued={self._telemetry_enqueued}, "
+                f"written={self._telemetry_written}, dropped={self._telemetry_dropped}, "
+                f"write_errors={self._telemetry_write_errors}, "
+                f"frames_skipped={self._frames_skipped}, finalize_errors={self._finalize_errors}, "
+                f"frame_encode_errors={frame_encode_errors}, "
+                f"recorder_stopped_written={stopped_event_ok}"
+            )
 
     def stats(self) -> RecorderStats | None:
         """运行统计快照；未启动返回 None。"""
@@ -548,6 +588,14 @@ class FlightRecorder:
             drops=drops,
             raw_reencoded=self._raw_reencoded,
             frames_skipped=self._frames_skipped,
+            frame_encode_errors=self._buffer.stats.encode_failures
+            if self._buffer is not None
+            else 0,
+            telemetry_received=self._telemetry_enqueued + self._telemetry_dropped,
+            telemetry_enqueued=self._telemetry_enqueued,
+            telemetry_write_errors=self._telemetry_write_errors,
+            telemetry_dropped=self._telemetry_dropped,
+            telemetry_pending=self._telemetry_pending,
         )
 
     # ------------------------------------------------------------------
@@ -628,6 +676,7 @@ class FlightRecorder:
                 "lag": frame.lag,
                 "extrapolated": frame.extrapolated,
                 "offset": frame.offset,
+                "telemetry_aligned": frame.snapshot is not None,
                 "bytes": len(jpeg),
             },
             ensure_ascii=False,
@@ -640,6 +689,9 @@ class FlightRecorder:
     def _telemetry_writer_loop(self) -> None:
         """按 ``telemetry_hz`` 节流写盘。"""
         assert self._broker is not None and self._telemetry_file is not None
+        if self._full_update_telemetry:
+            self._full_telemetry_writer_loop()
+            return
         broker = self._broker
         out = self._telemetry_file
         interval = 1.0 / self._telemetry_hz
@@ -668,14 +720,48 @@ class FlightRecorder:
                 LOGGER.exception("telemetry 写入失败")
                 continue
             except Exception:
-                # ⚠ 只能兜到这里：线程里逃出去的异常会直接结束本线程，而
-                # threading 的默认 excepthook 把 traceback 打到 sys.stderr、
-                # **不进 flight.log** ⇒ 这次飞行的遥测在某刻静默停止记录，
-                # 事后复盘只看到 stats 不再增长。UnicodeEncodeError（ValueError
-                # 的子类）就够触发：文件按 utf-8 文本模式打开且 ensure_ascii=False，
-                # 快照里任何不可编码的字符串都会炸。
                 LOGGER.exception("telemetry 写入异常（已兜住，写盘线程继续）")
                 continue
+
+    def _enqueue_full_update(self, snapshot: TelemetrySnapshot) -> None:
+        """回调只做有界入队，不在 MAVSDK 发布线程上编码或写盘。"""
+        with self._telemetry_queue_lock:
+            if not self._telemetry_accepting:
+                return
+            try:
+                self._telemetry_queue.put_nowait(snapshot)
+            except queue.Full:
+                self._telemetry_dropped += 1
+                return
+            self._telemetry_enqueued += 1
+            self._telemetry_pending += 1
+
+    def _full_telemetry_writer_loop(self) -> None:
+        """逐条排空标定采集队列；关闭入队后把已接纳尾样本写完。"""
+        assert self._telemetry_file is not None
+        out = self._telemetry_file
+        while True:
+            try:
+                snapshot = self._telemetry_queue.get(timeout=0.1)
+            except queue.Empty:
+                with self._telemetry_queue_lock:
+                    if self._stop_event.is_set() and self._telemetry_pending == 0:
+                        break
+                continue
+            try:
+                out.write(
+                    json.dumps(snapshot.as_dict(), ensure_ascii=False, default=_json_default) + "\n"
+                )
+                self._telemetry_written += 1
+                if self._telemetry_written % _TELEMETRY_FLUSH_EVERY == 0:
+                    out.flush()
+            except Exception:
+                with self._telemetry_queue_lock:
+                    self._telemetry_write_errors += 1
+                LOGGER.exception("全量遥测记录写入异常")
+            finally:
+                with self._telemetry_queue_lock:
+                    self._telemetry_pending -= 1
 
     # ------------------------------------------------------------------
     # 目录 / 文件
@@ -731,13 +817,30 @@ class FlightRecorder:
             self._drops_written = self._drops.count
             self._drops.close()
             self._drops = None
+        self._close_data_files()
+
+    def _close_data_files(self) -> None:
+        """关闭遥测与帧索引文件，并统计标定全量模式的 flush/close 错误。"""
         for attr in ("_telemetry_file", "_frames_index_file"):
             handle = getattr(self, attr)
             if handle is not None and not handle.closed:
                 try:
                     handle.flush()
+                except OSError:
+                    if self._full_update_telemetry:
+                        if attr == "_telemetry_file":
+                            self._telemetry_write_errors += 1
+                        else:
+                            self._finalize_errors += 1
+                    LOGGER.exception("文件 flush 失败: %s", attr)
+                try:
                     handle.close()
                 except OSError:
+                    if self._full_update_telemetry:
+                        if attr == "_telemetry_file":
+                            self._telemetry_write_errors += 1
+                        else:
+                            self._finalize_errors += 1
                     LOGGER.exception("文件关闭失败: %s", attr)
             setattr(self, attr, None)
 

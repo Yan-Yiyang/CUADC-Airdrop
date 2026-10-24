@@ -513,6 +513,8 @@ class PerceptionWorker:
 
     def _process_frame(self, frame: BufferedFrame) -> None:
         """一帧的完整处理：检测 → 按模式产出。"""
+        if frame.snapshot is None:
+            raise ValueError("感知处理不能接收未对齐遥测的采集帧")
         batch = self._detector.detect(
             frame.image,
             frame_index=frame.index,
@@ -556,6 +558,8 @@ class PerceptionWorker:
     ) -> ProcessedFrame:
         """复制图像和姿态标量，构造与业务对象无共享可变引用的帧快照。"""
         snapshot = frame.snapshot
+        if snapshot is None:
+            raise ValueError("感知帧快照缺少对齐遥测")
         pose = snapshot_pose(snapshot)
         configured_matrix = self._detector.config.camera_matrix
         matrix = None

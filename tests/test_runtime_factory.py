@@ -70,6 +70,83 @@ def test_real_runtime_rejects_unknown_calibration_time_reference(tmp_path: Path)
         prepare_config(RunOptions(mode="real", run_mission=False), config)
 
 
+def test_ground_calibration_capture_records_frames_without_position_alignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """地面无位置时，真实装配仍把原始帧和独立四元数都交给记录器。"""
+
+    class Source:
+        def __init__(self, _config) -> None:
+            self.sink = None
+
+        def add_sink(self, sink) -> None:
+            self.sink = sink
+
+        def emit(self, frame: VideoFrame) -> None:
+            assert self.sink is not None
+            self.sink(frame)
+
+    class Thread:
+        @classmethod
+        def from_config(cls, *_args, **_kwargs):
+            return cls()
+
+    monkeypatch.setattr(airdrop, "Hm30VideoSource", Source)
+    monkeypatch.setattr(airdrop, "MavsdkThread", Thread)
+    config = Config()
+    config = replace(
+        config,
+        record=replace(config.record, dir=str(tmp_path), telemetry_hz=0.0),
+    )
+    options = RunOptions(
+        mode="real",
+        run_mission=False,
+        capture=True,
+        recognize=False,
+        record=True,
+        calibration_capture=True,
+    )
+    components = build_live_components(options, config)
+    assert components.source is not None and components.writer is not None
+    assert components.broker is not None and components.buffer is not None
+    assert components.recorder is not None
+    source = cast(Source, components.source)
+    source.add_sink(components.writer)
+    components.recorder.start(broker=components.broker, buffer=components.buffer)
+    for index in range(3):
+        received = 100.0 + index * 0.1
+        components.broker.publish(
+            TelemetrySnapshot(
+                timestamp=received,
+                quaternion_received_at=received,
+                quaternion_timestamp_us=1_000_000 + index * 100_000,
+                quaternion_w=1.0,
+                quaternion_x=0.0,
+                quaternion_y=0.0,
+                quaternion_z=0.0,
+            )
+        )
+    source.emit(
+        VideoFrame(index=1, image=np.zeros((24, 32, 3), dtype=np.uint8), timestamp=100.1, lag=0.15)
+    )
+    components.recorder.stop()
+    assert components.writer.written == 1
+    flight_dir = components.recorder.flight_dir
+    assert flight_dir is not None
+    frame_index = json.loads((flight_dir / "frames_index.jsonl").read_text().strip())
+    assert frame_index["telemetry_aligned"] is False
+    assert frame_index["received_timestamp"] == pytest.approx(100.1)
+    assert frame_index["capture_timestamp"] == pytest.approx(99.95)
+    assert frame_index["lag"] == pytest.approx(0.15)
+    assert (flight_dir / "frames" / frame_index["filename"]).is_file()
+    telemetry = [
+        json.loads(line) for line in (flight_dir / "telemetry.jsonl").read_text().splitlines()
+    ]
+    assert len(telemetry) == 3
+    assert all(row["north_m"] is None for row in telemetry)
+    assert all(row["quaternion_timestamp_us"] is not None for row in telemetry)
+
+
 def _write_qgc_plan(path: Path, *, lat: float = 47.0, lon: float = 8.001) -> Path:
     """写入包含单个位置项的有效 QGC 航线。"""
     path.write_text(

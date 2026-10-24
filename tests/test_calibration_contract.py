@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -89,11 +90,136 @@ def test_calibration_pose_uses_the_same_source_time_as_runtime(position_delay: f
         assert offline[:3, :3] == pytest.approx(rotation, abs=1e-10)
 
 
+def test_full_update_recorder_contract_reaches_calibration_validator(tmp_path: Path) -> None:
+    """真实记录器的全量队列统计、JSONL 与标定校验器保持同一契约。"""
+    from airdrop_calibration.calibrate import _validate_full_update_capture
+    from airdrop_calibration.flight_log import load_flight_telemetry
+    from airdrop_calibration.source_timeline import SourceTimeline
+
+    from airdrop import AlignmentBuffer, Config, FlightRecorder, TelemetryBroker
+    from airdrop.telemetry.models import TelemetrySnapshot
+    from airdrop.video.align import AlignedSample
+    from airdrop.video.source import VideoFrame
+
+    config = Config()
+    config = replace(config, record=replace(config.record, dir=str(tmp_path), telemetry_hz=0.0))
+    broker = TelemetryBroker()
+    buffer = AlignmentBuffer(capacity=4)
+    recorder = FlightRecorder(config.validated(), base_dir=tmp_path / "records")
+    recorder.start(broker=broker, buffer=buffer)
+    for index in range(6):
+        received = 100.0 + index * 0.01
+        position_index = index // 2
+        snapshot = TelemetrySnapshot(
+            timestamp=received,
+            north_m=position_index / 2,
+            east_m=0.0,
+            down_m=-10.0,
+            quaternion_w=1.0,
+            quaternion_x=0.0,
+            quaternion_y=0.0,
+            quaternion_z=0.0,
+            position_timestamp_us=20_000 + position_index * 20_000,
+            position_velocity_received_at=100.0 + position_index * 0.02,
+            quaternion_timestamp_us=100_000 + index * 10_000,
+            quaternion_received_at=received,
+        )
+        broker.publish(snapshot)
+    for index in (1, 2):
+        received = 100.0 + index * 0.1
+        frame = VideoFrame(
+            index=index,
+            image=np.zeros((16, 16, 3), dtype=np.uint8),
+            timestamp=received,
+        )
+        buffer.put(
+            AlignedSample(
+                frame=frame,
+                snapshot=TelemetrySnapshot(timestamp=received),
+                timestamp=received,
+                lag=0.0,
+                mode="interpolate",
+            )
+        )
+    recorder.stop()
+    flight = recorder.flight_dir
+    assert flight is not None
+    telemetry_rows = load_flight_telemetry(flight)
+    quality = _validate_full_update_capture(flight, telemetry_rows)
+    assert quality is not None
+    assert quality["telemetry"]["telemetry_written"] == 6
+    timeline = SourceTimeline(load_flight_telemetry(flight))
+    assert timeline.quality_meta["quaternion"]["native_samples"] == 6
+    assert timeline.quality_meta["position"]["native_samples"] == 3
+    assert timeline.quality_meta["quaternion"]["received_hz"] == pytest.approx(100.0)
+    assert timeline.quality_meta["position"]["received_hz"] == pytest.approx(50.0)
+    first_frame = next((flight / "frames").glob("*.jpg"))
+    first_frame.unlink()
+    with pytest.raises(ValueError, match="帧文件缺失"):
+        _validate_full_update_capture(flight, telemetry_rows)
+
+
+@pytest.mark.parametrize(
+    "event_update",
+    [
+        {"kind": "wrong_end"},
+        {"telemetry_dropped": 1},
+        {"telemetry_write_errors": 1},
+        {"telemetry_pending": 1},
+        {"frame_encode_errors": 1},
+        {"telemetry_written": 99},
+    ],
+)
+def test_full_update_validator_rejects_incomplete_capture(
+    tmp_path: Path, event_update: dict[str, object]
+) -> None:
+    """全量记录的结束事件和写入计数缺失或不一致时拒绝标定。"""
+    import json
+
+    from airdrop_calibration.calibrate import _validate_full_update_capture
+
+    flight = tmp_path / "flight"
+    flight.mkdir()
+    (flight / "config_snapshot.json").write_text(
+        json.dumps({"record": {"telemetry_hz": 0}}), encoding="utf-8"
+    )
+    ended = {
+        "kind": "recorder_stopped",
+        "telemetry_received": 0,
+        "telemetry_enqueued": 0,
+        "telemetry_written": 0,
+        "telemetry_dropped": 0,
+        "telemetry_write_errors": 0,
+        "telemetry_pending": 0,
+        "frames_written": 2,
+        "frames_skipped": 0,
+        "frame_encode_errors": 0,
+        "finalize_errors": 0,
+        "events": 1,
+    }
+    ended.update(event_update)
+    (flight / "events.jsonl").write_text(
+        json.dumps({"kind": "recorder_started"}) + "\n" + json.dumps(ended) + "\n",
+        encoding="utf-8",
+    )
+    (flight / "telemetry.jsonl").write_text("", encoding="utf-8")
+    (flight / "frames_index.jsonl").write_text(
+        json.dumps({"received_timestamp": 10.0})
+        + "\n"
+        + json.dumps({"received_timestamp": 11.0})
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        _validate_full_update_capture(flight, [])
+
+
 def test_handwritten_flightrecorder_files_and_camera_model_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """独立手写 JSONL 可读取，来源 schema 可由生产相机模型加载。"""
     from airdrop_calibration import calibrate
+    from airdrop_calibration.algorithms import rotation_z
     from airdrop_calibration.flight_log import (
         load_flight_frames_paired,
         load_flight_stamps,
@@ -167,8 +293,7 @@ def test_handwritten_flightrecorder_files_and_camera_model_contract(
         lag=lag,
         measurement=LagMeasurement(lag, None, 0.2, True),
         extrinsics=ExtrinsicsResult(
-            r_bc=calibrate.rotation_z(90.0),
-            t_bc=np.array([1.0, 2.0, 0.5]),
+            r_bc=rotation_z(90.0),
             pairs=8,
             residual_rotation_deg=0.01,
         ),
@@ -179,6 +304,16 @@ def test_handwritten_flightrecorder_files_and_camera_model_contract(
         lag_step_s=0.005,
         measured_t_bc=(1.0, 2.0, 0.5),
         source="simulated_calibration",
+        translation_diagnostic={
+            "status": "disabled",
+            "reason": "disabled_by_user",
+            "measured": [1.0, 2.0, 0.5],
+            "estimated": None,
+            "delta_xyz_m": None,
+            "delta_m": None,
+            "residual_m": None,
+            "pairs": 0,
+        },
     )
     assert calibrate.CalibrateConfig().source == "measured_calibration"
     assert payload["meta"]["schema_version"] == 1

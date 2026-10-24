@@ -12,7 +12,7 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -23,11 +23,14 @@ import pytest
 from airdrop import (
     AlignedSample,
     AlignmentBuffer,
+    AlignmentWriter,
     Config,
     DetectionWriter,
     DropRecord,
     EventLog,
     FlightRecorder,
+    FrameTelemetryAligner,
+    Hm30VideoSource,
     TelemetryBroker,
     TelemetrySnapshot,
     VideoFrame,
@@ -186,6 +189,320 @@ def test_recorder_rolls_back_second_thread_start_failure(
     assert recorder._frame_thread is None
     assert recorder._events is None
     assert root.handlers == handlers and root.level == level
+
+
+def _full_update_recorder(tmp_path: Path) -> FlightRecorder:
+    config = Config()
+    config = replace(config, record=replace(config.record, telemetry_hz=0.0))
+    return FlightRecorder(config.validated(), base_dir=tmp_path)
+
+
+def _publish_full_update(broker: TelemetryBroker, index: int) -> None:
+    broker.publish(
+        TelemetrySnapshot(
+            timestamp=100.0 + index / 100.0,
+            quaternion_timestamp_us=1_000_000 + index * 10_000,
+            quaternion_received_at=100.0 + index / 100.0,
+            quaternion_w=1.0,
+            quaternion_x=0.0,
+            quaternion_y=0.0,
+            quaternion_z=0.0,
+        )
+    )
+
+
+def test_full_update_recorder_saves_every_broker_publication(tmp_path: Path) -> None:
+    """全量模式经 broker 订阅逐条落盘，不按 writer 醒来时的最新值抽样。"""
+    broker = TelemetryBroker()
+    recorder = _full_update_recorder(tmp_path)
+    recorder.start(broker=broker, buffer=AlignmentBuffer(capacity=4))
+    for index in range(1_000):
+        _publish_full_update(broker, index)
+    recorder.stop()
+    stats = recorder.stats()
+    assert stats is not None
+    assert stats.telemetry_received == stats.telemetry_enqueued == stats.telemetry_written == 1_000
+    assert stats.telemetry_dropped == stats.telemetry_write_errors == stats.telemetry_pending == 0
+    rows = [
+        json.loads(line)
+        for line in (recorder.flight_dir / "telemetry.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(rows) == 1_000
+    assert [row["quaternion_timestamp_us"] for row in rows] == [
+        1_000_000 + index * 10_000 for index in range(1_000)
+    ]
+
+
+def test_full_update_stop_timeout_retry_drains_accepted_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """慢 writer 超时后保留资源，重试 stop 会写完所有已接纳样本。"""
+    broker = TelemetryBroker()
+    recorder = _full_update_recorder(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    original = recorder._full_telemetry_writer_loop
+
+    def slow_writer() -> None:
+        entered.set()
+        assert release.wait(5)
+        original()
+
+    monkeypatch.setattr(recorder, "_full_telemetry_writer_loop", slow_writer)
+    recorder.start(broker=broker, buffer=AlignmentBuffer(capacity=4))
+    for index in range(20):
+        _publish_full_update(broker, index)
+    assert entered.wait(2)
+    recorder.stop(timeout=0.01)
+    assert recorder._telemetry_thread is not None
+    assert recorder._telemetry_file is not None and not recorder._telemetry_file.closed
+    release.set()
+    recorder.stop()
+    stats = recorder.stats()
+    assert stats is not None and stats.telemetry_written == 20
+    assert stats.telemetry_pending == stats.telemetry_dropped == 0
+
+
+def test_full_update_start_failure_unsubscribes_and_ignores_late_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """启动事件失败会回滚订阅，broker 后续发布不会再进已回滚记录器。"""
+    broker = TelemetryBroker()
+    recorder = _full_update_recorder(tmp_path)
+    emit = EventLog.emit
+
+    def fail_started(event_log, kind, **data):
+        if kind == "recorder_started":
+            raise OSError("模拟启动事件失败")
+        return emit(event_log, kind, **data)
+
+    monkeypatch.setattr(EventLog, "emit", fail_started)
+    with pytest.raises(OSError, match="启动事件失败"):
+        recorder.start(broker=broker, buffer=AlignmentBuffer(capacity=4))
+    assert recorder._telemetry_callback not in broker._subscribers
+    _publish_full_update(broker, 1)
+    stats = recorder.stats()
+    assert stats is not None and stats.telemetry_received == 0
+    assert not recorder.is_running
+
+
+def test_full_update_stop_rejects_callback_already_in_broker_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """已被 broker 复制的迟到回调在关闭接纳后不能进入队列。"""
+    broker = TelemetryBroker()
+    recorder = _full_update_recorder(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    original = recorder._telemetry_callback
+
+    def delayed_callback(snapshot: TelemetrySnapshot) -> None:
+        entered.set()
+        assert release.wait(5)
+        original(snapshot)
+
+    monkeypatch.setattr(recorder, "_telemetry_callback", delayed_callback)
+    recorder.start(broker=broker, buffer=AlignmentBuffer(capacity=4))
+    publisher = threading.Thread(target=_publish_full_update, args=(broker, 1))
+    publisher.start()
+    assert entered.wait(2)
+    stop_done = threading.Event()
+
+    def stop() -> None:
+        recorder.stop()
+        stop_done.set()
+
+    stopper = threading.Thread(target=stop)
+    stopper.start()
+    assert _wait_until(recorder._stop_event.is_set)
+    release.set()
+    publisher.join(2)
+    stopper.join(2)
+    assert stop_done.is_set()
+    stats = recorder.stats()
+    assert stats is not None and stats.telemetry_received == stats.telemetry_written == 0
+
+
+def test_full_update_queue_overflow_is_reported_as_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """满队列不静默丢样本，stop 明确报告标定采集不完整。"""
+    broker = TelemetryBroker()
+    recorder = _full_update_recorder(tmp_path)
+    recorder._telemetry_queue = queue.Queue(maxsize=1)
+    entered, release = threading.Event(), threading.Event()
+    original = recorder._full_telemetry_writer_loop
+
+    def blocked_writer() -> None:
+        entered.set()
+        assert release.wait(5)
+        original()
+
+    monkeypatch.setattr(recorder, "_full_telemetry_writer_loop", blocked_writer)
+    recorder.start(broker=broker, buffer=AlignmentBuffer(capacity=4))
+    assert entered.wait(2)
+    _publish_full_update(broker, 1)
+    _publish_full_update(broker, 2)
+    release.set()
+    with pytest.raises(RuntimeError, match="dropped=1"):
+        recorder.stop()
+    stats = recorder.stats()
+    assert stats is not None and stats.telemetry_received == 2
+    assert stats.telemetry_enqueued == stats.telemetry_written == 1
+    assert stats.telemetry_dropped == 1
+
+
+@pytest.mark.parametrize("failure", ["write", "encode", "flush"])
+def test_full_update_writer_failures_are_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """全量记录的序列化、写盘和最终 flush 错误都让停止返回失败。"""
+    broker = TelemetryBroker()
+    recorder = _full_update_recorder(tmp_path)
+    if failure in {"write", "flush"}:
+        original_open = recorder._open_files
+
+        class FailingFile:
+            def __init__(self, handle) -> None:
+                self.handle = handle
+                self.closed = False
+
+            def write(self, value: str) -> int:
+                if failure == "write":
+                    raise OSError("模拟遥测写入失败")
+                return self.handle.write(value)
+
+            def flush(self) -> None:
+                if failure == "flush":
+                    raise OSError("模拟遥测 flush 失败")
+                self.handle.flush()
+
+            def close(self) -> None:
+                self.handle.close()
+                self.closed = True
+
+        def open_files() -> None:
+            original_open()
+            recorder._telemetry_file = FailingFile(recorder._telemetry_file)
+
+        monkeypatch.setattr(recorder, "_open_files", open_files)
+    else:
+        monkeypatch.setattr(
+            TelemetrySnapshot,
+            "as_dict",
+            lambda self: (_ for _ in ()).throw(TypeError("模拟遥测编码失败")),
+        )
+    recorder.start(broker=broker, buffer=AlignmentBuffer(capacity=4))
+    _publish_full_update(broker, 1)
+    with pytest.raises(RuntimeError, match="write_errors=[1-9]"):
+        recorder.stop()
+    stats = recorder.stats()
+    assert stats is not None and stats.telemetry_write_errors > 0
+    event_rows = [
+        json.loads(line)
+        for line in (recorder.flight_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert event_rows[-1]["kind"] == "recorder_stopped"
+    assert event_rows[-1]["telemetry_write_errors"] > 0
+
+
+def test_full_update_frame_failure_is_reported_as_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """全量遥测模式也把视频帧失败作为标定采集不完整处理。"""
+    recorder = _full_update_recorder(tmp_path)
+    buffer = AlignmentBuffer(capacity=4)
+    buffer.put(_make_sample(1))
+
+    def fail_frame(*args, **kwargs):
+        raise OSError("模拟帧写入失败")
+
+    monkeypatch.setattr(recorder, "_write_one_frame", fail_frame)
+    recorder.start(broker=TelemetryBroker(), buffer=buffer)
+    assert _wait_until(lambda: recorder._frames_skipped == 1)
+    with pytest.raises(RuntimeError, match="frames_skipped=1"):
+        recorder.stop()
+
+
+def test_full_update_detects_frame_failure_before_buffer_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """源吞掉中间帧入库异常后，连续缓冲序号不能掩盖缺帧。"""
+    broker = TelemetryBroker()
+    buffer = AlignmentBuffer(capacity=8)
+    source = Hm30VideoSource()
+    source.add_sink(AlignmentWriter(buffer, FrameTelemetryAligner(broker), capture_only=True))
+    encode = buffer._encode
+    calls = 0
+
+    def fail_middle(image):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("模拟入库编码失败")
+        return encode(image)
+
+    monkeypatch.setattr(buffer, "_encode", fail_middle)
+    recorder = _full_update_recorder(tmp_path)
+    recorder.start(broker=broker, buffer=buffer)
+    for index in range(3):
+        source._publish(_make_image(index))
+    with pytest.raises(RuntimeError, match="frame_encode_errors=1"):
+        recorder.stop()
+    stats = recorder.stats()
+    assert stats is not None
+    assert source.stats.frames == 3
+    assert stats.frames_written == buffer.stats.last_index == 2
+    assert stats.frames_skipped == 0
+    assert stats.frame_encode_errors == 1
+    assert recorder.flight_dir is not None
+    events = [
+        json.loads(line)
+        for line in (recorder.flight_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-1]["frame_encode_errors"] == 1
+
+
+@pytest.mark.parametrize("failure", ["flush", "close"])
+def test_full_update_index_finalization_failure_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """帧索引最终 flush 或 close 失败必须写入收尾事件并拒绝完整记录。"""
+    recorder = _full_update_recorder(tmp_path)
+    open_files = recorder._open_files
+
+    class FailingIndex:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+
+        @property
+        def closed(self) -> bool:
+            return self.handle.closed
+
+        def flush(self) -> None:
+            if failure == "flush":
+                raise OSError("模拟帧索引 flush 失败")
+            self.handle.flush()
+
+        def close(self) -> None:
+            self.handle.close()
+            if failure == "close":
+                raise OSError("模拟帧索引 close 失败")
+
+    def open_failing_index() -> None:
+        open_files()
+        recorder._frames_index_file = FailingIndex(recorder._frames_index_file)
+
+    monkeypatch.setattr(recorder, "_open_files", open_failing_index)
+    recorder.start(broker=TelemetryBroker(), buffer=AlignmentBuffer(capacity=4))
+    with pytest.raises(RuntimeError, match="finalize_errors=1"):
+        recorder.stop()
+    assert recorder.flight_dir is not None
+    events = [
+        json.loads(line)
+        for line in (recorder.flight_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-1]["finalize_errors"] == 1
 
 
 def test_recorder_counts_failed_frame_writes(tmp_path: Path, broker, monkeypatch) -> None:

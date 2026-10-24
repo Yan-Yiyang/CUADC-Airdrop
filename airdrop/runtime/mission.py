@@ -146,6 +146,7 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         recorder=recorder,
         on_event=on_event,
         defer_until_airborne=options.run_mission,
+        calibration_capture=options.calibration_capture,
     )
     camera, writer, worker, targets = (
         perception.camera,
@@ -275,6 +276,7 @@ def main(  # noqa: PLR0913
     qgc_transport: str | None = None,
     qgc_fps: float | None = None,
     qgc_bitrate_kbps: int | None = None,
+    calibration_capture: bool = False,
     config: Config | None = None,
     components_factory: Callable[[RunOptions, Config], LiveComponents] | None = None,
     manifest_path: Path | str | None = None,
@@ -295,6 +297,7 @@ def main(  # noqa: PLR0913
         auto_land=auto_land,
         max_seconds=max_seconds,
         qgc_video=qgc_video,
+        calibration_capture=calibration_capture,
     ).validated()
     config_overrides = {key: value for key, value in config_overrides.items() if value is not None}
     if mode == "sitl":
@@ -421,6 +424,16 @@ def prepare_config(
     if not isinstance(options, RunOptions):
         raise TypeError("options 必须是 RunOptions")
     options.validated()
+    if options.calibration_capture:
+        config = replace(
+            config,
+            telemetry=replace(
+                config.telemetry,
+                quaternion_rate_hz=max(config.telemetry.quaternion_rate_hz, 100.0),
+                source_time_alignment=True,
+            ),
+            record=replace(config.record, telemetry_hz=0.0, video=True),
+        )
     config = _apply_calibrated_lag(options, config)
     if options.qgc_video is True and not options.capture:
         raise ValueError("开启 QGC 视频发布必须同时开启视频采集")
