@@ -133,13 +133,11 @@ PREFLIGHT_MAX_S = 180.0
 #: HOLD_PROCESS 的等待上限（秒）。
 #:
 #: 后处理最长等待时间（秒）。该时限需覆盖感知队列排空与目标聚类，
-#: 应根据部署平台的输入帧率、处理吞吐和任务航线持续时间配置。
+#: 仿真额外占用计算资源，保留较长等待；处理性能使用录制数据回放评估。
 HOLD_WAIT_S = 150.0
-#: 跨帧去重的窗口（秒 / 像素）——**OCR 吞吐阀**。
-#: 跨帧去重降低同一目标重复送检造成的 OCR 队列增长；被跳过的请求计入
-#: ``PerceptionStats.deduped``，便于区分输入帧数与实际识别任务数。
-OCR_DEDUPE_S = 1.5
-OCR_DEDUPE_PX = 250.0
+#: 关闭 OCR 跨帧去重，保留完整识别负载。
+OCR_DEDUPE_S = 0.0
+OCR_DEDUPE_PX = 0.0
 
 #: 场景提供的 SITL 图传链路延时（秒）；实际值取决于仿真编码、传输与接收配置。
 #: 该参数不代表真实 HM30 链路延时，部署时应使用对应设备的标定值。
@@ -336,7 +334,7 @@ def build_config(
         ),
         camera=replace(base.camera, calib_file=calib_file),
         # 模拟相机没有畸变：不让检测器做去畸变（像素与内参保持同一张图）。
-        # 去重窗口是**吞吐阀**（口径见 OCR_DEDUPE_* 的说明）：不挡的话 OCR 必被淹没
+        # 关闭跨帧去重，仿真资源争用通过处理等待上限容纳。
         perception=replace(
             base.perception,
             mode="ocr",
