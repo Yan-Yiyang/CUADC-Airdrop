@@ -221,7 +221,7 @@ def test_handwritten_flightrecorder_files_and_camera_model_contract(
     from airdrop_calibration import calibrate
     from airdrop_calibration.algorithms import rotation_z
     from airdrop_calibration.flight_log import (
-        load_flight_frames_paired,
+        iter_flight_frames_paired,
         load_flight_stamps,
         load_flight_telemetry,
     )
@@ -273,10 +273,11 @@ def test_handwritten_flightrecorder_files_and_camera_model_contract(
     )
 
     monkeypatch.chdir(tmp_path.parent)
-    paired = load_flight_frames_paired(flight.resolve())
+    paired = list(iter_flight_frames_paired(flight.resolve()))
     stamps = load_flight_stamps(flight.resolve())
     telemetry = load_flight_telemetry(flight.resolve())
     assert len(paired) == 1 and paired[0][0].received_timestamp == pytest.approx(10.2)
+    assert paired[0][1] == "000001.jpg"
     assert stamps[1].lag_s == 0.0
     assert [item.timestamp for item in telemetry] == [10.0, 10.1]
     assert telemetry[1].north_m == pytest.approx(1.0)

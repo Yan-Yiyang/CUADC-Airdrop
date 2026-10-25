@@ -4,6 +4,14 @@
 
 标定采集使用 `python -m airdrop.run mission --mode real --no-mission-control --no-recognize --record --calibration-capture`，录制标准飞行目录。此处 `real` 指真机遥测/视频输入，不表示起飞；在地面手持飞机绕多轴拍摄固定标靶即可采集内外参与视频延迟。关闭任务控制和识别。主旋转与延迟不依赖位置；存在可用的位置源时标时，独立工具会额外做平移杆臂对表。工具读取目录并输出 `camera_calib.json`，生产相机读取器消费该文件。字段、时间轴和坐标约定见 [数据契约](tool_contracts.md)，初始化与独立运行见 [工具仓库](tool_repositories.md)。
 
+离线分析默认覆盖完整采集过程，不再截取前 200 帧或前 60 个有效内参视图。工具逐帧解码并缓存原精度角点与时间记录，所有有效角点共同求解内参；相位和位姿分析按需重读当前帧，不保留整段原始图像。检测分辨率、亚像素精度和相位判据保持不变。全量采集的完整性验收还会单独逐帧核验图像。
+
+```powershell
+.\.venv\Scripts\python.exe -m airdrop.run calibrate --flight "flights/本次目录" --out camera_calib.json --pattern 9,6 --square 0.025 --strict
+```
+
+`--max-frames` 仅用于显式调试前缀，省略即分析全程。`meta.frame_analysis` 记录索引帧数、实际分析帧数、接收时间范围、有效内参视图数和位姿数，便于核对覆盖范围。角点、位姿和遥测等紧凑数据仍随样本量增长，像素图像只保留当前处理所需的少数帧。
+
 ## 延迟参照与已确认缺陷
 
 把异步位置、姿态按合并快照的接收/组装时间当作同时刻，是已确认的对齐 bug。正式配置默认启用 `TelemetryConfig.source_time_alignment`；关闭它只用于复现旧缺陷，不能作为正确的标定或定位路径。

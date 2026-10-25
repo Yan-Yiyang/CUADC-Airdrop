@@ -2108,6 +2108,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `meta.intrinsics` | `rms_px`、`views`、`per_view_errors`、`pattern_size`、`square_size_m` | 诊断 |
 | `meta.time_offset` | `lag_s`（= 绝对对齐量，同 `telemetry_lag`）、`peak_correlation`、`samples`、`search_s`、`step_s`、`curve`；另加时间轴与互核：`time_base`（恒 `received`）、`lag_baseline_s`（录制时配置的 lag）、`lag_residual_on_capture_axis_s`、`cross_check_ok`、`cross_check_tolerance_s`、`note` | 诊断（相关系数低 → 激励不足，重采；`cross_check_ok=False` → 素材索引里的 lag 与录制配置不一致，只告警，结果仍以 received 轴为准） |
 | `meta.extrinsics` | `pairs`、`residual_rotation_deg`、`axis_spread_deg`、`t_bc_source`、`methods`、`note` | 旋转诊断 |
+| `meta.frame_analysis` | 索引帧数、分析帧数、接收时间范围、内参视图数、位姿数及显式调试上限 | 默认全程覆盖；逐帧解码，仅缓存角点和位姿等紧凑数据 |
 | `meta.translation_diagnostic` | 平移估计状态、跳过原因、尺量值、估计值、逐轴差、距离差与残差 | 人工对比；`--no-estimate-translation` 可关闭 |
 | `meta.source_dir` | 用了哪个飞行目录 | 追溯 |
 
