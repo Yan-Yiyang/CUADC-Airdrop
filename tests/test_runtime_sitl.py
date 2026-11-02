@@ -22,7 +22,8 @@ from airdrop.perception.pipeline import PerceptionStats
 from airdrop.preflight import Preflight
 from airdrop.runtime import sitl, sitl_geometry, sitl_operations
 from airdrop.runtime.options import RunOptions
-from airdrop.runtime.session import LiveComponents
+from airdrop.runtime.session import LiveComponents, LiveSession
+from airdrop.video.buffer import AlignmentBuffer
 
 
 class _Thread:
@@ -184,8 +185,19 @@ def _components(config: Any, *, passive: bool = False) -> LiveComponents:
         runner=cast(Any, runner),
         controller=object() if runner is not None else None,
         broker=cast(Any, broker),
-        buffer=cast(Any, object()),
+        buffer=cast(Any, AlignmentBuffer(capacity=10)),
     )
+
+
+def test_session_cleanup_stops_thread_when_buffer_close_interface_is_missing() -> None:
+    thread = _Thread()
+    session = LiveSession(
+        RunOptions(mode="sitl"),
+        LiveComponents(thread=cast(Any, thread), buffer=cast(Any, object())),
+    )
+
+    assert session._cleanup(0) == 1
+    assert thread.stopped
 
 
 def test_sitl_adapter_prepares_config_and_writes_report_with_performance(

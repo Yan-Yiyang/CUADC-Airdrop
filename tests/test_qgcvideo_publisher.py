@@ -131,6 +131,48 @@ def test_finish_process_records_nonzero_code_when_already_exited() -> None:
     assert publisher.stats.last_error == "RuntimeError: FFmpeg 收尾退出码 7"
 
 
+def test_ffmpeg_uses_gpu_encoder_and_constant_frame_rate() -> None:
+    publisher = _publisher(lambda *_args, **_kwargs: _Process(_Pipe()))
+    command = publisher._command()
+    assert command[command.index("-c:v") + 1] == "h264_nvenc"
+    assert command[command.index("-fps_mode") + 1] == "cfr"
+    assert command[command.index("-use_wallclock_as_timestamps") + 1] == "1"
+    assert "-x264-params" not in command
+
+
+def test_encoder_repeats_latest_frame_on_its_own_output_schedule() -> None:
+    pipe = _Pipe()
+    process = _Process(pipe)
+    supplied = False
+
+    def supplier() -> DisplaySnapshot | None:
+        nonlocal supplied
+        if supplied:
+            return None
+        supplied = True
+        return _snapshot()
+
+    publisher = QgcVideoPublisher(
+        QgcVideoConfig(
+            enabled=True,
+            fps=20.0,
+            ffmpeg_executable="test-ffmpeg",
+            shutdown_timeout_s=1.5,
+        ),
+        supplier,
+        _Composer(),
+        subprocess_factory=lambda *_args, **_kwargs: process,
+    )
+    publisher.start()
+    deadline = time.monotonic() + 2.0
+    while publisher.stats.encoded < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    publisher.stop()
+
+    assert publisher.stats.submitted == 1
+    assert publisher.stats.encoded >= 3
+
+
 def test_blocked_pipe_does_not_backpressure_supplier_and_stop_unblocks_it() -> None:
     pipe = _Pipe(block=True)
     process = _Process(pipe)

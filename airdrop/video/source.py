@@ -61,17 +61,47 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import multiprocessing
+import os
+import queue
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
+from multiprocessing.connection import wait as wait_connections
+from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
+from ..telemetry.models import TelemetrySnapshot
+from .segments import SegmentLifecycle, SegmentState
+
 LOGGER = logging.getLogger(__name__)
+
+
+class VideoStorageError(RuntimeError):
+    """视频持久化或帧映射失败，禁止自动按网络断流重连。"""
+
+
+def _pyav_input_options(config: VideoConfig) -> dict[str, str]:
+    """校验实验 PyAV 路径支持的输入参数并转换为 av.open 选项。"""
+    if config.extra_output_args or config.ffmpeg_decoder:
+        raise VideoStorageError("PyAV 子进程暂不支持 FFmpeg 输出参数或 decoder 配置")
+    args = config.extra_input_args
+    if not args:
+        return {}
+    if len(args) != 2 or args[0] != "-protocol_whitelist" or not args[1].strip():
+        raise VideoStorageError(
+            "PyAV 子进程仅支持 -protocol_whitelist <protocols> 输入参数；请在启动前修正 VideoConfig"
+        )
+    return {"protocol_whitelist": args[1]}
+
 
 # HM30 常见地址（地面端与机载相机同处 192.168.144.0/24）
 HM30_CAMERA_IP = "192.168.144.25"
@@ -155,6 +185,17 @@ class VideoFrame:
     image: np.ndarray
     timestamp: float
     lag: float = 0.0
+    media_pts: int | None = None
+    time_base_num: int | None = None
+    time_base_den: int | None = None
+    segment: int = 0
+    random_access_dts: int | None = None
+    random_access_time_base_num: int | None = None
+    random_access_time_base_den: int | None = None
+    aligned_snapshot: TelemetrySnapshot | None = None
+    aligned_extrapolated: bool = False
+    aligned_offset: float = 0.0
+    alignment_disabled: bool = False
 
     @property
     def width(self) -> int:
@@ -203,6 +244,9 @@ class VideoStats:
     reconnects: int = 0
     fps: float = 0.0
     last_error: str | None = None
+    sink_errors: int = 0
+    pyav_queue_age_s: float = 0.0
+    pyav_queue_age_max_s: float = 0.0
 
 
 # ----------------------------------------------------------------------
@@ -222,6 +266,255 @@ def _find_ffmpeg(explicit: str | None = None) -> str | None:
 
 def _is_rtsp(url: str) -> bool:
     return url.lower().startswith("rtsp")
+
+
+def _watch_parent_exit() -> None:
+    """父进程被强制终止时由看门线程硬退出采集子进程。"""
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        wait_connections([parent.sentinel])
+        os._exit(91)
+
+
+def _is_normal_input_termination(error: Exception, exit_error_type: type[BaseException]) -> bool:
+    """识别网络读取超时或连接结束；解码错误不属于可正常封口的断流。"""
+    return isinstance(
+        error,
+        (
+            TimeoutError,
+            EOFError,
+            ConnectionError,
+            BrokenPipeError,
+            BlockingIOError,
+            InterruptedError,
+            exit_error_type,
+        ),
+    )
+
+
+def _pyav_capture_worker(  # noqa: PLR0912, PLR0915, PLR0917 - 子进程收尾需显式分支
+    config: VideoConfig,
+    recording_directory: str | None,
+    segment: int,
+    messages: Any,
+    free_slots: Any,
+    slot_names: tuple[str, ...],
+    frame_bytes: int,
+    stop_event: Any,
+) -> None:
+    """在可强制终止的独立进程中解码并写 TS，IPC 最多排队两帧。"""
+    import threading
+    from fractions import Fraction
+
+    threading.Thread(target=_watch_parent_exit, name="pyav-parent-watch", daemon=True).start()
+
+    def send(message: dict[str, Any]) -> bool:
+        while True:
+            try:
+                messages.put(message, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+
+    container = None
+    writer = None
+    shared_slots: list[SharedMemory] = []
+    error_kind = "network"
+    error_message: str | None = None
+    segment_sealable = False
+    finished = False
+    startup_packets_skipped = 0
+    try:
+        import av
+        from av.error import ExitError
+
+        from .cold import TsSegmentWriter
+
+        if not send({"kind": "opening"}):
+            return
+        options = {"probesize": "500000", "analyzeduration": "0"}
+        options.update(_pyav_input_options(config))
+        if _is_rtsp(config.url):
+            options["rtsp_transport"] = config.transport
+        timeout = max(float(config.read_timeout), 0.1)
+        container = av.open(
+            config.url,
+            mode="r",
+            options=options,
+            timeout=(timeout, timeout),
+        )
+        if not container.streams.video:
+            raise RuntimeError(f"输入没有视频流: {config.url}")
+        stream = container.streams.video[0]
+        stream.thread_type = "NONE"
+        if recording_directory is not None:
+            error_kind = "storage"
+            writer = TsSegmentWriter(
+                Path(recording_directory), segment=segment, input_stream=stream
+            )
+            if not send({"kind": "segment_opened", "segment": segment}):
+                return
+        shared_slots = [SharedMemory(name=name) for name in slot_names]
+        error_kind = "network"
+        random_access: list[tuple[Fraction, int, int, int]] = []
+        started = False
+        startup_deadline = time.monotonic() + max(30.0, timeout)
+        packets = iter(container.demux(stream))
+        while True:
+            if stop_event.is_set():
+                segment_sealable = started
+                finished = True
+                break
+            try:
+                packet = next(packets)
+            except StopIteration:
+                segment_sealable = started
+                finished = True
+                break
+            except Exception as exc:
+                if started and _is_normal_input_termination(exc, ExitError):
+                    # 读取下一包时链路正常超时/断开；当前已 mux 的分段可正常封口，
+                    # 同时把断流交给父线程触发重连。
+                    segment_sealable = True
+                    if stop_event.is_set():
+                        finished = True
+                    else:
+                        error_message = f"{type(exc).__name__}: {exc}"
+                    break
+                raise
+            packet_tb = packet.time_base
+            if not started:
+                if time.monotonic() >= startup_deadline:
+                    raise RuntimeError("等待视频随机访问关键帧超过 30 秒")
+                if getattr(packet, "is_corrupt", False):
+                    if packet.is_keyframe:
+                        raise RuntimeError("首个随机访问关键包标记为损坏")
+                    startup_packets_skipped += 1
+                    continue
+                if packet.size <= 0:
+                    continue
+                if not packet.is_keyframe:
+                    startup_packets_skipped += 1
+                    continue
+                if packet.pts is None or packet.dts is None or packet_tb is None:
+                    raise VideoStorageError("首个随机访问包缺少 PTS、DTS 或 time_base")
+                if not send({"kind": "ready", "startup_packets_skipped": startup_packets_skipped}):
+                    return
+                started = True
+            elif packet.size > 0 and getattr(packet, "is_corrupt", False):
+                raise RuntimeError("输入视频包标记为损坏")
+            if (
+                packet.size > 0
+                and packet.is_keyframe
+                and packet.pts is not None
+                and packet.dts is not None
+                and packet_tb is not None
+            ):
+                tb = Fraction(packet_tb.numerator, packet_tb.denominator)
+                random_access.append(
+                    (Fraction(packet.pts) * tb, packet.dts, tb.numerator, tb.denominator)
+                )
+            decoded = packet.decode()
+            ready_times = [(time.time(), time.monotonic_ns()) for _ in decoded]
+            if writer is not None and packet.size > 0:
+                error_kind = "storage"
+                writer.mux(packet)
+                error_kind = "network"
+            for frame, (frame_timestamp, frame_monotonic_ns) in zip(
+                decoded, ready_times, strict=True
+            ):
+                if getattr(frame, "is_corrupt", False):
+                    raise RuntimeError("解码帧标记为损坏")
+                if frame.pts is None or frame.time_base is None:
+                    raise VideoStorageError("解码帧缺少 PTS 或 time_base")
+                frame_tb = Fraction(frame.time_base.numerator, frame.time_base.denominator)
+                frame_time = Fraction(frame.pts) * frame_tb
+                access = next(
+                    (item for item in reversed(random_access) if item[0] <= frame_time),
+                    None,
+                )
+                if access is None:
+                    raise VideoStorageError(f"解码帧 PTS={frame.pts} 找不到对应随机访问点")
+                image = frame.to_ndarray(format="bgr24")
+                if image.shape[1] != config.width or image.shape[0] != config.height:
+                    import cv2
+
+                    image = cv2.resize(image, (config.width, config.height))
+                image = np.ascontiguousarray(image)
+                while True:
+                    try:
+                        slot_id = free_slots.get(timeout=0.1)
+                        break
+                    except queue.Empty:
+                        continue
+                slot = shared_slots[slot_id]
+                image_view = memoryview(image).cast("B")
+                if image_view.nbytes != frame_bytes:
+                    raise VideoStorageError(f"IPC 帧大小不符：{image_view.nbytes} != {frame_bytes}")
+                slot.buf[:frame_bytes] = image_view
+                if not send(
+                    {
+                        "kind": "frame",
+                        "timestamp": frame_timestamp,
+                        "producer_monotonic_ns": frame_monotonic_ns,
+                        "slot": slot_id,
+                        "pts": int(frame.pts),
+                        "time_base_num": frame_tb.numerator,
+                        "time_base_den": frame_tb.denominator,
+                        "segment": segment,
+                        "random_access_dts": access[1],
+                        "random_access_time_base_num": access[2],
+                        "random_access_time_base_den": access[3],
+                    }
+                ):
+                    return
+    except Exception as exc:  # noqa: BLE001 - 子进程需把所有失败传回父进程
+        if isinstance(exc, VideoStorageError):
+            error_kind = "fatal"
+        error_message = f"{type(exc).__name__}: {exc}"
+    finally:
+        segment_state: str | None = None
+        if writer is not None:
+            try:
+                complete = segment_sealable and error_kind not in {"storage", "fatal"}
+                writer.close(complete=complete)
+                segment_state = (
+                    SegmentState.CLOSED_COMPLETE.value
+                    if complete
+                    else SegmentState.CLOSED_INCOMPLETE.value
+                )
+            except Exception as exc:  # noqa: BLE001 - 清理错误必须经 IPC 报告
+                error_kind = "storage"
+                error_message = f"TS close: {type(exc).__name__}: {exc}"
+                segment_state = SegmentState.FAILED.value
+        if container is not None:
+            try:
+                container.close()
+            except Exception as exc:  # noqa: BLE001 - 输入容器关闭错误需报告
+                if error_message is None:
+                    error_kind = "network"
+                    error_message = f"input close: {type(exc).__name__}: {exc}"
+        for slot in shared_slots:
+            slot.close()
+        if error_message is not None:
+            message = {
+                "kind": (
+                    "storage_error"
+                    if error_kind == "storage"
+                    else "fatal_error"
+                    if error_kind == "fatal"
+                    else "stream_error"
+                ),
+                "error": error_message,
+            }
+            if segment_state is not None:
+                message["segment_state"] = segment_state
+            send(message)
+        elif finished:
+            message = {"kind": "eof"}
+            if segment_state is not None:
+                message["segment_state"] = segment_state
+            send(message)
 
 
 # ----------------------------------------------------------------------
@@ -254,7 +547,12 @@ class Hm30VideoSource:
     是实时的，消费速度慢于帧率时中间帧会被覆盖并计入 :attr:`VideoStats.dropped`。
     """
 
-    def __init__(self, config: VideoConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: VideoConfig | None = None,
+        *,
+        segment_lifecycle: SegmentLifecycle | None = None,
+    ) -> None:
         self._config = (config or VideoConfig()).validated()
         self._condition = threading.Condition(threading.RLock())
         self._stop_event = threading.Event()
@@ -265,11 +563,22 @@ class Hm30VideoSource:
         self._delivered = 0
         self._counter = 0
         self._stats = VideoStats()
-        self._fps_window_start = 0.0
-        self._fps_window_frames = 0
+        self._fps_timestamps: deque[float] = deque(maxlen=8192)
 
         self._process: subprocess.Popen | None = None
         self._ffmpeg_executable: str | None = None
+        self._recording_directory: Path | None = None
+        self._segment_counter = 0
+        self._ts_writer = None
+        self._container: Any = None
+        self._container_lock = threading.Lock()
+        self._pyav_process: Any = None
+        self._pyav_messages: Any = None
+        self._pyav_stop_event: Any = None
+        self._pyav_shared_slots: list[SharedMemory] = []
+        self._segment_lifecycle = segment_lifecycle or SegmentLifecycle()
+        self._segment_lifecycle_bound = segment_lifecycle is not None
+        self._active_pyav_segment: int | None = None
 
     # ------------------------------------------------------------------
     # 每帧回调（sink）
@@ -284,6 +593,10 @@ class Hm30VideoSource:
         典型用法是挂 :class:`airdrop.video.buffer.AlignmentWriter`，把每帧连同拍摄时刻的
         遥测写进环形缓冲。
         """
+        sink_buffer = getattr(sink, "_buffer", None)
+        lifecycle = getattr(sink_buffer, "segment_lifecycle", None)
+        if isinstance(lifecycle, SegmentLifecycle):
+            self.bind_segment_lifecycle(lifecycle)
         with self._condition:
             if sink not in self._sinks:
                 self._sinks.append(sink)
@@ -306,6 +619,33 @@ class Hm30VideoSource:
         return self._config
 
     @property
+    def segment_lifecycle(self) -> SegmentLifecycle:
+        """实验采集端共享的进程内分段状态。"""
+        return self._segment_lifecycle
+
+    def bind_segment_lifecycle(self, lifecycle: SegmentLifecycle) -> None:
+        """在采集启动前与冷缓冲绑定同一分段状态。"""
+        if lifecycle is self._segment_lifecycle:
+            self._segment_lifecycle_bound = True
+            return
+        if self._segment_lifecycle_bound or self.running or self._segment_counter:
+            raise RuntimeError("多个 sink 必须共享同一视频分段生命周期")
+        self._segment_lifecycle = lifecycle
+        self._segment_lifecycle_bound = True
+
+    def validate_pyav_config(self) -> None:
+        """在启动外部资源前检查 PyAV 采集支持的输入选项。"""
+        _pyav_input_options(self._config)
+
+    def set_recording_directory(self, directory: str | Path) -> None:
+        """设置 remux TS 的目录，必须在拉流开始前调用。"""
+        if self.running:
+            raise RuntimeError("视频 TS 目录必须在采集启动前设置")
+        path = Path(directory)
+        path.mkdir(parents=True, exist_ok=True)
+        self._recording_directory = path
+
+    @property
     def stats(self) -> VideoStats:
         """返回统计快照。"""
         with self._condition:
@@ -314,6 +654,21 @@ class Hm30VideoSource:
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def raise_if_failed(self) -> None:
+        """在任务心跳中报告致命采集或逐帧 sink 故障。"""
+        with self._condition:
+            if self._stats.sink_errors:
+                raise VideoStorageError(
+                    self._stats.last_error or "图传帧 sink 发生错误，逐帧数据可能不完整"
+                )
+            thread = self._thread
+            stopped_unexpectedly = (
+                thread is not None and not thread.is_alive() and not self._stop_event.is_set()
+            )
+            error = self._stats.last_error
+        if stopped_unexpectedly:
+            raise VideoStorageError(error or "视频采集线程意外退出")
 
     def start(self) -> "Hm30VideoSource":
         """启动后台拉流线程（幂等）。"""
@@ -332,23 +687,93 @@ class Hm30VideoSource:
 
     def stop(self, timeout: float = 5.0) -> None:
         """停止拉流并等待线程退出（幂等）。"""
+        deadline = time.monotonic() + max(timeout, 0.0)
         self._stop_event.set()
         # 兜底：ffmpeg 若正卡在管道读上，杀掉子进程即可让 readinto 立刻收到 EOF。
         process = self._process
         if process is not None and process.poll() is None:
             process.terminate()
+        pyav_stop_event = self._pyav_stop_event
+        if pyav_stop_event is not None:
+            pyav_stop_event.set()
         with self._condition:
             self._condition.notify_all()
         thread = self._thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout)
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                self._terminate_pyav_worker(max(0.0, deadline - time.monotonic()))
+                thread.join(max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
                 # 线程没停就别清引用：清了 running 会变 False、start() 会再起
                 # 一个线程，两个拉流线程抢同一个源。保留引用，稍后可再调 stop()。
                 LOGGER.warning("拉流线程未在 %.1fs 内退出，保留引用（可再调 stop()）", timeout)
                 return
+        if self._pyav_process is not None:
+            self._terminate_pyav_worker(max(0.0, deadline - time.monotonic()))
         self._thread = None
         self._set_state("stopped")
+
+    def _terminate_pyav_worker(self, timeout: float) -> None:
+        """强制结束可能卡在网络或 FFmpeg 调用中的 PyAV 工作进程。"""
+        worker = self._pyav_process
+        if worker is None:
+            return
+        stop_event = self._pyav_stop_event
+        if stop_event is not None:
+            stop_event.set()
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(max(0.0, timeout))
+        if worker.is_alive():
+            LOGGER.error("PyAV 工作进程未能在期限内退出，保留进程与队列引用")
+            segment = self._active_pyav_segment
+            if (
+                segment is not None
+                and self._segment_lifecycle.snapshot(segment).state is SegmentState.ACTIVE
+            ):
+                self._segment_lifecycle.failed(segment)
+            raise VideoStorageError("PyAV 工作进程未能确认退出；禁止继续启动新的采集周期")
+        segment = self._active_pyav_segment
+        if segment is not None:
+            self._settle_segment_after_worker_exit(segment, alive=False)
+        self._pyav_process = None
+        messages = self._pyav_messages
+        self._pyav_messages = None
+        self._pyav_stop_event = None
+        self._active_pyav_segment = None
+        if messages is not None:
+            messages.cancel_join_thread()
+            messages.close()
+        self._release_pyav_shared_slots()
+
+    def _settle_segment_after_worker_exit(self, segment: int, *, alive: bool) -> None:
+        """子进程无终止消息时以完成标记兜底，不猜测写入器是否仍活动。"""
+        if self._segment_lifecycle.snapshot(segment).state is not SegmentState.ACTIVE:
+            return
+        if alive:
+            self._segment_lifecycle.failed(segment)
+            return
+        complete = (
+            self._recording_directory is not None
+            and (self._recording_directory / f"segment-{segment:06d}.complete").is_file()
+        )
+        self._segment_lifecycle.closed(segment, complete=complete)
+
+    def _release_pyav_shared_slots(self) -> None:
+        """在工作进程退出后释放父端拥有的固定帧槽。"""
+        slots, self._pyav_shared_slots = self._pyav_shared_slots, []
+        for slot in slots:
+            try:
+                slot.close()
+            except Exception:
+                LOGGER.exception("关闭 PyAV 共享内存帧槽失败")
+            try:
+                slot.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                LOGGER.exception("删除 PyAV 共享内存帧槽失败")
 
     def __enter__(self) -> "Hm30VideoSource":
         return self.start()
@@ -411,19 +836,14 @@ class Hm30VideoSource:
     # 后台线程
     # ------------------------------------------------------------------
     def _run(self) -> None:
-        if self._ffmpeg_executable is None:
-            self._ffmpeg_executable = _find_ffmpeg(self._config.ffmpeg_executable)
-        if self._ffmpeg_executable is None:
-            # 环境问题，重连多少次都没用：直接说明白并停下
-            self._fail("找不到 ffmpeg 可执行文件（imageio-ffmpeg 与 PATH 里都没有），无法拉流")
-            self._set_state("stopped")
-            return
-
         delay = self._config.reconnect_delay
         while not self._stop_event.is_set():
             try:
-                self._stream_ffmpeg()
+                self._stream_pyav_process()
                 delay = self._config.reconnect_delay
+            except VideoStorageError as exc:
+                self._fail(str(exc))
+                break
             except Exception as exc:
                 LOGGER.exception("图传拉流异常")
                 self._fail(str(exc))
@@ -436,6 +856,323 @@ class Hm30VideoSource:
                 break
             delay = min(delay * 2, self._config.max_reconnect_delay)
         self._set_state("stopped")
+
+    def _stream_pyav_process(self) -> None:  # noqa: PLR0912, PLR0915
+        """显式实验入口：用独立 PyAV 进程输出有界的帧消息。"""
+        existing_worker = self._pyav_process
+        if existing_worker is not None:
+            if existing_worker.is_alive():
+                raise VideoStorageError("上一 PyAV 工作进程仍存活；禁止覆盖资源或启动新分段")
+            self._terminate_pyav_worker(0.0)
+        _pyav_input_options(self._config)
+        context: Any = None
+        messages: Any = None
+        free_slots: Any = None
+        stop_event: Any = None
+        slots: list[SharedMemory] = []
+        worker: Any = None
+        normal_exit = False
+        segment: int | None = None
+        segment_registered = False
+        try:
+            context = multiprocessing.get_context("spawn")
+            messages = context.Queue(maxsize=2)
+            free_slots = context.Queue(maxsize=2)
+            stop_event = context.Event()
+            self._segment_counter += 1
+            segment = self._segment_counter
+            self._active_pyav_segment = segment
+            directory = (
+                None if self._recording_directory is None else str(self._recording_directory)
+            )
+            frame_bytes = self._config.width * self._config.height * 3
+            for _ in range(2):
+                slots.append(SharedMemory(create=True, size=frame_bytes))
+                self._pyav_shared_slots = slots
+            for slot_id in range(len(slots)):
+                free_slots.put(slot_id)
+            worker = context.Process(
+                target=_pyav_capture_worker,
+                args=(
+                    self._config,
+                    directory,
+                    segment,
+                    messages,
+                    free_slots,
+                    tuple(slot.name for slot in slots),
+                    frame_bytes,
+                    stop_event,
+                ),
+                name=f"pyav-capture-{segment}",
+                daemon=True,
+            )
+            self._pyav_process = worker
+            self._pyav_messages = messages
+            self._pyav_stop_event = stop_event
+            self._set_state("connecting")
+            worker.start()
+            while True:
+                try:
+                    message = messages.get(timeout=0.1)
+                except queue.Empty:
+                    if not worker.is_alive():
+                        raise RuntimeError(
+                            f"PyAV 工作进程意外退出，exitcode={worker.exitcode}"
+                        ) from None
+                    continue
+                kind = message.get("kind")
+                if kind == "segment_opened":
+                    if message.get("segment") != segment:
+                        raise VideoStorageError("PyAV IPC 分段编号不匹配")
+                    self._segment_lifecycle.opened(segment)
+                    segment_registered = True
+                elif kind == "ready":
+                    self._set_state("streaming")
+                    skipped = int(message.get("startup_packets_skipped", 0))
+                    if skipped:
+                        LOGGER.warning("PyAV 启动时跳过了关键帧前的 %d 个视频包", skipped)
+                elif kind == "frame":
+                    if message.get("segment") != segment:
+                        raise VideoStorageError("PyAV IPC 帧分段编号不匹配")
+                    if segment_registered:
+                        self._segment_lifecycle.progress(segment)
+                    slot_id = int(message["slot"])
+                    if not 0 <= slot_id < len(slots):
+                        raise VideoStorageError(f"PyAV IPC 返回非法共享槽位: {slot_id}")
+                    image = np.ndarray(
+                        (self._config.height, self._config.width, 3),
+                        dtype=np.uint8,
+                        buffer=slots[slot_id].buf,
+                    ).copy()
+                    received_monotonic_ns = time.monotonic_ns()
+                    decoded_timestamp = float(message["timestamp"])
+                    queue_age = max(
+                        (received_monotonic_ns - int(message["producer_monotonic_ns"]))
+                        / 1_000_000_000,
+                        0.0,
+                    )
+                    with self._condition:
+                        self._stats.pyav_queue_age_s = queue_age
+                        self._stats.pyav_queue_age_max_s = max(
+                            self._stats.pyav_queue_age_max_s, queue_age
+                        )
+                    try:
+                        self._publish(
+                            image,
+                            received_timestamp=decoded_timestamp,
+                            media_pts=message["pts"],
+                            time_base_num=message["time_base_num"],
+                            time_base_den=message["time_base_den"],
+                            segment=message["segment"],
+                            random_access_dts=message["random_access_dts"],
+                            random_access_time_base_num=message["random_access_time_base_num"],
+                            random_access_time_base_den=message["random_access_time_base_den"],
+                            fail_on_sink_error=True,
+                        )
+                    finally:
+                        free_slots.put(slot_id)
+                elif kind in {"storage_error", "fatal_error", "stream_error", "eof"}:
+                    if (
+                        segment_registered
+                        and self._segment_lifecycle.snapshot(segment).state is SegmentState.ACTIVE
+                    ):
+                        reported_state = message.get("segment_state")
+                        if reported_state == SegmentState.CLOSED_COMPLETE.value:
+                            self._segment_lifecycle.closed(segment, complete=True)
+                        elif reported_state == SegmentState.CLOSED_INCOMPLETE.value:
+                            self._segment_lifecycle.closed(segment, complete=False)
+                        else:
+                            self._segment_lifecycle.failed(segment)
+                    if kind == "storage_error":
+                        raise VideoStorageError(str(message.get("error", "未知 TS 写入错误")))
+                    if kind == "fatal_error":
+                        raise VideoStorageError(str(message.get("error", "视频帧映射失败")))
+                    if kind == "stream_error":
+                        raise RuntimeError(str(message.get("error", "未知输入流错误")))
+                    worker.join(timeout=1.0)
+                    normal_exit = not worker.is_alive()
+                    if self._stop_event.is_set():
+                        return
+                    raise RuntimeError(f"输入流结束或中断（{self._config.url}）")
+        finally:
+            alive = False
+            if stop_event is not None:
+                stop_event.set()
+            if worker is not None and worker.pid is not None:
+                worker.join(timeout=1.0)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=1.0)
+                alive = worker.is_alive()
+            if alive:
+                LOGGER.error("PyAV 子进程未退出，保留进程与共享内存引用")
+                if segment_registered and segment is not None:
+                    self._settle_segment_after_worker_exit(segment, alive=True)
+                raise VideoStorageError("PyAV 子进程未能确认退出；保留资源并禁止自动重连")
+            else:
+                if segment_registered and segment is not None:
+                    self._settle_segment_after_worker_exit(segment, alive=False)
+                self._pyav_process = None
+                self._pyav_messages = None
+                self._pyav_stop_event = None
+                for q in (messages, free_slots):
+                    if q is not None:
+                        q.cancel_join_thread()
+                        q.close()
+                self._release_pyav_shared_slots()
+                self._active_pyav_segment = None
+            if normal_exit and self._stop_event.is_set():
+                self._set_state("stopped")
+
+    def _stream_pyav(self) -> None:
+        """单路 demux 同时解码图像并复制压缩包到本连接周期的 TS。"""
+        from fractions import Fraction
+
+        import av
+
+        from .cold import TsSegmentWriter
+
+        config = self._config
+        options = {
+            "fflags": "nobuffer",
+            "flags": "low_delay",
+            "probesize": "500000",
+            "analyzeduration": "0",
+        }
+        if _is_rtsp(config.url):
+            options["rtsp_transport"] = config.transport
+        timeout = max(float(config.read_timeout), 0.1)
+        self._set_state("connecting")
+        container = av.open(
+            config.url,
+            mode="r",
+            options=options,
+            timeout=(timeout, timeout),
+        )
+        writer = None
+        with self._container_lock:
+            self._container = container
+        try:
+            if not container.streams.video:
+                raise RuntimeError(f"输入没有视频流: {config.url}")
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            self._segment_counter += 1
+            segment = self._segment_counter
+            if self._recording_directory is not None:
+                try:
+                    writer = TsSegmentWriter(
+                        self._recording_directory, segment=segment, input_stream=stream
+                    )
+                except Exception as exc:
+                    raise VideoStorageError(f"无法创建 TS 分段: {exc}") from exc
+                self._ts_writer = writer
+            random_access: list[tuple[Fraction, int, int, int, int]] = []
+            self._set_state("streaming")
+            for packet in container.demux(stream):
+                if self._stop_event.is_set():
+                    break
+                packet_tb = packet.time_base
+                if (
+                    packet.size > 0
+                    and packet.is_keyframe
+                    and packet.pts is not None
+                    and packet.dts is not None
+                    and packet_tb is not None
+                ):
+                    tb = Fraction(packet_tb.numerator, packet_tb.denominator)
+                    random_access.append(
+                        (
+                            Fraction(packet.pts) * tb,
+                            packet.dts,
+                            tb.numerator,
+                            tb.denominator,
+                            packet.pts,
+                        )
+                    )
+                decoded = packet.decode()
+                if writer is not None and packet.size > 0:
+                    # 先保证压缩包已写入冷存储，再把对应解码帧交给对齐消费者。
+                    # remux 失败时不得继续发布看似可用、实际无法回读的帧。
+                    self._mux_pyav_packet(writer, packet)
+                for frame in decoded:
+                    self._publish_pyav_frame(frame, config, segment, random_access)
+            if not self._stop_event.is_set():
+                self._fail(f"输入流结束或中断（{config.url}）")
+        finally:
+            try:
+                if writer is not None:
+                    try:
+                        writer.close()
+                    except Exception as exc:
+                        raise VideoStorageError(f"关闭 TS 分段失败: {exc}") from exc
+            finally:
+                self._ts_writer = None
+                self._close_pyav_container(container)
+
+    @staticmethod
+    def _mux_pyav_packet(writer: Any, packet: Any) -> None:
+        """写入压缩包失败时中止当前持久化任务。"""
+        try:
+            writer.mux(packet)
+        except Exception as exc:
+            raise VideoStorageError(f"TS remux 写入失败: {exc}") from exc
+
+    def _publish_pyav_frame(
+        self,
+        frame: Any,
+        config: VideoConfig,
+        segment: int,
+        random_access: list[tuple[Any, int, int, int, int]],
+    ) -> None:
+        """验证帧的媒体时间映射后再呈现给下游。"""
+        from fractions import Fraction
+
+        import cv2
+
+        if frame.pts is None or frame.time_base is None:
+            raise VideoStorageError("解码帧缺少 PTS 或 time_base，无法映射业务帧与 TS")
+        frame_tb = Fraction(frame.time_base.numerator, frame.time_base.denominator)
+        frame_time = Fraction(frame.pts) * frame_tb
+        access = next(
+            (item for item in reversed(random_access) if item[0] <= frame_time),
+            None,
+        )
+        if access is None:
+            raise VideoStorageError(f"解码帧 PTS={frame.pts} 在本连接周期内找不到对应随机访问点")
+        image = frame.to_ndarray(format="bgr24")
+        if image.shape[1] != config.width or image.shape[0] != config.height:
+            image = cv2.resize(image, (config.width, config.height))
+        self._publish(
+            image,
+            media_pts=frame.pts,
+            time_base_num=frame_tb.numerator,
+            time_base_den=frame_tb.denominator,
+            segment=segment,
+            random_access_dts=access[1],
+            random_access_time_base_num=access[2],
+            random_access_time_base_den=access[3],
+            fail_on_sink_error=True,
+        )
+
+    def _interrupt_pyav_read(self) -> None:
+        """停止时关闭活动输入容器，尽可能中断阻塞中的 PyAV 读取。"""
+        with self._container_lock:
+            container = self._container
+            self._container = None
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                LOGGER.exception("关闭 PyAV 输入容器以中断读取失败")
+
+    def _close_pyav_container(self, container: Any) -> None:
+        """关闭输入容器；与 stop() 并发时避免重复释放。"""
+        with self._container_lock:
+            if self._container is not container:
+                return
+            self._container = None
+        container.close()
 
     def _stream_ffmpeg(self) -> None:
         executable = self._ffmpeg_executable
@@ -513,8 +1250,21 @@ class Hm30VideoSource:
     # ------------------------------------------------------------------
     # 状态与发布
     # ------------------------------------------------------------------
-    def _publish(self, image: np.ndarray) -> None:
-        now = time.time()
+    def _publish(
+        self,
+        image: np.ndarray,
+        *,
+        media_pts: int | None = None,
+        time_base_num: int | None = None,
+        time_base_den: int | None = None,
+        segment: int = 0,
+        random_access_dts: int | None = None,
+        random_access_time_base_num: int | None = None,
+        random_access_time_base_den: int | None = None,
+        fail_on_sink_error: bool = False,
+        received_timestamp: float | None = None,
+    ) -> None:
+        now = time.time() if received_timestamp is None else received_timestamp
         with self._condition:
             self._counter += 1
             frame = VideoFrame(
@@ -522,18 +1272,22 @@ class Hm30VideoSource:
                 image=image,
                 timestamp=now,
                 lag=self._config.telemetry_lag,
+                media_pts=media_pts,
+                time_base_num=time_base_num,
+                time_base_den=time_base_den,
+                segment=segment,
+                random_access_dts=random_access_dts,
+                random_access_time_base_num=random_access_time_base_num,
+                random_access_time_base_den=random_access_time_base_den,
             )
             self._frame = frame
-            # 帧率按 1 秒滑窗统计：链路刚接上时往往会先吐一批缓冲帧，
-            # 用相邻帧间隔做 EMA 会被这波突发带飞到几百 fps，失去参考价值。
-            if self._fps_window_start == 0.0:
-                self._fps_window_start = now
-            self._fps_window_frames += 1
-            elapsed = now - self._fps_window_start
-            if elapsed >= 1.0:
-                self._stats.fps = self._fps_window_frames / elapsed
-                self._fps_window_start = now
-                self._fps_window_frames = 0
+            # 用最近一秒的实际发布时刻，避免启动突发持续污染固定窗口。
+            fps_now = time.monotonic()
+            self._fps_timestamps.append(fps_now)
+            while self._fps_timestamps and self._fps_timestamps[0] < fps_now - 1.0:
+                self._fps_timestamps.popleft()
+            elapsed = fps_now - self._fps_timestamps[0]
+            self._stats.fps = (len(self._fps_timestamps) - 1) / elapsed if elapsed >= 0.5 else 0.0
             self._stats.frames += 1
             self._stats.state = "streaming"
             sinks = tuple(self._sinks)
@@ -545,8 +1299,13 @@ class Hm30VideoSource:
         for sink in sinks:
             try:
                 sink(frame)
-            except Exception:
+            except Exception as exc:
+                with self._condition:
+                    self._stats.sink_errors += 1
+                    self._stats.last_error = f"图传帧 sink 执行失败: {type(exc).__name__}: {exc}"
                 LOGGER.exception("图传帧 sink 执行失败")
+                if fail_on_sink_error:
+                    raise VideoStorageError(self._stats.last_error) from exc
 
     def _set_state(self, state: str) -> None:
         with self._condition:

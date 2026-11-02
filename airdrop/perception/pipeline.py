@@ -6,7 +6,7 @@
 
     AlignmentBuffer ──wait_new(一帧不落)──> PerceptionWorker
                                               ├─ YOLO 检测（全帧）
-                                              ├─ ocr 模式：裁剪 → 按目标去重 → mp.Queue → OCR 进程×N
+                                              ├─ ocr 模式：裁剪 → 磁盘积压 → 有界 mp.Queue → OCR 进程×N
                                               └─ cls12 模式：类别直出编号
                                             OCR 结果回填 ──> Detection ──> 结果队列（消费者取走）
 
@@ -21,11 +21,9 @@
 
 OCR 逐帧送检
 ------------
-默认不启用跨帧去重；显式打开时才按时间/像素窗口合并相邻重复请求。目标可能只在
-少数帧中清晰可见，运动模糊会让相邻帧的可识别性不同；**每个 YOLO 检测结果都会
-进入无界队列，绝不因为"队列满"而丢掉送检请求或结果**。OCR 落后时队列会积压
-（只告警、不丢弃），内存账由 ``ocr_queue_size`` 阈值上的 WARNING 与
-:attr:`PerceptionStats` 的 ``submitted - results`` 如实反映。
+默认不启用跨帧去重；显式打开时才按时间/像素窗口合并相邻重复请求。OCR 图像
+先无损写盘，mp 队列只传有界引用，积压由 ``ocr_queue_size`` 告警与
+:attr:`PerceptionStats` 的 ``submitted - results`` 反映。
 """
 
 from __future__ import annotations
@@ -37,11 +35,15 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
 
+import airdrop.perception.timing as timing  # noqa: PLR0402 - 避免惰性包循环导入
+
 from ..video.buffer import AlignmentBuffer, BufferedFrame
+from .crop_store import CropStore
 from .cropproc import OcrEngineConfig
 from .detector import Detector, DetectorConfig, FrameSizeMismatchError
 from .models import (
@@ -82,7 +84,7 @@ class PerceptionConfigLike:
     target_color: str = "blue"
     ocr_conf_threshold: float = 0.6
     ocr_workers: int = 2
-    #: OCR **积压告警阈值**（不是队列容量：请求/结果队列都无界、不丢弃，见 ocr_worker）
+    #: OCR 磁盘积压告警阈值；进程请求/结果队列都有界，见 ocr_worker。
     ocr_queue_size: int = 500
     # 仅在显式开启时生效；默认关闭，避免误伤运动模糊下唯一清晰帧。
     # 两个阈值是**与**关系：ocr_dedupe_s = 时间窗（秒），ocr_dedupe_px = 像素半径。
@@ -192,11 +194,14 @@ class PerceptionWorker:
         # 否则它会被每帧的检测结果喂大（见 _process_frame 的说明）。
         self._recent: list[tuple[float, float, float]] = []
         #: 送检中的 OCR 请求：request_id → 该帧的基础 Detection（结果回来时回填编号）
-        self._pending: dict[int, Detection] = {}
+        self._crop_store: CropStore | None = None
+        self._ocr_spool_directory: Path | None = None
         self._on_detection: Callable[[Detection], None] | None = None
         self._observer_lock = threading.Lock()
         self._frame_observers: set[Callable[[ProcessedFrame], None]] = set()
         self._result_observers: set[Callable[[DetectionSnapshot], None]] = set()
+        self._frozen_buffer: AlignmentBuffer | None = None
+        self._frozen_buffer_closed = False
 
     # ------------------------------------------------------------------
     # 状态
@@ -269,13 +274,15 @@ class PerceptionWorker:
                 old_cancel = self._wait_cancel
                 old_cancel.set()
                 self._buffer = frozen
+                self._frozen_buffer = frozen
+                self._frozen_buffer_closed = False
                 self._wait_cancel = threading.Event()
                 self._cutoff = cutoff
                 old_buffer.wake_waiters()
             return self._cutoff
 
     def raise_if_failed(self) -> None:
-        """将后台尺寸配置错误交给主线程，避免感知已停而任务继续。"""
+        """将后台致命错误交给主线程，避免感知已停而任务继续。"""
         with self._stats_lock:
             error = self._fatal_error
         if error is not None:
@@ -310,6 +317,8 @@ class PerceptionWorker:
                         },
                     },
                 )
+                if self._ocr_spool_directory is not None:
+                    self._pool.set_spool_directory(self._ocr_spool_directory)
             self._pool.start()
         else:
             # cls12 不需要 OCR：编号直接来自 YOLO 类别
@@ -331,6 +340,16 @@ class PerceptionWorker:
         )
         return self
 
+    def configure_crop_storage(self, directory: str | Path) -> None:
+        """启用飞行记录裁切保存；必须在工作线程启动前调用。"""
+        if self.running:
+            raise RuntimeError("裁切存储必须在感知工作器启动前配置")
+        if self._crop_store is not None:
+            self._crop_store.close()
+        self._crop_store = CropStore(directory)
+        self._ocr_spool_directory = Path(directory).parent / "ocr_spool"
+        self._ocr_spool_directory.mkdir(parents=True, exist_ok=True)
+
     def stop(self, timeout: float = 10.0) -> None:
         """停工作线程与 OCR 进程池（幂等）。"""
         self._stop_event.set()
@@ -351,6 +370,10 @@ class PerceptionWorker:
         if self._owns_pool and self._pool is not None:
             self._pool.stop()
         self._collect_remaining(timeout=0.5)
+        if self._crop_store is not None:
+            self._crop_store.close()
+            self._crop_store = None
+        self._close_frozen_buffer()
 
     def drain(self, timeout: float = 120.0) -> bool:
         """先停止生产者，再等待既有帧与 OCR 完成；失败或超时返回 False。
@@ -376,7 +399,9 @@ class PerceptionWorker:
         if self._drain_to is None:
             return
         with self._stats_lock:
-            if self._cursor >= self._drain_to and not self._pending:
+            pool_stats = {} if self._pool is None else self._pool.stats
+            pool_pending = int(pool_stats.get("pending", 0))
+            if self._cursor >= self._drain_to and pool_pending == 0:
                 self._drain_ok = self._stats.last_error is None
                 self._drained.set()
 
@@ -472,23 +497,49 @@ class PerceptionWorker:
                     LOGGER.exception("处理帧 #%d 失败", frame.index)
                     with self._stats_lock:
                         self._stats.last_error = f"{type(exc).__name__}: {exc}"
+                        if isinstance(exc, OSError):
+                            self._fatal_error = self._stats.last_error
+                    if isinstance(exc, OSError):
+                        return
                 self._collect_remaining(timeout=0.0)
                 with self._input_lock:
                     self._completed_index = frame.index
+                    close_frozen = False
                     if self._cutoff is not None and frame.index == self._cutoff:
                         # 尾帧已送检，OCR 持有独立裁剪；释放固定快照中的整帧引用。
                         self._buffer.clear()
+                        close_frozen = self._buffer is self._frozen_buffer
+                if close_frozen:
+                    self._close_frozen_buffer()
                 self._check_pool_health()
                 self._check_drained()
         except Exception as exc:
             LOGGER.exception("感知线程异常退出")
             with self._stats_lock:
                 self._stats.last_error = f"{type(exc).__name__}: {exc}"
+                self._fatal_error = self._stats.last_error
 
         finally:
             with self._stats_lock:
                 self._run_finished = True
                 self._drained.set()
+            self._close_frozen_buffer()
+
+    def _close_frozen_buffer(self) -> None:
+        """释放 worker 独占的固定视图及其 TS 解码器。"""
+        with self._input_lock:
+            buffer = self._frozen_buffer
+            if buffer is None or self._frozen_buffer_closed:
+                return
+            self._frozen_buffer_closed = True
+        try:
+            buffer.close_cold_storage()
+        except Exception as exc:
+            with self._input_lock:
+                self._frozen_buffer_closed = False
+            with self._stats_lock:
+                self._fatal_error = self._stats.last_error = f"冷存储视图关闭失败：{exc}"
+            raise
 
     def _check_pool_health(self) -> None:
         """巡检 OCR 进程池存活数（有 worker 掉了会打一条节流的 ERROR）。
@@ -510,11 +561,19 @@ class PerceptionWorker:
         check = getattr(self._pool, "check_alive", None)
         if check is not None:
             check()
+        pool_stats = getattr(self._pool, "stats", {})
+        if isinstance(pool_stats, dict) and pool_stats.get("dispatch_failures", 0):
+            message = "OCR 磁盘积压存在损坏请求，派发已停止；未确认文件已保留"
+            with self._stats_lock:
+                self._fatal_error = self._stats.last_error = message
+            self._stop_event.set()
+            self._buffer.wake_waiters()
 
     def _process_frame(self, frame: BufferedFrame) -> None:
         """一帧的完整处理：检测 → 按模式产出。"""
         if frame.snapshot is None:
             raise ValueError("感知处理不能接收未对齐遥测的采集帧")
+        trace_start = timing.now_ns() if timing.ENABLED else 0
         batch = self._detector.detect(
             frame.image,
             frame_index=frame.index,
@@ -522,6 +581,7 @@ class PerceptionWorker:
             telemetry=frame.snapshot,
             mode=self._config.mode,
         )
+        detect_end = timing.now_ns() if timing.ENABLED else 0
         with self._stats_lock:
             self._stats.frames += 1
             self._stats.detections += len(batch.detections)
@@ -530,14 +590,41 @@ class PerceptionWorker:
         if self._config.mode == "cls12":
             # 编号已由类别给出，直接产出
             self._notify_frame_observers(frame, batch.image, batch.undistorted, batch.detections)
-            for detection in batch.detections:
+            for ordinal, detection in enumerate(batch.detections):
+                if self._crop_store is not None:
+                    crop, bounds = self._crop_with_bounds(batch, detection)
+                    self._crop_store.save(
+                        detection, ordinal, crop, bounds, undistorted=batch.undistorted
+                    )
                 self._emit(detection)
+            if timing.ENABLED:
+                timing.emit(
+                    "frame_processing",
+                    frame_index=frame.index,
+                    start_ns=trace_start,
+                    detect_end_ns=detect_end,
+                    end_ns=timing.now_ns(),
+                    mode="cls12",
+                    detections=len(batch.detections),
+                )
             return
 
-        for detection in batch.detections:
-            crop = self._detector.crop(batch, detection)
+        for ordinal, detection in enumerate(batch.detections):
+            crop_start = timing.now_ns() if timing.ENABLED else 0
+            crop, bounds = self._crop_with_bounds(batch, detection)
             if crop.size == 0:
                 continue
+            if self._crop_store is not None:
+                saved_path = self._crop_store.save(
+                    detection, ordinal, crop, bounds, undistorted=batch.undistorted
+                )
+                detection.extra["crop_file"] = saved_path.name
+                rectified_path = saved_path.with_name(
+                    saved_path.stem.removesuffix("_box") + "_rectified.jpg"
+                )
+            else:
+                saved_path = None
+                rectified_path = None
             if self._should_skip(detection):
                 with self._stats_lock:
                     self._stats.deduped += 1
@@ -546,8 +633,26 @@ class PerceptionWorker:
             # 唯一调用点在 _should_skip 里），记下来的条目会随每帧检测无界增长。
             if self._dedupe_enabled():
                 self._remember(detection)
-            self._submit(detection, crop)
+            self._submit(detection, crop, rectified_path=rectified_path)
+            if timing.ENABLED:
+                timing.emit(
+                    "frame_crop_submit",
+                    frame_index=frame.index,
+                    ordinal=ordinal,
+                    start_ns=crop_start,
+                    end_ns=timing.now_ns(),
+                )
         self._notify_frame_observers(frame, batch.image, batch.undistorted, batch.detections)
+        if timing.ENABLED:
+            timing.emit(
+                "frame_processing",
+                frame_index=frame.index,
+                start_ns=trace_start,
+                detect_end_ns=detect_end,
+                end_ns=timing.now_ns(),
+                mode="ocr",
+                detections=len(batch.detections),
+            )
 
     def _make_frame_snapshot(
         self,
@@ -561,7 +666,8 @@ class PerceptionWorker:
         if snapshot is None:
             raise ValueError("感知帧快照缺少对齐遥测")
         pose = snapshot_pose(snapshot)
-        configured_matrix = self._detector.config.camera_matrix
+        detector_config = getattr(self._detector, "config", None)
+        configured_matrix = getattr(detector_config, "camera_matrix", None)
         matrix = None
         if configured_matrix is not None:
             values = np.asarray(configured_matrix, dtype=np.float64).reshape(3, 3)
@@ -585,6 +691,17 @@ class PerceptionWorker:
             pose=pose,
             detections=tuple(snapshot_detection(item) for item in detections),
         )
+
+    def _crop_with_bounds(
+        self, batch: Any, detection: Detection
+    ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+        """兼容离线注入的轻量检测器，并保留实际裁切坐标。"""
+        cropper = getattr(self._detector, "crop_with_bounds", None)
+        if cropper is not None:
+            return cropper(batch, detection)
+        image = self._detector.crop(batch, detection)
+        x1, y1, x2, y2 = detection.box.x1, detection.box.y1, detection.box.x2, detection.box.y2
+        return image, (int(x1), int(y1), int(np.ceil(x2)), int(np.ceil(y2)))
 
     def _notify_frame_observers(
         self,
@@ -660,7 +777,9 @@ class PerceptionWorker:
     # ------------------------------------------------------------------
     # OCR 送检与回填
     # ------------------------------------------------------------------
-    def _submit(self, detection: Detection, crop: np.ndarray) -> None:
+    def _submit(
+        self, detection: Detection, crop: np.ndarray, *, rectified_path: Path | None = None
+    ) -> None:
         pool = self._pool
         if pool is None:  # pragma: no cover - start() 已保证
             return
@@ -670,10 +789,10 @@ class PerceptionWorker:
             frame_index=detection.frame_index,
             capture_timestamp=detection.capture_timestamp,
             payload=payload,
+            rectified_path=rectified_path,
         )
         if request_id is None:
             return
-        self._pending[request_id] = payload
         with self._stats_lock:
             self._stats.submitted += 1
 
@@ -694,7 +813,38 @@ class PerceptionWorker:
             self._apply_result(result)
 
     def _apply_result(self, result: OcrResult) -> None:
-        base = self._pending.pop(result.request_id, None)
+        """先完成识别回填与裁切归档，最后向进程池确认已消费。"""
+        if not isinstance(result.payload, Detection):
+            raise OSError(f"OCR 结果缺少对应检测对象 #{result.request_id}")
+        self._apply_result_payload(result)
+        pool = self._pool
+        acknowledge = None if pool is None else getattr(pool, "ack", None)
+        if callable(acknowledge):
+            acknowledge(result)
+
+    def _apply_result_payload(self, result: OcrResult) -> None:
+        base = result.payload if isinstance(result.payload, Detection) else None
+        if base is not None and self._crop_store is not None:
+            crop_file = base.extra.get("crop_file")
+            if isinstance(crop_file, str):
+                final_crop = self._crop_store.finalize_ocr_result(
+                    crop_file,
+                    number=result.number,
+                    text=result.raw_text,
+                    error=result.error,
+                    archive_error=result.archive_error,
+                    rectified_written=result.rectified_written,
+                    confidence=result.confidence,
+                    side_px=result.side_px,
+                    stage=result.stage,
+                )
+                base.extra["crop_file"] = final_crop.name
+        if result.archive_error is not None:
+            with self._stats_lock:
+                self._stats.last_error = result.archive_error
+            LOGGER.error(
+                "帧 #%d 的转正裁切图归档失败: %s", result.frame_index, result.archive_error
+            )
         if base is None:
             return
         with self._stats_lock:

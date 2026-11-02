@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from queue import Queue
 
 import numpy as np
@@ -30,6 +31,127 @@ from airdrop import (
     capacity_for,
     raw_frame_bytes,
 )
+
+
+def test_cold_buffer_thread_start_failure_closes_created_decoder(tmp_path, monkeypatch) -> None:
+    from airdrop.video import buffer as buffer_module
+    from airdrop.video.cold import TsRangeDecoder
+
+    original_start = threading.Thread.start
+    created = []
+    real_decoder = buffer_module.TsRangeDecoder
+
+    def start(thread):
+        if thread.name == "video-cold-watermark":
+            raise RuntimeError("injected thread start failure")
+        return original_start(thread)
+
+    def decoder_factory(*args, **kwargs):
+        decoder = real_decoder(*args, **kwargs)
+        created.append(decoder)
+        return decoder
+
+    main_decoder = TsRangeDecoder(tmp_path)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    monkeypatch.setattr(buffer_module, "TsRangeDecoder", decoder_factory)
+    try:
+        with pytest.raises(RuntimeError, match="injected thread start failure"):
+            buffer_module.AlignmentBuffer(10, storage="raw", cold_decoder=main_decoder)
+        assert len(created) == 1
+        assert not created[0]._reaper.is_alive()
+    finally:
+        main_decoder.close()
+
+
+def test_freeze_rejects_shutdown_racing_with_watermark_wait(tmp_path, monkeypatch) -> None:
+    from airdrop.video import buffer as buffer_module
+    from airdrop.video.cold import TsRangeDecoder
+
+    decoder = TsRangeDecoder(tmp_path)
+    source = AlignmentBuffer(10, storage="raw", cold_decoder=decoder)
+    waiting = threading.Event()
+    original_wait = source._condition.wait
+    original_pending = source._cold_pending_through_locked
+
+    def pending(index: int, *, require_verified: bool = False) -> bool:
+        if threading.current_thread().name == "freeze-racer":
+            return not source._cold_stopping
+        return original_pending(index, require_verified=require_verified)
+
+    def wait(timeout: float | None = None) -> bool:
+        if threading.current_thread().name == "freeze-racer":
+            waiting.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(source, "_cold_pending_through_locked", pending)
+    monkeypatch.setattr(source._condition, "wait", wait)
+    errors: list[BaseException] = []
+
+    def freeze() -> None:
+        try:
+            source.freeze()
+        except BaseException as exc:  # noqa: BLE001 - 捕获线程中的预期异常
+            errors.append(exc)
+
+    thread = threading.Thread(target=freeze, name="freeze-racer")
+    thread.start()
+    assert waiting.wait(2)
+    source.close_cold_storage()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "关闭期间" in str(errors[0])
+    assert source._storage_lease is None
+    assert buffer_module.AlignmentBuffer is AlignmentBuffer
+
+
+@pytest.mark.parametrize("failure_stage", ["lease", "view"])
+def test_freeze_rolls_back_resources_when_frozen_view_construction_fails(
+    tmp_path, monkeypatch, failure_stage: str
+) -> None:
+    from airdrop.video import buffer as buffer_module
+    from airdrop.video.cold import TsRangeDecoder
+    from airdrop.video.storage import TemporaryTsStorage
+
+    owner = TemporaryTsStorage(parent=tmp_path)
+    lease = owner.acquire_lease()
+    decoder = TsRangeDecoder(owner.directory)
+    source = AlignmentBuffer(
+        10,
+        storage="raw",
+        cold_decoder=decoder,
+        storage_lease=lease,
+    )
+    cache = decoder.decoded_cache
+    assert cache is not None
+    baseline_cache_leases = cache._leases
+    baseline_storage_leases = owner.lease_count
+
+    if failure_stage == "lease":
+
+        def fail_lease_fork():
+            raise RuntimeError("injected frozen lease failure")
+
+        monkeypatch.setattr(lease, "fork", fail_lease_fork)
+        expected_error = "injected frozen lease failure"
+    else:
+
+        def fail_view(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("injected frozen view construction failure")
+
+        monkeypatch.setattr(buffer_module, "AlignmentBuffer", fail_view)
+        expected_error = "injected frozen view construction failure"
+    with pytest.raises(RuntimeError, match=expected_error):
+        source.freeze()
+
+    assert cache._leases == baseline_cache_leases
+    assert owner.lease_count == baseline_storage_leases
+    source.close_cold_storage()
+    owner.producer_stopped()
+    assert owner.finalize()
 
 
 def make_frame(timestamp: float, image: np.ndarray | None = None) -> VideoFrame:
@@ -93,6 +215,35 @@ def test_put_and_read() -> None:
     assert buffer.latest().index == 3
     assert buffer.at(2).snapshot.latitude_deg == pytest.approx(47.1)
     assert buffer.at(99) is None
+
+
+def test_buffer_preserves_source_pts_and_random_access_mapping() -> None:
+    buffer = AlignmentBuffer(capacity=2)
+    sample = make_sample(1000.0)
+    source_frame = replace(
+        sample.frame,
+        media_pts=1234,
+        time_base_num=1,
+        time_base_den=90000,
+        segment=7,
+        random_access_dts=900,
+        random_access_time_base_num=1,
+        random_access_time_base_den=90000,
+    )
+    sample = replace(sample, frame=source_frame)
+
+    buffer.put(sample, materialize=False)
+    recovered = buffer.wait_new(after_index=0, timeout=0)
+
+    assert recovered is not None
+    assert recovered.media_pts == 1234
+    assert (recovered.time_base_num, recovered.time_base_den) == (1, 90000)
+    assert recovered.segment == 7
+    assert recovered.random_access_dts == 900
+    assert (recovered.random_access_time_base_num, recovered.random_access_time_base_den) == (
+        1,
+        90000,
+    )
 
 
 def test_capacity_evicts_oldest() -> None:

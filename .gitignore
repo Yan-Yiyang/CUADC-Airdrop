@@ -34,6 +34,7 @@ plan/
 .*-tmp/
 .handeye-verify/
 pytest-cache-files-*/
+.dsh-meow/
 
 # 任务输入与运行产物由操作者自行准备
 flights/

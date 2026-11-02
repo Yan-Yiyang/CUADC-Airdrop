@@ -20,9 +20,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from airdrop.ballistics.drops import DropRecord
-    from airdrop.video.buffer import AlignmentWriter
+    from airdrop.video.buffer import AlignmentBuffer, AlignmentWriter
 
-    from .session import LiveComponents
+    from .session import Drainable, LiveComponents
 
 # argparse 从这些默认值读取入口参数。
 SYSTEM_ADDRESS: str | None = None
@@ -42,6 +42,26 @@ REAL_RELEASE = False
 AUTO_LAND = True
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _raise_live_input_failures(
+    worker: Drainable | None,
+    source: object | None,
+    buffer: AlignmentBuffer,
+    recorder: object | None = None,
+) -> None:
+    """巡检感知、采集和冷存储输入，避免任务在数据链路失效后继续。"""
+    if worker is not None:
+        worker.raise_if_failed()
+    if source is not None:
+        check_source = getattr(source, "raise_if_failed", None)
+        if callable(check_source):
+            check_source()
+    buffer.raise_if_failed()
+    if recorder is not None:
+        check_recorder = getattr(recorder, "raise_if_failed", None)
+        if callable(check_recorder):
+            check_recorder()
 
 
 def build_config(
@@ -92,9 +112,14 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         TelemetryBroker,
         capacity_for,
     )
+    from airdrop.video.cold import TsRangeDecoder
+    from airdrop.video.source import Hm30VideoSource as PyavSource
 
     from .components import build_perception_components, configure_opencv_threads
     from .session import LiveComponents
+
+    if options.capture:
+        PyavSource(config.video).validate_pyav_config()
 
     broker = TelemetryBroker(
         history_interval=config.telemetry.history_interval,
@@ -136,125 +161,154 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
 
     on_drop = append_drop if recorder is not None else None
 
-    buffer = AlignmentBuffer(capacity_for(30.0, 180.0), storage="jpeg")
-    perception = build_perception_components(
-        config,
-        broker,
-        buffer,
-        capture=options.capture,
-        recognize=options.recognize,
-        recorder=recorder,
-        on_event=on_event,
-        defer_until_airborne=options.run_mission,
-        calibration_capture=options.calibration_capture,
-    )
-    camera, writer, worker, targets = (
-        perception.camera,
-        perception.writer,
-        perception.worker,
-        perception.targets,
-    )
-    prepare_perception: Callable[[], None] | None = None
-    if worker is not None:
-        selected_worker = worker
-        output_size = (int(config.video.width), int(config.video.height))
-        warmup_lock = threading.Lock()
-        warmed = False
-
-        def prepare_selected_perception() -> None:
-            nonlocal warmed
-            with warmup_lock:
-                if warmed:
-                    return
-                if camera is not None and camera.image_size is not None:
-                    calib_size = tuple(int(value) for value in camera.image_size)
-                    if calib_size != output_size:
-                        raise RuntimeError(
-                            f"相机标定尺寸 {calib_size} 与视频输出尺寸 {output_size} 不一致"
-                        )
-                configure_opencv_threads(
-                    selected_worker,
-                    config.perception.opencv_threads,
-                )
-                if not selected_worker.detector.warmup(*output_size):
-                    raise RuntimeError(f"YOLO 按视频输出尺寸 {output_size} 预热失败")
-                warmed = True
-
-        prepare_perception = prepare_selected_perception
-
-    if config.qgc_video.enabled:
-        if source is None:
-            raise ValueError("QGC 视频发布需要开启视频采集")
-        from .qgc import QgcVideoRuntime
-
-        display_runtime = QgcVideoRuntime(
+    if options.capture:
+        decoder = TsRangeDecoder(Path("."), max_cache_bytes=64 * 1024 * 1024)
+        try:
+            buffer = AlignmentBuffer(
+                capacity_for(30.0, 180.0),
+                storage="raw",
+                cold_decoder=decoder,
+                hot_seconds=1.0,
+                max_hot_bytes=128 * 1024 * 1024,
+            )
+        except BaseException as exc:
+            try:
+                decoder.close()
+            except BaseException as cleanup_error:  # noqa: BLE001 - 保留缓冲构造异常
+                exc.add_note(f"历史解码器清理失败: {cleanup_error}")
+            raise
+    else:
+        buffer = AlignmentBuffer(capacity_for(30.0, 180.0), storage="jpeg")
+    try:
+        perception = build_perception_components(
             config,
-            source,
             broker,
-            camera,
-            worker,
+            buffer,
+            capture=options.capture,
+            recognize=options.recognize,
+            recorder=recorder,
             on_event=on_event,
-            simulated_release=not options.real_release,
+            defer_until_airborne=options.run_mission,
+            calibration_capture=options.calibration_capture,
+        )
+        camera, writer, worker, targets = (
+            perception.camera,
+            perception.writer,
+            perception.worker,
+            perception.targets,
+        )
+        prepare_perception: Callable[[], None] | None = None
+        if worker is not None:
+            selected_worker = worker
+            output_size = (int(config.video.width), int(config.video.height))
+            warmup_lock = threading.Lock()
+            warmed = False
+
+            def prepare_selected_perception() -> None:
+                nonlocal warmed
+                with warmup_lock:
+                    if warmed:
+                        return
+                    if camera is not None and camera.image_size is not None:
+                        calib_size = tuple(int(value) for value in camera.image_size)
+                        if calib_size != output_size:
+                            raise RuntimeError(
+                                f"相机标定尺寸 {calib_size} 与视频输出尺寸 {output_size} 不一致"
+                            )
+                    configure_opencv_threads(
+                        selected_worker,
+                        config.perception.opencv_threads,
+                    )
+                    if not selected_worker.detector.warmup(*output_size):
+                        raise RuntimeError(f"YOLO 按视频输出尺寸 {output_size} 预热失败")
+                    warmed = True
+
+            prepare_perception = prepare_selected_perception
+
+        if config.qgc_video.enabled:
+            if source is None:
+                raise ValueError("QGC 视频发布需要开启视频采集")
+            from .qgc import QgcVideoRuntime
+
+            display_runtime = QgcVideoRuntime(
+                config,
+                source,
+                broker,
+                camera,
+                worker,
+                on_event=on_event,
+                simulated_release=not options.real_release,
+            )
+
+        def preflight_cancelled() -> bool:
+            return runner is not None and (runner.stopped or runner.machine.is_terminal)
+
+        if options.run_mission:
+            inner = DroneController.from_config(config, thread, on_event=on_event)
+            controller = (
+                inner if options.real_release else DryRunController(inner, on_event=on_event)
+            )
+            judge = ReleaseJudge(
+                config.drop,
+                BallisticsModel(config.ballistics),
+                overfly_heading_deg=config.overfly.heading_deg,
+                on_event=on_event,
+            )
+
+            def load_camera() -> str:
+                model = camera if camera is not None else config.camera.load_model()
+                origin = model.source or "默认模型（标定缺失/损坏，坐标不可信）"
+                return f"{config.camera.calib_file} → {origin}，标定尺寸 {model.image_size}"
+
+            loaders = (
+                {"detector": worker.detector.load, "ocr": worker.start, "camera": load_camera}
+                if worker is not None
+                else {}
+            )
+            preflight = Preflight(
+                config.preflight,
+                model_loaders=loaders,
+                video_source=source,
+                camera_model=camera,
+                on_event=on_event,
+                cancel_requested=preflight_cancelled,
+            )
+            runner = MissionRunner(
+                config,
+                controller,
+                broker,
+                target_result=None if targets is None else targets.result,
+                target_busy=None if targets is None else targets.busy,
+                health_check=lambda: _raise_live_input_failures(worker, source, buffer, recorder),
+                finish_recon=None if worker is None else worker.finish_input,
+                release_judge=judge,
+                on_event=on_event,
+                on_drop=on_drop,
+                preflight=preflight,
+            )
+        return LiveComponents(
+            thread=thread,
+            source=source,
+            writer=writer,
+            worker=worker,
+            targets=targets,
+            recorder=recorder,
+            display=display_runtime,
+            runner=runner,
+            controller=None if runner is None else controller,
+            broker=broker,
+            buffer=buffer,
+            prepare_perception=prepare_perception,
+            ts_video=options.capture,
+            readiness_timeout_s=35.0 if options.capture else 10.0,
         )
 
-    def preflight_cancelled() -> bool:
-        return runner is not None and (runner.stopped or runner.machine.is_terminal)
-
-    if options.run_mission:
-        inner = DroneController.from_config(config, thread, on_event=on_event)
-        controller = inner if options.real_release else DryRunController(inner, on_event=on_event)
-        judge = ReleaseJudge(
-            config.drop,
-            BallisticsModel(config.ballistics),
-            overfly_heading_deg=config.overfly.heading_deg,
-            on_event=on_event,
-        )
-
-        def load_camera() -> str:
-            model = camera if camera is not None else config.camera.load_model()
-            origin = model.source or "默认模型（标定缺失/损坏，坐标不可信）"
-            return f"{config.camera.calib_file} → {origin}，标定尺寸 {model.image_size}"
-
-        loaders = (
-            {"detector": worker.detector.load, "ocr": worker.start, "camera": load_camera}
-            if worker is not None
-            else {}
-        )
-        preflight = Preflight(
-            config.preflight,
-            model_loaders=loaders,
-            video_source=source,
-            camera_model=camera,
-            on_event=on_event,
-            cancel_requested=preflight_cancelled,
-        )
-        runner = MissionRunner(
-            config,
-            controller,
-            broker,
-            target_result=None if targets is None else targets.result,
-            target_busy=None if targets is None else targets.busy,
-            health_check=None if worker is None else worker.raise_if_failed,
-            finish_recon=None if worker is None else worker.finish_input,
-            release_judge=judge,
-            on_event=on_event,
-            on_drop=on_drop,
-            preflight=preflight,
-        )
-    return LiveComponents(
-        thread=thread,
-        source=source,
-        writer=writer,
-        worker=worker,
-        targets=targets,
-        recorder=recorder,
-        display=display_runtime,
-        runner=runner,
-        controller=None if runner is None else controller,
-        broker=broker,
-        buffer=buffer,
-        prepare_perception=prepare_perception,
-    )
+    except BaseException as exc:
+        try:
+            buffer.close_cold_storage()
+        except BaseException as cleanup_error:  # noqa: BLE001 - 保留工厂构造的原始异常
+            exc.add_note(f"帧缓冲清理失败: {cleanup_error}")
+        raise
 
 
 # 参数与统一 CLI 一一对应，保持具名覆盖便于脚本与测试调用。
@@ -378,6 +432,13 @@ def _apply_qgc_video_overrides(
     return replace(config, qgc_video=replace(config.qgc_video, **updates)).validated()
 
 
+def _disable_qgc_video_without_capture(options: RunOptions, config: Config) -> Config:
+    """无采集时关闭默认显示；显式要求时由前置检查报错。"""
+    if options.qgc_video is not None or options.capture:
+        return config
+    return replace(config, qgc_video=replace(config.qgc_video, enabled=False))
+
+
 def _apply_calibrated_lag(options: RunOptions, config: Config) -> Config:
     """实飞识别使用文件中的同参照标定量；SITL 和录制回放各自保留显式时间轴。"""
     import json
@@ -439,6 +500,7 @@ def prepare_config(
         raise ValueError("开启 QGC 视频发布必须同时开启视频采集")
     if options.qgc_video is not None:
         config = replace(config, qgc_video=replace(config.qgc_video, enabled=options.qgc_video))
+    config = _disable_qgc_video_without_capture(options, config)
     if options.real_release and not config.gripper.enabled:
         raise ValueError("真实投弹已启用，但 Config.gripper.enabled=False")
     preflight = replace(

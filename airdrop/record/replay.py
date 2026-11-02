@@ -39,8 +39,9 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
+from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args, get_type_hints
 
 import cv2
 import numpy as np
@@ -91,6 +92,88 @@ class FrameIndexError(FlightLogError):
     """``frames_index.jsonl`` 损坏（时间戳不递增、字段缺失）。"""
 
 
+def _has_complete_recording(log: FlightLog) -> bool:
+    """核验停止事件的错误计数与 TS 段标记，判断记录是否正常收尾。"""
+    event_path = log.flight_dir / "events.jsonl"
+    if not event_path.is_file():
+        return False
+    try:
+        rows = [
+            json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines() if line
+        ]
+    except OSError, json.JSONDecodeError:
+        return False
+    if not rows or not isinstance(rows[-1], dict) or rows[-1].get("kind") != "recorder_stopped":
+        return False
+    stopped = rows[-1]
+    zero_fields = (
+        "frame_write_errors",
+        "frame_encode_errors",
+        "telemetry_write_errors",
+        "finalize_errors",
+        "frames_skipped",
+        "telemetry_dropped",
+        "telemetry_pending",
+    )
+    if any(type(stopped.get(name)) is not int or stopped[name] != 0 for name in zero_fields):
+        return False
+    segments = (
+        log.indexed_ts_segments
+        if log.indexed_ts_segments is not None
+        else {record.segment for record in log.frames if record.storage == "ts"}
+    )
+    return all(
+        (log.flight_dir / "video" / f"segment-{segment:06d}.complete").is_file()
+        for segment in segments
+    )
+
+
+def _index_bool(value: Any, field: str) -> bool:
+    """JSON索引布尔字段必须是实际布尔值，不能接受数字等相似类型。"""
+    if type(value) is not bool:
+        raise ValueError(f"索引字段 {field} 必须是布尔值")
+    return value
+
+
+def _aligned_snapshot(record: FrameRecord) -> TelemetrySnapshot | None:
+    """读取 TS 帧自身保存的完整对齐快照，禁止以低频日志补猜。"""
+    data = record.aligned_telemetry
+    if record.storage != "ts" and data is None:
+        return None
+    if record.storage == "ts" and record.telemetry_aligned is False and data is None:
+        return None
+    if data is None:
+        raise FrameIndexError(f"TS 帧 #{record.index} 缺少逐帧对齐遥测")
+    expected = set(TelemetrySnapshot.__dataclass_fields__)
+    if set(data) != expected:
+        missing = sorted(expected - set(data))
+        extra = sorted(set(data) - expected)
+        raise FrameIndexError(
+            f"帧 #{record.index} 对齐遥测字段不完整: missing={missing}, extra={extra}"
+        )
+    hints = get_type_hints(TelemetrySnapshot)
+    for name, annotation in hints.items():
+        value = data[name]
+        allowed = get_args(annotation) or (annotation,)
+        if value is None:
+            if type(None) not in allowed:
+                raise FrameIndexError(f"帧 #{record.index} 对齐遥测 {name} 不允许为空")
+            continue
+        valid = False
+        for expected in allowed:
+            if expected is float:
+                valid = isinstance(value, int | float) and not isinstance(value, bool)
+                if valid:
+                    valid = isfinite(float(value))
+            elif expected in (int, bool, str):
+                valid = type(value) is expected
+            if valid:
+                break
+        if not valid:
+            raise FrameIndexError(f"帧 #{record.index} 对齐遥测 {name} 类型或数值无效: {value!r}")
+    return TelemetrySnapshot(**data)
+
+
 # ----------------------------------------------------------------------
 # 索引记录
 # ----------------------------------------------------------------------
@@ -106,6 +189,18 @@ class FrameRecord:
     extrapolated: bool = False
     offset: float = 0.0
     bytes: int = 0
+    storage: str = "jpeg"
+    media_pts: int | None = None
+    time_base_num: int | None = None
+    time_base_den: int | None = None
+    segment: int = 0
+    random_access_dts: int | None = None
+    random_access_time_base_num: int | None = None
+    random_access_time_base_den: int | None = None
+    width: int | None = None
+    height: int | None = None
+    aligned_telemetry: dict[str, Any] | None = None
+    telemetry_aligned: bool | None = None
 
     @property
     def timestamp(self) -> float:
@@ -128,6 +223,36 @@ class FrameRecord:
                 extrapolated=bool(data.get("extrapolated", False)),
                 offset=float(data.get("offset", 0.0)),
                 bytes=int(data.get("bytes", 0)),
+                storage=str(data.get("storage", "jpeg")),
+                media_pts=None if data.get("media_pts") is None else int(data["media_pts"]),
+                time_base_num=None
+                if data.get("time_base_num") is None
+                else int(data["time_base_num"]),
+                time_base_den=None
+                if data.get("time_base_den") is None
+                else int(data["time_base_den"]),
+                segment=int(data.get("segment", 0)),
+                random_access_dts=None
+                if data.get("random_access_dts") is None
+                else int(data["random_access_dts"]),
+                random_access_time_base_num=None
+                if data.get("random_access_time_base_num") is None
+                else int(data["random_access_time_base_num"]),
+                random_access_time_base_den=None
+                if data.get("random_access_time_base_den") is None
+                else int(data["random_access_time_base_den"]),
+                width=None if data.get("width") is None else int(data["width"]),
+                height=None if data.get("height") is None else int(data["height"]),
+                aligned_telemetry=(
+                    None
+                    if data.get("aligned_telemetry") is None
+                    else dict(data["aligned_telemetry"])
+                ),
+                telemetry_aligned=(
+                    None
+                    if "telemetry_aligned" not in data
+                    else _index_bool(data["telemetry_aligned"], "telemetry_aligned")
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise FrameIndexError(
@@ -148,15 +273,26 @@ class FlightLog:
 
     flight_dir: Path
     frames: list[FrameRecord] = field(default_factory=list)
+    index_time_error: str | None = None
+    indexed_ts_segments: frozenset[int] | None = None
 
     @classmethod
-    def open(cls, flight_dir: str | Path) -> "FlightLog":
-        """打开目录并解析帧索引（遥测按需流式读）。"""
+    def open(cls, flight_dir: str | Path, *, recover_time: bool = False) -> "FlightLog":
+        """打开目录并解析帧索引；显式恢复时保留首个时间倒流之前的前缀。"""
         path = Path(flight_dir)
         if not path.is_dir():
             raise FlightLogError(f"飞行目录不存在: {path}")
-        frames = _read_frame_index(path / FRAMES_INDEX_NAME)
-        log = cls(flight_dir=path, frames=frames)
+        frames, time_error, segments = _read_frame_index(
+            path / FRAMES_INDEX_NAME, recover_time=recover_time
+        )
+        log = cls(
+            flight_dir=path,
+            frames=frames,
+            index_time_error=time_error,
+            indexed_ts_segments=frozenset(segments),
+        )
+        if time_error is not None:
+            LOGGER.warning("%s；保留此前 %d 帧的连续前缀", time_error, len(frames))
         LOGGER.info("回放素材就绪：%s（%d 帧）", path, len(frames))
         return log
 
@@ -210,12 +346,16 @@ class FlightLog:
                 yield snapshot
 
 
-def _read_frame_index(path: Path) -> list[FrameRecord]:
-    """解析帧索引并校验时间戳单调递增。"""
+def _read_frame_index(
+    path: Path, *, recover_time: bool = False
+) -> tuple[list[FrameRecord], str | None, set[int]]:
+    """解析索引；恢复模式保留时间倒流前缀并继续核验其后的索引格式。"""
     if not path.is_file():
         raise FlightLogError(f"缺少帧索引: {path}")
     records: list[FrameRecord] = []
     last_capture: float | None = None
+    time_error: str | None = None
+    segments: set[int] = set()
     with open(path, encoding="utf-8") as handle:
         raw_lines = handle.readlines()
     for line_no, raw_line in enumerate(raw_lines, start=1):
@@ -239,16 +379,25 @@ def _read_frame_index(path: Path) -> list[FrameRecord]:
                 f"frames_index.jsonl 第 {line_no} 行不是合法 JSON: {exc}"
             ) from exc
         record = FrameRecord.from_dict(data, line_no=line_no)
-        if last_capture is not None and record.capture_timestamp < last_capture:
-            raise FrameIndexError(
+        if record.storage == "ts":
+            segments.add(record.segment)
+        if (
+            time_error is None
+            and last_capture is not None
+            and record.capture_timestamp < last_capture
+        ):
+            time_error = (
                 f"frames_index.jsonl 第 {line_no} 行时间戳倒流："
                 f"{record.capture_timestamp} < {last_capture}"
             )
-        last_capture = record.capture_timestamp
-        records.append(record)
+            if not recover_time:
+                raise FrameIndexError(time_error)
+        if time_error is None:
+            last_capture = record.capture_timestamp
+            records.append(record)
     if not records:
         raise FrameIndexError(f"帧索引为空: {path}")
-    return records
+    return records, time_error, segments
 
 
 # ----------------------------------------------------------------------
@@ -432,6 +581,7 @@ def load_broker_from_log(
     broker: TelemetryBroker | None = None,
     history_maxlen: int = 0,
     ahead_s: float = 0.5,
+    recover_time: bool = False,
 ) -> tuple[TelemetryBroker, TelemetryPacer]:
     """建一个专用 broker，并返回``(broker, pacer)``——**遥测尚未灌入**。
 
@@ -467,7 +617,7 @@ def load_broker_from_log(
             source_time_alignment=source_time_alignment,
         )
     )
-    log = FlightLog.open(flight_dir)
+    log = FlightLog.open(flight_dir, recover_time=recover_time)
     if not log.has_telemetry:
         raise FlightLogError(f"缺少遥测日志: {log.telemetry_path}")
     snapshots = list(log.iter_telemetry())
@@ -534,10 +684,8 @@ class ReplayVideoSource:
     repeat:
         播完一遍后是否循环（做长时间稳定性验证时有用）。
     strict:
-        ``True``（默认）：素材损坏（帧文件缺失/解码失败）或 **sink 抛异常**都
-        直接让回放以 ``state="error"`` 结束——做正式评估时宁可失败，也不要
-        "看起来跑通了、其实少了一半帧"。``False`` 则从宽：缺帧记账跳过，
-        sink 异常只记日志、继续播后面的帧（适合"先看看效果"的探索阶段）。
+        ``None`` 自动按收尾标记选择：完整航次严格失败，异常航次报告坏帧并保留
+        有效前缀。显式 ``True`` 始终严格失败，``False`` 则始终跳过坏帧。
     """
 
     def __init__(
@@ -548,7 +696,7 @@ class ReplayVideoSource:
         telemetry: "TelemetryPacer | None" = None,
         buffer: AlignmentBuffer | None = None,
         repeat: bool = False,
-        strict: bool = True,
+        strict: bool | None = None,
         tail_s: float = 0.0,
     ) -> None:
         if speed < 0:
@@ -556,12 +704,24 @@ class ReplayVideoSource:
         if tail_s < 0:
             raise ValueError(f"tail_s 不能为负: {tail_s}")
 
-        self._log = FlightLog.open(flight_dir)
+        self._log = FlightLog.open(flight_dir, recover_time=strict is not True)
+        complete_recording = _has_complete_recording(self._log)
+        if strict is None and complete_recording and self._log.index_time_error is not None:
+            raise FrameIndexError(self._log.index_time_error)
+        self._ts_decoder = None
+        if any(record.storage == "ts" for record in self._log.frames):
+            from ..video.cold import TsRangeDecoder
+
+            self._ts_decoder = TsRangeDecoder(self._log.flight_dir / "video")
         self._speed = float(speed)
         self._telemetry = telemetry
         self._buffer = buffer
         self._repeat = repeat
-        self._strict = strict
+        self._strict = complete_recording if strict is None else strict
+        if not complete_recording:
+            LOGGER.warning(
+                "航次收尾事件计数异常、缺失或 TS 分段未完成，回放将保留可用前缀并报告坏帧"
+            )
         self._tail_s = tail_s
 
         self._condition = threading.Condition(threading.RLock())
@@ -673,6 +833,8 @@ class ReplayVideoSource:
                 LOGGER.warning("回放线程未在 %.1fs 内退出，保留引用（可再调 stop()）", timeout)
                 return
         self._thread = None
+        if self._ts_decoder is not None:
+            self._ts_decoder.close()
         self._set_state("stopped")
 
     def __enter__(self) -> "ReplayVideoSource":
@@ -843,7 +1005,14 @@ class ReplayVideoSource:
                 if record.capture_timestamp > self._telemetry.cover_to():
                     self._telemetry_published += self._telemetry.finish(record.capture_timestamp)
                 self._telemetry_published += self._telemetry.publish_until(record.capture_timestamp)
-            image = self._read_image(record)
+            try:
+                image = self._read_image(record)
+                aligned_snapshot = _aligned_snapshot(record)
+            except Exception as exc:
+                if self._strict:
+                    raise
+                self._skip(record, f"帧解码失败: {exc}")
+                continue
             if image is None:
                 self._skip(record, "帧文件缺失或无法解码")
                 continue
@@ -852,6 +1021,17 @@ class ReplayVideoSource:
                 image=image,
                 timestamp=record.timestamp,
                 lag=record.lag,
+                media_pts=record.media_pts,
+                time_base_num=record.time_base_num,
+                time_base_den=record.time_base_den,
+                segment=record.segment,
+                random_access_dts=record.random_access_dts,
+                random_access_time_base_num=record.random_access_time_base_num,
+                random_access_time_base_den=record.random_access_time_base_den,
+                aligned_snapshot=aligned_snapshot,
+                aligned_extrapolated=record.extrapolated,
+                aligned_offset=record.offset,
+                alignment_disabled=(record.storage == "ts" and record.telemetry_aligned is False),
             )
             self._publish(frame)
         if self._skipped:
@@ -930,6 +1110,26 @@ class ReplayVideoSource:
     # 内部工具
     # ------------------------------------------------------------------
     def _read_image(self, record: FrameRecord) -> np.ndarray | None:
+        if record.storage == "ts":
+            if (
+                self._ts_decoder is None
+                or record.media_pts is None
+                or record.time_base_num is None
+                or record.time_base_den is None
+                or record.width is None
+                or record.height is None
+            ):
+                raise FlightLogError(f"TS 帧索引缺少定位或尺寸信息: #{record.index}")
+            image = self._ts_decoder.read(
+                record.segment,
+                record.media_pts,
+                record.time_base_num,
+                record.time_base_den,
+                output_size=(record.width, record.height),
+            )
+            if image is None and self._strict:
+                raise FlightLogError(f"TS 帧无法按精确 PTS 解码: #{record.index}")
+            return image
         path = self._log.frames_dir / record.filename
         if not path.is_file():
             if self._strict:

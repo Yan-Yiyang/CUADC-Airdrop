@@ -60,15 +60,21 @@ class _Worker:
 
 
 class _Source:
-    def __init__(self, calls: list[str], *, stuck: bool = False) -> None:
+    def __init__(self, calls: list[str], *, stuck: bool = False, ready: bool = True) -> None:
         self.calls = calls
         self.running = False
         self.stuck = stuck
+        self.ready = ready
+        self.readiness_timeouts: list[float] = []
         self.stats: VideoStats = VideoStats(frames=1)
         self.stop_on_start = False
+        self.raise_if_failed: Callable[[], None] = lambda: None
 
     def add_sink(self, sink: Callable[[VideoFrame], None]) -> None:
         del sink
+
+    def set_recording_directory(self, directory: str | Path) -> None:
+        del directory
 
     def start(self) -> _Source:
         self.calls.append("source.start")
@@ -77,8 +83,8 @@ class _Source:
         return self
 
     def wait_ready(self, timeout: float = 10.0) -> bool:
-        del timeout
-        return True
+        self.readiness_timeouts.append(timeout)
+        return self.ready
 
     def stop(self, timeout: float = 5.0) -> None:
         del timeout
@@ -125,14 +131,15 @@ class _Targets:
 
 
 class _Recorder:
-    flight_dir: Path | None = None
-
-    def __init__(self, calls: list[str]) -> None:
+    def __init__(self, calls: list[str], flight_dir: Path | None = None) -> None:
         self.calls = calls
+        self.flight_dir = flight_dir
         self.is_running = False
 
-    def start(self, *, broker: TelemetryBroker, buffer: AlignmentBuffer) -> None:
-        del broker, buffer
+    def start(
+        self, *, broker: TelemetryBroker, buffer: AlignmentBuffer, ts_video: bool = False
+    ) -> None:
+        del broker, buffer, ts_video
         self.calls.append("recorder.start")
         self.is_running = True
 
@@ -142,10 +149,140 @@ class _Recorder:
         self.is_running = False
 
 
+def test_crop_storage_path_is_injected_after_recorder_start(tmp_path) -> None:
+    calls: list[str] = []
+
+    class CropWorker(_Worker):
+        def configure_crop_storage(self, path: Path) -> None:
+            calls.append(f"worker.crop_storage:{path}")
+
+    flight_dir = tmp_path / "flight"
+    worker = CropWorker(calls)
+    components = LiveComponents(
+        thread=_Thread(calls),
+        source=_Source(calls),
+        worker=worker,
+        recorder=_Recorder(calls, flight_dir),
+        broker=TelemetryBroker(),
+        buffer=AlignmentBuffer(10),
+    )
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
+
+    assert LiveSession(options, components).run() == 0
+    assert calls.index("recorder.start") < calls.index(
+        f"worker.crop_storage:{flight_dir / 'crops'}"
+    )
+    assert calls.index(f"worker.crop_storage:{flight_dir / 'crops'}") < calls.index("worker.start")
+
+
+def test_passive_session_uses_explicit_video_readiness_timeout() -> None:
+    calls: list[str] = []
+    source = _Source(calls)
+    components = LiveComponents(thread=_Thread(calls), source=source, readiness_timeout_s=35.0)
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
+
+    assert LiveSession(options, components).run() == 0
+    assert source.readiness_timeouts == [35.0]
+
+
+def test_passive_session_default_video_readiness_timeout_is_ten_seconds() -> None:
+    calls: list[str] = []
+    source = _Source(calls)
+    components = LiveComponents(thread=_Thread(calls), source=source)
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
+
+    assert LiveSession(options, components).run() == 0
+    assert source.readiness_timeouts == [10.0]
+
+
+def test_ts_session_binds_temporary_directory_and_cleans_after_stop(tmp_path, monkeypatch) -> None:
+    from airdrop.video import storage as storage_module
+    from airdrop.video.cold import TsRangeDecoder
+
+    calls: list[str] = []
+
+    class Source(_Source):
+        directory: Path | None = None
+
+        def validate_pyav_config(self) -> None:
+            calls.append("validate")
+
+        def set_recording_directory(self, directory: str | Path) -> None:
+            self.directory = Path(directory)
+            calls.append("bind")
+
+    real_storage = storage_module.TemporaryTsStorage
+    monkeypatch.setattr(storage_module, "TemporaryTsStorage", lambda: real_storage(parent=tmp_path))
+    source = Source(calls)
+    buffer = AlignmentBuffer(10, storage="raw", cold_decoder=TsRangeDecoder(tmp_path))
+    components = LiveComponents(thread=_Thread(calls), source=source, buffer=buffer, ts_video=True)
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
+
+    assert LiveSession(options, components).run() == 0
+    assert calls.index("validate") < calls.index("thread.connect") < calls.index("bind")
+    assert source.directory is not None and not source.directory.exists()
+
+
+def test_ts_session_binds_recording_directory_before_source_start(tmp_path) -> None:
+    from airdrop.video.cold import TsRangeDecoder
+
+    calls: list[str] = []
+
+    class Source(_Source):
+        directory: Path | None = None
+
+        def set_recording_directory(self, directory: str | Path) -> None:
+            self.directory = Path(directory)
+            calls.append("bind")
+
+    class Recorder(_Recorder):
+        def start(self, *, broker, buffer, ts_video=False) -> None:
+            assert ts_video
+            assert self.flight_dir is not None
+            (self.flight_dir / "video").mkdir(parents=True)
+            super().start(broker=broker, buffer=buffer)
+
+    source = Source(calls)
+    flight_dir = tmp_path / "flight"
+    buffer = AlignmentBuffer(10, storage="raw", cold_decoder=TsRangeDecoder(tmp_path))
+    components = LiveComponents(
+        thread=_Thread(calls),
+        source=source,
+        buffer=buffer,
+        broker=TelemetryBroker(),
+        recorder=Recorder(calls, flight_dir),
+        ts_video=True,
+    )
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
+
+    assert LiveSession(options, components).run() == 0
+    assert source.directory == flight_dir / "video"
+    assert calls.index("recorder.start") < calls.index("bind") < calls.index("source.start")
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True])
+def test_live_components_reject_invalid_video_readiness_timeout(timeout: object) -> None:
+    with pytest.raises(ValueError, match="视频首帧等待上限"):
+        LiveComponents(thread=_Thread([]), readiness_timeout_s=timeout)  # type: ignore[arg-type]
+
+
+def test_passive_session_reports_video_readiness_timeout() -> None:
+    calls: list[str] = []
+    source = _Source(calls, ready=False)
+    components = LiveComponents(thread=_Thread(calls), source=source, readiness_timeout_s=35.0)
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
+
+    assert LiveSession(options, components).run() == 1
+    assert source.readiness_timeouts == [35.0]
+    assert calls[-1] == "thread.stop"
+
+
 def test_session_drains_before_result_pump_and_stops_thread_last() -> None:
     calls: list[str] = []
     worker = _Worker(calls)
     source = _Source(calls)
+    buffer = AlignmentBuffer(10)
+    buffer.close_cold_storage = lambda timeout=5.0: calls.append("buffer.close_cold_storage")
     components = LiveComponents(
         thread=_Thread(calls),
         source=source,
@@ -153,7 +290,7 @@ def test_session_drains_before_result_pump_and_stops_thread_last() -> None:
         targets=_Targets(calls),
         recorder=_Recorder(calls),
         broker=TelemetryBroker(),
-        buffer=AlignmentBuffer(10),
+        buffer=buffer,
         on_finish=lambda: calls.append("finish"),
     )
     options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
@@ -162,7 +299,12 @@ def test_session_drains_before_result_pump_and_stops_thread_last() -> None:
     assert calls.index("source.stop") < calls.index("worker.drain")
     assert calls.index("worker.drain") < calls.index("targets.pump")
     assert calls.index("targets.pump") < calls.index("recorder.stop")
-    assert calls.index("recorder.stop") < calls.index("finish") < calls.index("thread.stop")
+    assert calls.index("recorder.stop") < calls.index("buffer.close_cold_storage")
+    assert (
+        calls.index("buffer.close_cold_storage")
+        < calls.index("finish")
+        < calls.index("thread.stop")
+    )
 
 
 def test_stuck_video_source_fails_and_still_releases_everything() -> None:
@@ -176,6 +318,28 @@ def test_stuck_video_source_fails_and_still_releases_everything() -> None:
     assert "worker.drain" not in calls
     assert calls[-1] == "thread.stop"
     assert "worker.stop" in calls
+
+
+@pytest.mark.parametrize("failed_component", ["source", "buffer"])
+def test_passive_session_propagates_video_storage_health_failure(failed_component: str) -> None:
+    calls: list[str] = []
+    source = _Source(calls)
+    buffer = AlignmentBuffer(10)
+
+    def fail() -> None:
+        raise OSError(f"模拟 {failed_component} 持久化故障")
+
+    if failed_component == "source":
+        source.raise_if_failed = fail
+    else:
+        buffer.raise_if_failed = fail
+    components = LiveComponents(
+        thread=_Thread(calls), source=source, buffer=buffer, broker=TelemetryBroker()
+    )
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.01)
+
+    assert LiveSession(options, components).run() == 1
+    assert calls[-1] == "thread.stop"
 
 
 def test_prepare_perception_runs_before_worker_and_video() -> None:

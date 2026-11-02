@@ -155,7 +155,7 @@ def test_full_update_recorder_contract_reaches_calibration_validator(tmp_path: P
     assert timeline.quality_meta["position"]["received_hz"] == pytest.approx(50.0)
     first_frame = next((flight / "frames").glob("*.jpg"))
     first_frame.unlink()
-    with pytest.raises(ValueError, match="帧文件缺失"):
+    with pytest.raises(ValueError, match="标定帧无法读取或验证"):
         _validate_full_update_capture(flight, telemetry_rows)
 
 

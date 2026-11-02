@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -174,6 +175,51 @@ def test_flight_log_reads_frame_index(workdir: Path) -> None:
     assert span[1] - span[0] == pytest.approx(4 * 0.1)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("frame_write_errors", 1),
+        ("frame_write_errors", True),
+        ("frame_write_errors", None),
+        ("frame_encode_errors", 1),
+        ("telemetry_write_errors", 1),
+        ("finalize_errors", 1),
+        ("frames_skipped", 1),
+        ("telemetry_dropped", 1),
+        ("telemetry_pending", 1),
+    ],
+)
+def test_replay_marks_abnormal_recorder_stopped_as_prefix(
+    workdir: Path, caplog: pytest.LogCaptureFixture, field: str, value: Any
+) -> None:
+    flight_dir, *_ = _write_flight(workdir, frames=2)
+    stopped: dict[str, Any] = {
+        "kind": "recorder_stopped",
+        "frames_written": 2,
+        "telemetry_received": 0,
+        "telemetry_enqueued": 0,
+        "telemetry_written": 0,
+        "events": 0,
+        "detections": 0,
+        "drops": 0,
+        "frame_write_errors": 0,
+        "frame_encode_errors": 0,
+        "telemetry_write_errors": 0,
+        "finalize_errors": 0,
+        "frames_skipped": 0,
+        "telemetry_dropped": 0,
+        "telemetry_pending": 0,
+    }
+    stopped[field] = value
+    (flight_dir / "events.jsonl").write_text(json.dumps(stopped) + "\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        source = ReplayVideoSource(flight_dir, speed=0)
+
+    assert source._strict is False
+    assert "收尾事件计数异常" in caplog.text
+
+
 def test_flight_log_rejects_missing_dir(workdir: Path) -> None:
     with pytest.raises(FlightLogError, match="不存在"):
         FlightLog.open(workdir / "nope")
@@ -250,6 +296,166 @@ def test_flight_log_rejects_time_going_backwards(workdir: Path) -> None:
     )
     with pytest.raises(FrameIndexError, match="时间戳倒流"):
         FlightLog.open(flight_dir)
+
+
+@pytest.mark.parametrize(
+    ("complete", "strict", "should_raise"),
+    [
+        (False, True, True),
+        (False, None, False),
+        (False, False, False),
+        (True, True, True),
+        (True, None, True),
+        (True, False, False),
+    ],
+)
+def test_replay_time_reversal_preserves_prefix_without_modifying_files(
+    workdir: Path,
+    caplog: pytest.LogCaptureFixture,
+    complete: bool,
+    strict: bool | None,
+    should_raise: bool,
+) -> None:
+    flight_dir, *_ = _write_flight(workdir, frames=4)
+    index_path = flight_dir / "frames_index.jsonl"
+    rows = [json.loads(line) for line in index_path.read_text(encoding="utf-8").splitlines()]
+    # 相同时间仍可读取，后续倒流的位置才成为恢复边界。
+    rows[1]["capture_timestamp"] = rows[0]["capture_timestamp"]
+    rows[2]["capture_timestamp"] = rows[0]["capture_timestamp"] - 1.0
+    index_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    event_path = flight_dir / "events.jsonl"
+    if complete:
+        stopped = {
+            "kind": "recorder_stopped",
+            "frame_write_errors": 0,
+            "frame_encode_errors": 0,
+            "telemetry_write_errors": 0,
+            "finalize_errors": 0,
+            "frames_skipped": 0,
+            "telemetry_dropped": 0,
+            "telemetry_pending": 0,
+        }
+        event_path.write_text(json.dumps(stopped) + "\n", encoding="utf-8")
+    before = hashlib.sha256(index_path.read_bytes()).digest()
+    with pytest.raises(FrameIndexError, match="时间戳倒流"):
+        FlightLog.open(flight_dir)
+    recovered = FlightLog.open(flight_dir, recover_time=True)
+    assert len(recovered.frames) == 2
+    assert recovered.index_time_error is not None
+    assert recovered.frames[0].capture_timestamp == recovered.frames[1].capture_timestamp
+    if should_raise:
+        with pytest.raises(FrameIndexError, match="时间戳倒流"):
+            ReplayVideoSource(flight_dir, strict=strict)
+    else:
+        with caplog.at_level(logging.WARNING, logger="airdrop.record.replay"):
+            source = ReplayVideoSource(flight_dir, strict=strict)
+            seen: list[int] = []
+            source.add_sink(lambda frame: seen.append(frame.index))
+            _play_to_completion(source)
+        assert seen == [1, 2]
+        assert "时间戳倒流" in caplog.text
+    assert hashlib.sha256(index_path.read_bytes()).digest() == before
+
+
+def test_time_reversal_recovery_does_not_hide_later_malformed_index(workdir: Path) -> None:
+    flight_dir, *_ = _write_flight(workdir, frames=4)
+    path = flight_dir / "frames_index.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[1]["capture_timestamp"] = rows[0]["capture_timestamp"] - 1.0
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows[:2])
+        + "not-json\n"
+        + json.dumps(rows[3])
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(FrameIndexError, match="不是合法 JSON"):
+        FlightLog.open(flight_dir, recover_time=True)
+    with pytest.raises(FrameIndexError, match="不是合法 JSON"):
+        ReplayVideoSource(flight_dir, strict=False)
+
+
+def test_telemetry_loader_can_explicitly_recover_time_reversal(workdir: Path) -> None:
+    flight_dir, *_ = _write_flight(workdir, frames=3)
+    path = flight_dir / "frames_index.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[1]["capture_timestamp"] = rows[0]["capture_timestamp"] - 1.0
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    with pytest.raises(FrameIndexError, match="时间戳倒流"):
+        load_broker_from_log(flight_dir)
+    _, pacer = load_broker_from_log(flight_dir, recover_time=True)
+    assert pacer.total > 0
+
+
+@pytest.mark.parametrize(
+    ("complete", "strict", "should_raise"),
+    [(False, None, False), (False, True, True), (True, None, True), (True, False, False)],
+)
+def test_runtime_replay_recovers_time_reversal_before_source_creation(
+    workdir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    complete: bool,
+    strict: bool | None,
+    should_raise: bool,
+) -> None:
+    import airdrop
+
+    flight_dir, *_ = _write_flight(workdir, frames=3)
+    path = flight_dir / "frames_index.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[1]["capture_timestamp"] = rows[0]["capture_timestamp"] - 1.0
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    if complete:
+        stopped = {
+            "kind": "recorder_stopped",
+            "frame_write_errors": 0,
+            "frame_encode_errors": 0,
+            "telemetry_write_errors": 0,
+            "finalize_errors": 0,
+            "frames_skipped": 0,
+            "telemetry_dropped": 0,
+            "telemetry_pending": 0,
+        }
+        (flight_dir / "events.jsonl").write_text(json.dumps(stopped) + "\n", encoding="utf-8")
+
+    class SourceReached(Exception):
+        pass
+
+    def inspect_source(*args: Any, **kwargs: Any) -> None:
+        source = ReplayVideoSource(*args, **kwargs)
+        assert len(source._log.frames) == 1
+        assert source._log.index_time_error is not None
+        raise SourceReached
+
+    monkeypatch.setattr(airdrop, "ReplayVideoSource", inspect_source)
+    expected = FrameIndexError if should_raise else SourceReached
+    with pytest.raises(expected):
+        replay_runtime.main(flight_dir=flight_dir, strict=strict, qgc_video=False)
+
+
+def test_recovery_checks_ts_segments_even_after_reversal(workdir: Path) -> None:
+    flight_dir, *_ = _write_flight(workdir, frames=3)
+    path = flight_dir / "frames_index.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[1]["capture_timestamp"] = rows[0]["capture_timestamp"] - 1.0
+    rows[2]["storage"] = "ts"
+    rows[2]["segment"] = 2
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    stopped = {
+        "kind": "recorder_stopped",
+        "frame_write_errors": 0,
+        "frame_encode_errors": 0,
+        "telemetry_write_errors": 0,
+        "finalize_errors": 0,
+        "frames_skipped": 0,
+        "telemetry_dropped": 0,
+        "telemetry_pending": 0,
+    }
+    (flight_dir / "events.jsonl").write_text(json.dumps(stopped) + "\n", encoding="utf-8")
+    source = ReplayVideoSource(flight_dir)
+    assert source._strict is False
+    assert len(source._log.frames) == 1
+    assert source._log.index_time_error is not None
 
 
 def test_iter_telemetry_streams_snapshots(workdir: Path) -> None:
@@ -842,7 +1048,9 @@ def test_replay_setup_and_keyboard_interrupt_still_clean_all_components(
     monkeypatch.setattr(replay_runtime, "build_config", lambda **_kwargs: config)
     monkeypatch.setattr(replay_runtime, "resolve_flight_dir", lambda _path: workdir)
     monkeypatch.setattr(
-        airdrop, "load_broker_from_log", lambda _path: (object(), SimpleNamespace(total=0))
+        airdrop,
+        "load_broker_from_log",
+        lambda _path, **_kwargs: (object(), SimpleNamespace(total=0)),
     )
     monkeypatch.setattr(airdrop, "ReplayVideoSource", lambda *_args, **_kwargs: source)
     monkeypatch.setattr(

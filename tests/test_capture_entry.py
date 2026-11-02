@@ -7,8 +7,10 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from fractions import Fraction
 from pathlib import Path
 
+import av
 import numpy as np
 import pytest
 
@@ -16,6 +18,7 @@ import airdrop
 from airdrop import Config, FlightRecorder, TelemetryBroker, TelemetrySnapshot
 from airdrop.run import resolve_kwargs
 from airdrop.runtime.mission import main as run_mission
+from airdrop.video.cold import TsRangeDecoder, TsSegmentWriter
 from airdrop.video.source import VideoConfig, VideoFrame, VideoStats
 
 
@@ -86,7 +89,11 @@ def test_capture_entry_records_and_closes_resources(
             self.stats = VideoStats()
             self.running = False
             self.sinks: list[Callable[[VideoFrame], None]] = []
+            self.directory: Path | None = None
             sources.append(self)
+
+        def set_recording_directory(self, directory: str | Path) -> None:
+            self.directory = Path(directory)
 
         def add_sink(self, sink: Callable[[VideoFrame], None]) -> None:
             self.sinks.append(sink)
@@ -98,11 +105,41 @@ def test_capture_entry_records_and_closes_resources(
             if ending in {"normal", "interrupt"}:
                 span = brokers[0].history_span()
                 assert span is not None
+                assert self.directory is not None
+                input_path = tmp_path / f"{ending}-input.mp4"
+                output = av.open(str(input_path), mode="w", format="mp4")
+                stream = output.add_stream("libx264", rate=12)
+                stream.width, stream.height, stream.pix_fmt = 16, 16, "yuv420p"
+                image = av.VideoFrame.from_ndarray(
+                    np.zeros((16, 16, 3), dtype=np.uint8), format="bgr24"
+                )
+                image.pts, image.time_base = 0, Fraction(1, 12)
+                for packet in stream.encode(image):
+                    output.mux(packet)
+                for packet in stream.encode():
+                    output.mux(packet)
+                output.close()
+                input_container = av.open(str(input_path))
+                input_stream = input_container.streams.video[0]
+                writer = TsSegmentWriter(self.directory, segment=1, input_stream=input_stream)
+                decoded = []
+                for packet in input_container.demux(input_stream):
+                    decoded.extend(packet.decode())
+                    writer.mux(packet)
+                writer.close()
+                input_container.close()
+                assert len(decoded) == 1
+                decoded_frame = decoded[0]
+                assert decoded_frame.pts is not None and decoded_frame.time_base is not None
                 frame = VideoFrame(
                     index=1,
-                    image=np.zeros((16, 16, 3), dtype=np.uint8),
+                    image=decoded_frame.to_ndarray(format="bgr24"),
                     timestamp=span[0] + self.config.telemetry_lag,
                     lag=self.config.telemetry_lag,
+                    media_pts=decoded_frame.pts,
+                    time_base_num=decoded_frame.time_base.numerator,
+                    time_base_den=decoded_frame.time_base.denominator,
+                    segment=1,
                 )
                 for sink in self.sinks:
                     sink(frame)
@@ -137,6 +174,7 @@ def test_capture_entry_records_and_closes_resources(
             "--capture",
             "--no-recognize",
             "--record",
+            "--no-qgc-video",
             "--max-seconds",
             "0.000001",
         ],
@@ -158,7 +196,19 @@ def test_capture_entry_records_and_closes_resources(
     if ending in {"normal", "interrupt"}:
         assert len(rows) == 1
         row = json.loads(rows[0])
-        assert (flight_dir / "frames" / row["filename"]).is_file()
+        assert row["storage"] == "ts"
+        decoder = TsRangeDecoder(flight_dir / "video")
+        try:
+            image = decoder.read(
+                row["segment"],
+                row["media_pts"],
+                row["time_base_num"],
+                row["time_base_den"],
+                output_size=(16, 16),
+            )
+            assert image is not None and image.shape == (16, 16, 3)
+        finally:
+            decoder.close()
         assert row["received_timestamp"] - row["capture_timestamp"] == pytest.approx(
             row["lag"], abs=1e-6
         )

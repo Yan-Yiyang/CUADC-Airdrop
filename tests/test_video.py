@@ -100,24 +100,19 @@ def test_frame_carries_telemetry_lag(live_source) -> None:
 def test_sink_receives_every_frame(live_source) -> None:
     """每帧都必须经过 sink——这是"一帧都不能丢"的保证点。
 
-    同时验证：坏 sink 抛异常既不打断拉流、也不影响别的 sink；而 ``read()``
-    那条实时路径允许丢帧，两者互不影响。
+    ``read()`` 的实时路径允许丢帧，两者互不影响。
     """
     seen: list[int] = []
 
     def counting_sink(frame) -> None:
         seen.append(frame.index)
 
-    def failing_sink(frame) -> None:
-        raise RuntimeError("故意失败")
-
     def configure(source: Hm30VideoSource) -> None:
         # 必须在 start() 之前挂上，否则首帧之后才生效
         source.add_sink(counting_sink)
-        source.add_sink(failing_sink)
 
     source = live_source(configure=configure)
-    assert len(source.sinks) == 2
+    assert len(source.sinks) == 1
 
     # 故意慢消费（每帧拖 100ms，远低于 30fps）：实时读取必然丢帧，
     # 而 sink 一帧都不会少
@@ -137,7 +132,30 @@ def test_sink_receives_every_frame(live_source) -> None:
 
     source.remove_sink(counting_sink)
     assert counting_sink not in source.sinks
-    assert failing_sink in source.sinks
+
+
+@pytest.mark.stream
+def test_sink_failure_is_fatal(make_source, sender, stream_config) -> None:
+    """接收者异常必须显式停止，不能静默丢失逐帧数据。"""
+    from airdrop.video.source import VideoStorageError
+
+    source = make_source(stream_config)
+
+    def failing_sink(frame) -> None:
+        raise RuntimeError("故意失败")
+
+    source.add_sink(failing_sink)
+    source.start()
+    time.sleep(0.8)
+    sender.start()
+    deadline = time.monotonic() + 12.0
+    while source.running and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not source.running
+    assert source.stats.reconnects == 0
+    assert source.stats.sink_errors == 1
+    with pytest.raises(VideoStorageError, match="故意失败"):
+        source.raise_if_failed()
 
 
 @pytest.mark.stream

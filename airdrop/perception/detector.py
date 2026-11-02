@@ -22,6 +22,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+import airdrop.perception.timing as timing  # noqa: PLR0402 - 避免惰性包循环导入
+
 from ..telemetry.models import TelemetrySnapshot
 from .models import Detection, PixelBox
 
@@ -267,12 +269,14 @@ class Detector:
         self.load()
         assert self._model is not None  # load() 已保证
 
+        trace_start = timing.now_ns() if timing.ENABLED else 0
         do_undistort = config.undistort if undistort is None else undistort
         if do_undistort and config.camera_matrix is not None:
             picture, rectified = self.undistort(image)
         else:
             picture, rectified = image, False
 
+        predict_start = timing.now_ns() if timing.ENABLED else 0
         results = self._model.predict(
             picture,
             device=config.device,
@@ -282,6 +286,7 @@ class Detector:
             max_det=config.max_detections,
             verbose=False,
         )
+        predict_end = timing.now_ns() if timing.ENABLED else 0
         snapshot = telemetry if telemetry is not None else TelemetrySnapshot()
         height, width = picture.shape[:2]
         detections: list[Detection] = []
@@ -318,6 +323,17 @@ class Detector:
                         )
                     )
         detections.sort(key=lambda d: d.confidence, reverse=True)
+        if timing.ENABLED:
+            timing.emit(
+                "detector",
+                frame_index=frame_index,
+                start_ns=trace_start,
+                remap_end_ns=predict_start,
+                predict_end_ns=predict_end,
+                end_ns=timing.now_ns(),
+                ultralytics_speed_ms=getattr(results[0], "speed", None) if results else None,
+                detections=len(detections),
+            )
         return DetectionBatch(
             image=picture,
             detections=tuple(detections),
@@ -326,14 +342,21 @@ class Detector:
 
     def crop(self, batch: DetectionBatch, detection: Detection) -> np.ndarray:
         """按检测框裁出目标图（含外扩，保留完整五边形轮廓）。"""
+        image, _ = self.crop_with_bounds(batch, detection)
+        return image
+
+    def crop_with_bounds(
+        self, batch: DetectionBatch, detection: Detection
+    ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+        """返回外扩裁切图及其在输入图像中的半开像素范围。"""
         box = detection.box.expanded(self._config.crop_expand_ratio).clipped(
             batch.image.shape[1], batch.image.shape[0]
         )
         x1, y1 = int(box.x1), int(box.y1)
         x2, y2 = int(np.ceil(box.x2)), int(np.ceil(box.y2))
         if x2 <= x1 or y2 <= y1:
-            return np.zeros((0, 0, 3), np.uint8)
-        return batch.image[y1:y2, x1:x2].copy()
+            return np.zeros((0, 0, 3), np.uint8), (x1, y1, x2, y2)
+        return batch.image[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
 
     def replace_config(self, **changes: Any) -> "Detector":
         """派生一个改了参数的 detector（权重重新加载）。"""

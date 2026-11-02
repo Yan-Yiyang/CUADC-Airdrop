@@ -257,7 +257,7 @@ class FrameTelemetryAligner:
     # ------------------------------------------------------------------
     # 对齐
     # ------------------------------------------------------------------
-    def align(self, frame: VideoFrame | None) -> AlignedSample | None:
+    def align(self, frame: VideoFrame | None) -> AlignedSample | None:  # noqa: PLR0911 - 对齐失败原因分别早退
         """把一帧对齐到它拍摄时刻的遥测。
 
         返回 ``None`` 的四种情况：
@@ -279,6 +279,27 @@ class FrameTelemetryAligner:
 
         lag = self._lag if self._lag is not None else frame.lag
         timestamp = frame.timestamp - lag
+
+        if frame.alignment_disabled:
+            return AlignedSample(
+                frame=frame,
+                snapshot=None,
+                timestamp=timestamp,
+                lag=lag,
+                mode="capture_only",
+            )
+
+        if frame.aligned_snapshot is not None:
+            self._bump("aligned")
+            return AlignedSample(
+                frame=frame,
+                snapshot=frame.aligned_snapshot,
+                timestamp=timestamp,
+                lag=lag,
+                mode="recorded",
+                extrapolated=frame.aligned_extrapolated,
+                offset=frame.aligned_offset,
+            )
 
         # 历史为空：一条遥测都没收到；等也没用，直接跳过（细分到 no_telemetry）
         span = self._broker.history_span()

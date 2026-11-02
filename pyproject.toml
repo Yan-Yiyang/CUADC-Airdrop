@@ -4,6 +4,7 @@ version = "0.2.1"
 authors = [{ name = "太原理工大学航模协会" }, { name = "燕羿洋" }]
 requires-python = ">=3.14"
 dependencies = [
+    "av>=19.0.2",
     "imageio-ffmpeg",
     "mavsdk",
     "onnxruntime-gpu>=1.30.0",

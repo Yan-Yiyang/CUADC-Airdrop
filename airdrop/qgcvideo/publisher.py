@@ -203,14 +203,16 @@ class QgcVideoPublisher:
             "-i",
             "pipe:0",
             "-fps_mode",
-            "vfr",
+            "cfr",
             "-an",
             "-c:v",
-            "libx264",
+            "h264_nvenc",
             "-preset",
-            "ultrafast",
+            "p1",
             "-tune",
-            "zerolatency",
+            "ull",
+            "-zerolatency",
+            "1",
             "-pix_fmt",
             "yuv420p",
             "-bf",
@@ -223,8 +225,10 @@ class QgcVideoPublisher:
             "0",
             "-force_key_frames",
             "expr:gte(t,n_forced*1)",
-            "-x264-params",
-            "repeat-headers=1",
+            "-forced-idr",
+            "1",
+            "-bsf:v",
+            "dump_extra=freq=keyframe",
             "-b:v",
             f"{int(self.config.bitrate_kbps)}k",
         ]
@@ -292,13 +296,31 @@ class QgcVideoPublisher:
                 with self._lock:
                     self._dropped += 1
 
-    def _encode(self) -> None:
+    def _encode(self) -> None:  # noqa: PLR0912, PLR0915 - 编码时钟、进程恢复和管道收尾共享状态
         restarts_left = int(self.config.max_restarts)
         process = self._start_process()
+        period = 1.0 / float(self.config.fps)
+        next_frame = self._clock()
+        latest: tuple[np.ndarray, float, float | None] | None = None
         while not self._stop.is_set():
+            received = True
             try:
-                item = self._frames.get(timeout=0.1)
+                item = self._frames.get(timeout=max(0.0, next_frame - self._clock()))
             except queue.Empty:
+                received = False
+                item = None
+            if received and item is None:
+                break
+            if received and item is not None:
+                latest = item
+            now = self._clock()
+            if now < next_frame:
+                continue
+            next_frame += period
+            if next_frame <= now:
+                # 编码落后时跳过过期节拍，不追赶补发旧帧。
+                next_frame = now + period
+            if latest is None:
                 if self._process_unavailable(process):
                     if restarts_left <= 0:
                         self._record_error(RuntimeError("FFmpeg 重启次数已耗尽"))
@@ -307,8 +329,6 @@ class QgcVideoPublisher:
                     self._restart_delay()
                     process = self._start_process(restart=True)
                 continue
-            if item is None:
-                break
             if self._process_unavailable(process):
                 if restarts_left <= 0:
                     with self._lock:
@@ -322,7 +342,7 @@ class QgcVideoPublisher:
                 with self._lock:
                     self._dropped += 1
                 continue
-            frame, submitted_at, capture_time = item
+            frame, submitted_at, capture_time = latest
             try:
                 data = memoryview(frame).cast("B")
                 offset = 0

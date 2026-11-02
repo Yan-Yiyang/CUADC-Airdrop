@@ -194,7 +194,7 @@ def test_real_encoder_failure_is_recorded_and_restart_finishes_cleanly(tmp_path:
     def factory(command: list[str], **kwargs: Any) -> subprocess.Popen:
         command = [*command[:-1], str(tmp_path / f"encoded-{len(processes)}.ts")]
         if not processes:
-            command[command.index("libx264")] = "airdrop_intentional_invalid_encoder"
+            command[command.index("h264_nvenc")] = "airdrop_intentional_invalid_encoder"
         process = subprocess.Popen(command, **kwargs)
         processes.append(process)
         return process

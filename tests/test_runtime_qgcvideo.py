@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -37,6 +38,9 @@ class _Source:
 
     def add_sink(self, sink: Callable[[VideoFrame], None]) -> None:
         del sink
+
+    def set_recording_directory(self, directory: str | Path) -> None:
+        del directory
 
     def start(self) -> _Source:
         self.calls.append("source.start")

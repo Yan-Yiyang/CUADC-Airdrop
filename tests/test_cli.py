@@ -106,6 +106,12 @@ def test_real_release_has_explicit_positive_and_negative_flags() -> None:
     assert run.resolve_kwargs("mission", ["--no-real-release"])["real_release"] is False
 
 
+def test_replay_strictness_cli_preserves_automatic_and_explicit_modes() -> None:
+    assert run.resolve_kwargs("replay", [])["strict"] is None
+    assert run.resolve_kwargs("replay", ["--strict"])["strict"] is True
+    assert run.resolve_kwargs("replay", ["--no-strict"])["strict"] is False
+
+
 def test_qgc_cli_options_resolve_to_config_overrides_and_tool_arguments() -> None:
     mission = run.resolve_kwargs("mission", ["--mode", "real", "--qgc-video", "--qgc-port", "5614"])
     assert mission["qgc_video"] is True

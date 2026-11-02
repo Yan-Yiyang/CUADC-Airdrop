@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Sequence
+from dataclasses import fields, is_dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -14,6 +16,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from airdrop.qgcvideo.models import DisplaySnapshot
+
+LOGGER = logging.getLogger(__name__)
 
 CANVAS_SIZE = (1760, 990)
 VIDEO_RECT = (0, 130, 1280, 720)
@@ -86,6 +90,33 @@ def _format_duration(seconds: float | None) -> str:
     return f"{value // 60:02d}:{value % 60:02d}"
 
 
+def _format_seconds(seconds: float | None) -> str:
+    if seconds is None or not math.isfinite(seconds):
+        return "未知"
+    return f"{max(0, int(seconds))} 秒"
+
+
+def _whole_second(seconds: float | None) -> int | None:
+    if seconds is None or not math.isfinite(seconds):
+        return None
+    return max(0, int(seconds))
+
+
+def _stable_key(value: Any) -> Any:
+    """构造不比较图像像素的渲染依赖键。"""
+    if isinstance(value, np.ndarray):
+        return ("ndarray", id(value), value.shape, value.dtype.str)
+    if is_dataclass(value):
+        return tuple((item.name, _stable_key(getattr(value, item.name))) for item in fields(value))
+    if isinstance(value, dict):
+        return tuple(sorted((key, _stable_key(item)) for key, item in value.items()))
+    if isinstance(value, (tuple, list)):
+        return tuple(_stable_key(item) for item in value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    return value
+
+
 def _format_clock(timestamp: float | None) -> str:
     if timestamp is None or not math.isfinite(timestamp):
         return "未知"
@@ -151,27 +182,193 @@ class FrameComposer:
             tuple[str, tuple[int, int], int, tuple[int, int, int], tuple[int, int, int, int] | None]
         ] = []
         self._video_label_bounds: list[tuple[int, int, int, int]] = []
+        self._canvas = np.full((990, 1760, 3), BACKGROUND_COLOR, dtype=np.uint8)
+        self._canvas[:130] = SURFACE_COLOR
+        self._canvas[130:850, 1280:] = PANEL_COLOR
+        self._canvas[850:] = SURFACE_COLOR
+        cv2.line(self._canvas, (1280, 130), (1280, 849), (60, 49, 38), 1)
+        cv2.line(self._canvas, (0, 850), (1759, 850), (60, 49, 38), 1)
+        self._region_keys: dict[str, Any] = {}
+        self._active_text_x_range: tuple[int, int] | None = None
 
     def set_publisher_stats(self, stats: Any) -> None:
         """接收发布线程的只读统计快照。"""
         self._publisher_stats = stats
 
     def compose(self, snapshot: DisplaySnapshot) -> np.ndarray:
-        """渲染单张画布，所有绘制都在新数组上完成。"""
+        """只重绘显示依赖变化的区域，并复用上一张完整画布。"""
         self._text_commands = []
         self._video_label_bounds = []
-        canvas = np.full((990, 1760, 3), BACKGROUND_COLOR, dtype=np.uint8)
-        canvas[:130] = SURFACE_COLOR
-        canvas[130:850, 1280:] = PANEL_COLOR
-        canvas[850:] = SURFACE_COLOR
-        cv2.line(canvas, (1280, 130), (1280, 849), (60, 49, 38), 1)
-        cv2.line(canvas, (0, 850), (1759, 850), (60, 49, 38), 1)
-        self._render_video(canvas, snapshot)
-        self._render_status(canvas, snapshot)
-        self._render_panel(canvas, snapshot)
-        self._render_footer(canvas, snapshot)
-        self._draw_text_commands(canvas)
+        canvas = self._canvas
+        progress = snapshot.progress
+        frame = snapshot.frame
+        image = None if frame is None else frame.image
+        video_key = (
+            None if frame is None else frame.frame_index,
+            id(image),
+            snapshot.mode,
+            _stable_key(snapshot.detections),
+            _stable_key(snapshot.observations),
+            _stable_key(snapshot.projected_observations),
+            _stable_key(snapshot.target_projected),
+            _stable_key(snapshot.impact_projected),
+            snapshot.flypast_completed,
+            _whole_second(snapshot.capture_delay_s),
+            snapshot.replay_mode,
+        )
+        status_key = (
+            snapshot.stage,
+            snapshot.mode,
+            snapshot.completed_stages,
+            snapshot.replay_mode,
+            progress.lag_frames,
+            progress.processing,
+            progress.ocr_pending,
+            progress.queued_results,
+            progress.processed_frames,
+            progress.mission_current,
+            progress.mission_total,
+            _whole_second(progress.stage_elapsed_s),
+            _whole_second(progress.hold_remaining_s),
+            _whole_second(progress.eta_s),
+            snapshot.released,
+            snapshot.release_simulated,
+            snapshot.release_command_status,
+            _format_clock(snapshot.release_timestamp),
+            _format_clock(snapshot.release_command_timestamp),
+        )
+        panel_key = (
+            _stable_key(snapshot.panel),
+            snapshot.recent_codes,
+            snapshot.geometry_error,
+            tuple(
+                self._thumbnail_age(snapshot, entry, snapshot.observed_at)
+                for entry in snapshot.panel
+                if entry.code in snapshot.recent_codes
+            ),
+            tuple(
+                (entry.thumbnail_frame_index, id(frame.image))
+                for entry in snapshot.panel
+                if entry.thumbnail is None and entry.thumbnail_frame_index is not None
+                for frame in snapshot.history_frames
+                if frame.frame_index == entry.thumbnail_frame_index
+            ),
+        )
+        stats = self._publisher_stats
+        footer_left_key = (
+            progress.processed_frames,
+            progress.lag_frames,
+            progress.queued_results,
+            None if progress.processing_fps is None else round(progress.processing_fps, 1),
+            progress.ocr_completed,
+            progress.ocr_pending,
+            None if progress.ocr_rate_per_s is None else round(progress.ocr_rate_per_s, 1),
+        )
+        footer_center_key = (
+            snapshot.replay_mode,
+            progress.telemetry_age_s is None or progress.telemetry_age_s > 0.5,
+            _whole_second(progress.telemetry_age_s),
+            None if stats is None else (stats.encoded // 30, stats.dropped, stats.restarts),
+            None if stats is None else _whole_second(stats.last_latency_s),
+        )
+        live = snapshot.live_prediction
+        state_age = (
+            None
+            if snapshot.observed_at is None
+            or live is None
+            or live.position_velocity_received_at is None
+            else float(snapshot.observed_at) - float(live.position_velocity_received_at)
+        )
+        footer_right_key = (
+            snapshot.stage,
+            snapshot.replay_mode,
+            progress.mission_current,
+            progress.mission_total,
+            _whole_second(progress.stage_elapsed_s),
+            _whole_second(progress.hold_remaining_s),
+            _whole_second(progress.eta_s),
+            snapshot.released,
+            snapshot.release_simulated,
+            snapshot.release_command_status,
+            _format_clock(snapshot.release_timestamp),
+            _format_clock(snapshot.release_command_timestamp),
+            snapshot.flypast_completed,
+            None
+            if live is None
+            else (
+                live.valid,
+                live.reason,
+                live.wind_available,
+                None if live.error_m is None else round(live.error_m, 1),
+                _whole_second(live.flight_time_s),
+                state_age is None or state_age > 0.5,
+                _whole_second(state_age),
+            ),
+            None if snapshot.release_error_m is None else round(snapshot.release_error_m, 1),
+            _whole_second(snapshot.release_flight_time_s),
+            _format_clock(snapshot.release_prediction_timestamp),
+        )
+        regions = (
+            ("video", video_key, (0, 130, 1280, 850), None, self._render_video),
+            ("status", status_key, (0, 0, 1760, 130), None, self._render_status),
+            ("panel", panel_key, (1280, 130, 1760, 850), None, self._render_panel),
+            (
+                "footer_left",
+                footer_left_key,
+                (0, 850, 580, 990),
+                (0, 580),
+                self._render_footer,
+            ),
+            (
+                "footer_center",
+                footer_center_key,
+                (580, 850, 1165, 990),
+                (580, 1165),
+                self._render_footer,
+            ),
+            (
+                "footer_right",
+                footer_right_key,
+                (1165, 850, 1760, 990),
+                (1165, 1760),
+                self._render_footer,
+            ),
+        )
+        rendered_keys: dict[str, tuple[object, ...]] = {}
+        changed_regions: list[tuple[int, int, int, int, np.ndarray]] = []
+        try:
+            for name, key, (x1, y1, x2, y2), text_range, renderer in regions:
+                if self._region_keys.get(name) == key:
+                    continue
+                changed_regions.append((x1, y1, x2, y2, canvas[y1:y2, x1:x2].copy()))
+                canvas[y1:y2, x1:x2] = self._region_background(name)
+                self._active_text_x_range = text_range
+                try:
+                    renderer(canvas, snapshot)
+                finally:
+                    self._active_text_x_range = None
+                rendered_keys[name] = key
+            cv2.line(canvas, (1280, 130), (1280, 849), (60, 49, 38), 1)
+            cv2.line(canvas, (0, 850), (1759, 850), (60, 49, 38), 1)
+            self._draw_text_commands(canvas)
+        except Exception:
+            LOGGER.exception("QGC 画面渲染失败；恢复画布以便下一帧重试")
+            for x1, y1, x2, y2, previous in changed_regions:
+                canvas[y1:y2, x1:x2] = previous
+            raise
+        self._region_keys.update(rendered_keys)
         return canvas
+
+    @staticmethod
+    def _region_background(name: str) -> tuple[int, int, int]:
+        return {
+            "video": BACKGROUND_COLOR,
+            "status": SURFACE_COLOR,
+            "panel": PANEL_COLOR,
+            "footer_left": SURFACE_COLOR,
+            "footer_center": SURFACE_COLOR,
+            "footer_right": SURFACE_COLOR,
+        }[name]
 
     def _render_video(self, canvas: np.ndarray, snapshot: DisplaySnapshot) -> None:  # noqa: PLR0912
         current = getattr(snapshot, "frame", None)
@@ -232,7 +429,7 @@ class FrameComposer:
             if getattr(snapshot, "replay_mode", False):
                 delay_text = "回放原时间轴"
             else:
-                delay_text = "未知" if delay is None else f"{delay * 1000:.0f} 毫秒"
+                delay_text = _format_seconds(delay)
             self._text(
                 canvas,
                 (
@@ -591,8 +788,10 @@ class FrameComposer:
         elif stage == "HOLD_PROCESS":
             remaining = getattr(progress, "hold_remaining_s", None)
             eta = getattr(progress, "eta_s", None)
-            detail = f"距超时 {remaining:.1f} 秒" if remaining is not None else "距超时 未知"
-            route = f"预计处理 {eta:.1f} 秒" if eta is not None else "预计处理 未知"
+            detail = (
+                f"距超时 {_format_seconds(remaining)}" if remaining is not None else "距超时 未知"
+            )
+            route = f"预计处理 {_format_seconds(eta)}" if eta is not None else "预计处理 未知"
         elif stage in {"OVERFLY", "LAND", "DONE", "ABORT"}:
             status = self._release_text(snapshot)
             stamp = getattr(snapshot, "release_timestamp", None)
@@ -719,14 +918,14 @@ class FrameComposer:
     def _thumbnail_age(snapshot: DisplaySnapshot, entry: Any, observed_at: float | None) -> str:
         capture_timestamp = getattr(entry, "thumbnail_capture_timestamp", None)
         if capture_timestamp is not None and observed_at is not None:
-            return f"{max(0.0, observed_at - float(capture_timestamp)):.1f}秒前"
+            return f"{max(0, int(observed_at - float(capture_timestamp)))}秒前"
         frame_index = getattr(entry, "thumbnail_frame_index", None)
         if frame_index is None or observed_at is None:
             return "时间未知"
         for frame in getattr(snapshot, "history_frames", ()):
             if getattr(frame, "frame_index", None) == frame_index:
                 age = max(0.0, observed_at - float(frame.capture_timestamp))
-                return f"{age:.1f}秒前"
+                return f"{max(0, int(age))}秒前"
         return "无截图"
 
     def _render_footer(self, canvas: np.ndarray, snapshot: DisplaySnapshot) -> None:  # noqa: PLR0915
@@ -768,7 +967,7 @@ class FrameComposer:
         dropped = 0 if stats is None else stats.dropped
         restarts = 0 if stats is None else stats.restarts
         latency = None if stats is None else stats.last_latency_s
-        latency_text = "未知" if latency is None else f"{latency * 1000:.0f} 毫秒"
+        latency_text = _format_seconds(latency)
         self._text(
             canvas,
             "静态预览 · 发布器未启动"
@@ -792,7 +991,7 @@ class FrameComposer:
             if getattr(snapshot, "replay_mode", False)
             else "遥测新鲜度 未知"
             if telemetry_age is None
-            else f"遥测新鲜度 {telemetry_age:.2f} 秒"
+            else f"遥测新鲜度 {_format_seconds(telemetry_age)}"
         )
         self._text(canvas, telemetry_text, (600, 966), 0.35, (190, 200, 210))
 
@@ -812,9 +1011,13 @@ class FrameComposer:
             route += f" · 已用时 {_format_duration(stage_elapsed)}"
         elif stage == "HOLD_PROCESS":
             remaining = getattr(progress, "hold_remaining_s", None)
-            route = f"距超时 {remaining:.1f} 秒" if remaining is not None else "距超时 未知"
+            route = (
+                f"距超时 {_format_seconds(remaining)}" if remaining is not None else "距超时 未知"
+            )
             eta = getattr(progress, "eta_s", None)
-            route += f" · 预计处理 {eta:.1f} 秒" if eta is not None else " · 预计处理 未知"
+            route += (
+                f" · 预计处理 {_format_seconds(eta)}" if eta is not None else " · 预计处理 未知"
+            )
         if getattr(snapshot, "replay_mode", False):
             route = "历史任务阶段不可用"
             release_text = "回放不包含投放状态"
@@ -836,12 +1039,12 @@ class FrameComposer:
             else float(observed_at) - float(received_at)
         )
         live_text = (
-            f"实时预测误差 {live_error:.1f} 米 · 预计滞空 {live_flight:.1f} 秒"
+            f"实时预测误差 {live_error:.1f} 米 · 预计滞空 {_format_seconds(live_flight)}"
             if live_error is not None and live_flight is not None
             else f"实时无效 · {('未启动' if live is None else live.reason)}"
         )
         live_text += " · 状态龄 "
-        live_text += "未知" if state_age is None else f"{state_age:.2f} 秒"
+        live_text += "未知" if state_age is None else _format_seconds(state_age)
         if live is not None and live.valid and not live.wind_available:
             live_text += " · 缺风按零风"
         release_error = getattr(snapshot, "release_error_m", None)
@@ -853,7 +1056,7 @@ class FrameComposer:
             else "投放时模型预测 · 未知（无匹配的成功投放预测）"
         )
         if release_error is not None and release_time is not None:
-            release_text += f" · 滞空 {release_time:.1f} 秒"
+            release_text += f" · 滞空 {_format_seconds(release_time)}"
         self._text(
             canvas,
             live_text,
@@ -903,51 +1106,75 @@ class FrameComposer:
         clip: tuple[int, int, int, int] | None = None,
     ) -> None:
         del image
+        if self._active_text_x_range is not None:
+            left, right = self._active_text_x_range
+            if not left <= origin[0] < right:
+                return
         self._text_commands.append((text, origin, max(12, round(scale * 34)), color, clip))
 
     def _draw_text_commands(self, canvas: np.ndarray) -> None:
         if not self._text_commands:
             return
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(rgb)
-        draw = ImageDraw.Draw(image)
+        measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
         for text, origin, size, color, clip in self._text_commands:
             font = _font(size)
-            fill = (color[2], color[1], color[0], 255)
-            stroke = (17, 14, 12, 255)
             if clip is None:
+                anchor = origin
+                bounds = measure.textbbox(anchor, text, font=font, anchor="ls")
+            else:
+                left, top, right, bottom = clip
+                if right <= left or bottom <= top:
+                    continue
+                fitted = _fit_text_anchor(measure, text, font, origin, clip)
+                if fitted is None:
+                    continue
+                font, anchor, bounds = fitted
+            x1 = max(0, int(math.floor(bounds[0] - 9)))
+            y1 = max(0, int(math.floor(bounds[1] - 6)))
+            x2 = min(canvas.shape[1], int(math.ceil(bounds[2] + 9)))
+            y2 = min(canvas.shape[0], int(math.ceil(bounds[3] + 7)))
+            if clip is not None:
+                x1, y1 = max(x1, clip[0]), max(y1, clip[1])
+                x2, y2 = min(x2, clip[2]), min(y2, clip[3])
+            if x2 <= x1 or y2 <= y1:
+                continue
+            patch = canvas[y1:y2, x1:x2]
+            image = Image.fromarray(cv2.cvtColor(patch, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(image)
+            local_anchor = (anchor[0] - x1, anchor[1] - y1)
+            if clip is not None:
+                local_bounds = tuple(
+                    value - (x1 if index % 2 == 0 else y1) for index, value in enumerate(bounds)
+                )
+                draw.rounded_rectangle(
+                    (
+                        local_bounds[0] - 7,
+                        local_bounds[1] - 4,
+                        local_bounds[2] + 7,
+                        local_bounds[3] + 4,
+                    ),
+                    radius=4,
+                    fill=(12, 20, 28),
+                )
                 draw.text(
-                    origin,
+                    local_anchor,
                     text,
                     font=font,
                     anchor="ls",
-                    fill=fill[:3],
+                    fill=(color[2], color[1], color[0], 255),
+                    stroke_width=1,
+                    stroke_fill=(17, 14, 12, 255),
+                )
+            else:
+                draw.text(
+                    local_anchor,
+                    text,
+                    font=font,
+                    anchor="ls",
+                    fill=(color[2], color[1], color[0]),
                     stroke_width=0,
                 )
-                continue
-            left, top, right, bottom = clip
-            if right <= left or bottom <= top:
-                continue
-            draw = ImageDraw.Draw(image)
-            fitted = _fit_text_anchor(draw, text, font, origin, clip)
-            if fitted is None:
-                continue
-            font, anchor, bounds = fitted
-            draw.rounded_rectangle(
-                (bounds[0] - 7, bounds[1] - 4, bounds[2] + 7, bounds[3] + 4),
-                radius=4,
-                fill=(12, 20, 28),
-            )
-            draw.text(
-                anchor,
-                text,
-                font=font,
-                anchor="ls",
-                fill=fill,
-                stroke_width=1,
-                stroke_fill=stroke,
-            )
-        canvas[:] = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+            canvas[y1:y2, x1:x2] = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
         self._text_commands.clear()
 
     @staticmethod

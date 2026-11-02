@@ -13,8 +13,17 @@ from airdrop.runtime.options import RunOptions
 def test_qgc_video_defaults_avoid_sitl_input_ports() -> None:
     config = QgcVideoConfig()
     assert (config.host, config.port, config.transport) == ("127.0.0.1", 5602, "rtp")
+    assert config.enabled is True
+    assert config.fps == 30.0
     assert config.validated() is config
     assert Config().validated().qgc_video == config
+
+
+def test_qgc_video_defaults_off_without_capture_but_explicit_request_fails() -> None:
+    options = RunOptions(mode="real", run_mission=False, recognize=False, capture=False)
+    assert prepare_config(options, Config()).qgc_video.enabled is False
+    with pytest.raises(ValueError, match="必须同时开启视频采集"):
+        prepare_config(replace(options, qgc_video=True), Config())
 
 
 @pytest.mark.parametrize(

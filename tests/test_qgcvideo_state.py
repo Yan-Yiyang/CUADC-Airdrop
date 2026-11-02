@@ -441,7 +441,7 @@ def test_panel_keeps_latest_thumbnail_after_frame_history_and_observation_cloud_
     assert FrameComposer._thumbnail(snapshot, entry) is entry.thumbnail
     assert snapshot.observed_at is not None
     assert FrameComposer._thumbnail_age(snapshot, entry, snapshot.observed_at) == (
-        f"{max(0.0, snapshot.observed_at - 1.0):.1f}秒前"
+        f"{max(0, int(snapshot.observed_at - 1.0))}秒前"
     )
     composed = FrameComposer().compose(snapshot)
     assert np.any(np.all(composed[226:306, 1306:1744] == (10, 80, 220), axis=2))

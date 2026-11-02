@@ -55,7 +55,7 @@ import math
 import queue
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -67,7 +67,7 @@ from ..ballistics.drops import DROPS_NAME, DropRecord
 from ..config import Config, RecordConfig
 from ..telemetry.broker import TelemetryBroker
 from ..telemetry.models import TelemetrySnapshot
-from ..video.buffer import AlignmentBuffer, BufferedFrame
+from ..video.buffer import AlignmentBuffer, BufferedFrame, BufferedFrameMetadata
 
 LOGGER = logging.getLogger(__name__)
 
@@ -115,13 +115,23 @@ class _JsonlWriter:
     * ``close()`` 幂等，``stop()`` 时调用一次即可。
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        failure_callback: Callable[[str], None] | None = None,
+    ) -> None:
         self._path = path
         self._lock = threading.RLock()
         # SIM115：这个句柄要活到 close()，是有意为之的长生命周期（不是漏了 with）
         self._file = open(path, "a", encoding="utf-8")  # noqa: SIM115
         self._closed = False
         self._count = 0
+        self._failure_callback = failure_callback
+
+    def _report_failure(self, operation: str, exc: BaseException) -> None:
+        if self._failure_callback is not None:
+            self._failure_callback(f"{self._path.name} {operation}: {type(exc).__name__}: {exc}")
 
     @property
     def path(self) -> Path:
@@ -142,8 +152,9 @@ class _JsonlWriter:
         try:
             self._file.write(line + "\n")
             self._file.flush()
-        except OSError, UnicodeError:
+        except (OSError, UnicodeError) as exc:
             LOGGER.exception("JSONL 写入失败: %s", self._path)
+            self._report_failure("写入失败", exc)
             return False
         self._count += 1
         return True
@@ -154,10 +165,16 @@ class _JsonlWriter:
                 return
             try:
                 self._file.flush()
+            except OSError as exc:
+                LOGGER.exception("JSONL flush 失败: %s", self._path)
+                self._report_failure("flush 失败", exc)
+            try:
                 self._file.close()
-            except OSError:
-                LOGGER.exception("JSONL 关闭失败: %s", self._path)
-            self._closed = True
+            except OSError as exc:
+                LOGGER.exception("JSONL close 失败: %s", self._path)
+                self._report_failure("close 失败", exc)
+            finally:
+                self._closed = True
 
 
 class EventLog(_JsonlWriter):
@@ -282,6 +299,7 @@ class RecorderStats:
     telemetry_write_errors: int = 0
     telemetry_dropped: int = 0
     telemetry_pending: int = 0
+    frame_write_errors: int = 0
 
 
 # ----------------------------------------------------------------------
@@ -331,6 +349,7 @@ class FlightRecorder:
 
         self._flight_dir: Path | None = None
         self._frames_dir: Path | None = None
+        self._video_dir: Path | None = None
 
         # 文件句柄（启动后才有）
         self._log_handler: logging.FileHandler | None = None
@@ -351,6 +370,9 @@ class FlightRecorder:
         # 运行统计
         self._frames_written = 0
         self._frames_skipped = 0
+        self._frame_write_errors = 0
+        self._frame_write_failure: str | None = None
+        self._persistence_failure: str | None = None
         self._telemetry_written = 0
         self._telemetry_queue: queue.Queue[TelemetrySnapshot] = queue.Queue(maxsize=10_000)
         self._telemetry_queue_lock = threading.Lock()
@@ -384,6 +406,21 @@ class FlightRecorder:
     def flight_dir(self) -> Path | None:
         """本次飞行的根目录；启动前为 None。"""
         return self._flight_dir
+
+    @property
+    def video_directory(self) -> Path | None:
+        """TS 记录模式下由视频源使用的分段目录。"""
+        return self._video_dir
+
+    def raise_if_failed(self) -> None:
+        """在任务心跳中报告已锁存的任意持久化故障。"""
+        if self._persistence_failure is not None:
+            raise RuntimeError(f"飞行记录持久化失败: {self._persistence_failure}")
+
+    def _latch_persistence_failure(self, message: str) -> None:
+        """保留首个持久化故障，供健康巡检与 stop 一致报告。"""
+        if self._persistence_failure is None:
+            self._persistence_failure = message
 
     @property
     def events(self) -> EventLog:
@@ -421,6 +458,7 @@ class FlightRecorder:
         *,
         broker: TelemetryBroker,
         buffer: AlignmentBuffer,
+        ts_video: bool = False,
     ) -> "FlightRecorder":
         """创建飞行目录、打开五件套 + 投放记录、启动后台线程。
 
@@ -443,8 +481,12 @@ class FlightRecorder:
                 self._broker = broker
                 self._buffer = buffer
                 self._flight_dir = self._make_flight_dir()
-                self._frames_dir = self._flight_dir / FRAMES_DIR
-                self._frames_dir.mkdir(parents=False, exist_ok=False)
+                if ts_video:
+                    self._video_dir = self._flight_dir / "video"
+                    self._video_dir.mkdir(parents=False, exist_ok=False)
+                else:
+                    self._frames_dir = self._flight_dir / FRAMES_DIR
+                    self._frames_dir.mkdir(parents=False, exist_ok=False)
 
                 self._dump_config_snapshot()
                 self._open_files()
@@ -542,6 +584,7 @@ class FlightRecorder:
                     finalize_errors=self._finalize_errors,
                     telemetry_dropped=self._telemetry_dropped,
                     telemetry_pending=self._telemetry_pending,
+                    frame_write_errors=self._frame_write_errors,
                     events=self._events.count,
                     detections=self._detections.count if self._detections else 0,
                     drops=self._drops.count if self._drops else 0,
@@ -549,6 +592,8 @@ class FlightRecorder:
             except Exception:
                 stopped_event_ok = False
                 LOGGER.exception("recorder_stopped 事件写入失败")
+            if not stopped_event_ok:
+                self._latch_persistence_failure("events.jsonl 写入 recorder_stopped 失败")
 
         self._uninstall_log_handler()
         self._close_files()
@@ -556,6 +601,7 @@ class FlightRecorder:
             self._telemetry_dropped
             or self._telemetry_write_errors
             or self._frames_skipped
+            or self._frame_write_errors
             or frame_encode_errors
             or self._finalize_errors
             or not stopped_event_ok
@@ -565,10 +611,12 @@ class FlightRecorder:
                 f"enqueued={self._telemetry_enqueued}, "
                 f"written={self._telemetry_written}, dropped={self._telemetry_dropped}, "
                 f"write_errors={self._telemetry_write_errors}, "
-                f"frames_skipped={self._frames_skipped}, finalize_errors={self._finalize_errors}, "
+                f"frames_skipped={self._frames_skipped}, frame_write_errors={self._frame_write_errors}, "
+                f"finalize_errors={self._finalize_errors}, "
                 f"frame_encode_errors={frame_encode_errors}, "
                 f"recorder_stopped_written={stopped_event_ok}"
             )
+        self.raise_if_failed()
 
     def stats(self) -> RecorderStats | None:
         """运行统计快照；未启动返回 None。"""
@@ -596,6 +644,7 @@ class FlightRecorder:
             telemetry_write_errors=self._telemetry_write_errors,
             telemetry_dropped=self._telemetry_dropped,
             telemetry_pending=self._telemetry_pending,
+            frame_write_errors=self._frame_write_errors,
         )
 
     # ------------------------------------------------------------------
@@ -608,7 +657,8 @@ class FlightRecorder:
         容量（默认 5400 帧 ≈3 分钟），被驱逐的帧就补不回来了。所以这里显式
         检查序号跳变——跳号只记账 + 告警，不假装"录全了"。
         """
-        assert self._buffer is not None and self._frames_dir is not None
+        assert self._buffer is not None
+        assert self._frames_dir is not None or self._video_dir is not None
         buffer = self._buffer
         frames_dir = self._frames_dir
         index_file = self._frames_index_file
@@ -618,7 +668,11 @@ class FlightRecorder:
             cutoff = self._stop_cutoff
             if cutoff is not None and cursor >= cutoff:
                 break
-            frame = buffer.wait_new(after_index=cursor, timeout=0.1)
+            frame = (
+                buffer.wait_new_metadata(after_index=cursor, timeout=0.1)
+                if self._video_dir is not None
+                else buffer.wait_new(after_index=cursor, timeout=0.1)
+            )
             cutoff = self._stop_cutoff
             if cutoff is not None and (frame is None or frame.index > cutoff):
                 # 截止范围内已无可读记录（驱逐、清空或解码失败），缺失必须计数。
@@ -640,50 +694,85 @@ class FlightRecorder:
             cursor = frame.index
             try:
                 self._write_one_frame(frame, frames_dir, index_file)
-            except Exception:
+            except Exception as exc:
                 self._frames_skipped += 1
-                LOGGER.exception("录制帧 #%d 失败", frame.index)
+                self._frame_write_errors += 1
+                if self._frame_write_failure is None:
+                    self._frame_write_failure = f"帧 #{frame.index}: {type(exc).__name__}: {exc}"
+                self._latch_persistence_failure(self._frame_write_failure)
+                LOGGER.exception("飞行记录帧写入失败，停止录制后续帧")
+                break
 
     def _write_one_frame(
         self,
-        frame: BufferedFrame,
-        frames_dir: Path,
+        frame: BufferedFrame | BufferedFrameMetadata,
+        frames_dir: Path | None,
         index_file,
     ) -> None:
-        assert self._buffer is not None
-        jpeg = self._buffer.read_jpeg_bytes(frame.index)
-        if jpeg is None:
-            # raw 缓冲：内部存的是 ndarray，自己编码一次
-            ok, encoded = cv2.imencode(
-                ".jpg",
-                frame.image,
-                [int(cv2.IMWRITE_JPEG_QUALITY), _REENCODE_JPEG_QUALITY],
-            )
-            if not ok:
-                raise RuntimeError(f"raw 缓冲帧 #{frame.index} 编码失败")
-            jpeg = encoded.tobytes()
-            self._raw_reencoded += 1
-
-        filename = f"{frame.index:06d}.jpg"
-        (frames_dir / filename).write_bytes(jpeg)
+        aligned_telemetry = _payload_of(frame.snapshot) if frame.snapshot is not None else None
+        if frame.snapshot is not None and aligned_telemetry is None:
+            raise TypeError(f"帧 #{frame.index} 的对齐遥测不支持 JSON 序列化")
+        if self._video_dir is not None:
+            if (
+                frame.media_pts is None
+                or frame.time_base_num is None
+                or frame.time_base_den is None
+                or frame.time_base_den <= 0
+                or frame.segment < 1
+            ):
+                raise RuntimeError(f"TS 记录帧 #{frame.index} 缺少精确媒体时间映射")
+            filename = f"segment-{frame.segment:06d}.ts"
+            if not (self._video_dir / filename).is_file():
+                raise FileNotFoundError(f"TS 记录帧 #{frame.index} 对应分段不存在: {filename}")
+            byte_count = 0
+        else:
+            if isinstance(frame, BufferedFrameMetadata):
+                raise RuntimeError("JPEG 记录需要图像帧，不能使用元数据游标")
+            assert self._buffer is not None and frames_dir is not None
+            jpeg = self._buffer.read_jpeg_bytes(frame.index)
+            if jpeg is None:
+                # raw 缓冲：内部存的是 ndarray，自己编码一次
+                ok, encoded = cv2.imencode(
+                    ".jpg",
+                    frame.image,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), _REENCODE_JPEG_QUALITY],
+                )
+                if not ok:
+                    raise RuntimeError(f"raw 缓冲帧 #{frame.index} 编码失败")
+                jpeg = encoded.tobytes()
+                self._raw_reencoded += 1
+            filename = f"{frame.index:06d}.jpg"
+            (frames_dir / filename).write_bytes(jpeg)
+            byte_count = len(jpeg)
 
         index_line = json.dumps(
             {
                 "index": frame.index,
                 "filename": filename,
+                "storage": "ts" if self._video_dir is not None else "jpeg",
                 "capture_timestamp": frame.capture_timestamp,
                 "received_timestamp": frame.received_timestamp,
                 "lag": frame.lag,
                 "extrapolated": frame.extrapolated,
                 "offset": frame.offset,
                 "telemetry_aligned": frame.snapshot is not None,
-                "bytes": len(jpeg),
+                "aligned_telemetry": aligned_telemetry,
+                "media_pts": frame.media_pts,
+                "time_base_num": frame.time_base_num,
+                "time_base_den": frame.time_base_den,
+                "segment": frame.segment,
+                "random_access_dts": frame.random_access_dts,
+                "random_access_time_base_num": frame.random_access_time_base_num,
+                "random_access_time_base_den": frame.random_access_time_base_den,
+                "width": frame.width,
+                "height": frame.height,
+                "bytes": byte_count,
             },
             ensure_ascii=False,
         )
         index_file.write(index_line + "\n")
         self._frames_written += 1
-        if self._frames_written % _INDEX_FLUSH_EVERY == 0:
+        if self._video_dir is not None or self._frames_written % _INDEX_FLUSH_EVERY == 0:
             index_file.flush()
 
     def _telemetry_writer_loop(self) -> None:
@@ -716,10 +805,18 @@ class FlightRecorder:
                 self._telemetry_written += 1
                 if self._telemetry_written % _TELEMETRY_FLUSH_EVERY == 0:
                     out.flush()
-            except OSError:
+            except OSError as exc:
+                self._telemetry_write_errors += 1
+                self._latch_persistence_failure(
+                    f"telemetry.jsonl 写入: {type(exc).__name__}: {exc}"
+                )
                 LOGGER.exception("telemetry 写入失败")
                 continue
-            except Exception:
+            except Exception as exc:
+                self._telemetry_write_errors += 1
+                self._latch_persistence_failure(
+                    f"telemetry.jsonl 写入: {type(exc).__name__}: {exc}"
+                )
                 LOGGER.exception("telemetry 写入异常（已兜住，写盘线程继续）")
                 continue
 
@@ -755,9 +852,12 @@ class FlightRecorder:
                 self._telemetry_written += 1
                 if self._telemetry_written % _TELEMETRY_FLUSH_EVERY == 0:
                     out.flush()
-            except Exception:
+            except Exception as exc:
                 with self._telemetry_queue_lock:
                     self._telemetry_write_errors += 1
+                self._latch_persistence_failure(
+                    f"telemetry.jsonl 写入: {type(exc).__name__}: {exc}"
+                )
                 LOGGER.exception("全量遥测记录写入异常")
             finally:
                 with self._telemetry_queue_lock:
@@ -793,9 +893,18 @@ class FlightRecorder:
 
     def _open_files(self) -> None:
         assert self._flight_dir is not None
-        self._events = EventLog(self._flight_dir / EVENTS_NAME)
-        self._detections = DetectionWriter(self._flight_dir / DETECTIONS_NAME)
-        self._drops = DropWriter(self._flight_dir / DROPS_NAME)
+        self._events = EventLog(
+            self._flight_dir / EVENTS_NAME,
+            failure_callback=self._latch_persistence_failure,
+        )
+        self._detections = DetectionWriter(
+            self._flight_dir / DETECTIONS_NAME,
+            failure_callback=self._latch_persistence_failure,
+        )
+        self._drops = DropWriter(
+            self._flight_dir / DROPS_NAME,
+            failure_callback=self._latch_persistence_failure,
+        )
         # SIM115：两个句柄都活到 _close_files()，长生命周期是有意为之
         self._telemetry_file = open(  # noqa: SIM115
             self._flight_dir / TELEMETRY_NAME, "a", encoding="utf-8"
@@ -805,43 +914,47 @@ class FlightRecorder:
         )
 
     def _close_files(self) -> None:
-        if self._events is not None:
-            self._events_written = self._events.count
-            self._events.close()
-            self._events = None
-        if self._detections is not None:
-            self._detections_written = self._detections.count
-            self._detections.close()
-            self._detections = None
-        if self._drops is not None:
-            self._drops_written = self._drops.count
-            self._drops.close()
-            self._drops = None
+        for attr, count_attr in (
+            ("_events", "_events_written"),
+            ("_detections", "_detections_written"),
+            ("_drops", "_drops_written"),
+        ):
+            writer = getattr(self, attr)
+            if writer is None:
+                continue
+            try:
+                setattr(self, count_attr, writer.count)
+                writer.close()
+            except Exception as exc:
+                self._latch_persistence_failure(
+                    f"{writer.path.name} 关闭失败: {type(exc).__name__}: {exc}"
+                )
+                LOGGER.exception("JSONL 文件收尾失败: %s", writer.path)
+            finally:
+                setattr(self, attr, None)
         self._close_data_files()
 
     def _close_data_files(self) -> None:
-        """关闭遥测与帧索引文件，并统计标定全量模式的 flush/close 错误。"""
+        """逐个 flush/close 遥测与帧索引文件，任何模式都锁存错误。"""
         for attr in ("_telemetry_file", "_frames_index_file"):
             handle = getattr(self, attr)
-            if handle is not None and not handle.closed:
+            if handle is None:
+                continue
+            name = "telemetry.jsonl" if attr == "_telemetry_file" else "frames_index.jsonl"
+            for operation in ("flush", "close"):
+                if operation == "close" and handle.closed:
+                    break
                 try:
-                    handle.flush()
-                except OSError:
-                    if self._full_update_telemetry:
-                        if attr == "_telemetry_file":
-                            self._telemetry_write_errors += 1
-                        else:
-                            self._finalize_errors += 1
-                    LOGGER.exception("文件 flush 失败: %s", attr)
-                try:
-                    handle.close()
-                except OSError:
-                    if self._full_update_telemetry:
-                        if attr == "_telemetry_file":
-                            self._telemetry_write_errors += 1
-                        else:
-                            self._finalize_errors += 1
-                    LOGGER.exception("文件关闭失败: %s", attr)
+                    getattr(handle, operation)()
+                except OSError as exc:
+                    if attr == "_telemetry_file":
+                        self._telemetry_write_errors += 1
+                    else:
+                        self._finalize_errors += 1
+                    self._latch_persistence_failure(
+                        f"{name} {operation}: {type(exc).__name__}: {exc}"
+                    )
+                    LOGGER.exception("文件 %s 失败: %s", operation, attr)
             setattr(self, attr, None)
 
     # ------------------------------------------------------------------
@@ -877,8 +990,14 @@ class FlightRecorder:
             LOGGER.exception("移除 log handler 失败")
         try:
             handler.flush()
+        except OSError as exc:
+            self._latch_persistence_failure(f"flight.log flush: {type(exc).__name__}: {exc}")
+            LOGGER.exception("log handler flush 失败")
+        try:
             handler.close()
-        except OSError:
-            LOGGER.exception("log handler 关闭失败")
-        logging.getLogger().setLevel(self._original_root_level)
-        self._log_handler = None
+        except OSError as exc:
+            self._latch_persistence_failure(f"flight.log close: {type(exc).__name__}: {exc}")
+            LOGGER.exception("log handler close 失败")
+        finally:
+            logging.getLogger().setLevel(self._original_root_level)
+            self._log_handler = None

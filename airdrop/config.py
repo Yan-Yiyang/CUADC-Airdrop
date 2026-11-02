@@ -145,16 +145,11 @@ class PerceptionConfig:
     max_side_px: float = 400.0
     ocr_conf_threshold: float = 0.6
     ocr_workers: int = 2
-    #: OCR 积压告警阈值（请求/结果队列都无界、不丢弃；见 airdrop.perception.ocr_worker）
+    #: OCR 积压告警阈值；待处理裁切图保存在磁盘，请求队列只传有界文件引用。
     ocr_queue_size: int = 500
     # 保留旧字段以兼容配置文件；当前 OCR 逐帧送检，这两个字段不再参与运行时判定。
     ocr_dedupe_s: float = 0.0
     ocr_dedupe_px: float = 0.0
-
-    # 排故素材
-    save_crops: bool = False
-    crop_dir: str = "log/target"
-    max_crops: int = 5000
 
     # 处理落后监控（全帧处理，不抽帧）
     lag_warn_frames: int = 900
@@ -462,11 +457,11 @@ class RecordConfig:
 class QgcVideoConfig:
     """可选的 QGC 实时视频发布配置。"""
 
-    enabled: bool = False
+    enabled: bool = True
     host: str = "127.0.0.1"
     port: int = 5602
     transport: str = "rtp"
-    fps: float = 12.0
+    fps: float = 30.0
     bitrate_kbps: int = 2500
     ffmpeg_executable: str | None = None
     history_frames: int = 8

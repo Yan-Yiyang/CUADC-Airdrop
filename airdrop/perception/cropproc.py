@@ -17,8 +17,8 @@
    斜视角会把 60° 投影到这个区间）；
 6. 转正图整图 OCR。注意用彩图——PP-OCRv6 的 det 对灰度图检不出文本框
    （使用彩图输入以保留文本检测所需的颜色信息）；
-7. 候选合并：单数字框按行聚类拼成两位数；两位结果置信度加权（×1.15）、
-   单位 ×0.6，防止把 ``"7"`` 误报成 ``07``；
+7. 候选合并：单数字框按行聚类拼成两位数；编号至少需要两个数字字符，
+   结果按数值加权（10–99 ×1.15、00–09 ×0.6）；
 8. 编号交给 :func:`~airdrop.perception.number.correct_ocr_number` 纠错。
 
 与旧版实现的差异（都是被 rapidocr 3.9.2 的 API 逼的，不是主动改的）
@@ -49,6 +49,8 @@ from typing import Any
 
 import cv2
 import numpy as np
+
+import airdrop.perception.timing as timing  # noqa: PLR0402 - 避免惰性包循环导入
 
 from .number import correct_ocr_number
 
@@ -831,8 +833,8 @@ class OpenCvPostProcess:
     ) -> CropResult:
         """挑最优候选，返回新的 :class:`CropResult`（更差时原样返回 ``best``）。
 
-        两位结果置信度加权 ×1.15、单位 ×0.6：单数字框被读成 ``"7"`` 时我们会
-        补成 ``07``，但那种"猜出来"的结果不该压过真正的两位读数。
+        编号至少需要两个数字字符；保留既有的数值加权：10–99 ×1.15、
+        00–09 ×0.6。
 
         形态成立的候选优先，其次才比置信度：几何不成立的"转正"再自信也不能
         压过真实目标。若仅比较 OCR 置信度，错误的几何转正仍可能胜出。
@@ -882,6 +884,7 @@ class OpenCvPostProcess:
         if image is None or image.size == 0:
             return CropResult(None, -1.0, None, "", 0.0, stage="empty")
         try:
+            trace_start = timing.now_ns() if timing.ENABLED else 0
             picture = self._denoise(image)
             height, width = picture.shape[:2]
             scale = min(self.target_side_px / max(min(height, width), 1), self.max_upscale)
@@ -892,7 +895,16 @@ class OpenCvPostProcess:
                 )
             self.scale = scale
             self.image = picture  # edge_detection() 与 visualize() 都读它
+            preprocess_end = timing.now_ns() if timing.ENABLED else 0
             result = self._geometry_ocr(picture)
+            if timing.ENABLED:
+                timing.emit(
+                    "ocr_geometry",
+                    start_ns=trace_start,
+                    preprocess_end_ns=preprocess_end,
+                    end_ns=timing.now_ns(),
+                    scale=scale,
+                )
             if result.side_px > 0:
                 result = CropResult(
                     number=result.number,
@@ -916,11 +928,23 @@ class OpenCvPostProcess:
         圈出了但没有候选通过置信度/形态门限时返回 ``stage="none"``。
         """
         best = CropResult(None, -1.0, None, "", 0.0, stage="none")
+        best_rectified: CropResult | None = None
         found_pentagon = False
         for s_min in self._sat_levels():
+            attempt_start = timing.now_ns() if timing.ENABLED else 0
             self.s_min = s_min
             approx, ok = self.edge_detection()
+            edge_end = timing.now_ns() if timing.ENABLED else 0
             if not ok:
+                if timing.ENABLED:
+                    timing.emit(
+                        "ocr_attempt",
+                        saturation=s_min,
+                        found=False,
+                        start_ns=attempt_start,
+                        edge_end_ns=edge_end,
+                        end_ns=timing.now_ns(),
+                    )
                 continue
             found_pentagon = True
             side_px = float(cv2.arcLength(approx, True)) / 5.0
@@ -937,6 +961,16 @@ class OpenCvPostProcess:
             else:
                 point, min_deg = self._find_min_angle(approx)
                 if not 40.0 < min_deg < 130.0:
+                    if timing.ENABLED:
+                        timing.emit(
+                            "ocr_attempt",
+                            saturation=s_min,
+                            found=True,
+                            valid_angle=False,
+                            start_ns=attempt_start,
+                            edge_end_ns=edge_end,
+                            end_ns=timing.now_ns(),
+                        )
                     continue
                 vx = point[0] - center[0]
                 vy = point[1] - center[1]
@@ -946,7 +980,20 @@ class OpenCvPostProcess:
                 # 兜底路径量到的也是顶角，只是门限宽（40~130°）；严格成立仍要求 ≈60°
                 house_ok = abs(min_deg - self.HOUSE_APEX_ANGLE_DEG) <= self.HOUSE_APEX_ANGLE_TOL_DEG
             rectified = self._rotate_img(image, row_deg)
+            if best_rectified is None or (house_ok and not best_rectified.house_ok):
+                best_rectified = CropResult(
+                    number=None,
+                    side_px=side_px,
+                    rectified=rectified,
+                    raw_text="",
+                    confidence=0.0,
+                    saturation_level=s_min,
+                    stage=stage,
+                    house_ok=house_ok,
+                )
+            ocr_start = timing.now_ns() if timing.ENABLED else 0
             candidates = self._ocr_candidates(rectified)
+            ocr_end = timing.now_ns() if timing.ENABLED else 0
             best = self._best_candidate(
                 candidates,
                 side_px,
@@ -956,6 +1003,20 @@ class OpenCvPostProcess:
                 stage=stage,
                 house_ok=house_ok,
             )
+            if timing.ENABLED:
+                timing.emit(
+                    "ocr_attempt",
+                    saturation=s_min,
+                    found=True,
+                    valid_angle=True,
+                    house_ok=house_ok,
+                    start_ns=attempt_start,
+                    edge_end_ns=edge_end,
+                    ocr_start_ns=ocr_start,
+                    ocr_end_ns=ocr_end,
+                    end_ns=timing.now_ns(),
+                    candidates=len(candidates),
+                )
             # 只有形态成立的结果才提前返回。形态不成立时继续尝试更宽松的饱和度，
             # 避免严格阈值下的错误候选遮蔽后续档位找到的真实目标。
             if best.number is not None and best.house_ok:
@@ -963,6 +1024,8 @@ class OpenCvPostProcess:
         if not found_pentagon:
             # 饱和度回退全试完，一个五边形都没圈出来（与 recognize() 早退时同义）
             return CropResult(None, -1.0, None, "", 0.0, stage="no_pentagon")
+        if best.number is None and best_rectified is not None:
+            return best_rectified
         return best
 
     # ------------------------------------------------------------------

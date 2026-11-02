@@ -83,7 +83,7 @@ def test_sitl_recon_accuracy(tmp_path: Path) -> None:
 
     exit_code = sitl.main(
         work_dir=str(tmp_path),
-        qgc_video=True,
+        qgc_video=False,
         manifest_path=os.environ.get("AIRDROP_SITL_MANIFEST") or None,
         source_time_alignment=os.environ.get("AIRDROP_SITL_SOURCE_TIME_ALIGNMENT", "1") == "1",
     )

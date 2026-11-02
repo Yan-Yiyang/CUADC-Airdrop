@@ -38,7 +38,7 @@ def correct_ocr_number(raw: str | None) -> int | None:
     2. 过滤掉所有非数字字符；
     3. 去掉首尾的 ``'1'``（五边形边缘/装饰线常被认成 ``'1'``——实测
        ``'156'``/``'561'``/``'1561'`` 都是 ``56``）；
-    4. 仍然超过两位 → 取末两位；只剩一位 → 前置补 0（``'7'``→``07``）。
+    4. 仍然超过两位 → 取末两位；不足两位则无法判断编号。
 
     第 3 步是"去首尾 1"而不是"直接取末两位"：``'15'`` 这种两位结果里的 ``1``
     是真实数字，不能被砍掉；只有超过两位时首尾的 ``1`` 才判定为噪声。
@@ -47,7 +47,7 @@ def correct_ocr_number(raw: str | None) -> int | None:
         return None
     mapped = "".join(OCR_CHAR_MAP.get(char, char) for char in raw.strip())
     digits = "".join(char for char in mapped if char.isdigit())
-    if not digits:
+    if len(digits) < 2:
         return None
     if len(digits) > 2:
         while len(digits) > 2 and digits[0] == "1":
@@ -56,6 +56,4 @@ def correct_ocr_number(raw: str | None) -> int | None:
             digits = digits[:-1]
     if len(digits) > 2:
         digits = digits[-2:]
-    elif len(digits) == 1:
-        digits = "0" + digits
     return int(digits)

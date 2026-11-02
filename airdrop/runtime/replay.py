@@ -51,7 +51,7 @@ SPEED = 0.0  # 0=全速 / 1.0=原速 / 2.0=两倍速
 BUFFER_SECONDS = 180.0
 BUFFER_FPS = 30.0
 PLAN_DROP_MISSION = True  # 出了结果就生成飞掠+降落航线（不上传，只打印）
-STRICT = True  # 回放异常（缺帧/sink 抛异常）就让本次以 error 结束
+STRICT: bool | None = None  # None 根据航次是否正常结束选择严格或前缀恢复
 DRAIN_TIMEOUT_S = 120.0  # 停止生产后等待尾帧与 OCR 的最大秒数
 PERCEPTION_MODE: str | None = None  # None = 用 Config 默认（ocr）
 SELECTION_RULE: str | None = None  # None = 用 Config 默认（median）
@@ -117,7 +117,7 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
     buffer_seconds: float = BUFFER_SECONDS,
     buffer_fps: float = BUFFER_FPS,
     plan_drop_mission: bool = PLAN_DROP_MISSION,
-    strict: bool = STRICT,
+    strict: bool | None = STRICT,
     drain_timeout_s: float = DRAIN_TIMEOUT_S,
     side_check_tolerance: float | None = SIDE_CHECK_TOLERANCE,
     qgc_video: bool | None = None,
@@ -161,7 +161,7 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
     resolved = resolve_flight_dir(Path(flight_dir))
 
     # 1) 遥测回填：专用 broker + 按帧推进的 pacer（帧拍摄时刻必然落在历史区间内）
-    broker, pacer = load_broker_from_log(resolved)
+    broker, pacer = load_broker_from_log(resolved, recover_time=strict is not True)
     LOGGER.info("素材：%s（%d 条遥测）", resolved, pacer.total)
 
     # 2) 回放源：与 Hm30VideoSource 同一套接口，直接换掉即可

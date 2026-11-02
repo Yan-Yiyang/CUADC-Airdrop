@@ -32,6 +32,67 @@ from airdrop.telemetry.broker import TelemetryBroker
 from airdrop.video.source import VideoFrame
 
 
+def test_factory_closes_decoder_when_buffer_construction_fails(monkeypatch, tmp_path) -> None:
+    from airdrop.video import cold
+
+    decoders = []
+    real_decoder = cold.TsRangeDecoder
+
+    def make_decoder(*args, **kwargs):
+        decoder = real_decoder(tmp_path, **kwargs)
+        decoders.append(decoder)
+        return decoder
+
+    def fail_buffer(*args, **kwargs):
+        raise RuntimeError("injected buffer failure")
+
+    monkeypatch.setattr(cold, "TsRangeDecoder", make_decoder)
+    monkeypatch.setattr(airdrop, "AlignmentBuffer", fail_buffer)
+    options = RunOptions(mode="real", run_mission=False, capture=True, recognize=False)
+    with pytest.raises(RuntimeError, match="injected buffer failure"):
+        build_live_components(options, Config())
+    assert len(decoders) == 1
+    assert not decoders[0]._reaper.is_alive()
+
+
+@pytest.mark.parametrize("failure_site", ["perception", "qgc"])
+def test_factory_failure_closes_cold_buffer(monkeypatch, failure_site: str) -> None:
+    from airdrop.runtime import components as components_module
+    from airdrop.runtime import qgc as qgc_module
+
+    created = []
+    original_buffer = airdrop.AlignmentBuffer
+
+    def capture_buffer(*args, **kwargs):
+        buffer = original_buffer(*args, **kwargs)
+        created.append(buffer)
+        return buffer
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"injected {failure_site} failure")
+
+    monkeypatch.setattr(airdrop, "AlignmentBuffer", capture_buffer)
+    if failure_site == "perception":
+        monkeypatch.setattr(components_module, "build_perception_components", fail)
+    else:
+        monkeypatch.setattr(
+            components_module,
+            "build_perception_components",
+            lambda *args, **kwargs: SimpleNamespace(
+                camera=None, writer=None, worker=None, targets=None
+            ),
+        )
+        monkeypatch.setattr(qgc_module, "QgcVideoRuntime", fail)
+    options = RunOptions(mode="real", run_mission=False, capture=True, recognize=False)
+
+    with pytest.raises(RuntimeError, match=f"injected {failure_site} failure"):
+        build_live_components(options, Config())
+
+    assert len(created) == 1
+    assert created[0]._cold_thread is not None
+    assert not created[0]._cold_thread.is_alive()
+
+
 @pytest.mark.parametrize("lag", [0.0, 0.28])
 def test_real_runtime_applies_calibrated_lag_to_video_config(tmp_path: Path, lag: float) -> None:
     """标定输出须真正覆盖视频源和记录器使用的配置，不能只留在相机模型。"""
@@ -212,7 +273,12 @@ def test_live_components_prepare_detector_with_video_dimensions(
             camera=camera, writer=None, worker=worker, targets=None
         ),
     )
-    config = replace(Config(), video=replace(Config().video, width=1920, height=1080))
+    base = Config()
+    config = replace(
+        base,
+        video=replace(base.video, width=1920, height=1080),
+        qgc_video=replace(base.qgc_video, enabled=False),
+    )
     components = build_live_components(
         RunOptions(
             mode="real",
@@ -278,7 +344,11 @@ def test_live_components_reject_invalid_detector_warmup(
         ),
     )
     base = Config()
-    config = replace(base, video=replace(base.video, width=1920, height=1080))
+    config = replace(
+        base,
+        video=replace(base.video, width=1920, height=1080),
+        qgc_video=replace(base.qgc_video, enabled=False),
+    )
     components = build_live_components(
         RunOptions(
             mode="real",

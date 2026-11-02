@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import cv2
 import numpy as np
+import pytest
 from PIL import Image, ImageDraw
 
 from airdrop.georef.project import ProjectedPoint
@@ -91,6 +92,27 @@ def test_compose_letterboxes_without_mutating_frame_and_draws_same_frame_box() -
     assert not np.array_equal(result[150, 1300], np.array((18, 22, 27), dtype=np.uint8))
 
 
+def test_text_render_failure_does_not_commit_region_cache_keys(monkeypatch) -> None:
+    snapshot, _ = _snapshot()
+    composer = FrameComposer()
+    original = composer._draw_text_commands
+    failed = False
+
+    def fail_once(canvas: np.ndarray) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("injected text rendering failure")
+        original(canvas)
+
+    monkeypatch.setattr(composer, "_draw_text_commands", fail_once)
+    with pytest.raises(RuntimeError, match="injected"):
+        composer.compose(snapshot)
+    assert not composer._region_keys
+    recovered = composer.compose(snapshot)
+    assert recovered.shape == (990, 1760, 3)
+
+
 def test_drop_mode_never_reuses_detection_boxes() -> None:
     snapshot, _ = _snapshot("drop")
 
@@ -98,6 +120,194 @@ def test_drop_mode_never_reuses_detection_boxes() -> None:
 
     # drop 模式的原帧区域没有 recon 检测框的绿色边线。
     assert tuple(result[240, 40]) == (20, 40, 60)
+
+
+def test_composer_reuses_unchanged_regions_and_clears_old_video_overlays() -> None:
+    snapshot, _ = _snapshot()
+    composer = FrameComposer()
+    rendered = {"video": 0, "panel": 0}
+    original_video = composer._render_video
+    original_panel = composer._render_panel
+
+    def count_video(canvas: np.ndarray, snapshot: DisplaySnapshot) -> None:
+        rendered["video"] += 1
+        original_video(canvas, snapshot)
+
+    def count_panel(canvas: np.ndarray, snapshot: DisplaySnapshot) -> None:
+        rendered["panel"] += 1
+        original_panel(canvas, snapshot)
+
+    composer._render_video = count_video
+    composer._render_panel = count_panel
+    first = composer.compose(snapshot).copy()
+    assert rendered == {"video": 1, "panel": 1}
+
+    composer.compose(snapshot)
+    assert rendered == {"video": 1, "panel": 1}
+
+    changed_panel = replace(snapshot, panel=(PanelEntry(17, 4, None, None, 4, (20, 20, 60, 60)),))
+    composer.compose(changed_panel)
+    assert rendered == {"video": 1, "panel": 2}
+
+    cleared = composer.compose(replace(snapshot, mode="drop", detections=()))
+    assert rendered["video"] == 2
+    assert tuple(first[170, 40]) != tuple(cleared[170, 40])
+    assert np.array_equal(
+        cleared, FrameComposer().compose(replace(snapshot, mode="drop", detections=()))
+    )
+
+
+def test_time_display_precision_does_not_redraw_within_same_second() -> None:
+    snapshot, _ = _snapshot()
+    snapshot = replace(
+        snapshot, stage="HOLD_PROCESS", progress=ProgressSnapshot(hold_remaining_s=4.1)
+    )
+    composer = FrameComposer()
+    renders = 0
+    original = composer._render_status
+
+    def count_status(canvas: np.ndarray, snapshot: DisplaySnapshot) -> None:
+        nonlocal renders
+        renders += 1
+        original(canvas, snapshot)
+
+    composer._render_status = count_status
+    composer.compose(snapshot)
+    composer.compose(replace(snapshot, progress=ProgressSnapshot(hold_remaining_s=4.8)))
+    assert renders == 1
+    composer.compose(replace(snapshot, progress=ProgressSnapshot(hold_remaining_s=5.0)))
+    assert renders == 2
+
+
+def test_footer_cache_invalidates_when_release_status_changes(monkeypatch) -> None:
+    snapshot, _ = _snapshot()
+    composer = FrameComposer()
+    rendered: list[str] = []
+    original = FrameComposer._draw_text_commands
+
+    def capture(self: FrameComposer, canvas: np.ndarray) -> None:
+        rendered.extend(command[0] for command in self._text_commands)
+        original(self, canvas)
+
+    monkeypatch.setattr(FrameComposer, "_draw_text_commands", capture)
+    composer.compose(snapshot)
+    rendered.clear()
+    composer.compose(replace(snapshot, release_command_status="failed"))
+    assert any("投放指令失败" in text for text in rendered)
+
+
+def test_failed_region_render_does_not_commit_its_cache_key(monkeypatch) -> None:
+    snapshot, _ = _snapshot()
+    composer = FrameComposer()
+    original = composer._render_video
+    attempts = 0
+
+    def fail_once(canvas: np.ndarray, current: DisplaySnapshot) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("render failed")
+        original(canvas, current)
+
+    monkeypatch.setattr(composer, "_render_video", fail_once)
+    with pytest.raises(RuntimeError, match="render failed"):
+        composer.compose(snapshot)
+    result = composer.compose(snapshot)
+    assert attempts == 2
+    assert tuple(result[400, 500]) == (20, 40, 60)
+
+
+def test_failed_panel_render_restores_canvas_and_region_keys(monkeypatch) -> None:
+    snapshot, _ = _snapshot()
+    assert snapshot.frame is not None
+    composer = FrameComposer()
+    rendered_a = composer.compose(snapshot).copy()
+    committed_keys = composer._region_keys.copy()
+    changed = replace(
+        snapshot,
+        frame=replace(snapshot.frame, image=np.full_like(snapshot.frame.image, (200, 10, 20))),
+        panel=(PanelEntry(17, 99, None, None, 4, (20.0, 20.0, 60.0, 60.0)),),
+    )
+    original_panel = composer._render_panel
+
+    def fail_panel(canvas: np.ndarray, current: DisplaySnapshot) -> None:
+        original_panel(canvas, current)
+        raise RuntimeError("injected panel failure")
+
+    monkeypatch.setattr(composer, "_render_panel", fail_panel)
+    with pytest.raises(RuntimeError, match="panel failure"):
+        composer.compose(changed)
+    assert composer._region_keys == committed_keys
+    assert np.array_equal(composer._canvas, rendered_a)
+
+    monkeypatch.setattr(composer, "_render_panel", original_panel)
+    assert np.array_equal(composer.compose(snapshot), rendered_a)
+
+
+def test_geometry_error_change_invalidates_panel_cache(monkeypatch) -> None:
+    snapshot, _ = _snapshot()
+    composer = FrameComposer()
+    panel_renders = 0
+    original = composer._render_panel
+
+    def count_panel(canvas: np.ndarray, current: DisplaySnapshot) -> None:
+        nonlocal panel_renders
+        panel_renders += 1
+        original(canvas, current)
+
+    monkeypatch.setattr(composer, "_render_panel", count_panel)
+    composer.compose(snapshot)
+    changed = replace(snapshot, geometry_error="空间投影不可用")
+    actual = composer.compose(changed).copy()
+    expected = FrameComposer().compose(changed)
+
+    assert panel_renders == 2
+    assert np.array_equal(actual, expected)
+    restored = composer.compose(snapshot).copy()
+    assert panel_renders == 3
+    assert np.array_equal(restored, FrameComposer().compose(snapshot))
+
+
+def test_footer_counter_update_only_renders_its_column(monkeypatch) -> None:
+    snapshot, _ = _snapshot()
+    composer = FrameComposer()
+    original = composer._render_footer
+    rendered: list[tuple[int, int] | None] = []
+
+    def count_footer(canvas: np.ndarray, current: DisplaySnapshot) -> None:
+        rendered.append(composer._active_text_x_range)
+        original(canvas, current)
+
+    monkeypatch.setattr(composer, "_render_footer", count_footer)
+    composer.compose(snapshot)
+    assert len(rendered) == 3
+    composer.compose(replace(snapshot, progress=replace(snapshot.progress, processed_frames=1)))
+    assert rendered == [(0, 580), (580, 1165), (1165, 1760), (0, 580)]
+
+
+def test_thumbnail_age_cache_follows_displayed_integer_age(monkeypatch) -> None:
+    snapshot, _ = _snapshot()
+    entry = replace(
+        snapshot.panel[0],
+        thumbnail_capture_timestamp=1.0,
+        thumbnail=np.zeros((20, 20, 3), dtype=np.uint8),
+    )
+    snapshot = replace(snapshot, panel=(entry,), observed_at=2.2)
+    composer = FrameComposer()
+    renders = 0
+    original = composer._render_panel
+
+    def count_panel(canvas: np.ndarray, current: DisplaySnapshot) -> None:
+        nonlocal renders
+        renders += 1
+        original(canvas, current)
+
+    monkeypatch.setattr(composer, "_render_panel", count_panel)
+    composer.compose(snapshot)
+    composer.compose(replace(snapshot, observed_at=2.9))
+    assert renders == 1
+    composer.compose(replace(snapshot, observed_at=3.0))
+    assert renders == 2
 
 
 def test_bad_projected_point_does_not_draw_a_stale_or_invalid_marker() -> None:
@@ -199,8 +409,8 @@ def test_hold_stage_card_shows_timeout_and_processing_eta(monkeypatch) -> None:
     monkeypatch.setattr(FrameComposer, "_draw_text_commands", capture)
     FrameComposer().compose(snapshot)
 
-    assert any("距超时 7.4 秒" in item for item in rendered)
-    assert any("预计处理 1.8 秒" in item for item in rendered)
+    assert any("距超时 7 秒" in item for item in rendered)
+    assert any("预计处理 1 秒" in item for item in rendered)
 
 
 def test_drop_markers_use_distinct_target_and_impact_shapes() -> None:
@@ -538,7 +748,7 @@ def test_flypast_latch_replaces_projection_arrows_and_uses_released_error_label(
     assert arrow_calls == 0
     assert any("已飞掠目标航段" in item for item in rendered)
     assert any("投放时模型：误差 1.4 米" in item for item in rendered)
-    assert any("滞空 3.2 秒" in item for item in rendered)
+    assert any("滞空 3 秒" in item for item in rendered)
     assert tuple(result[330, 200]) == (20, 40, 60)
     assert not np.array_equal(result[130:850, :1280], baseline[130:850, :1280])
 

@@ -420,8 +420,12 @@ def test_full_update_frame_failure_is_reported_as_incomplete(
     monkeypatch.setattr(recorder, "_write_one_frame", fail_frame)
     recorder.start(broker=TelemetryBroker(), buffer=buffer)
     assert _wait_until(lambda: recorder._frames_skipped == 1)
+    with pytest.raises(RuntimeError, match="模拟帧写入失败"):
+        recorder.raise_if_failed()
     with pytest.raises(RuntimeError, match="frames_skipped=1"):
         recorder.stop()
+    stats = recorder.stats()
+    assert stats is not None and stats.frame_write_errors == 1
 
 
 def test_full_update_detects_frame_failure_before_buffer_index(
@@ -505,8 +509,106 @@ def test_full_update_index_finalization_failure_is_reported(
     assert events[-1]["finalize_errors"] == 1
 
 
+@pytest.mark.parametrize("failure", ["flush", "close"])
+def test_normal_record_index_finalization_failure_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """常规任务也会在帧索引最终 flush/close 失败后返回失败。"""
+    recorder = FlightRecorder(Config().validated(), base_dir=tmp_path)
+    open_files = recorder._open_files
+
+    class FailingIndex:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+
+        @property
+        def closed(self) -> bool:
+            return self.handle.closed
+
+        def flush(self) -> None:
+            if failure == "flush":
+                raise OSError("模拟常规帧索引 flush 失败")
+            self.handle.flush()
+
+        def close(self) -> None:
+            self.handle.close()
+            if failure == "close":
+                raise OSError("模拟常规帧索引 close 失败")
+
+    def open_failing_index() -> None:
+        open_files()
+        recorder._frames_index_file = FailingIndex(recorder._frames_index_file)
+
+    monkeypatch.setattr(recorder, "_open_files", open_failing_index)
+    recorder.start(broker=TelemetryBroker(), buffer=AlignmentBuffer(capacity=4))
+    with pytest.raises(RuntimeError, match="模拟常规帧索引"):
+        recorder.stop()
+
+
+def test_normal_record_telemetry_write_failure_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """常规任务的遥测写入异常锁存并在 stop 后传播。"""
+    broker = TelemetryBroker()
+    recorder = FlightRecorder(Config().validated(), base_dir=tmp_path)
+    open_files = recorder._open_files
+
+    class FailingTelemetry:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+            self.closed = False
+
+        def write(self, _value: str) -> None:
+            raise OSError("模拟常规遥测写入失败")
+
+        def flush(self) -> None:
+            self.handle.flush()
+
+        def close(self) -> None:
+            self.handle.close()
+            self.closed = True
+
+    def open_failing_telemetry() -> None:
+        open_files()
+        recorder._telemetry_file = FailingTelemetry(recorder._telemetry_file)
+
+    monkeypatch.setattr(recorder, "_open_files", open_failing_telemetry)
+    recorder.start(broker=broker, buffer=AlignmentBuffer(capacity=4))
+    broker.publish(TelemetrySnapshot(timestamp=time.time(), north_m=1, east_m=2, down_m=3))
+    assert _wait_until(lambda: recorder._telemetry_write_errors > 0)
+    with pytest.raises(RuntimeError, match="模拟常规遥测写入失败"):
+        recorder.stop()
+
+
+def test_jsonl_flush_failure_still_closes_and_fails_recorder(tmp_path: Path) -> None:
+    """JSONL flush 失败仍尝试 close，并使常规记录 stop 失败。"""
+    recorder = FlightRecorder(Config().validated(), base_dir=tmp_path)
+    recorder.start(broker=TelemetryBroker(), buffer=AlignmentBuffer(capacity=4))
+
+    class FailingEventsFile:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+            self.closed = False
+
+        def write(self, value: str) -> int:
+            return self.handle.write(value)
+
+        def flush(self) -> None:
+            raise OSError("模拟 events flush 失败")
+
+        def close(self) -> None:
+            self.handle.close()
+            self.closed = True
+
+    failing_file = FailingEventsFile(recorder._events._file)
+    recorder._events._file = failing_file
+    with pytest.raises(RuntimeError, match="events.jsonl"):
+        recorder.stop()
+    assert failing_file.closed
+
+
 def test_recorder_counts_failed_frame_writes(tmp_path: Path, broker, monkeypatch) -> None:
-    """编码失败与写盘失败都记入缺帧统计，不影响后续帧。"""
+    """帧写盘失败锁存健康状态并停止继续写帧。"""
     buffer = AlignmentBuffer(capacity=4, storage="raw")
     for index in range(1, 4):
         buffer.put(_make_sample(index))
@@ -520,10 +622,14 @@ def test_recorder_counts_failed_frame_writes(tmp_path: Path, broker, monkeypatch
 
     monkeypatch.setattr(recorder, "_write_one_frame", write)
     recorder.start(broker=broker, buffer=buffer)
-    recorder.stop()
+    with pytest.raises(RuntimeError, match="模拟磁盘失败"):
+        recorder.stop()
     stats = recorder.stats()
     assert stats is not None
-    assert stats.frames_written == 2 and stats.frames_skipped == 1
+    assert stats.frames_written == 0 and stats.frames_skipped == 1
+    assert stats.frame_write_errors == 1
+    with pytest.raises(RuntimeError, match="模拟磁盘失败"):
+        recorder.raise_if_failed()
 
 
 def test_recorder_writes_full_flight_directory(tmp_path: Path, broker: TelemetryBroker) -> None:
@@ -928,6 +1034,36 @@ def test_recorder_logger_handler_removed_after_stop(
         assert root.level == logging.ERROR
     finally:
         root.setLevel(original_level)
+
+
+def test_log_handler_flush_failure_still_closes_handler_and_fails_stop(
+    tmp_path: Path, broker: TelemetryBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = FlightRecorder(Config().validated(), base_dir=tmp_path)
+    recorder.start(broker=broker, buffer=AlignmentBuffer(capacity=4))
+    handler = recorder._log_handler
+    assert handler is not None
+    root = logging.getLogger()
+    original_close = handler.close
+    close_called = False
+
+    def fail_flush() -> None:
+        raise OSError("模拟 flight.log flush 失败")
+
+    def tracked_close() -> None:
+        nonlocal close_called
+        close_called = True
+        original_close()
+
+    monkeypatch.setattr(handler, "flush", fail_flush)
+    monkeypatch.setattr(handler, "close", tracked_close)
+
+    with pytest.raises(RuntimeError, match="flight.log flush"):
+        recorder.stop()
+
+    assert close_called
+    assert recorder._log_handler is None
+    assert handler not in root.handlers
 
 
 # ----------------------------------------------------------------------

@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import pickle
 import queue
 import sys
 import threading
@@ -18,9 +19,10 @@ import time
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
+import cv2
 import numpy as np
 import pytest
 
@@ -42,7 +44,8 @@ from airdrop.perception import (
 )
 from airdrop.perception.detector import Detector, FrameSizeMismatchError
 from airdrop.telemetry.models import TelemetrySnapshot
-from airdrop.video.buffer import AlignedSample, AlignmentBuffer
+from airdrop.video.buffer import AlignedSample, AlignmentBuffer, ColdFrameRef
+from airdrop.video.cold import TsRangeDecoder
 from airdrop.video.source import VideoFrame
 
 
@@ -53,7 +56,7 @@ from airdrop.video.source import VideoFrame
     ("raw", "want"),
     [
         ("42", 42),
-        ("7", 7),
+        ("01", 1),
         ("07", 7),
         ("00", 0),
         ("99", 99),
@@ -81,7 +84,7 @@ def test_correct_ocr_number(raw: str, want: int) -> None:
     assert correct_ocr_number(raw) == want
 
 
-@pytest.mark.parametrize("raw", [None, "", "   ", "!!!", "-"])
+@pytest.mark.parametrize("raw", [None, "", "   ", "!!!", "-", "0", "1", "7", "I", "l", "abc"])
 def test_correct_ocr_number_rejects_garbage(raw) -> None:
     assert correct_ocr_number(raw) is None
 
@@ -89,11 +92,9 @@ def test_correct_ocr_number_rejects_garbage(raw) -> None:
 def test_correct_ocr_number_maps_confusable_letters_in_words() -> None:
     """纯字母串里若含易混字符，仍会被映射成数字——这是旧版实现的既定行为。
 
-    ``'abc'`` 里的 ``b`` 按表映射成 6，所以结果是 6 而不是"拒绝"。这条**故意
-    保留**：那张映射表是实测调出来的，改它就得重新验证所有历史识别结果。
-    真正的把关在别处——OCR 置信度阈值 + 像素边长区间 + 后续的跨帧投票。
+    两个易混字符仍可映射成两位；映射后只有一位时不能推测另一位。
     """
-    assert correct_ocr_number("abc") == 6  # b→6
+    assert correct_ocr_number("abc") is None  # b→6，不能推测为 06
     assert correct_ocr_number("oo") == 0  # o→0
     assert correct_ocr_number("sl") == 51  # s→5, l→1
 
@@ -262,6 +263,97 @@ def test_best_candidate_still_compares_confidence_without_house() -> None:
     assert high.number == 56 and high.saturation_level == 40
 
 
+def test_geometry_retains_valid_rectification_without_ocr_number(monkeypatch) -> None:
+    post = OpenCvPostProcess(color="blue")
+    probe = np.full((10, 10, 3), 90, np.uint8)
+    polygon = _pentagon_approx().astype(np.float32)
+    monkeypatch.setattr(post, "_sat_levels", lambda: [60])
+    monkeypatch.setattr(post, "edge_detection", lambda: (polygon, True))
+    monkeypatch.setattr(post, "_find_apex_by_parallel", lambda _polygon: (0, (1, 3), 0.0))
+    monkeypatch.setattr(post, "_center_of_polygon", lambda _polygon: (5.0, 5.0))
+    monkeypatch.setattr(post, "_parallel_rectify_angle", lambda *_args: 0.0)
+    monkeypatch.setattr(post, "_is_house_pentagon", lambda *_args: True)
+    monkeypatch.setattr(post, "_rotate_img", lambda *_args: probe)
+    monkeypatch.setattr(post, "_ocr_candidates", lambda _rectified: [])
+    best = post._geometry_ocr(probe)
+    assert best.number is None
+    assert best.rectified is probe
+    assert best.stage == "parallel"
+
+
+def test_geometry_fallback_does_not_change_later_ocr_candidate_ranking(monkeypatch) -> None:
+    post = OpenCvPostProcess(color="blue")
+    polygon = _pentagon_approx().astype(np.float32)
+    probes = [np.full((10, 10, 3), value, np.uint8) for value in (40, 80)]
+    level = 0
+    monkeypatch.setattr(post, "_sat_levels", lambda: [100, 60])
+
+    def detect_polygon():
+        nonlocal level
+        level += 1
+        return polygon, True
+
+    monkeypatch.setattr(post, "edge_detection", detect_polygon)
+
+    def apex(_polygon):
+        return (0, (1, 3), 0.0) if level == 1 else (None, None, None)
+
+    monkeypatch.setattr(post, "_find_apex_by_parallel", apex)
+    monkeypatch.setattr(post, "_center_of_polygon", lambda _polygon: (100.0, 100.0))
+    monkeypatch.setattr(post, "_parallel_rectify_angle", lambda *_args: 0.0)
+    monkeypatch.setattr(post, "_is_house_pentagon", lambda *_args: True)
+    monkeypatch.setattr(post, "_find_min_angle", lambda _polygon: ((0.0, 0.0), 90.0))
+    monkeypatch.setattr(post, "_rotate_img", lambda *_args: probes[level - 1])
+
+    def candidates(_image):
+        return [] if level == 1 else [(0.0, 0.0, "42", 0.95)]
+
+    monkeypatch.setattr(post, "_ocr_candidates", candidates)
+    result = post._geometry_ocr(np.zeros((10, 10, 3), np.uint8))
+    assert result.number == 42
+    assert result.stage == "min_angle"
+
+
+def test_crop_filename_in_detection_tracks_final_ocr_filename(tmp_path) -> None:
+    from airdrop.perception.crop_store import CropStore
+
+    directory = tmp_path / "crops"
+    store = CropStore(directory)
+    detection = Detection(
+        frame_index=1,
+        capture_timestamp=1.0,
+        pixel=(4.0, 4.0),
+        box=PixelBox(0.0, 0.0, 8.0, 8.0),
+        confidence=0.9,
+        telemetry=TelemetrySnapshot(),
+        mode="ocr",
+        extra={},
+    )
+    initial = store.save(
+        detection, 0, np.zeros((8, 8, 3), np.uint8), (0, 0, 8, 8), undistorted=False
+    )
+    detection.extra["crop_file"] = initial.name
+    worker = PerceptionWorker(
+        PerceptionConfigLike(), buffer=_buffer_with(1), detector=_FakeDetector(), pool=_FakePool()
+    )
+    worker.configure_crop_storage(directory)
+    worker._apply_result(
+        OcrResult(
+            request_id=1,
+            frame_index=1,
+            capture_timestamp=1.0,
+            number=42,
+            raw_text="42",
+            side_px=100.0,
+            payload=detection,
+        )
+    )
+    result = worker.drain_results()[0]
+    store.close()
+    assert result.extra["crop_file"].endswith("_ocr.jpg")
+    assert (directory / result.extra["crop_file"]).is_file()
+
+
 def test_parallel_rectify_angle_makes_parallel_edges_vertical() -> None:
     """转正角必须把平行边对（房子的上/下边）转到竖直。"""
     for angle in (0.0, 12.0, -25.0, 40.0):
@@ -411,6 +503,43 @@ def test_collect_candidates_keeps_multi_char_text() -> None:
     texts = [_text("42", 100, 100)]
     candidates = OpenCvPostProcess._collect_candidates(texts)
     assert any(c[2] == "42" for c in candidates)
+
+
+@pytest.mark.parametrize("raw", ["I", "1", "7"])
+def test_best_candidate_rejects_single_recognized_digit(raw: str) -> None:
+    """单个字符不能成为补零后的编号，包括本次仿真误识的 I。"""
+    post = OpenCvPostProcess(color="blue")
+    empty = CropResult(None, -1.0, None, "", 0.0, stage="none")
+    picked = post._best_candidate(
+        post._collect_candidates([_text(raw, 100, 100)]),
+        10.0,
+        np.zeros((10, 10, 3), np.uint8),
+        empty,
+        saturation_level=60,
+        stage="parallel",
+        house_ok=True,
+    )
+    assert picked.number is None
+
+
+@pytest.mark.parametrize("texts", [["01"], ["0", "1"]])
+def test_best_candidate_accepts_recognized_zero_prefix(texts: list[str]) -> None:
+    """真实识别到 01 时，无论是否拆框都保留编号 1。"""
+    post = OpenCvPostProcess(color="blue")
+    candidates = post._collect_candidates(
+        [_text(value, 100 + i * 22, 100) for i, value in enumerate(texts)]
+    )
+    picked = post._best_candidate(
+        candidates,
+        10.0,
+        np.zeros((10, 10, 3), np.uint8),
+        CropResult(None, -1.0, None, "", 0.0, stage="none"),
+        saturation_level=60,
+        stage="parallel",
+        house_ok=True,
+    )
+    assert picked.number == 1
+    assert picked.raw_text == "01"
 
 
 # ----------------------------------------------------------------------
@@ -1014,10 +1143,18 @@ class _FakePool:
             "dropped": self._dropped,
             "results": self._next,
             "workers": 1,
-            "pending": 0,
+            "pending": len(self._pending),
         }
 
-    def submit(self, crop, *, frame_index: int, capture_timestamp: float, payload=None) -> int:
+    def submit(
+        self,
+        crop,
+        *,
+        frame_index: int,
+        capture_timestamp: float,
+        payload=None,
+        rectified_path=None,
+    ) -> int:
         self._next += 1
         number = self.numbers.pop(0) if self.numbers else None
         self.submitted.append((frame_index, capture_timestamp, self._next))
@@ -1159,6 +1296,29 @@ def test_finish_input_cancels_old_buffer_wait_then_stop_wakes_snapshot() -> None
     assert worker._buffer is frozen
 
 
+def test_worker_stop_closes_owned_frozen_ts_decoder(tmp_path: Path) -> None:
+    original = AlignmentBuffer(
+        storage="raw",
+        cold_decoder=TsRangeDecoder(tmp_path),
+        _start_cold_worker=False,
+    )
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=original,
+        detector=_FakeDetector(),
+    ).start()
+    try:
+        assert worker.finish_input() == 0
+        frozen_decoder = worker._buffer._cold_decoder
+        assert frozen_decoder is not None and frozen_decoder._reaper.is_alive()
+        worker.stop(timeout=2)
+        assert not worker.running
+        assert not frozen_decoder._reaper.is_alive()
+    finally:
+        worker.stop(timeout=2)
+        original.close_cold_storage()
+
+
 def test_stop_restart_and_repeated_stop_use_fresh_wait_generation() -> None:
     buffer = _buffer_with(0)
     entered = _make_unbounded_wait(buffer)
@@ -1279,6 +1439,84 @@ def test_drain_empty_and_failed_worker() -> None:
     ) as failed:
         assert not failed.drain(timeout=5)
         assert "检测失败" in (failed.stats.last_error or "")
+
+
+def test_cold_read_value_error_is_latched_as_fatal_worker_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """wait_new 的冷读 ValueError 必须从外层线程边界锁存并传到健康检查。"""
+    decoder = TsRangeDecoder(tmp_path)
+    buffer = AlignmentBuffer(storage="raw", cold_decoder=decoder, _start_cold_worker=False)
+    capture_timestamp = 1000.0
+    sample = AlignedSample(
+        frame=VideoFrame(
+            index=1,
+            image=np.zeros((8, 8, 3), np.uint8),
+            timestamp=capture_timestamp,
+            lag=0,
+            media_pts=1,
+            time_base_num=1,
+            time_base_den=30,
+            segment=1,
+        ),
+        snapshot=TelemetrySnapshot(timestamp=capture_timestamp, north_m=1),
+        timestamp=capture_timestamp,
+        lag=0,
+        mode="test",
+    )
+    buffer.put(sample, materialize=False)
+    reference = ColdFrameRef(1, 1, 30, 1)
+    with buffer._condition:
+        buffer._records[0] = replace(
+            buffer._records[0], payload=reference, cold_locator=reference, nbytes=0
+        )
+        buffer._hot_bytes = 0
+
+    def fail_cold_read(*args, **kwargs):
+        del args, kwargs
+        raise ValueError("冷 TS 目标 PTS 不存在")
+
+    monkeypatch.setattr(decoder, "read", fail_cold_read)
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=buffer,
+        detector=_FakeDetector(),
+    ).start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while worker.stats.last_error is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert worker.stats.last_error is not None
+        while worker.running and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not worker.running
+        assert "冷 TS 目标 PTS 不存在" in (worker.stats.last_error or "")
+        with pytest.raises(ValueError, match="冷 TS 目标 PTS 不存在"):
+            worker.raise_if_failed()
+        assert not worker.drain(timeout=0)
+    finally:
+        worker.stop(timeout=5)
+        buffer.close_cold_storage()
+
+
+def test_pipeline_fails_drain_when_ocr_spool_index_commit_fails() -> None:
+    class BrokenPool(_FakePool):
+        def submit(self, *args, **kwargs):
+            del args, kwargs
+            raise OSError("OCR 请求已落盘但 SQLite 索引提交失败")
+
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr"),
+        buffer=_buffer_with(1),
+        detector=_FakeDetector(),
+        pool=BrokenPool(),
+    ).start()
+    try:
+        assert not worker.drain(timeout=5)
+        assert "SQLite 索引提交失败" in (worker.stats.last_error or "")
+        assert "SQLite 索引提交失败" in (worker._fatal_error or "")
+    finally:
+        worker.stop(timeout=5)
 
 
 def test_recon_cutoff_drains_only_accepted_frames_and_late_ocr() -> None:
@@ -1573,6 +1811,26 @@ def test_pipeline_cls12_mode_emits_without_ocr() -> None:
     # 单类权重 → 类别 0 → code = 0+1 = 1
     assert [d.code for d in results] == [1, 1]
     assert pool.submitted == [], "cls12 不该走 OCR"
+
+
+def test_pipeline_cls12_without_crop_storage_does_not_crop() -> None:
+    class NoCropDetector(_FakeDetector):
+        def crop(self, batch, detection):
+            del batch, detection
+            raise AssertionError("未启用裁切归档时不应生成 cls12 裁切图")
+
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=_buffer_with(1),
+        detector=NoCropDetector(),
+    ).start()
+    try:
+        assert worker.drain(timeout=5)
+    finally:
+        worker.stop(timeout=5)
+    results = worker.drain_results()
+    assert len(results) == 1
+    assert results[0].code == 1
 
 
 def test_pipeline_surfaces_dead_ocr_workers(caplog: pytest.LogCaptureFixture) -> None:
@@ -2256,7 +2514,7 @@ def test_ocr_initialization_failure_cannot_pass_preflight() -> None:
 
 
 def test_ocr_restart_uses_fresh_queues() -> None:
-    """失败启动和正常关闭都不能把旧就绪消息或退出哨兵留给下一轮。"""
+    """失败启动后重启能继续派发；旧消息和退出哨兵不会污染新队列。"""
     pool, _ = _startup_pool(["error"])
     with pytest.raises(RuntimeError):
         pool.start()
@@ -2267,14 +2525,32 @@ def test_ocr_restart_uses_fresh_queues() -> None:
         assert pool.started
         assert pool._request_q is not previous
         assert pool._request_q.empty()
+        request_id = pool.submit(
+            np.zeros((2, 2, 3), np.uint8), frame_index=1, capture_timestamp=1.0
+        )
+        assert request_id == pool._next_id
+        request = pool._request_q.get(timeout=2.0)
+        assert request.request_id == request_id
+        pool._result_q.put(
+            OcrResult(
+                request_id=request_id,
+                frame_index=1,
+                capture_timestamp=1.0,
+                number=None,
+            )
+        )
+        result = pool.poll(timeout=1.0)
+        assert result is not None
+        pool.ack(result)
         pool.stop()
 
 
-def test_ocr_pool_submit_never_drops() -> None:
-    """queue_size 只是告警阈值：请求队列无界，submit 永远回任务号。"""
+def test_ocr_pool_spools_lossless_images_and_bounds_request_queue(tmp_path) -> None:
+    """输入图像以 PNG 无损暂存，进程队列只传有界文件引用。"""
     from airdrop.perception.ocr_worker import OcrWorkerPool
 
     pool = OcrWorkerPool(workers=1, queue_size=2)
+    pool.set_spool_directory(tmp_path / "spool")
     # 不拉起真的 OCR 进程（那会加载 torch/权重）：只验证队列策略
     pool._started = True
     try:
@@ -2287,16 +2563,454 @@ def test_ocr_pool_submit_never_drops() -> None:
         assert ids == [1, 2, 3, 4, 5]
         assert pool.stats["submitted"] == 5
         assert pool.stats["dropped"] == 0, "不丢弃策略下 dropped 必须恒为 0"
+        assert pool._request_q._maxsize == 1
+        original = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+        request_id = pool.submit(original, frame_index=7, capture_timestamp=7.0)
+        restored = cv2.imdecode(
+            np.fromfile(pool._spool_dir / f"{request_id:012d}.png", dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        assert restored is not None
+        assert np.array_equal(original, restored)
+        (pool._result_q).put(
+            OcrResult(
+                request_id=1,
+                frame_index=0,
+                capture_timestamp=0.0,
+                number=None,
+            )
+        )
+        result = pool.poll(timeout=1.0)
+        assert result is not None
+        assert (pool._spool_dir / "000000000001.request").is_file()
+        assert (pool._spool_dir / "000000000001.png").is_file()
+        pool.ack(result)
+        assert not (pool._spool_dir / "000000000001.request").exists()
+        assert not (pool._spool_dir / "000000000001.png").exists()
     finally:
         _close_pool_queues(pool)
 
 
-def test_ocr_pool_warns_when_backlog_exceeds_threshold(caplog) -> None:
+def test_ocr_dispatch_recovers_existing_sparse_request_ids(tmp_path) -> None:
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    for request_id in (5, 1_000_000):
+        (spool / f"{request_id:012d}.png").write_bytes(b"png")
+        with (spool / f"{request_id:012d}.request").open("wb") as stream:
+            pickle.dump((request_id, float(request_id), None, None), stream)
+    pool = OcrWorkerPool(workers=1)
+    pool.set_spool_directory(spool)
+    assert pool._next_id == 1_000_000
+    assert pool._dispatch_id == 5
+    pool._started = True
+    pool._dispatch_stop.clear()
+    thread = threading.Thread(target=pool._dispatch_spool)
+    thread.start()
+    try:
+        first = pool._request_q.get(timeout=2.0)
+        second = pool._request_q.get(timeout=2.0)
+        assert (first.request_id, second.request_id) == (5, 1_000_000)
+    finally:
+        pool._dispatch_stop.set()
+        thread.join(2.0)
+        _close_pool_queues(pool)
+
+
+def test_ocr_dispatch_metadata_operations_scale_linearly_with_backlog(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    count = 300
+    spool = tmp_path / "large-spool"
+    spool.mkdir()
+    for request_id in range(1, count + 1):
+        stem = f"{request_id:012d}"
+        (spool / f"{stem}.png").write_bytes(b"png")
+        with (spool / f"{stem}.request").open("wb") as stream:
+            pickle.dump((request_id, float(request_id), None, None), stream)
+
+    pool = OcrWorkerPool(workers=1)
+    pool._request_q = queue.Queue(maxsize=1)
+    operations = 0
+    original_exists = Path.exists
+    original_is_file = Path.is_file
+
+    def count_exists(path: Path) -> bool:
+        nonlocal operations
+        operations += 1
+        return original_exists(path)
+
+    def count_is_file(path: Path) -> bool:
+        nonlocal operations
+        operations += 1
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "exists", count_exists)
+    monkeypatch.setattr(Path, "is_file", count_is_file)
+    pool.set_spool_directory(spool)
+    pool._started = True
+    thread = threading.Thread(target=pool._dispatch_spool)
+    thread.start()
+    request_ids: list[int] = []
+    try:
+        for _ in range(count):
+            request = pool._request_q.get(timeout=2.0)
+            request_ids.append(request.request_id)
+        pool._dispatch_stop.set()
+        thread.join(2.0)
+        assert not thread.is_alive()
+        assert request_ids == list(range(1, count + 1))
+        assert operations <= count * 4 + 20
+    finally:
+        pool._dispatch_stop.set()
+        thread.join(2.0)
+        _close_pool_queues(pool)
+
+
+@pytest.mark.parametrize("failure_point", ["connect", "select", "delete"])
+def test_ocr_dispatch_sqlite_errors_are_fatal_and_preserve_sidecar(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, caplog, failure_point: str
+) -> None:
+    import sqlite3
+
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    request_path = spool / "000000000001.request"
+    crop_path = spool / "000000000001.png"
+    crop_path.write_bytes(b"png")
+    with request_path.open("wb") as stream:
+        pickle.dump((1, 1.0, None, None), stream)
+
+    pool = OcrWorkerPool(workers=1)
+    pool._request_q = queue.Queue(maxsize=1)
+    pool.set_spool_directory(spool)
+    pool._started = True
+
+    if failure_point == "connect":
+
+        def broken_connection():
+            raise sqlite3.DatabaseError("injected connection error")
+
+        monkeypatch.setattr(pool, "_spool_index_connection_locked", broken_connection)
+    else:
+
+        class BrokenIndex:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def execute(self, statement: str, parameters=()):
+                del parameters
+                if (failure_point == "select" and statement.startswith("SELECT")) or (
+                    failure_point == "delete" and statement.startswith("DELETE")
+                ):
+                    raise sqlite3.DatabaseError(f"injected {failure_point} error")
+                return SimpleNamespace(fetchone=lambda: (1,))
+
+        def broken_index():
+            return BrokenIndex()
+
+        monkeypatch.setattr(pool, "_spool_index_connection_locked", broken_index)
+
+    thread = threading.Thread(target=pool._dispatch_spool)
+    thread.start()
+    try:
+        thread.join(2.0)
+        assert not thread.is_alive()
+        assert pool.stats["dispatch_failures"] == 1
+        assert request_path.is_file() and crop_path.is_file()
+        assert pool._dispatch_error is not None
+        assert "磁盘索引异常" in pool._dispatch_error
+        if failure_point == "delete":
+            assert pool._request_q.get_nowait().request_id == 1
+        else:
+            assert pool._request_q.empty()
+        with caplog.at_level(logging.ERROR, logger="airdrop.perception.ocr_worker"):
+            pool.check_alive()
+        assert "OCR 磁盘积压派发异常" in caplog.text
+    finally:
+        pool._dispatch_stop.set()
+        thread.join(2.0)
+        pool._close_spool_index()
+        _close_pool_queues(pool)
+
+
+@pytest.mark.parametrize("failure_point", ["insert", "commit"])
+def test_ocr_submit_sqlite_error_keeps_published_request_and_blocks_overwrite(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, failure_point: str, caplog
+) -> None:
+    import sqlite3
+
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    spool = tmp_path / "spool"
+    pool = OcrWorkerPool(workers=1)
+    pool.set_spool_directory(spool)
+    pool._started = True
+
+    class BrokenIndex:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            if failure_point == "commit":
+                raise sqlite3.DatabaseError("injected commit error")
+            return False
+
+        def execute(self, statement: str, parameters=()):
+            del parameters
+            if failure_point == "insert" and statement.startswith("INSERT"):
+                raise sqlite3.DatabaseError("injected insert error")
+            return self
+
+    def broken_index():
+        return BrokenIndex()
+
+    monkeypatch.setattr(pool, "_spool_index_connection_locked", broken_index)
+    image = np.full((4, 4, 3), 91, dtype=np.uint8)
+    try:
+        with pytest.raises(OSError, match="已落盘但 SQLite 索引提交失败"):
+            pool.submit(image, frame_index=4, capture_timestamp=4.0)
+        request_path = spool / "000000000001.request"
+        crop_path = spool / "000000000001.png"
+        assert request_path.is_file() and crop_path.is_file()
+        assert pool._next_id == 1
+        assert pool.stats["submitted"] == 1
+        original_crop = crop_path.read_bytes()
+        with pytest.raises(OSError, match="磁盘积压已停止派发"):
+            pool.submit(image, frame_index=5, capture_timestamp=5.0)
+        assert crop_path.read_bytes() == original_crop
+        assert not (spool / "000000000002.request").exists()
+        with caplog.at_level(logging.ERROR, logger="airdrop.perception.ocr_worker"):
+            pool.check_alive()
+        assert "OCR 磁盘积压派发异常" in caplog.text
+    finally:
+        pool._close_spool_index()
+        _close_pool_queues(pool)
+
+
+def test_ocr_dispatch_missing_unacknowledged_sidecar_is_fatal(tmp_path) -> None:
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    request_path = spool / "000000000001.request"
+    crop_path = spool / "000000000001.png"
+    request_path.write_bytes(b"sidecar")
+    crop_path.write_bytes(b"crop")
+    pool = OcrWorkerPool(workers=1)
+    pool.set_spool_directory(spool)
+    request_path.unlink()
+    pool._started = True
+    thread = threading.Thread(target=pool._dispatch_spool)
+    thread.start()
+    try:
+        thread.join(2.0)
+        assert not thread.is_alive()
+        assert pool.stats["dispatch_failures"] == 1
+        assert pool.stats["pending"] == 1
+        assert crop_path.is_file()
+        assert pool._dispatch_error is not None
+        assert "sidecar 缺失" in pool._dispatch_error
+    finally:
+        pool._dispatch_stop.set()
+        thread.join(2.0)
+        pool._close_spool_index()
+        _close_pool_queues(pool)
+
+
+def test_ocr_ack_index_delete_failure_is_io_error_and_keeps_recoverable_files(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    request_path = spool / "000000000001.request"
+    crop_path = spool / "000000000001.png"
+    request_path.write_bytes(b"metadata")
+    crop_path.write_bytes(b"image")
+    pool = OcrWorkerPool(workers=1)
+    pool.set_spool_directory(spool)
+
+    class BrokenIndex:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def execute(self, statement: str, parameters=()):
+            del parameters
+            if statement.startswith("DELETE"):
+                raise sqlite3.DatabaseError("injected ack index delete error")
+            return self
+
+    def broken_index():
+        return BrokenIndex()
+
+    monkeypatch.setattr(pool, "_spool_index_connection_locked", broken_index)
+    result = OcrResult(
+        request_id=1,
+        frame_index=1,
+        capture_timestamp=1.0,
+        number=None,
+    )
+    try:
+        with pytest.raises(OSError, match="SQLite 索引删除失败"):
+            pool.ack(result)
+        assert (spool / "000000000001.ack").is_file()
+        assert request_path.is_file() and crop_path.is_file()
+    finally:
+        pool._close_spool_index()
+        _close_pool_queues(pool)
+
+
+def test_ocr_ack_marker_recovers_interrupted_cleanup(tmp_path) -> None:
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    (spool / "000000000004.request").write_bytes(b"metadata")
+    (spool / "000000000004.png").write_bytes(b"image")
+    (spool / "000000000004.ack").write_text("4\n", encoding="ascii")
+
+    pool = OcrWorkerPool(workers=1)
+    pool.set_spool_directory(spool)
+
+    assert not (spool / "000000000004.request").exists()
+    assert not (spool / "000000000004.png").exists()
+    assert pool._next_id == 4
+    assert pool.stats["pending"] == 0
+
+
+def test_ocr_restart_preserves_owned_spool_with_unconfirmed_request(tmp_path) -> None:
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    spool = tmp_path / "owned-spool"
+    spool.mkdir()
+    request_id = 5
+    (spool / f"{request_id:012d}.png").write_bytes(b"png")
+    with (spool / f"{request_id:012d}.request").open("wb") as stream:
+        pickle.dump((8, 8.0, None, None), stream)
+    pool = OcrWorkerPool(workers=1)
+    pool._spool_dir = spool
+    pool._owns_spool_dir = True
+    pool._used = True
+    pool._context = cast(Any, _StartupContext(["ready"]))
+
+    pool.start(timeout=1.0)
+    try:
+        request = pool._request_q.get(timeout=2.0)
+        assert request.request_id == request_id
+        assert pool.stats["pending"] == 1
+        pool._result_q.put(
+            OcrResult(
+                request_id=request_id,
+                frame_index=8,
+                capture_timestamp=8.0,
+                number=None,
+            )
+        )
+        result = pool.poll(timeout=1.0)
+        assert result is not None
+        pool.ack(result)
+        assert pool.stats["pending"] == 0
+    finally:
+        pool.stop()
+
+
+def test_ocr_start_rejects_live_dispatcher_from_previous_stop() -> None:
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    pool = OcrWorkerPool(workers=1)
+    release_dispatcher = threading.Event()
+    dispatcher_started = threading.Event()
+
+    def stale_dispatcher() -> None:
+        dispatcher_started.set()
+        release_dispatcher.wait(2.0)
+
+    thread = threading.Thread(target=stale_dispatcher)
+    pool._dispatch_thread = thread
+    pool._dispatch_stop.clear()
+    thread.start()
+    assert dispatcher_started.wait(1.0)
+    try:
+        with pytest.raises(RuntimeError, match="派发线程尚未退出"):
+            pool.start(timeout=0.1)
+        assert pool._dispatch_thread is thread
+    finally:
+        release_dispatcher.set()
+        thread.join(2.0)
+        _close_pool_queues(pool)
+
+
+@pytest.mark.parametrize("corruption", ["missing_png", "bad_metadata"])
+def test_ocr_dispatch_fails_visibly_and_preserves_corrupt_request(tmp_path, corruption) -> None:
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    request = spool / "000000000002.request"
+    request.write_bytes(b"not pickle" if corruption == "bad_metadata" else b"metadata")
+    crop = spool / "000000000002.png"
+    if corruption == "bad_metadata":
+        crop.write_bytes(b"png")
+    pool = OcrWorkerPool(workers=1)
+    pool.set_spool_directory(spool)
+    pool._started = True
+    thread = threading.Thread(target=pool._dispatch_spool)
+    thread.start()
+    try:
+        thread.join(2.0)
+        assert not thread.is_alive()
+        assert pool.stats["dispatch_failures"] == 1
+        assert request.is_file()
+        assert crop.is_file() is (corruption == "bad_metadata")
+    finally:
+        pool._dispatch_stop.set()
+        thread.join(2.0)
+        _close_pool_queues(pool)
+
+
+def test_worker_drain_waits_for_recovered_pool_pending_requests() -> None:
+    class RecoveredPool(_FakePool):
+        pending = 1
+
+        @property
+        def stats(self) -> dict[str, int]:
+            return {"pending": self.pending, "dropped": 0}
+
+    pool = RecoveredPool()
+    worker = PerceptionWorker(
+        PerceptionConfigLike(), buffer=_buffer_with(1), detector=_FakeDetector(), pool=pool
+    )
+    worker._drain_to = 1
+    worker._cursor = 1
+    worker._check_drained()
+    assert not worker._drained.is_set()
+    pool.pending = 0
+    worker._check_drained()
+    assert worker._drained.is_set()
+
+
+def test_ocr_pool_warns_when_backlog_exceeds_threshold(caplog, tmp_path) -> None:
     """积压超过 queue_size 时告警（只跨阈值一次）；回落后再次涨上来会重新告警。"""
     from airdrop.perception.ocr_worker import OcrWorkerPool
 
     logger_name = "airdrop.perception.ocr_worker"
     pool = OcrWorkerPool(workers=1, queue_size=4)
+    pool.set_spool_directory(tmp_path / "spool")
     pool._started = True
     try:
         with caplog.at_level(logging.WARNING, logger=logger_name):
@@ -2312,6 +3026,7 @@ def test_ocr_pool_warns_when_backlog_exceeds_threshold(caplog) -> None:
         # 造 4 条结果取走：未完成数回到 1（< 阈值一半），告警状态复位。
         # ⚠ mp.Queue 的 put_nowait 只是写进父进程的 feeder 缓冲，紧接着的 get_nowait
         # 可能读不到——这里用带超时的 get，别让用例依赖调度时序。
+        pool._result_q = queue.Queue()
         for request_id in range(1, 5):
             pool._result_q.put_nowait(
                 OcrResult(
@@ -2322,7 +3037,9 @@ def test_ocr_pool_warns_when_backlog_exceeds_threshold(caplog) -> None:
                 )
             )
         for _ in range(4):
-            assert pool.poll(timeout=1.0) is not None
+            result = pool.poll(timeout=1.0)
+            assert result is not None
+            pool.ack(result)
 
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger=logger_name):

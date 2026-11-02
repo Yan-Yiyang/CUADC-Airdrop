@@ -26,7 +26,7 @@
 | **本文档** `docs/handbook.md` | 全景手册：目录、数据流、逐模块调用方法、参数总表、输入输出、流程、审查清单、排障 | 使用 + 审查口径 |
 | `AGENTS.md` | 面向 AI 智能体的执行约束、代码入口与按需阅读索引 | 智能体工作指南 |
 | `docs/calibration_opencv.md` | 三步标定与 OpenCV 5.0 问题与易错点全记录（实测表、方程、判据） | **实测口径** |
-| `docs/video_hm30_ffmpeg.md` | 图传链路为什么只有 ffmpeg 一个后端 + 逐项实测 | **实测口径** |
+| `docs/video_hm30_ffmpeg.md` | 图传接收、冷热存储与排障 | **实测口径** |
 | `docs/perception_ocr.md` | 检测/OCR 细节：转正形态门限、Cls 权重命名、onnxruntime 前提 | **实测口径** |
 | `docs/ballistics_fit.md` | 投放记录与反演：可辨识性判据、σ、留一验证 | **实测口径** |
 
@@ -70,7 +70,7 @@
 | `PX4-Autopilot-1.17.0/` | PX4 固件源码，**仅供查阅，禁止当项目代码修改** | — | 否 |
 | `qgroundcontrol-master/` | QGC 地面站源码，同上（`MissionManager/LandingComplexItem.cc` 是 `.plan` 复杂项展开的权威依据） | — | 否 |
 | `flights/` | **运行期产物**：`record.dir` 默认值，每次飞行一个子目录 | 见 §5.1 | 否（已 ignore） |
-| `log/` | 运行期产物：`perception.crop_dir` 默认 `log/target`（裁剪排故图） | — | 否（已 ignore） |
+| 飞行记录目录内 `crops/`、`ocr_spool/` | 裁切 JPG、JSONL 索引及 OCR 磁盘积压 | — | 随飞行记录保留 |
 | pytest `tmp_path` | 测试用的系统临时工作目录，每个用例隔离（见 §5.6） | — | 否 |
 | `.sitl-test-tmp/` | SITL 演练的临时产物（演练日志、机上任务备份、ulog 探查脚本） | — | 否（已 ignore） |
 | `.idea/`、`.vscode/`、`.workbuddy/` | 编辑器/工具配置 | — | 否（已 ignore） |
@@ -80,7 +80,7 @@
 | 子包 / 模块 | 一句话职责 | 关键类型 |
 | --- | --- | --- |
 | `airdrop/telemetry/` | 遥测与控制：MAVSDK 工作线程、线程安全代理、任务级控制器 | `MavsdkThread`、`TelemetryBroker`、`TelemetrySnapshot`、`DroneController`、`MissionController`、`NedOrigin` |
-| `airdrop/video/` | 图传接收：ffmpeg 拉流、帧-遥测时间对齐、环形缓冲 | `Hm30VideoSource`、`FrameTelemetryAligner`、`AlignedSample`、`AlignmentBuffer`、`AlignmentWriter`、`BufferedFrame` |
+| `airdrop/video/` | 图传接收：PyAV 单路采集、帧-遥测对齐与冷热存储 | `Hm30VideoSource`、`FrameTelemetryAligner`、`AlignedSample`、`AlignmentBuffer`、`AlignmentWriter`、`BufferedFrame` |
 | `airdrop/record/` | 记录与回放：飞行目录写入磁盘、按原时间轴重放 | `FlightRecorder`、`EventLog`、`DropWriter`、`DetectionWriter`、`ReplayVideoSource`、`TelemetryPacer`、`FlightLog` |
 | `airdrop/perception/` | 视频处理：YOLO 检测 +（OCR 读编号 \| 12 类直出） | `Detector`、`DetectionBatch`、`OpenCvPostProcess`、`OcrEngine`、`OcrWorkerPool`、`PerceptionWorker`、`Detection` |
 | `airdrop/georef/` | 坐标处理：像素 → NED（视线与地面求交）→ WGS84 | `CameraModel`、`pixel_to_ned`、`cross_check_by_side`、`LLARef`、`wgs84_to_ned` |
@@ -145,7 +145,7 @@
  └──────────────┘        └──────┬───────┘
                                 │ rtsp://192.168.144.25:8554/main.264
                     ┌───────────▼─────────────────────────────┐
-                    │ airdrop.video.source.Hm30VideoSource     │  1 个采集线程 + ffmpeg 子进程
+                    │ airdrop.video.source.Hm30VideoSource     │  1 个采集线程 + PyAV 子进程
                     │  · add_sink(逐帧，一帧不落)  · read()/latest()(允许丢帧)
                     └───────────┬─────────────────────────────┘
                                 │ VideoFrame(index, image, timestamp, lag)
@@ -155,13 +155,13 @@
                     └───────────┬─────────────────────────────┘
                                 │ AlignedSample(frame, snapshot, timestamp, lag, mode)
                     ┌───────────▼─────────────────────────────┐
-                    │ airdrop.video.buffer.AlignmentBuffer     │  环形缓冲（jpeg/raw，默认 5400 帧）
+                    │ airdrop.video.buffer.AlignmentBuffer     │  BGR 热区 + TS 历史区
                     │  AlignmentWriter 是标准 sink 接法         │  写者 1、读者 N（各自游标）
                     └───┬───────────────────────┬─────────────┘
       wait_new(逐帧)    │                       │ wait_new(逐帧)
         ┌───────────────▼──────────┐   ┌────────▼──────────────────────────┐
         │ perception.PerceptionWorker│  │ record.FlightRecorder              │
-        │  YOLO 全帧检测             │  │  frames/%06d.jpg + frames_index.jsonl│
+        │  YOLO 全帧检测             │  │  video/*.ts + frames_index.jsonl│
         │  ocr: 裁剪→去重→OCR 进程池 │  │  telemetry.jsonl（10Hz 节流）        │
         │  cls12: 类别直出编号       │  │  events.jsonl / drops.jsonl / flight.log│
         └───────────────┬───────────┘   └────────────────────────────────────┘
@@ -202,7 +202,7 @@
 | `airdrop.telemetry.broker` | `models` | video.align / record（recorder + replay）/ runtime / tests |
 | `airdrop.telemetry.mavsdk_thread` | `models`、`broker`、mavsdk | runtime；`controller` 通过它下发指令 |
 | `airdrop.telemetry.controller` | `models`、`mavsdk_thread`（经 `submit`）、`mavsdk` 的 `mission_raw`/`mission`/`gripper`/`action` | `mission.runner`（按 `MissionController` 协议） |
-| `airdrop.video.source` | `VideoConfig`（本模块定义）、ffmpeg 子进程 | `record.replay`（同接口）、runtime |
+| `airdrop.video.source` | `VideoConfig`（本模块定义）、PyAV 子进程 | `record.replay`（同接口）、runtime |
 | `airdrop.video.align` | `broker`、`VideoFrame`、`AlignConfig` 语义 | `video.buffer.AlignmentWriter`、`record.replay` |
 | `airdrop.video.buffer` | `align.AlignedSample`、cv2/numpy | `perception.pipeline`、`record.recorder` |
 | `airdrop.record.recorder` | `broker`、`buffer`、`ballistics.drops.DropRecord` | runtime（`on_event`/`on_drop`/`detections`） |
@@ -239,7 +239,7 @@
 | --- | --- | --- | --- |
 | `MavsdkThread` | **1 个线程**（内部跑独立 asyncio 事件循环 + supervisor 重连循环） | 调用方 `MavsdkThread.from_config(...)` + `.start()` | `.stop()` 显式结束；**必须**保证会话结束释放 `mavsdk_server`（§7 第 1 条） |
 | `mavsdk_server` | **1 个外部进程**（mavsdk 库自己拉起，gRPC 端口固定 50051） | mavsdk 库 | 由 `_release_drone()` 收尾；不显式释放会留僵尸进程 |
-| `Hm30VideoSource` | **1 个采集线程 + 1 个 ffmpeg 子进程** | `Hm30VideoSource(config)` 构造时起线程，`.start()` 起流 | `.stop()` 杀子进程并 join 线程 |
+| `Hm30VideoSource` | **1 个采集线程 + 1 个 PyAV 子进程** | `Hm30VideoSource(config)` 构造时起线程，`.start()` 起流 | `.stop()` 杀子进程并 join 线程 |
 | `AlignmentBuffer` | 无自己的线程：写者是采集线程（经 `AlignmentWriter`），读者是各自线程/主线程 | 调用方 | 随进程 |
 | `PerceptionWorker` | **1 个工作线程 + N 个 OCR 进程**（`ocr_workers`，默认 2） | `.start()` | `.stop()` 停线程并收进程池 |
 | `FlightRecorder` | **2 个写盘线程**（`recorder-frames`、`recorder-telemetry`，daemon） | `.start(broker=…, buffer=…)` | `.stop()` join + 关文件 |
@@ -255,7 +255,7 @@
   的 pickle 管道；OCR 进程池是唯一的多进程组件（`airdrop/perception/ocr_worker.py:1` 的
   docstring 说明了"为什么单独开进程"以及复测前的保守默认）。
 * **谁也不用共享内存**：没有全局可变状态；`config` 是 frozen dataclass，构造后不可变。
-* **优先"每帧路径不阻塞"**：OCR 在独立进程池、事件/检测写盘在独立线程、ffmpeg 在子进程。
+* **优先"每帧路径不阻塞"**：OCR 在独立进程池、事件/检测写盘和 PyAV 采集隔离。
 
 ---
 
@@ -419,7 +419,7 @@ DryRunController(inner: MissionController, *, on_event=None)
 
 ### 3.2 `airdrop.video` —— 图传接收、对齐与缓冲
 
-#### 3.2.1 `Hm30VideoSource`（唯一的拉流后端：ffmpeg 子进程）
+#### 3.2.1 `Hm30VideoSource`（PyAV 采集子进程）
 
 ```python
 Hm30VideoSource(config: VideoConfig | None = None)
@@ -429,7 +429,7 @@ open_hm30_video(config=None, *, autostart=True) -> Hm30VideoSource
 | 方法 | 说明 |
 | --- | --- |
 | `add_sink(sink)` / `remove_sink(sink)` | 注册**每帧**回调（在采集线程里调用，**一帧不落**） |
-| `start()` / `stop(timeout=5.0)` | 起动/停止拉流（幂等；stop 会杀 ffmpeg 子进程） |
+| `start()` / `stop(timeout=5.0)` | 启动/停止拉流（幂等；超时会强制回收采集子进程） |
 | `wait_ready(timeout=10.0)` | 等到第一帧；超时 False |
 | `read(timeout=None)` | 阻塞等**下一帧新画面**（实时路径，允许跳帧，跳帧计入 `stats.dropped`） |
 | `latest()` | 立刻返回最新一帧（不等待） |
@@ -501,23 +501,18 @@ AlignmentWriter(buffer, aligner, *, defer_until_airborne=False)  # 可调用对�
 | `iter_between(start=None, end=None, *, batch=16)` | **按时间区间分批迭代**（回看历史的正道） |
 | `wait_new(after_index=0, timeout=None, *, cancel_event=None)` | 等一条更新记录，返回**最早**满足条件的那条（读者各自持游标）；取消事件已置位时返回 `None` |
 | `wake_waiters()` | 仅唤醒等待线程，让它们检查各自的取消事件；不改缓存或读者游标 |
-| `read_jpeg_bytes(index)` | 内部 API：取原始 jpeg 字节（`FlightRecorder` 零重编码写入磁盘用） |
+| `read_jpeg_bytes(index)` | JPEG 缓冲模式的内部读取接口 |
 | `clear()` | 清空（不影响已发出的记录对象） |
 | `AlignmentWriter.stats()` | `(written, skipped)`：`skipped` 只因"该时刻取不到遥测"增加 |
 | `AlignmentWriter.begin_after(source_index)` | 开启延迟写入，只接收源帧序号大于 cutoff 的帧；可传回调在 writer 锁内读取 cutoff，首次调用后幂等 |
 | `AlignmentWriter.seal()` | 停止接纳新帧；已接纳在途帧仍完成对齐与入缓冲，且 writer 不可再次开启 |
 | `BufferStats` | `storage` / `capacity` / `max_bytes` / `frames` / `put` / `evicted` / `bytes` / `last_index` |
 
-默认 `storage="jpeg"`：720p 约 0.1–0.2 MB/帧，满载（`capacity_for(30, 180)` = 5400 帧）约
-0.6–1 GiB；`storage="raw"` 无损但 5400 帧约 13.9 GiB。满了从**最旧**一端驱逐。
-`capacity_for(fps=30.0, seconds=180.0)` 做换算；`raw_frame_bytes(width, height, channels=3)`
-算未压缩一帧的字节数。
+独立构造 `AlignmentBuffer` 的默认存储仍为 `jpeg`；正式采集任务显式采用 raw 热区和 TS 冷区。热区按约 1 秒保留 BGR，硬上限 128 MiB；历史图像共享 64 MiB LRU，两者额度独立。后台验证直接读取 TS，未验证的热帧不会释放；积压超过上限时明确报错。`freeze` 固定截止帧、共享缓存和存储租约，并使用独立解码游标。缓存额度不包括返回图像、当前解码帧及编解码器工作集。`capacity_for(fps=30.0, seconds=180.0)` 和 `raw_frame_bytes(width, height, channels=3)` 分别计算帧数与原始帧字节数。
 
 正式任务装配可延迟接收至起飞判定后；延迟期间视频源的 `latest()` 与统计仍可用于预览和预检，但帧不对齐、不入缓冲，也不会被感知或记录器消费。被动采集与回放默认立即接收。
 
-**易错点**：ffmpeg 后端的 `VideoFrame.image` 是**复用管道缓冲区的视图**——
-`AlignmentBuffer` 内部已拷贝，但你若自己跨帧保存必须 `.copy()`；`raw` 模式读到的 image 是
-只读视图。
+**易错点**：跨帧持有 `VideoFrame.image` 应先 `.copy()`；缓冲区负责持有已接纳帧，`raw` 模式读到的 image 是只读视图。采集时间参考已改为 PyAV 解码就绪时刻，切换后须重新标定或实测确认 `telemetry_lag`，此时刻仍不是相机曝光时间。
 
 ### 3.3 `airdrop.record` —— 记录与回放
 
@@ -525,7 +520,7 @@ AlignmentWriter(buffer, aligner, *, defer_until_airborne=False)  # 可调用对�
 
 ```python
 FlightRecorder(config: Config, *, base_dir: str | Path | None = None)
-start(*, broker: TelemetryBroker, buffer: AlignmentBuffer) -> FlightRecorder
+start(*, broker: TelemetryBroker, buffer: AlignmentBuffer, ts_video=False) -> FlightRecorder
 stop(timeout: float = 5.0) -> None
 stats() -> RecorderStats | None
 events      -> EventLog          # events.jsonl 写入器（未启动时抛 RuntimeError）
@@ -545,99 +540,22 @@ flight_dir  -> Path | None
 存活时仍为真，稍后再次 `stop` 完成收尾。`frames_skipped` 包含驱逐、解码缺失、
 编码及写盘失败，最终事件也记录该计数。JSONL 编码失败返回 `False`，后续有效记录仍可写入。
 
-**最小的"录一次 + 回放"示例**（真跑通；用工作区内的临时目录，避免污染 `flights/`）：
+正式视频采集任务调用 `start(..., ts_video=True)`，将视频流写入 `video/segment-*.ts`；`frames_index.jsonl` 保存帧序号、分段、PTS、随机访问点、尺寸、时间及对齐遥测。断流重连创建新段。未开启飞行记录时使用临时冷存储，仅在采集结束、消费者排空且全部冻结视图租约释放后清理；清理失败或异常退出时保留并报告。更多使用与异常恢复说明见 [运行说明](runtime.md)。
 
-```python
-import json, shutil, time, uuid
-from pathlib import Path
-import cv2, numpy as np
-from airdrop import (
-    AlignmentBuffer,
-    Config,
-    FlightLog,
-    FlightRecorder,
-    ReplayVideoSource,
-    TelemetryBroker,
-    TelemetrySnapshot,
-    load_broker_from_log,
-)
-
-work = Path(tempfile.mkdtemp(prefix="fit-example-"))  # 任意可写目录
-work.mkdir(parents=True, exist_ok=True)
-config = Config()
-
-recorder = FlightRecorder(config, base_dir=work)
-recorder.start(broker=TelemetryBroker(), buffer=AlignmentBuffer(capacity=4))
-recorder.events.emit("state", from_state="RECON", to_state="HOLD")
-recorder.stop()
-flight_dir = recorder.flight_dir  # work/<时间戳>/
-print(sorted(p.name for p in flight_dir.iterdir()))
-# ['config_snapshot.json', 'detections.jsonl', 'drops.jsonl', 'events.jsonl',
-#  'flight.log', 'frames', 'frames_index.jsonl', 'telemetry.jsonl']
-
-# 手工补一份最小素材（真飞时由写盘线程产出）：1 帧 + 3 条遥测
-frames_dir = flight_dir / "frames"
-frames_dir.mkdir(exist_ok=True)
-base = time.time()
-snapshots = []
-for i, north in enumerate((0.0, 10.0, 20.0)):
-    snap = TelemetrySnapshot(timestamp=base + i * 0.1)
-    snap.north_m = north
-    snapshots.append(snap)
-(flight_dir / "telemetry.jsonl").write_text(
-    "\n".join(json.dumps(s.as_dict()) for s in snapshots) + "\n", encoding="utf-8"
-)
-jpeg = cv2.imencode(".jpg", np.zeros((180, 320, 3), dtype=np.uint8))[1].tobytes()
-(frames_dir / "000001.jpg").write_bytes(jpeg)
-(flight_dir / "frames_index.jsonl").write_text(
-    json.dumps(
-        {
-            "index": 1,
-            "filename": "000001.jpg",
-            "capture_timestamp": base,
-            "received_timestamp": base + 0.15,
-            "lag": 0.15,
-            "extrapolated": False,
-            "offset": 0.0,
-            "bytes": len(jpeg),
-        }
-    )
-    + "\n",
-    encoding="utf-8",
-)
-
-log = FlightLog.open(flight_dir)
-print(len(log.frames), sum(1 for _ in log.iter_telemetry()))  # 1 3
-broker, pacer = load_broker_from_log(flight_dir)  # 遥测尚未灌入
-pacer.publish_until(snapshots[-1].timestamp)
-print(broker.get_snapshot().north_m)  # 20.0
-
-received = []
-source = ReplayVideoSource(flight_dir, speed=0.0)  # 0 = 全速
-source.add_sink(received.append)
-source.start()
-try:
-    source.wait_ready(timeout=5.0)
-    while not received:
-        time.sleep(0.05)
-    print(received[0].index, abs(received[0].capture_timestamp - base) < 1e-9)  # 1 True
-finally:
-    source.stop()
-    shutil.rmtree(work, ignore_errors=True)
-```
+独立调用记录器且未启用 `ts_video` 时，当前接口仍可能创建 `frames/`；正式视频采集任务使用上述 TS 文件。
 
 #### 3.3.2 `ReplayVideoSource`（与实飞源同接口）
 
 ```python
 ReplayVideoSource(flight_dir, *, speed=0.0, telemetry=None, buffer=None,
-                  repeat=False, strict=True, tail_s=0.0)
+                  repeat=False, strict=None, tail_s=0.0)
 ```
 
 `speed=0` 全速（批量回归）/ `1.0` 原速。与 `Hm30VideoSource` **同一套公开接口**
 （`add_sink`/`read`/`latest`/`stats`/`iter_frames`/`stop`/`wait_ready`），换进去即可。
 `sink` 路径一帧不落；`read()` 仍允许跳帧（计入 `stats.dropped`，回放里叫 `skipped` 的是
-"素材缺文件/解码失败"）。`strict=True`（默认）下缺帧或 sink 抛异常会让回放以
-`state="error"` 结束——做正式评估时宁可失败，也不要静默跳过。
+"素材缺文件/解码失败"）。`strict=True` 下缺帧或 sink 抛异常会让回放以
+`state="error"` 结束。默认 `strict=None` 在完整航次启用严格模式，异常收尾时告警并保留可验证的数据前缀；`strict=False` 明确允许跳过坏帧。
 
 #### 3.3.3 `load_broker_from_log` / `TelemetryPacer`（原时间轴回填）
 
@@ -752,7 +670,7 @@ OpenCvPostProcess(color='blue', ocr_conf_threshold=0.6, *, engine=None,
 3. 形态学 + 凸包 + `approxPolyDP` 确定性扫描 `epsilon=3..40` 找五边形；
 4. 几何转正（**平行边法**为主、最小内角法兜底），顶角形态判据（60°±15°）拒绝假房子；
 5. **彩图**整图 OCR（v6 检测模型对灰度图检不出文本框）；
-6. 单数字框按行聚类拼两位 → 置信度加权（两位 ×1.15、单位 ×0.6）→ `correct_ocr_number` 纠错。
+6. 单数字框按行聚类拼两位 → `correct_ocr_number` 纠错，至少识别出两位才接受 → 按编号数值加权（10–99 ×1.15、00–09 ×0.6）。
 
 三个接口：
 
@@ -834,7 +752,7 @@ OcrWorkerPool(workers=2, *, queue_size=500, config: dict | None = None)
 # poll(timeout=0.0) / drain()
 ```
 
-- `submit` 返回任务号；请求/结果队列都**无界、不丢弃**（目标可能只清晰一瞬，漏一个请求就可能漏目标）。`queue_size` 不再是容量，而是**积压告警阈值**：未完成数（`submitted - results`）达到它时打一条 WARNING（跨阈值一次；回落到一半以下后再次涨上来会重新告警），提示降帧率或加 OCR worker。`PerceptionStats.ocr_dropped` 同步池侧的 `dropped` 计数——不丢弃策略下它恒为 0，保留作监控。
+- `submit` 先将 PNG 无损裁切图与请求元数据写入磁盘，进程请求队列只传有界文件引用；结果队列也有界并阻塞回压。成功关联结果后清理请求文件。启动/恢复时流式扫描磁盘积压一次并重建 SQLite 磁盘顺序索引；运行期间只查询下一个编号，跳过空洞无需逐号探测，也不把积压请求载入内存。sidecar 与 ack 标记仍是恢复依据，索引可重建。`queue_size` 是**积压告警阈值**，不是内存队列容量；超阈值告警同时仍保留磁盘请求。`PerceptionStats.ocr_dropped` 记录丢弃数。
 - OCR 放独立进程的理由：RapidOCR 单帧几十到几百毫秒，放主循环里会直接拖垮逐帧检测。进程参数经 `config`（字典）传给 `ocr_worker_main`。
 - `start` 并行启动所有进程，等待每个进程完成模型预热并确认就绪才返回；120 秒是整池初始化总时限。预热返回 `False`、初始化异常、进程提前退出或超时均失败，并回收本轮已启动进程。`PerceptionWorker.start()` 将错误传给自检，不能仅凭进程已创建就报告通过。初始化消息使用独立队列，不混入识别结果，也不增加逐帧消息。重启使用新队列并重置队列统计，防止旧退出哨兵或结果进入新一轮。
 - Windows 是 spawn 语义：**入口脚本必须放在 `if __name__ == "__main__":` 之下**，否则子进程会重复导入主模块。受限沙箱里命名管道不可用，进程池会起不来（见 §8）。
@@ -864,7 +782,7 @@ PerceptionWorker(config: PerceptionConfigLike, *, buffer: AlignmentBuffer,
 其余行为约定：
 
 - **边长过滤**：`side_px` 不在 `min_side_px` 与 `max_side_px` 之间的检测被丢弃并计入 `invalid_side`（默认 10–400 px）。
-- **OCR 逐帧送检**：默认不启用跨帧去重，避免运动模糊导致唯一清晰帧被跳过；显式打开 `ocr_dedupe_s` / `ocr_dedupe_px` 时，才按时间和像素窗口合并相邻重复请求。**OCR 请求、OCR 结果、检测结果三条队列都无界、不丢弃**：积压只告警（OCR 侧按 `ocr_queue_size`，检测结果侧按 2000 条阈值），不会因为"队列满"丢掉任何请求或结果；积压长期不降时调 `perception.ocr_workers` 或降检测帧率。
+- **OCR 逐帧送检**：默认不启用跨帧去重，避免运动模糊导致唯一清晰帧被跳过；显式打开 `ocr_dedupe_s` / `ocr_dedupe_px` 时，才按时间和像素窗口合并相邻重复请求。OCR 图片与元数据放在磁盘，mp 请求/结果队列有界；检测业务结果队列保持不丢弃策略并在积压时告警。
 - **编号覆盖规则**：只有 `cls12` 的类别直出才写编号；OCR 结果回填时不会清掉已存在的编号（否则跨帧投票会被打乱）。
 - 单帧异常不终止循环：记日志并写进 `PerceptionStats.last_error`。
 - `PerceptionStats` 字段：`frames`（处理的帧数）、`detections`、`with_code`、`submitted`（送 OCR 次数）、`deduped`、`results`、`invalid_side`、`ocr_dropped`（队列丢弃数——不丢弃策略下恒为 0，保留作监控）、`lag_frames`、`last_error`。
@@ -1667,7 +1585,7 @@ config.replace(**changes)  # 派生一个变体（改哪个传哪个，如 drop=
 正式流程：`INIT`（遥测 + NED 原点）→ **`PREFLIGHT`**（载入模型 → 视频自检）→
 `WAIT_AIRBORNE`（等飞机在空中）→ `RECON`（正式任务等操作手在 QGC 启动侦查航线）。
 
-这些检查各自要碰外部资源（GPU/权重文件、ffmpeg 图传子进程、相机标定），而状态机必须
+这些检查各自要碰外部资源（GPU/权重文件、PyAV 图传子进程、相机标定），而状态机必须
 **离线可测**，所以每一步都做成**注入**：
 
 ```python
@@ -1772,10 +1690,10 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `telemetry_lag` | float | `0.15` | 链路固定延时：拍摄时刻 = 收到时刻 − 该值 |
 | `reconnect_delay` | float | `1.0` | 首次重连等待 |
 | `max_reconnect_delay` | float | `10.0` | 重连退避上限 |
-| `ffmpeg_executable` | str / None | `None` | 指定 ffmpeg 路径（默认用 `imageio-ffmpeg` 自带） |
-| `ffmpeg_decoder` | str / None | `None` | 强制解码器（排障用） |
-| `extra_input_args` | tuple | `()` | 追加到输入侧的 ffmpeg 参数 |
-| `extra_output_args` | tuple | `()` | 追加到输出侧的 ffmpeg 参数 |
+| `ffmpeg_executable` | str / None | `None` | 保留字段；当前 PyAV 采集不使用外部 ffmpeg 路径 |
+| `ffmpeg_decoder` | str / None | `None` | PyAV 采集不支持，非空时启动前报错 |
+| `extra_input_args` | tuple | `()` | 允许为空或 `-protocol_whitelist <protocols>` |
+| `extra_output_args` | tuple | `()` | PyAV 采集不支持，非空时启动前报错 |
 
 方法 `validated()` 校验传输方式与参数组合。
 
@@ -1809,12 +1727,9 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `max_side_px` | float | `400.0` | 最大像素边长（校验要求大于最小值） |
 | `ocr_conf_threshold` | float | `0.6` | OCR 置信度门限 |
 | `ocr_workers` | int | `2` | OCR 进程数（≥ 1） |
-| `ocr_queue_size` | int | `500` | OCR 积压**告警阈值**（≥ 1；队列无界、不丢弃） |
+| `ocr_queue_size` | int | `500` | OCR 积压**告警阈值**（≥ 1；请求图像积压到磁盘） |
 | `ocr_dedupe_s` | float | `0.0` | 旧配置兼容字段，当前不启用去重 |
 | `ocr_dedupe_px` | float | `0.0` | 旧配置兼容字段，当前不启用去重 |
-| `save_crops` | bool | `False` | 裁剪图写入磁盘开关（⚠ 当前无消费者，见 4.17） |
-| `crop_dir` | str | `'log/target'` | 裁剪图目录（⚠ 同上） |
-| `max_crops` | int | `5000` | 裁剪图上限（⚠ 同上） |
 | `lag_warn_frames` | int | `900` | 落后告警帧数（⚠ 同上） |
 
 ### 4.5 `CameraConfig` —— 相机与标定文件
@@ -1969,11 +1884,11 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `enabled` | bool | `False` | 独立启用合成显示，不改变识别和记录 |
+| `enabled` | bool | `True` | 默认启用合成显示；无采集时自动关闭，不改变识别和记录 |
 | `host` | str | `'127.0.0.1'` | QGC 接收主机 |
 | `port` | int | `5602` | 视频目的端口；RTP 还使用下一端口 |
 | `transport` | str | `'rtp'` | RTP/H.264 或 `'mpegts'` |
-| `fps` | float | `12.0` | 显示合成与编码帧率 |
+| `fps` | float | `30.0` | 显示合成与编码目标帧率 |
 | `bitrate_kbps` | int | `2500` | H.264 目标码率 |
 | `ffmpeg_executable` | str 或 None | `None` | 未指定时寻找已有 ffmpeg |
 | `history_frames` | int | `8` | 显示历史帧容量，不改变业务缓冲 |
@@ -2043,7 +1958,6 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 
 | 字段 | 现状 |
 | --- | --- |
-| `save_crops` / `crop_dir` / `max_crops` | 裁剪图写入磁盘的功能尚未接入，改这些参数没有效果 |
 | `lag_warn_frames` | 落后告警改用别的口径计数（`PerceptionStats.lag_frames` 仍会统计） |
 | `undistort`（相机分块） | 去畸变由检测器内参与坐标解算决定，该开关不生效 |
 | `flat` / `ground_point_lat` / `ground_point_lon` | 地面高程只用 `ground_point_alt`；平地假设是隐含的 |
@@ -2064,8 +1978,8 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `detections.jsonl` | `PerceptionWorker` → `recorder.detections.append(Detection)` | `Detection.as_dict()`：`frame_index`、`capture_timestamp`、`pixel`、`box`、`confidence`、`code`、`side_px`、`raw_text`、`ocr_confidence`、`mode`、`extra`（含 `undistorted`/`ocr_stage`/`ocr_worker`）+ 精简遥测字段 | 人、脚本 | ✅ 追加字段不影响解析 |
 | `events.jsonl` | 各模块经 `recorder.events.emit(kind, **data)`（线程安全、写完即 flush） | `{timestamp, kind, ...}`，`kind` 目录见 §5.2 | 人、复盘脚本 | ⚠ 建议只读（这是任务时间线） |
 | `drops.jsonl` | `MissionRunner(on_drop=…)` → `recorder.drops.append(DropRecord)` | 投放瞬间**原始状态**：位置/速度/姿态（欧拉角+四元数）/风/离地高度/NED 原点/目标点/判据前推位置与预测落点（**数值不四舍五入**） | `tools/fit_ballistics.py`、人 | ⚠ 只读；实测落点写在 `impacts.jsonl`，别改这个文件 |
-| `frames/%06d.jpg` | recorder 的 frame writer 线程（**零重编码**：把缓冲里的 jpeg 字节直接写入磁盘） | 逐帧 JPEG，文件名 = 缓冲序号 | `record.replay.ReplayVideoSource` | ⚠ 删帧会让回放 `strict=True` 报错 |
-| `frames_index.jsonl` | 同上 | `index`、`filename`、`capture_timestamp`、`received_timestamp`、`lag`、`extrapolated`、`offset`、`bytes`（`capture = received − lag`；**标定第 2/3 步用 `received_timestamp`**，见 §5.3） | `record.replay.FlightLog`、`vendor/airdrop-calibration/airdrop_calibration/calibrate.py` | ⚠ 只读（时间戳必须递增） |
+| `video/segment-*.ts`、`segment-*.rap.jsonl`、`segment-*.complete` | PyAV 采集子进程复制压缩流，按连接周期生成分段和随机访问索引 | MPEG-TS 与分段索引、正常封口标记 | `record.replay.ReplayVideoSource`、标定工具 | ⚠ 删除或修改分段会使对应帧无法回读 |
+| `frames_index.jsonl` | recorder 帧索引线程 | 业务帧序号、分段和 PTS、随机访问点、尺寸、时间、对齐遥测及标记；`capture = received − lag` | `record.replay.FlightLog`、`vendor/airdrop-calibration/airdrop_calibration/calibrate.py` | ⚠ 只读；损坏尾行会报告并恢复可用前缀 |
 | `config_snapshot.json` | `start()` 时立刻写 | `asdict(Config)` 全量（含视频地址、标定文件路径） | 人、审查 | ⚠ 只读（"当时怎么配的"证据） |
 | `impacts.jsonl` / `impacts.csv` | **人**（现场量完落点后填） | `index` + 经纬度（`lat_deg`/`lon_deg`/`alt_m`）**或** NED（`north_m`/`east_m`/`down_m`） | `tools/fit_ballistics.py` | ✅ 本来就要手填（模板见 `write_impact_template`） |
 
@@ -2192,7 +2106,7 @@ uv sync                                                # 依赖（清华镜像�
 | `python -m airdrop.run dump-api` | 自省生成主包接口参考 |
 | `python -m airdrop.run check-docs` | 检查手册与主包 API、配置、记录文件和 CLI 的一致性 |
 
-`mission` / `replay` 可用 `--qgc-video` 开启合成显示，目的主机/端口/封装分别用 `--qgc-host`、`--qgc-port`、`--qgc-transport` 配置。画面和编码故障隔离见 [QGC 视频](qgc_video.md)。
+`mission` / `replay` 默认启用合成显示；用 `--no-qgc-video` 关闭，目的主机/端口/封装分别用 `--qgc-host`、`--qgc-port`、`--qgc-transport` 配置。默认使用 GPU 的 `h264_nvenc`，需本机 NVIDIA 编码器支持。画面和编码故障隔离见 [QGC 视频](qgc_video.md)。
 
 完整选项见各命令 `--help`。运行参数语义、相互约束和生命周期见 [统一运行说明](runtime.md)。工具仓初始化与升级见 [独立工具](tool_repositories.md)。
 
@@ -2260,7 +2174,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | `tests/test_alignment.py` | 对齐器 lag 语义、等待上限、外推标记、超时策略 | 否 |
 | `tests/test_buffer.py` | 环形缓冲容量/驱逐、复用缓冲区必须拷贝、`AlignmentWriter` 逐帧入库 | 否 |
 | `tests/test_runtime_factory.py` | 真实组件装配阶段开关与任务视频 writer 起飞门控 | 否 |
-| `tests/test_video.py` | ffmpeg 拉流：无效地址显式报错、sink 每帧不落、`stats.dropped` 语义 | 起 ffmpeg 子进程 |
+| `tests/test_video.py` | 视频源接口、输入失败与 `stats.dropped` 语义 | 按用例启动视频子进程 |
 | `tests/test_recorder.py` | 飞行目录七个文件齐全、帧零重编码、事件/检测/投放写入、幂等启停 | 否（**沙箱里挂 `tmp_path`**） |
 | `tests/test_replay.py` | 回放对齐结果与"直接从日志查询"的参考 broker 完全一致 | 否 |
 | `tests/test_perception.py` | pipeline 逻辑（假 detector / 假 OCR 池）、去重、编号不被覆盖 | 否 |
@@ -2322,7 +2236,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | 1 | `mavsdk` 没有公开 `close()`，会话结束必须显式释放，**且释放要有超时兜底**（守护线程 + `RELEASE_TIMEOUT_S`） | `telemetry/mavsdk_thread.py` 的 `stop()` / `_release_drone()` | mavsdk_server 子进程（固定 gRPC 端口 50051）变僵尸，新会话连上它并级联断连；⚠ 无飞控时这条释放路径实测会**永久阻塞**（gRPC poller 报 `Event loop is closed`），没有兜底就会把 `stop()` 的调用方一起拖死 |
 | 2 | 历史按时间查询用 `bisect(key=attrgetter("timestamp"))` 直接探 deque | `telemetry/broker.py` | 每次查询重建整张时间表（曾 22µs → 0.42µs） |
 | 3 | 留存（`add_sink` 逐帧）与实时（`read()`/`latest()`）是两条路 | `video/source.py`、`video/buffer.py` | 用 `read()` 送入推理＝把丢帧引回来 |
-| 4 | 跨帧持有画面必须 copy | `video/source.py` 的 `VideoFrame.copy()`、`video/buffer.py` | ffmpeg 后端复用管道缓冲，历史帧全变成"最新那一张" |
+| 4 | 跨帧持有画面必须 copy | `video/source.py` 的 `VideoFrame.copy()`、`video/buffer.py` | 跨帧持有图像时要按接口约定复制，避免复用缓存导致图像变化 |
 | 5 | 取遥测用 `frame.capture_timestamp`（= 收到时间 − `telemetry_lag`） | `video/source.py`、`video/align.py` | 目标坐标顺航迹偏一个链路延时（10 m/s → 1.5 m） |
 | 6 | 快照是"最新可用值合并"，字段间无严格时间同步 | `telemetry/models.py`、`broker.py` | 误以为同一瞬间 → 解算误差归因错 |
 | 7 | 去畸变只做一次（检测器 remap 过，georef 就不能再纠正） | `perception/detector.py` → `Detection.extra["undistorted"]` → `mission/targets.py` | 双重纠正，坐标系统性偏 |
@@ -2429,8 +2343,8 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | pytest 报 `PermissionError` | 可能受临时目录、进程或 socket 权限影响 | 按现场错误逐项确认权限原因，使用可写临时目录或正常权限环境复验；未复验的失败不能忽略 |
-| 图传一帧都没有，`stats.last_error` 有 ffmpeg 输出 | 地址/网络不对（HM30 网段 `192.168.144.0/24`，相机 `192.168.144.25`） | `ffmpeg -rtsp_transport udp -i rtsp://192.168.144.25:8554/main.264 -frames:v 1 -f null -` 手工核对；地址**不探测**，写错就报错 |
-| 断了流仍在读旧画面 / `read()` 阻塞不返回 | ffmpeg 后端靠 `-timeout` 判死链路；cv2 后端 `read()` 30s 不可中断 | 用 `Hm30VideoSource`（可杀子进程）；`VideoConfig.read_timeout` 调小；详见 `docs/video_hm30_ffmpeg.md` |
+| 图传一帧都没有，`stats.last_error` 有采集错误 | 地址、网络或输入参数不对（HM30 网段 `192.168.144.0/24`） | 检查地址与错误，确认流有可解码关键帧；程序不探测地址 |
+| 断了流仍在读旧画面 / `read()` 阻塞不返回 | 链路超时或消费者没有等待新帧 | 检查 `read_timeout`、进程状态及重连；详见 `docs/video_hm30_ffmpeg.md` |
 | 新会话连不上飞控 / 端口 50051 被占 | 旧 mavsdk_server 僵尸进程 | 必须走 `MavsdkThread.stop()`（内部 `_release_drone()`）；必要时手动结束残留进程 |
 | ONNX/TORCH 报 CUDA 不可用，静默退回 CPU | 进程里没有先 `import torch`（cuDNN/cuBLAS DLL 不在搜索路径） | 本项目 det/rec 走 TORCH 天然满足；`OcrEngine._report_cls_device()` 会告警——看日志 |
 | OCR 读出 `95` 而目视是 `56` | 转正差 180°（形态门限被绕过） | 已修（形态判据 + `house_ok` 优先）；别改 60°±15°，要改先重新量分布（`docs/perception_ocr.md`） |
@@ -2476,13 +2390,13 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | PX4 侧配置 | gripper 输出、起飞项航点动作、任务结束后是否 RTL 都不在本包范围内 |
 | 仿真世界 | 已提供世界、下视相机与主仓感知接入，布局可由seed复现；仿真与历史验收不能保证当前版本真机精度，现场相机、网络和挂架仍需验证 |
 | 工程设施 | 无 CI（pytest/ruff/pyright 在本地运行）；覆盖率以当前测试报告为准；沙箱权限问题须与代码失败分别核实 |
-| 声明但尚未接入的参数 | 见 §4.18 的表（`save_crops`/`crop_dir`/`max_crops`/`lag_warn_frames`/相机 `undistort`/`flat`+经纬度/记录 `video`/`event_eval_hz`） |
+| 声明但尚未接入的参数 | 见 §4.18 的表（`lag_warn_frames`/相机 `undistort`/`flat`+经纬度/记录 `video`/`event_eval_hz`） |
 
 ### 9.2 数据与结果的可复现性
 
 - **权重不进 git**：拿权重后配 `config_snapshot.json` 才知道当时用的是什么；`models/ppocr/*.txt` 字典入库，
   正是为了让 rec 的字符集固定。
-- **一次飞行的全部输入都在飞行目录里**：`config_snapshot.json` + `telemetry.jsonl` + `frames/`，
+- **启用记录时，飞行目录保留数据**：`config_snapshot.json`、`telemetry.jsonl`、`video/` 和 `frames_index.jsonl`，
   配合 `ReplayVideoSource` 可离线重跑同一条链路；改动算法后**先跑 `python -m airdrop.run replay` 对比**
   再考虑实飞。
 - **投放试验的结论是可追溯的**：`ballistics_fit.json` 里同时留着原始 `record` 与 `impact_ned`、

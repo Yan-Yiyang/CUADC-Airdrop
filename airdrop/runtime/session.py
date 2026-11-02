@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -62,6 +63,8 @@ class VideoSource(Protocol):
 
     def wait_ready(self, timeout: float = 10.0) -> bool: ...
 
+    def set_recording_directory(self, directory: str | Path) -> None: ...
+
 
 class TaskRunner(Protocol):
     """状态机生命周期接口。"""
@@ -93,7 +96,9 @@ class Recorder(Protocol):
     @property
     def is_running(self) -> bool: ...
 
-    def start(self, *, broker: TelemetryBroker, buffer: AlignmentBuffer) -> None: ...
+    def start(
+        self, *, broker: TelemetryBroker, buffer: AlignmentBuffer, ts_video: bool = False
+    ) -> object: ...
 
     def stop(self, timeout: float = 5.0) -> None: ...
 
@@ -140,6 +145,19 @@ class LiveComponents:
     on_start: Callable[[], int | None] | None = None
     on_finish: Callable[[], None] | None = None
     prepare_perception: Callable[[], None] | None = None
+    readiness_timeout_s: float = 10.0
+    ts_video: bool = False
+
+    def __post_init__(self) -> None:
+        """验证视频首帧等待上限，避免无效配置连接外部资源后才失败。"""
+        timeout = self.readiness_timeout_s
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int | float)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("视频首帧等待上限必须是正的有限秒数")
 
 
 class LiveSession:
@@ -149,6 +167,7 @@ class LiveSession:
         self.options = options.validated()
         self.components = components
         self._worker_start_attempted = False
+        self._temporary_storage = None
         if not self.options.run_mission and components.runner is not None:
             raise ValueError("被动采集模式不得创建任务状态机")
 
@@ -169,17 +188,49 @@ class LiveSession:
             status = self._cleanup(status)
         return status
 
-    def _start_components(self) -> None:  # noqa: PLR0912 - 资源启动顺序需显式保持
+    def _start_components(self) -> None:  # noqa: PLR0912, PLR0915 - 资源启动顺序需显式保持
         """按数据依赖顺序启动遥测、记录、感知和视频。"""
         c = self.components
+        if c.ts_video and c.source is not None:
+            validate = getattr(c.source, "validate_pyav_config", None)
+            if callable(validate):
+                validate()
         c.thread.connect()
         if c.prepare_perception is not None:
             c.prepare_perception()
         if c.recorder is not None:
             if c.broker is None or c.buffer is None:
                 raise RuntimeError("启用记录时必须提供遥测代理和帧缓冲")
-            c.recorder.start(broker=c.broker, buffer=c.buffer)
+            if c.ts_video:
+                c.recorder.start(broker=c.broker, buffer=c.buffer, ts_video=True)
+            else:
+                c.recorder.start(broker=c.broker, buffer=c.buffer)
+        if c.ts_video:
+            if c.source is None or c.buffer is None:
+                raise RuntimeError("TS 视频需要采集源和帧缓冲")
+            if c.recorder is not None:
+                if c.recorder.flight_dir is None:
+                    raise RuntimeError("记录器未创建飞行目录")
+                directory = c.recorder.flight_dir / "video"
+                c.buffer.bind_cold_directory(directory)
+            else:
+                from airdrop.video.storage import TemporaryTsStorage
+
+                storage = TemporaryTsStorage()
+                self._temporary_storage = storage
+                lease = storage.acquire_lease()
+                try:
+                    c.buffer.bind_cold_directory(storage.directory, storage_lease=lease)
+                except BaseException:
+                    lease.close()
+                    raise
+                directory = storage.directory
+            c.source.set_recording_directory(directory)
         if c.worker is not None:
+            if c.recorder is not None and c.recorder.flight_dir is not None:
+                configure_crop_storage = getattr(c.worker, "configure_crop_storage", None)
+                if callable(configure_crop_storage):
+                    configure_crop_storage(c.recorder.flight_dir / "crops")
             self._worker_start_attempted = True
             c.worker.start()
         if c.source is not None:
@@ -187,7 +238,7 @@ class LiveSession:
                 c.source.add_sink(c.writer)
             c.source.start()
             if not self.options.recognize:
-                if not c.source.wait_ready(10.0):
+                if not c.source.wait_ready(c.readiness_timeout_s):
                     raise RuntimeError("视频采集启动后未收到视频帧")
                 if c.source.stats.frames < 1:
                     raise RuntimeError("视频采集未收到任何视频帧")
@@ -224,6 +275,18 @@ class LiveSession:
             if self.components.worker is not None:
                 self.components.worker.raise_if_failed()
             source = self.components.source
+            if source is not None:
+                check_source = getattr(source, "raise_if_failed", None)
+                if callable(check_source):
+                    check_source()
+            buffer = self.components.buffer
+            if buffer is not None:
+                buffer.raise_if_failed()
+            recorder = self.components.recorder
+            if recorder is not None:
+                check_recorder = getattr(recorder, "raise_if_failed", None)
+                if callable(check_recorder):
+                    check_recorder()
             if source is not None and not source.running:
                 raise RuntimeError("被动采集期间视频源意外停止")
             time.sleep(0.1)
@@ -232,7 +295,7 @@ class LiveSession:
             raise RuntimeError(f"被动采集结束时视频源状态异常：{source.stats.state}")
         return 0
 
-    def _cleanup(self, status: int) -> int:  # noqa: PLR0912 - 每个异步资源都需独立释放
+    def _cleanup(self, status: int) -> int:  # noqa: PLR0912, PLR0915 - 每个异步资源都需独立释放
         """逐项收尾；任何错误都不跳过后续资源，尤其是 MAVSDK 线程。"""
         c = self.components
         errors: list[BaseException] = []
@@ -285,6 +348,24 @@ class LiveSession:
             except BaseException as exc:
                 errors.append(exc)
                 LOGGER.exception("清理步骤失败：recorder.stop")
+        buffer = c.buffer
+        if buffer is not None:
+
+            def close_cold_storage() -> None:
+                buffer.close_cold_storage()
+
+            attempt("buffer.close_cold_storage", close_cold_storage)
+        storage = self._temporary_storage
+        if storage is not None:
+            if source_stopped and not errors and status == 0:
+                try:
+                    storage.producer_stopped()
+                    storage.finalize()
+                except BaseException as exc:
+                    errors.append(exc)
+                    LOGGER.exception("临时 TS 存储清理失败，目录保留：%s", storage.directory)
+            else:
+                LOGGER.warning("运行未正常排空，临时 TS 存储已保留：%s", storage.directory)
         if c.on_finish is not None:
             attempt("on_finish", c.on_finish)
         attempt("thread.stop", c.thread.stop)
