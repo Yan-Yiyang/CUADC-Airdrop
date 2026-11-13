@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -16,8 +17,43 @@ if TYPE_CHECKING:
     from airdrop.record.recorder import FlightRecorder
     from airdrop.telemetry.broker import TelemetryBroker
     from airdrop.video.buffer import AlignmentBuffer, AlignmentWriter
+    from airdrop.video.segments import SegmentLifecycle
 
 LOGGER = logging.getLogger(__name__)
+
+
+def build_alignment_buffer(
+    *,
+    capture: bool,
+    ts_directory: Path = Path("."),
+    segment_lifecycle: SegmentLifecycle | None = None,
+) -> AlignmentBuffer | None:
+    """建立在线与回放共用的原始帧缓冲和有界冷读缓存。"""
+    if not capture:
+        return None
+    from airdrop import AlignmentBuffer, capacity_for
+    from airdrop.video.cold import TsRangeDecoder
+
+    decoder = TsRangeDecoder(
+        ts_directory,
+        max_cache_bytes=64 * 1024 * 1024,
+        segment_lifecycle=segment_lifecycle,
+    )
+    try:
+        return AlignmentBuffer(
+            capacity_for(30.0, 180.0),
+            storage="raw",
+            cold_decoder=decoder,
+            hot_seconds=1.0,
+            max_hot_bytes=128 * 1024 * 1024,
+            segment_lifecycle=segment_lifecycle,
+        )
+    except BaseException as exc:
+        try:
+            decoder.close()
+        except BaseException as cleanup_error:  # noqa: BLE001 - 回滚必须保留构造原始异常
+            exc.add_note(f"历史解码器清理失败: {cleanup_error}")
+        raise
 
 
 @dataclass(slots=True)
@@ -42,6 +78,26 @@ def configure_opencv_threads(worker: PerceptionWorker, threads: int) -> None:
         threads,
         cv2.getNumThreads(),
     )
+
+
+def prepare_perception_components(
+    components: PerceptionComponents,
+    *,
+    output_size: tuple[int, int],
+    opencv_threads: int,
+) -> None:
+    """校验相机尺寸并预热感知模型，供在线与回放共用。"""
+    worker = components.worker
+    if worker is None:
+        return
+    camera = components.camera
+    if camera is not None and camera.image_size is not None:
+        calib_size = tuple(int(value) for value in camera.image_size)
+        if calib_size != output_size:
+            raise RuntimeError(f"相机标定尺寸 {calib_size} 与视频输出尺寸 {output_size} 不一致")
+    configure_opencv_threads(worker, opencv_threads)
+    if not worker.detector.warmup(*output_size):
+        raise RuntimeError(f"YOLO 按视频输出尺寸 {output_size} 预热失败")
 
 
 def build_perception_components(

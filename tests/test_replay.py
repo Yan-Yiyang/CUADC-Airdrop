@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -427,6 +427,7 @@ def test_runtime_replay_recovers_time_reversal_before_source_creation(
         assert source._log.index_time_error is not None
         raise SourceReached
 
+    monkeypatch.setattr(replay_runtime, "build_config", lambda **_overrides: Config())
     monkeypatch.setattr(airdrop, "ReplayVideoSource", inspect_source)
     expected = FrameIndexError if should_raise else SourceReached
     with pytest.raises(expected):
@@ -954,11 +955,14 @@ def test_replay_strict_raises_on_missing_frame(workdir: Path) -> None:
         source.stop()
 
 
-@pytest.mark.parametrize("failure_stage", [None, "load", "threads"])
+@pytest.mark.parametrize(
+    "failure_stage", [None, "load", "threads", "components", "cold-close", "worker-stop"]
+)
 def test_replay_setup_and_keyboard_interrupt_still_clean_all_components(
     monkeypatch: pytest.MonkeyPatch,
     workdir: Path,
     failure_stage: str | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import airdrop
     import airdrop.runtime.components as runtime_components
@@ -996,6 +1000,7 @@ def test_replay_setup_and_keyboard_interrupt_still_clean_all_components(
 
     class Worker:
         stats = object()
+        running = False
 
         class Detector:
             def load(self) -> None:
@@ -1003,10 +1008,18 @@ def test_replay_setup_and_keyboard_interrupt_still_clean_all_components(
                 if failure_stage == "load":
                     raise RuntimeError("detector load failed")
 
+            def warmup(self, width: int, height: int) -> bool:
+                calls.append(f"warmup:{width}x{height}")
+                return True
+
         detector = Detector()
 
         def start(self) -> None:
             calls.append("worker.start")
+            self.running = True
+
+        def finish_input(self) -> None:
+            calls.append("worker.finish_input")
 
         def raise_if_failed(self) -> None:
             return
@@ -1018,6 +1031,8 @@ def test_replay_setup_and_keyboard_interrupt_still_clean_all_components(
 
         def stop(self) -> None:
             calls.append("worker.stop")
+            if failure_stage != "worker-stop":
+                self.running = False
 
     class Writer:
         def __call__(self, frame: object) -> None:
@@ -1045,8 +1060,36 @@ def test_replay_setup_and_keyboard_interrupt_still_clean_all_components(
     source = Source()
     worker = Worker()
     targets = Targets()
+
+    def close_cold_storage() -> None:
+        calls.append("buffer.close")
+        if failure_stage == "cold-close":
+            raise OSError("cold storage close failed")
+
+    def build_components() -> PerceptionComponents:
+        if failure_stage == "components":
+            calls.append("components.build")
+            raise RuntimeError("component construction failed")
+        return cast(
+            PerceptionComponents,
+            SimpleNamespace(
+                writer=Writer(), camera=None, worker=worker, tracker=object(), targets=targets
+            ),
+        )
+
     monkeypatch.setattr(replay_runtime, "build_config", lambda **_kwargs: config)
     monkeypatch.setattr(replay_runtime, "resolve_flight_dir", lambda _path: workdir)
+    monkeypatch.setattr(
+        replay_runtime,
+        "_build_replay_buffer",
+        lambda _source, _resolved: (
+            SimpleNamespace(
+                close_cold_storage=close_cold_storage,
+                raise_if_failed=lambda: None,
+            ),
+            (96, 64),
+        ),
+    )
     monkeypatch.setattr(
         airdrop,
         "load_broker_from_log",
@@ -1056,12 +1099,7 @@ def test_replay_setup_and_keyboard_interrupt_still_clean_all_components(
     monkeypatch.setattr(
         runtime_components,
         "build_perception_components",
-        lambda *_args, **_kwargs: cast(
-            PerceptionComponents,
-            SimpleNamespace(
-                writer=Writer(), camera=None, worker=worker, tracker=object(), targets=targets
-            ),
-        ),
+        lambda *_args, **_kwargs: build_components(),
     )
     monkeypatch.setattr(runtime_qgc, "QgcVideoRuntime", Display)
 
@@ -1072,21 +1110,35 @@ def test_replay_setup_and_keyboard_interrupt_still_clean_all_components(
 
     monkeypatch.setattr(cv2, "setNumThreads", set_threads)
 
-    with pytest.raises(KeyboardInterrupt, match="stop interrupted"):
+    expected_exception = RuntimeError if failure_stage == "components" else KeyboardInterrupt
+    expected_message = (
+        "component construction failed" if failure_stage == "components" else "stop interrupted"
+    )
+    with pytest.raises(expected_exception, match=expected_message):
         replay_runtime.main(flight_dir=workdir)
+
+    if failure_stage == "components":
+        assert calls == ["components.build", "buffer.close", "source.stop"]
+        return
 
     expected_setup = ["detector.load"]
     if failure_stage != "load":
         expected_setup.append("threads:4")
-    if failure_stage is None:
+    worker_started = failure_stage not in {"load", "threads"}
+    if worker_started:
+        expected_setup.append("warmup:96x64")
+    if worker_started:
         expected_setup.append("worker.start")
     assert calls == expected_setup + [
         "source.stop",
-        "worker.drain",
+        *(["worker.finish_input", "worker.drain"] if worker_started else []),
         "worker.stop",
         "targets.pump",
         "display.stop",
+        "buffer.close",
     ]
+    if failure_stage == "worker-stop":
+        assert "回放感知工作器未确认停止" in caplog.text
 
 
 def test_replay_rejects_bad_params(workdir: Path) -> None:
@@ -1106,28 +1158,16 @@ def test_replay_tail_keeps_source_alive(workdir: Path) -> None:
     assert time.monotonic() - started >= 0.25
 
 
-def test_replay_sink_exception_does_not_stop_playback(workdir: Path) -> None:
-    """非 strict：sink 抛异常只记日志，其余 sink 与后续帧不受影响。"""
+@pytest.mark.parametrize("strict", [False, True])
+def test_replay_sink_exception_is_fatal(workdir: Path, strict: bool) -> None:
+    """素材恢复开关不屏蔽正式帧处理 sink 的故障。"""
     flight_dir, *_ = _write_flight(workdir, frames=4)
-    source = ReplayVideoSource(flight_dir, speed=0.0, strict=False)
-    good: list[int] = []
+    source = ReplayVideoSource(flight_dir, speed=0.0, strict=strict)
 
     def bad_sink(frame) -> None:
         raise RuntimeError("sink 抛出异常了")
 
     source.add_sink(bad_sink)
-    source.add_sink(lambda f: good.append(f.index))
-    _play_to_completion(source)
-    assert good == [1, 2, 3, 4]
-    assert source.stats.frames == 4
-    assert source.stats.state == "finished"
-
-
-def test_replay_strict_sink_exception_fails_fast(workdir: Path) -> None:
-    """strict：sink 抛异常直接让回放进入 error，不静默吞掉。"""
-    flight_dir, *_ = _write_flight(workdir, frames=4)
-    source = ReplayVideoSource(flight_dir, speed=0.0, strict=True)
-    source.add_sink(lambda frame: (_ for _ in ()).throw(RuntimeError("sink 抛出异常了")))
     _play_to_completion(source)
     assert source.stats.state == "error"
     assert "sink" in (source.stats.last_error or "")
@@ -1147,6 +1187,59 @@ def test_replay_remove_sink(workdir: Path) -> None:
     assert source.sinks == ()
     _play_to_completion(source)
     assert got == []
+
+
+def test_replay_config_snapshot_restores_sections_and_cli_overrides(workdir: Path) -> None:
+    """回放恢复录制时的业务配置，再只覆盖显式 CLI 字段。"""
+    from airdrop.config import Waypoint
+    from airdrop.record.replay import load_config_snapshot
+
+    flight_dir = workdir / "snapshot"
+    flight_dir.mkdir()
+    recorded = Config().replace(
+        perception=replace(Config().perception, mode="cls12", ocr_workers=5),
+        align=replace(Config().align, max_wait=2.5),
+        targeting=replace(Config().targeting, selection_rule="max"),
+        routes=replace(Config().routes, recon_route=(Waypoint(1, 2, 3),)),
+        video=replace(Config().video, extra_input_args=("-x", "y")),
+    )
+    (flight_dir / "config_snapshot.json").write_text(json.dumps(asdict(recorded)), encoding="utf-8")
+    restored = load_config_snapshot(flight_dir)
+    assert restored == recorded
+    overridden = replay_runtime.build_config(
+        flight_dir=flight_dir, perception_mode="ocr", selection_rule="median"
+    )
+    assert overridden.perception.mode == "ocr"
+    assert overridden.perception.ocr_workers == 5
+    assert overridden.align.max_wait == 2.5
+    assert overridden.targeting.selection_rule == "median"
+    assert overridden.routes.recon_route == recorded.routes.recon_route
+    assert overridden.video.extra_input_args == ("-x", "y")
+
+    data = asdict(recorded)
+    del data["align"]["max_wait"]
+    (flight_dir / "config_snapshot.json").write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="字段"):
+        load_config_snapshot(flight_dir)
+
+    data = asdict(recorded)
+    data["routes"]["backup_point"] = {"lat": 1.0, "lon": 2.0, "alt_m": 3.0}
+    (flight_dir / "config_snapshot.json").write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="航点字段"):
+        load_config_snapshot(flight_dir)
+
+    data["routes"]["backup_point"]["acceptance_radius_m"] = 0.0
+    data["routes"]["backup_point"]["lat"] = True
+    (flight_dir / "config_snapshot.json").write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="航点类型"):
+        load_config_snapshot(flight_dir)
+
+    data = asdict(recorded)
+    data["routes"]["backup_point"] = None
+    data["align"]["max_extrapolation"] = "None"
+    (flight_dir / "config_snapshot.json").write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="align.max_extrapolation"):
+        load_config_snapshot(flight_dir)
 
 
 def test_replay_stats_snapshot_is_a_copy(workdir: Path) -> None:
@@ -1372,24 +1465,86 @@ def test_replay_from_buffer_mode_ends_when_expected_frames_were_evicted(
 def test_replay_sink_mode_does_not_wait_for_a_nonexistent_read_consumer(
     workdir: Path,
 ) -> None:
-    """纯 sink 消费（全链路回放 / record 落盘）不该按"未读帧数"白等。
-
-    ``_delivered`` 只在 read() 里推进，纯 sink 路径一次都不调 ⇒ outstanding 等于
-    全部已播帧数，按 0.01s/未读帧 算出来的 deadline 是 0.5+0.01×N：6 分钟 30fps
-    的素材就是白等 108 秒。
-    """
-    flight_dir, *_ = _write_flight(workdir, frames=40)
+    """纯 sink 自然结束不按未读帧数空等。"""
+    flight_dir, *_ = _write_flight(workdir, frames=500)
     source = ReplayVideoSource(flight_dir, speed=0.0)
-    source.add_sink(lambda f: None)  # 只有 sink，没有 read()
+    sink_entered = threading.Event()
+    release_sink = threading.Event()
+    tail_delivered = threading.Event()
+    sunk: list[int] = []
 
-    t0 = time.perf_counter()
-    _play_to_completion(source)
-    elapsed = time.perf_counter() - t0
+    def sink(frame: Any) -> None:
+        sunk.append(frame.index)
+        if frame.index == 1:
+            sink_entered.set()
+            assert release_sink.wait(10.0), "首帧 sink gate 未释放"
+        if frame.index == 500:
+            tail_delivered.set()
 
-    assert source.stats.state == "finished"
-    assert source.stats.frames == 40
-    # 40 帧 × 0.01s = 0.4s 额外空等；修复后只剩固定 0.5s 宽限期
-    assert elapsed < 5.0, f"纯 sink 回放收尾空等过久：{elapsed:.2f}s"
+    source.add_sink(sink)
+    source.start()
+    try:
+        assert sink_entered.wait(5.0), "首帧没有到达 sink"
+        assert source.wait_ready(timeout=1.0)
+        release_sink.set()
+        assert tail_delivered.wait(15.0), "回放未送达末帧"
+        assert source.wait_finished(timeout=2.0), "末帧送达后未及时进入 finished"
+        assert source.stats.state == "finished"
+        assert source.join(timeout=1.0)
+    finally:
+        release_sink.set()
+        source.stop()
+
+    assert source.stats.frames == 500
+    assert sunk == list(range(1, 501)), "纯 sink 回放丢帧"
+
+
+def test_replay_wait_ready_preserves_first_frame(workdir: Path) -> None:
+    """wait_ready 等待首帧时不推进 read() 消费游标。"""
+    flight_dir, *_ = _write_flight(workdir, frames=3)
+    source = ReplayVideoSource(flight_dir, speed=0.0)
+    sink_entered = threading.Event()
+    release_sink = threading.Event()
+
+    def sink(frame: Any) -> None:
+        if frame.index == 1:
+            sink_entered.set()
+            assert release_sink.wait(10.0), "首帧 sink gate 未释放"
+
+    source.add_sink(sink)
+    source.start()
+    try:
+        assert sink_entered.wait(5.0), "首帧没有到达 sink"
+        assert source.wait_ready(timeout=1.0)
+        assert source.wait_ready(timeout=0.0)
+        first = source.read(timeout=0)
+    finally:
+        release_sink.set()
+        source.stop()
+
+    assert first is not None and first.index == 1, "wait_ready 消费了首帧"
+
+
+@pytest.mark.parametrize(("strict", "terminal"), [(True, "error"), (False, "finished")])
+def test_replay_wait_ready_returns_false_without_any_frame(
+    workdir: Path, strict: bool, terminal: str
+) -> None:
+    """首帧缺失时 ready 等待返回 False，且不掩盖终态。"""
+    flight_dir, *_ = _write_flight(workdir, frames=1)
+    (flight_dir / "frames" / "000001.jpg").unlink()
+    source = ReplayVideoSource(flight_dir, speed=0.0, strict=strict)
+
+    assert not source.wait_ready(timeout=0.0)
+    source.start()
+    try:
+        started = time.monotonic()
+        assert not source.wait_ready(timeout=5.0)
+        assert time.monotonic() - started < 2.0, "无帧终态未及时返回"
+        assert source.wait_finished(timeout=5.0)
+        assert source.stats.state == terminal
+    finally:
+        source.stop()
+    assert not source.wait_ready(timeout=0.0)
 
 
 def test_replay_finished_state_distinguishable_from_stopped(workdir: Path) -> None:

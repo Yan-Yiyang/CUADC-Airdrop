@@ -37,15 +37,17 @@ import json
 import logging
 import threading
 import time
+import types
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from math import isfinite
 from pathlib import Path
-from typing import Any, get_args, get_type_hints
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import cv2
 import numpy as np
 
+from ..config import Config, Waypoint
 from ..telemetry.broker import TelemetryBroker
 from ..telemetry.models import TelemetrySnapshot
 from ..video.buffer import AlignmentBuffer
@@ -62,7 +64,85 @@ __all__ = [
     "ReplayVideoSource",
     "TelemetryPacer",
     "load_broker_from_log",
+    "load_config_snapshot",
 ]
+
+
+def load_config_snapshot(flight_dir: str | Path) -> Config:
+    """严格恢复录制的完整配置快照，拒绝缺失或未知字段。"""
+    path = Path(flight_dir) / "config_snapshot.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("配置快照顶层必须是对象")
+    defaults = Config()
+    expected_sections = {field.name for field in fields(Config)}
+    if set(data) != expected_sections:
+        raise ValueError("配置快照字段与当前 Config 不一致")
+
+    def restore(section, values: dict[str, Any], name: str):
+        expected = {field.name for field in fields(section)}
+        if not isinstance(values, dict) or set(values) != expected:
+            raise ValueError(f"配置快照 {name} 字段与当前配置不一致")
+        if name == "routes":
+            values = dict(values)
+            for key in ("recon_route", "landing_route"):
+                if not isinstance(values[key], list):
+                    raise ValueError(f"配置快照 routes.{key} 必须是数组")
+                values[key] = tuple(restore_waypoint(item, f"routes.{key}") for item in values[key])
+            if values["backup_point"] is not None:
+                values["backup_point"] = restore_waypoint(
+                    values["backup_point"], "routes.backup_point"
+                )
+        if name == "video":
+            values = dict(values)
+            for key in ("extra_input_args", "extra_output_args"):
+                if not isinstance(values[key], list) or not all(
+                    isinstance(item, str) for item in values[key]
+                ):
+                    raise ValueError(f"配置快照 video.{key} 必须是字符串数组")
+                values[key] = tuple(values[key])
+        hints = get_type_hints(type(section))
+        for key, value in values.items():
+            if not matches(value, hints[key]):
+                raise ValueError(f"配置快照 {name}.{key} 类型无效")
+        return type(section)(**values)
+
+    def restore_waypoint(value: Any, name: str) -> Waypoint:
+        expected = {item.name for item in fields(Waypoint)}
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError(f"配置快照 {name} 航点字段无效")
+        hints = get_type_hints(Waypoint)
+        if not all(matches(value[key], hints[key]) for key in expected):
+            raise ValueError(f"配置快照 {name} 航点类型无效")
+        return Waypoint(**value)
+
+    def matches(value: Any, annotation: Any) -> bool:
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        if origin in (types.UnionType, Union):
+            return any(matches(value, option) for option in args)
+        if annotation in (type(None), bool, int, str):
+            return type(value) is annotation
+        if origin is tuple:
+            if type(value) is not tuple:
+                return False
+            if len(args) == 2 and args[1] is Ellipsis:
+                return all(matches(item, args[0]) for item in value)
+            return len(value) == len(args) and all(
+                matches(item, item_type) for item, item_type in zip(value, args, strict=True)
+            )
+        if annotation is float:
+            return type(value) in (int, float) and isfinite(float(value))
+        if isinstance(annotation, type) and hasattr(annotation, "__dataclass_fields__"):
+            return isinstance(value, annotation)
+        return False
+
+    restored = {
+        field.name: restore(getattr(defaults, field.name), data[field.name], field.name)
+        for field in fields(Config)
+    }
+    return Config(**restored).validated()
+
 
 # 与 FlightRecorder 落盘格式一致的文件名（见 airdrop.record.recorder）
 FRAMES_DIR = "frames"
@@ -712,7 +792,7 @@ class ReplayVideoSource:
         if any(record.storage == "ts" for record in self._log.frames):
             from ..video.cold import TsRangeDecoder
 
-            self._ts_decoder = TsRangeDecoder(self._log.flight_dir / "video")
+            self._ts_decoder = TsRangeDecoder(self._log.flight_dir / "video", cache_enabled=False)
         self._speed = float(speed)
         self._telemetry = telemetry
         self._buffer = buffer
@@ -845,7 +925,20 @@ class ReplayVideoSource:
 
     def wait_ready(self, timeout: float = 10.0) -> bool:
         """等到第一帧被投递（与实飞源同义）。"""
-        return self.read(timeout=timeout) is not None
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while True:
+                if self._frame is not None:
+                    return True
+                if (
+                    self._stats.state in {"finished", "error", "stopped"}
+                    or self._stop_event.is_set()
+                ):
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
 
     def wait_finished(self, timeout: float | None = None) -> bool:
         """等待播放进入 finished/error/stopped 终态，超时返回 False。"""
@@ -1167,11 +1260,8 @@ class ReplayVideoSource:
             try:
                 sink(frame)
             except Exception:
-                if self._strict:
-                    # strict 模式下不吞：sink 抛异常通常意味着配置/接线错了，
-                    # 静默跳过只会让人以为"回放跑通了"。
-                    raise
                 LOGGER.exception("回放帧 sink 执行失败")
+                raise
 
     def _update_fps_locked(self) -> None:
         """按回放墙钟统计实际帧率（``speed=0`` 时就是处理吞吐）。"""

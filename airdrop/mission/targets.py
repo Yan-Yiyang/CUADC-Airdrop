@@ -212,16 +212,19 @@ class TargetTracker:
     # 内部
     # ------------------------------------------------------------------
     def _image_size_matches(self, detection: Detection) -> bool:
-        """已知尺寸必须匹配；旧记录没有尺寸字段时保留原有读取行为。"""
+        """检测记录必须携带有效尺寸，已知相机尺寸还必须与之匹配。"""
         size = detection.extra.get("image_size")
         expected = self.camera.image_size
-        if size is None or expected is None:
-            return True
-        if isinstance(size, (tuple, list)) and tuple(size) == expected:
+        valid = (
+            isinstance(size, (tuple, list))
+            and len(size) == 2
+            and all(type(value) is int and value > 0 for value in size)
+        )
+        if valid and (expected is None or tuple(size) == expected):
             return True
         self._image_size_mismatch += 1
         if self._image_size_mismatch == 1:
-            LOGGER.warning("检测画面尺寸 %s 与相机模型 %s 不符，拒绝解算", size, expected)
+            LOGGER.warning("检测画面尺寸 %s 无效或与相机模型 %s 不符，拒绝解算", size, expected)
         self._emit(
             "image_size_mismatch",
             {

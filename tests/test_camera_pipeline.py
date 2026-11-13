@@ -91,7 +91,7 @@ def test_remapped_and_raw_pixels_resolve_the_same_known_ray(ray: tuple[float, fl
         box=PixelBox(0, 0, 1, 1),
         confidence=1.0,
         telemetry=snapshot,
-        extra={"undistorted": False},
+        extra={"undistorted": False, "image_size": (640, 480)},
     )
     tracker = TargetTracker(Config(), camera=camera)
     raw_point = tracker.add(raw)
@@ -104,13 +104,18 @@ def test_remapped_and_raw_pixels_resolve_the_same_known_ray(ray: tuple[float, fl
     assert (rectified_point.north_m, rectified_point.east_m) == pytest.approx(expected, abs=0.02)
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-@pytest.mark.parametrize("override", [None, False])
-@pytest.mark.parametrize("prepared", [True, False])
+@pytest.mark.parametrize(
+    ("enabled", "override"),
+    [
+        pytest.param(True, None, id="first-frame"),
+        pytest.param(False, None, id="disabled-in-config"),
+        pytest.param(True, False, id="disabled-for-frame"),
+    ],
+)
 def test_detector_rejects_wrong_size_before_inference(
-    enabled: bool, override: bool | None, prepared: bool, monkeypatch: pytest.MonkeyPatch
+    enabled: bool, override: bool | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """关闭纠正、首帧尺寸错误或后续变尺寸，都不能用原内参继续检测。"""
+    """首帧与标定尺寸不符时，任何去畸变设置都应在加载模型前报错。"""
     detector = Detector(
         DetectorConfig(
             camera_matrix=np.array([[450.0, 0, 320], [0, 450.0, 240], [0, 0, 1.0]]),
@@ -118,8 +123,6 @@ def test_detector_rejects_wrong_size_before_inference(
             undistort=enabled,
         )
     )
-    if prepared:
-        detector.prepare_undistort(640, 480)
     monkeypatch.setattr(detector, "load", lambda: pytest.fail("尺寸不符不应加载或运行模型"))
     with pytest.raises(FrameSizeMismatchError, match="320x240.*640, 480.*停止运行"):
         detector.detect(np.zeros((240, 320, 3), np.uint8), undistort=override)
@@ -129,14 +132,17 @@ def test_detector_rejects_size_change_when_only_the_cached_size_is_known() -> No
     detector = Detector(
         DetectorConfig(camera_matrix=np.array([[450.0, 0, 320], [0, 450.0, 240], [0, 0, 1.0]]))
     )
-    assert detector.prepare_undistort(640, 480)
     model = _MarkerModel()
     detector._model = model
+    first = np.zeros((480, 640, 3), np.uint8)
+    first[240, 320] = 255
+    detector.detect(first)
+    assert model.calls == 1
     image = np.zeros((240, 320, 3), np.uint8)
     image[120, 160] = 255
     with pytest.raises(FrameSizeMismatchError):
         detector.detect(image, undistort=False)
-    assert model.calls == 0
+    assert model.calls == 1
 
 
 def test_detector_records_matching_size() -> None:
@@ -150,17 +156,28 @@ def test_detector_records_matching_size() -> None:
     assert model.calls == 1
 
 
-@pytest.mark.parametrize("size", [(320, 240), [320, 240], [640], "640x480", 640])
-@pytest.mark.parametrize("undistort", [None, False, True])
-def test_tracker_rejects_incompatible_image_size(size, undistort: bool | None) -> None:
-    """解算端也核对尺寸，覆盖不经正式检测器进入的记录和外部检测结果。"""
+@pytest.mark.parametrize(
+    ("camera_size", "extra"),
+    [
+        pytest.param((640, 480), {"image_size": [320, 240]}, id="different-size"),
+        pytest.param((640, 480), {}, id="missing-field"),
+        pytest.param((640, 480), {"image_size": [640.0, 480]}, id="float-equals-int"),
+        pytest.param(None, {"image_size": None}, id="null-without-reference"),
+        pytest.param(None, {"image_size": "640x480"}, id="not-a-sequence-of-dimensions"),
+        pytest.param(None, {"image_size": [640]}, id="missing-height"),
+        pytest.param(None, {"image_size": [True, 480]}, id="boolean"),
+        pytest.param(None, {"image_size": [640, 0]}, id="nonpositive"),
+    ],
+)
+def test_tracker_rejects_invalid_or_incompatible_image_size(camera_size, extra) -> None:
+    """外部记录缺尺寸、尺寸畸形或与标定不符时不产生定位点。"""
     camera = CameraModel(
         camera_matrix=np.array([[450.0, 0, 320], [0, 450.0, 240], [0, 0, 1.0]]),
-        image_size=(640, 480),
+        image_size=camera_size,
     )
     events: list[str] = []
     tracker = TargetTracker(
-        Config(), camera=camera, undistort=undistort, on_event=lambda kind, _: events.append(kind)
+        Config(), camera=camera, undistort=False, on_event=lambda kind, _: events.append(kind)
     )
     detection = Detection(
         frame_index=1,
@@ -171,7 +188,7 @@ def test_tracker_rejects_incompatible_image_size(size, undistort: bool | None) -
         telemetry=TelemetrySnapshot(
             north_m=10.0, east_m=20.0, down_m=-50.0, roll_deg=0.0, pitch_deg=0.0, yaw_deg=0.0
         ),
-        extra={"image_size": size, "undistorted": True},
+        extra=extra,
     )
     assert tracker.add(detection) is None
     assert not tracker.points
@@ -181,8 +198,7 @@ def test_tracker_rejects_incompatible_image_size(size, undistort: bool | None) -
     assert tracker.stats["image_size_mismatch"] == 0
 
 
-@pytest.mark.parametrize("recorded_size", [(640, 480), [640, 480], None])
-def test_tracker_accepts_matching_sizes_and_legacy_records(recorded_size) -> None:
+def test_tracker_accepts_matching_sizes_and_json_records() -> None:
     camera = CameraModel(
         camera_matrix=np.array([[450.0, 0, 320], [0, 450.0, 240], [0, 0, 1.0]]),
         image_size=(640, 480),
@@ -198,15 +214,17 @@ def test_tracker_accepts_matching_sizes_and_legacy_records(recorded_size) -> Non
     # 实际写入 JSON 后尺寸变成列表，也必须与元组形式兼容。
     extra = json.loads(json.dumps(detection.as_dict()))["extra"]
     assert extra["image_size"] == [640, 480]
-    if recorded_size is None:
-        extra.pop("image_size")
-    else:
-        extra["image_size"] = recorded_size
-    tracker = TargetTracker(Config(), camera=camera)
-    point = tracker.add(replace(detection, extra=extra))
-    assert point is not None
-    assert (point.north_m, point.east_m) == pytest.approx((10.0, 20.0))
-    assert tracker.stats["image_size_mismatch"] == 0
+    from_json = replace(detection, extra=extra)
+    for model, record in (
+        (camera, detection),
+        (camera, from_json),
+        (replace(camera, image_size=None), from_json),
+    ):
+        tracker = TargetTracker(Config(), camera=model)
+        point = tracker.add(record)
+        assert point is not None
+        assert (point.north_m, point.east_m) == pytest.approx((10.0, 20.0))
+        assert tracker.stats["image_size_mismatch"] == 0
 
 
 def test_scaled_camera_must_be_shared_by_detector_and_tracker() -> None:

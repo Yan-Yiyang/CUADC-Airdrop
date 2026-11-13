@@ -592,7 +592,7 @@ class PerceptionWorker:
             self._notify_frame_observers(frame, batch.image, batch.undistorted, batch.detections)
             for ordinal, detection in enumerate(batch.detections):
                 if self._crop_store is not None:
-                    crop, bounds = self._crop_with_bounds(batch, detection)
+                    crop, bounds = self._detector.crop_with_bounds(batch, detection)
                     self._crop_store.save(
                         detection, ordinal, crop, bounds, undistorted=batch.undistorted
                     )
@@ -611,7 +611,7 @@ class PerceptionWorker:
 
         for ordinal, detection in enumerate(batch.detections):
             crop_start = timing.now_ns() if timing.ENABLED else 0
-            crop, bounds = self._crop_with_bounds(batch, detection)
+            crop, bounds = self._detector.crop_with_bounds(batch, detection)
             if crop.size == 0:
                 continue
             if self._crop_store is not None:
@@ -691,17 +691,6 @@ class PerceptionWorker:
             pose=pose,
             detections=tuple(snapshot_detection(item) for item in detections),
         )
-
-    def _crop_with_bounds(
-        self, batch: Any, detection: Detection
-    ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
-        """兼容离线注入的轻量检测器，并保留实际裁切坐标。"""
-        cropper = getattr(self._detector, "crop_with_bounds", None)
-        if cropper is not None:
-            return cropper(batch, detection)
-        image = self._detector.crop(batch, detection)
-        x1, y1, x2, y2 = detection.box.x1, detection.box.y1, detection.box.x2, detection.box.y2
-        return image, (int(x1), int(y1), int(np.ceil(x2)), int(np.ceil(y2)))
 
     def _notify_frame_observers(
         self,

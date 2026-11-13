@@ -8,11 +8,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 
-def _run(code: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+
+def _run(
+    code: str, env: dict[str, str], *, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-B", "-c", code],
         env=env,
+        cwd=cwd,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -21,11 +26,26 @@ def _run(code: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_trace_disabled_does_not_create_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
+def test_trace_switch_controls_file_creation(tmp_path: Path, enabled: bool) -> None:
+    """在实际工作目录检查追踪开关，启用场景同时验证子进程确实写出事件。"""
     env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     env.pop("AIRDROP_PERF_TRACE_DIR", None)
-    _run("from airdrop.perception.timing import emit, flush; emit('disabled'); flush()", env)
-    assert list(tmp_path.iterdir()) == []
+    if enabled:
+        env["AIRDROP_PERF_TRACE_DIR"] = str(tmp_path)
+    _run(
+        "from airdrop.perception.timing import emit, flush; emit('probe'); flush()",
+        env,
+        cwd=tmp_path,
+    )
+    files = list(tmp_path.iterdir())
+    if enabled:
+        assert len(files) == 1 and files[0].name.startswith("perf-")
+        rows = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+        assert [row["event"] for row in rows] == ["probe"]
+    else:
+        assert files == []
 
 
 def test_trace_records_process_context_and_preserves_call_result(tmp_path: Path) -> None:

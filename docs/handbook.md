@@ -5,7 +5,7 @@
 > **不是手抄**；字段语义、失败语义与流程说明由人工逐文件核对源码后写出，
 > 关键处以 `文件:行号` 或 `模块.函数` 标注。
 > 文中所有 `airdrop.*` 形式的引用都经过核验：能真正 `import` + `getattr` 解析到。
-> §3 的示例由 `tests/test_handbook.py` **逐条真跑**（11 条），文档一致性由
+> §3 的代表性装配示例由 `tests/test_handbook.py` 验证，算法行为由各模块专项回归验证；文档一致性由
 > `python -m airdrop.run check-docs` 把关（参数齐全 / 引用可解析 / 产物文件名齐全 / 无编造参数名）。
 
 ## 0. 这份文档怎么用
@@ -193,6 +193,10 @@
 **原始时间戳**逐步灌进 broker（见 §3.3），于是对齐、解算、聚类、判据**一行都不用改**
 （`airdrop.record.replay` 的模块 docstring 把这条设计意图写在最前面）。
 
+正式在线与 runtime 回放共用原始帧缓存配置和模型预热函数。回放严格恢复
+`config_snapshot.json`，再应用显式命令行覆盖；只接受具备统一尺寸的 TS 帧索引。
+回放不接飞控或上传任务，离线通过不代表完整飞行验收。缓存、推理改动需同时验证在线和回放。
+
 ### 2.2 模块依赖关系
 
 | 模块 | 依赖谁 | 被谁依赖 |
@@ -262,7 +266,7 @@
 ## 3. 模块逐个说明
 
 每节给出：职责与关键类型 → **调用方法（签名）** → **最小可运行示例**（离线、不碰硬件；
-本节所有示例都在 `tests/test_handbook.py` 里逐条真跑，11/11 通过）→ 注入点/协议 →
+其中五个装配示例在 `tests/test_handbook.py` 维护，手写用例不自动提取本节原文）→ 注入点/协议 →
 失败语义 → 易错点与指针。
 
 ### 3.1 `airdrop.telemetry` —— 遥测与控制
@@ -554,8 +558,8 @@ ReplayVideoSource(flight_dir, *, speed=0.0, telemetry=None, buffer=None,
 `speed=0` 全速（批量回归）/ `1.0` 原速。与 `Hm30VideoSource` **同一套公开接口**
 （`add_sink`/`read`/`latest`/`stats`/`iter_frames`/`stop`/`wait_ready`），换进去即可。
 `sink` 路径一帧不落；`read()` 仍允许跳帧（计入 `stats.dropped`，回放里叫 `skipped` 的是
-"素材缺文件/解码失败"）。`strict=True` 下缺帧或 sink 抛异常会让回放以
-`state="error"` 结束。默认 `strict=None` 在完整航次启用严格模式，异常收尾时告警并保留可验证的数据前缀；`strict=False` 明确允许跳过坏帧。
+"素材缺文件/解码失败"）。缺帧恢复由 `strict` 控制；sink 异常始终让回放以
+`state="error"` 结束。默认 `strict=None` 在完整航次启用严格模式，异常收尾时告警并保留可验证的数据前缀；`strict=False` 明确允许跳过坏素材。
 
 #### 3.3.3 `load_broker_from_log` / `TelemetryPacer`（原时间轴回填）
 
@@ -614,7 +618,7 @@ FlightLog.iter_telemetry() -> Iterator[TelemetrySnapshot]
 | `raw_text` | `''` | OCR 原始串（纠错前） |
 | `ocr_confidence` | `0.0` | OCR 置信度 |
 | `mode` | `''` | 产生它的模式（`ocr` / `cls12`） |
-| `extra` | 空字典 | 检测器写入 `undistorted`（是否已纠正）和 `image_size`（像素所在画面的宽、高；JSON 中为二元素列表） |
+| `extra` | 空字典 | 检测器写入 `undistorted`（是否已纠正）和 `image_size`（画面宽、高）。送入 `TargetTracker` 定位时必须提供尺寸，JSON 中为二元素列表。 |
 
 属性 `has_code`（`code is not None`）与 `as_dict()`（键：`frame_index`、`capture_timestamp`、`pixel`、`box`、`confidence`、`code`、`side_px`、`raw_text`、`ocr_confidence`、`mode`、`telemetry`、`extra`；`telemetry` 内嵌 `timestamp`、`latitude_deg`、`longitude_deg`、`absolute_altitude_m`、`north_m`、`east_m`、`down_m`、`roll_deg`、`pitch_deg`、`yaw_deg`，`extra` 为空时不出现）。`detections.jsonl` 与回放素材里写的就是这个字典。
 
@@ -638,6 +642,7 @@ DetectorConfig(model_path='models/best2.pt', device='0', conf_threshold=0.25,
 | `undistort(image)` | 返回 `(纠正后图像, 是否真的纠正了)` |
 | `detect(image, *, frame_index=0, capture_timestamp=0.0, telemetry=None, mode='', undistort=None)` | 返回 `DetectionBatch(image, detections, undistorted)`；已知尺寸不符时抛 `FrameSizeMismatchError`，提示输入与标定尺寸并终止本次运行，不加载或运行模型 |
 | `crop(batch, detection)` | 按 `crop_expand_ratio` 外扩取目标裁剪图（交给后处理） |
+| `crop_with_bounds(batch, detection)` | 返回外扩并裁至画面内的图像，以及它在输入图像中的半开范围 `(x1, y1, x2, y2)`。感知工作器用这组坐标记录裁剪位置。 |
 | `replace_config(**changes)` | 派生一个新检测器（改 `conf_threshold` 等做 A/B） |
 
 三个必须知道的行为：
@@ -1333,7 +1338,7 @@ PerceptionTargetSource(worker, tracker)
 行为约定：
 
 - **缺姿态或位置的点不猜**：分别计入 `attitude_missing` / `no_fix` 后跳过（计数可从 tracker 的统计读到）。
-- **画面尺寸必须与相机模型一致**：`Detection.extra["image_size"]` 与 `CameraModel.image_size` 不符或格式错误时拒绝解算，计入 `image_size_mismatch` 并记录同名事件；`reset()` 清零。旧记录未携带尺寸，或模型未声明尺寸时保留原行为，这不代表已经通过尺寸核对。
+- `TargetTracker.add` 要求 `Detection.extra["image_size"]` 是由两个正整数组成的元组或列表，依次表示画面宽、高。相机模型声明了 `image_size` 时还要核对两者相等。检测尺寸缺失、格式错误或与标定不符时，跳过该条定位，计入 `image_size_mismatch` 并记录同名事件。`reset()` 清零。相机模型未声明尺寸时，有效检测仍按模型内参解算。
 - **边长交叉验证默认只当诊断**：超门限记 `side_check` 事件与计数，**不剔点**（默认 `reject_on_side_mismatch=False`；误判一个真实观测比多一个野点的代价大）。`DEFAULT_SIDE_TOLERANCE=0.25` 与 `cross_check_by_side` 的默认一致。
 - `undistort=None` 时按 `Detection.extra["undistorted"]` 自动判断要不要去畸变（见 3.5.4）。
 - `ground_z(snapshot)` 只依赖配置里的地面点参数；给不出时返回 0（原点高度面），由调用方决定记不记警告。
@@ -2007,7 +2012,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `recon_waiting_operator` | `MissionRunner` | `note`：`recon_upload='operator'`，本包**不上传**侦查航线，等操作手在 QGC 上传并启动 |
 | `drop_dry_run` | `DryRunController` | `count`：演练模式下第几次"投放只记日志" |
 | `side_check` | `TargetTracker` | 边长法交叉验证超门限的诊断（**默认不剔点**） |
-| `image_size_mismatch` | `TargetTracker` | 检测画面尺寸与相机不符：含帧号、拍摄时刻、实际及预期尺寸；该条不解算 |
+| `image_size_mismatch` | `TargetTracker` | 检测尺寸缺失、格式错误或与标定不符时跳过定位。事件含帧号、拍摄时刻、实际及预期尺寸。 |
 | `recorder_started` / `recorder_stopped` | `FlightRecorder` | 目录、频率、缓冲容量 / 各类计数 |
 
 ### 5.3 `camera_calib.json`（`vendor/airdrop-calibration/airdrop_calibration/calibrate.py` 产出）
@@ -2150,7 +2155,7 @@ config = Config(
 
 ### 6.5 测试怎么跑
 
-真实素材视频由环境变量 `AIRDROP_REALDATA_VIDEO` 指定；已记录架次的反向诊断由 `AIRDROP_REALDATA_FLIGHT` 指定包含 `telemetry.jsonl` 和 `detections.jsonl` 的目录。输入不随仓库提供，缺少输入时对应测试会跳过；完整验收必须实际提供输入并核对执行结果。
+真实素材视频由环境变量 `AIRDROP_REALDATA_VIDEO` 指定。编号与方向用例按 SHA-256 核对素材，再对四个标注帧中的 56 号靶板逐帧验证。视频摘要和像素区域见 `tests/test_perception_realdata.py`。已记录架次的反向诊断由 `AIRDROP_REALDATA_FLIGHT` 指定包含 `telemetry.jsonl` 和 `detections.jsonl` 的目录。缺少输入时对应测试会跳过，完整验收须提供输入并核对执行结果。
 
 SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并按接收链路标定的 manifest；`AIRDROP_SITL_SOURCE_TIME_ALIGNMENT` 默认为 `1`；显式设为 `0` 仅复现旧接收时刻对齐缺陷。manifest 的 `camera.telemetry_lag_s` 与 `vehicle.camera.telemetry_lag_s` 必须一致；CPU/GPU 编码或接收路径改变后重新标定，不能套用另一链路的默认延时。运行前固定标定输入，再用独立航次核对在线目标和留一误差；不能把本航次离线调参的结果代替在线验收。项目和测试仍在 Windows，WSL 只运行仿真及其环境配置。
 
@@ -2178,7 +2183,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | `tests/test_recorder.py` | 飞行目录七个文件齐全、帧零重编码、事件/检测/投放写入、幂等启停 | 否（**沙箱里挂 `tmp_path`**） |
 | `tests/test_replay.py` | 回放对齐结果与"直接从日志查询"的参考 broker 完全一致 | 否 |
 | `tests/test_perception.py` | pipeline 逻辑（假 detector / 假 OCR 池）、去重、编号不被覆盖 | 否 |
-| `tests/test_camera_pipeline.py` | 原图与 remap 视线一致性、尺寸不匹配拦截、显式缩放模型与旧记录兼容 | 否 |
+| `tests/test_camera_pipeline.py` | 原图与 remap 视线一致性、检测尺寸校验、显式缩放模型与 JSON 尺寸列表 | 否 |
 | `tests/test_capture_entry.py` | 标定采集入口正常/中断/视频未就绪/零帧的返回码、摘要、文件与资源清理 | 否 |
 | `tests/test_perception_realdata.py` | 真 YOLO + 真 OCR 的外部素材回归（素材不随仓库提供） | ✅ GPU + 素材绝对路径 |
 | `tests/test_georef.py` | 相机模型加载/回退、像素→NED、边长法交叉验证（**沙箱里挂 `tmp_path`**） | 否 |
@@ -2207,7 +2212,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | `tests/test_mission_transfer.py` | 上传/激活的取消竞态、一次恢复及关闭等待 | 否 |
 | `tests/test_sitl_recon.py` | **SITL 侦查精度（可选，标 `sitl`；仅 `--test-tier all -m sitl` 才跑）**：驱动 `airdrop/runtime/sitl.py` 跑完整标准流程，断言状态机 `DONE`、三个编号全识别、任务选中 56、误差与留一验证都 < 2 m；探活用**裸 UDP 听 14540 心跳**（不建 MAVSDK 会话），没在跑就 skip | 否（要 WSL 里已起 PX4 SITL） |
 | `tests/test_cli.py` | 集中式入口：子命令注册表（parser + handler）、`--help`/`check-docs` **不加载重库**（干净子进程实测）、参数不合法退出码 2、选项覆盖真的进了 `build_config()` | 否 |
-| `tests/test_handbook.py` | **本手册 §3 的 11 段示例逐条真跑**（文档里的代码必须能运行） | 否 |
+| `tests/test_handbook.py` | 手册 §3 的五个代表性装配示例及文档一致性回归 | 否 |
 | `vendor/airdrop-sim/tests/test_world.py` | CUADC 赛区世界：**生成结果 == 入库文件**、目标区在起飞线两端（±200, 0）、天井区内随机摆放且间距 > 20m、五边形环壁（厚 5mm、高 400mm）、**规则里只是示意的东西不许出现**（4m/6m 打击圈、天井箭头）、同区天井同色、贴地标线不共面重叠（防 z-fighting）、两轮靶标摆位（第二轮中位数落在第 3 座）、演练航线对准中位数天井、目标区底色（常见路面色 + 少量纹理）、周边航拍底图（不压跑道/目标区、互不重叠）、底图生成器（可复现/离线校验）、俯视预览图（尺寸/可复现/参数校验）、资产逐级存在、数字板必须是**白底黑字** | 否 |
 | `vendor/airdrop-sim/tests/test_sim_scripts.py` | WSL/ext4 临时假构建：资产软链、幂等、启动参数/插件配置、卸载保留日志、拒绝覆盖实体或在 PX4 树内创建运行目录，比较假 PX4 树前后不变 | 否 |
 

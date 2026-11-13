@@ -52,7 +52,7 @@ def zero_test_params(
     thread: Any,
     names: tuple[str, ...] = ("NAV_DLL_ACT", "NAV_RCL_ACT"),
     *,
-    ledger: dict[str, int] | None = None,
+    ledger: dict[str, int],
 ) -> dict[str, int]:
     """把 SITL 测试要临时关掉的飞控参数置 0，返回原值（``main`` 收尾时还原）。
 
@@ -66,8 +66,6 @@ def zero_test_params(
     它已经在仿真机型里永久置 0（``vendor/airdrop-sim/airdrop_sim/assets/airframes/4007_gz_rc_cessna_down_cam``，附了原因）
     ——投弹航线要空中出结果才能生成、降落段没法预先和侦查段拼成一条任务。
     """
-    if ledger is None:
-        ledger = {}
     for name in names:
         value = read_param(thread, name)
         ledger.setdefault(name, value)

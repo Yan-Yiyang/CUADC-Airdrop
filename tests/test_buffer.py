@@ -18,7 +18,6 @@ import numpy as np
 import pytest
 
 from airdrop import (
-    DEFAULT_BUFFER_CAPACITY,
     DEFAULT_TELEMETRY_LAG,
     AlignedSample,
     AlignmentBuffer,
@@ -29,7 +28,6 @@ from airdrop import (
     TelemetrySnapshot,
     VideoFrame,
     capacity_for,
-    raw_frame_bytes,
 )
 
 
@@ -247,7 +245,7 @@ def test_buffer_preserves_source_pts_and_random_access_mapping() -> None:
 
 
 def test_capacity_evicts_oldest() -> None:
-    buffer = AlignmentBuffer(capacity=5)
+    buffer = AlignmentBuffer(capacity=capacity_for(2.5, 2.0))
     for i in range(8):
         buffer.put(make_sample(1000.0 + i))
 
@@ -779,14 +777,6 @@ def test_deferred_writer_default_still_accepts_passive_capture() -> None:
 # ----------------------------------------------------------------------
 # 参数校验 / 换算 / 统计
 # ----------------------------------------------------------------------
-def test_capacity_helpers() -> None:
-    assert capacity_for(30.0, 180.0) == 5400
-    assert DEFAULT_BUFFER_CAPACITY == 5400
-    # 720p 未压缩一帧 ≈ 2.64 MiB，5400 帧 ≈ 13.9 GiB
-    assert raw_frame_bytes(1280, 720) == 2_764_800
-    assert raw_frame_bytes(1280, 720) * 5400 / 1024**3 == pytest.approx(13.90, abs=0.01)
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -808,8 +798,12 @@ def test_rejects_bad_iter_batch() -> None:
 
 
 def test_put_none_is_rejected() -> None:
+    buffer = AlignmentBuffer(capacity=5)
+    buffer.put(make_sample(1000.0))
+    before = buffer.stats
     with pytest.raises(ValueError):
-        AlignmentBuffer(capacity=5).put(None)
+        buffer.put(None)  # type: ignore[arg-type]
+    assert buffer.stats == before
 
 
 def test_stats_and_clear() -> None:

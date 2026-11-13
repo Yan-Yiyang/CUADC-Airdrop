@@ -115,7 +115,8 @@ class StreamSender:
         self._url = url
         self._processes: list[subprocess.Popen] = []
 
-    def start(self) -> subprocess.Popen:
+    def start(self, *, color: str | None = None) -> subprocess.Popen:
+        pattern = "testsrc=" if color is None else f"color=c={color}:"
         process = subprocess.Popen(
             [
                 self._executable,
@@ -126,7 +127,7 @@ class StreamSender:
                 "-f",
                 "lavfi",
                 "-i",
-                f"testsrc=size={SRC_W}x{SRC_H}:rate={SRC_FPS}",
+                f"{pattern}size={SRC_W}x{SRC_H}:rate={SRC_FPS}",
                 "-c:v",
                 "libx264",
                 "-preset",

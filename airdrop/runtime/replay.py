@@ -48,19 +48,15 @@ from airdrop import Config
 # ----------------------------------------------------------------------
 FLIGHT_DIR = Path("flights")  # 指向某次飞行目录，或指向包含多次飞行的目录以选取最新记录
 SPEED = 0.0  # 0=全速 / 1.0=原速 / 2.0=两倍速
-BUFFER_SECONDS = 180.0
-BUFFER_FPS = 30.0
 PLAN_DROP_MISSION = True  # 出了结果就生成飞掠+降落航线（不上传，只打印）
 STRICT: bool | None = None  # None 根据航次是否正常结束选择严格或前缀恢复
 DRAIN_TIMEOUT_S = 120.0  # 停止生产后等待尾帧与 OCR 的最大秒数
-PERCEPTION_MODE: str | None = None  # None = 用 Config 默认（ocr）
-SELECTION_RULE: str | None = None  # None = 用 Config 默认（median）
-#: 相机标定文件；None = 用 Config 默认（仓库根的 ``camera_calib.json``，通常不存在，
-#: 那时会退回"60° 视场角粗估"的默认模型——坐标解算结果不可信）。
-#: ⚠ 回放要**用录这段素材时同一份标定**：SITL 架次是
-#: ``.sitl-recon-tmp/camera_calib_sim.json``（见 ``python -m airdrop.run mission --mode sitl``）。
+PERCEPTION_MODE: str | None = None  # None = 保留录制快照中的感知模式
+SELECTION_RULE: str | None = None  # None = 保留录制快照中的选靶规则
+#: 相机标定文件；None = 保留录制快照中的路径。
+#: 素材迁移后应显式指定同一份标定的新位置，不能换用不匹配的标定。
 CALIB_FILE: str | None = None
-#: 降落航线 ``.plan``；None = 用 Config 默认（不配降落段 → 只打印飞掠段，不规划降落）。
+#: 降落航线 ``.plan``；None = 保留录制快照中的路径。
 LAND_PLAN: str | None = None
 #: 边长交叉验证门限（``None`` = 用库默认 = **关**；回放优化时才给，比如 0.25）。
 #: 它是诊断：用已知目标边长独立估深度、再与地面求交互校——标定不对时会大面积不过
@@ -70,8 +66,36 @@ SIDE_CHECK_TOLERANCE: float | None = None
 LOGGER = logging.getLogger("replay_flight")
 
 
+def _build_replay_buffer(source, resolved: Path):
+    """验证正式回放输入并按其已封口 TS 段装配共享缓冲。"""
+    from airdrop.video.segments import SegmentLifecycle
+
+    from .components import build_alignment_buffer
+
+    if not source.frames or any(frame.storage != "ts" for frame in source.frames):
+        raise ValueError("正式 runtime 回放只接受完整 TS 帧索引")
+    sizes = {(frame.width, frame.height) for frame in source.frames}
+    if len(sizes) != 1:
+        raise ValueError("回放帧必须具有统一且有效的 width/height")
+    width, height = next(iter(sizes))
+    if width is None or height is None or width <= 0 or height <= 0:
+        raise ValueError("回放帧必须具有统一且有效的 width/height")
+    segment_lifecycle = SegmentLifecycle()
+    for segment in {frame.segment for frame in source.frames}:
+        complete = (resolved / "video" / f"segment-{segment:06d}.complete").is_file()
+        segment_lifecycle.closed(segment, complete=complete)
+    buffer = build_alignment_buffer(
+        capture=True,
+        ts_directory=resolved / "video",
+        segment_lifecycle=segment_lifecycle,
+    )
+    assert buffer is not None
+    return buffer, (width, height)
+
+
 def build_config(
     *,
+    flight_dir: Path,
     perception_mode: str | None = PERCEPTION_MODE,
     selection_rule: str | None = SELECTION_RULE,
     calib_file: str | None = CALIB_FILE,
@@ -79,9 +103,11 @@ def build_config(
 ) -> Config:
     """回放用的配置（感知模式 / 选唯一规则 / 相机标定 / 降落航线可覆盖）。
 
-    ``None`` = 不覆盖（沿用 ``airdrop/config.py`` 里的默认值），而不是"设成 None"。
+    CLI 参数的 ``None`` = 不覆盖；记录快照中的 ``None`` 则表示字段原值为空。
     """
-    base = Config()
+    from airdrop.record.replay import load_config_snapshot
+
+    base = load_config_snapshot(flight_dir)
     if perception_mode is not None:
         base = base.replace(perception=replace(base.perception, mode=perception_mode))
     if selection_rule is not None:
@@ -114,8 +140,6 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
     *,
     flight_dir: Path = FLIGHT_DIR,
     speed: float = SPEED,
-    buffer_seconds: float = BUFFER_SECONDS,
-    buffer_fps: float = BUFFER_FPS,
     plan_drop_mission: bool = PLAN_DROP_MISSION,
     strict: bool | None = STRICT,
     drain_timeout_s: float = DRAIN_TIMEOUT_S,
@@ -134,9 +158,7 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
     # 重依赖在使用时才导入：`python -m airdrop.run replay --help` 不加载它们
     from airdrop import (
         DEFAULT_SIDE_TOLERANCE,
-        AlignmentBuffer,
         ReplayVideoSource,
-        capacity_for,
         load_broker_from_log,
     )
     from airdrop.perception.detector import FrameSizeMismatchError
@@ -146,7 +168,8 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    config = build_config(**config_overrides)
+    resolved = resolve_flight_dir(Path(flight_dir))
+    config = build_config(flight_dir=resolved, **config_overrides)
     from .mission import _apply_qgc_video_overrides
 
     config = _apply_qgc_video_overrides(
@@ -158,7 +181,6 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
         fps=qgc_fps,
         bitrate_kbps=qgc_bitrate_kbps,
     )
-    resolved = resolve_flight_dir(Path(flight_dir))
 
     # 1) 遥测回填：专用 broker + 按帧推进的 pacer（帧拍摄时刻必然落在历史区间内）
     broker, pacer = load_broker_from_log(resolved, recover_time=strict is not True)
@@ -174,52 +196,94 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
     )
 
     # 3) 与实飞一致：对齐 → 环形缓冲 → 感知 → 坐标解算 → 目标统计
-    buffer = AlignmentBuffer(capacity_for(buffer_fps, buffer_seconds), storage="jpeg")
-    from .components import build_perception_components, configure_opencv_threads
+    from .components import build_perception_components, prepare_perception_components
 
-    perception = build_perception_components(
-        config,
-        broker,
-        buffer,
-        capture=True,
-        recognize=True,
-        side_check_tolerance=(
-            DEFAULT_SIDE_TOLERANCE if side_check_tolerance is None else float(side_check_tolerance)
-        ),
-    )
-    if (
-        perception.writer is None
-        or perception.worker is None
-        or perception.tracker is None
-        or perception.targets is None
-    ):
-        raise RuntimeError("回放感知组件未完整创建")
-    writer, worker, tracker, targets = (
-        perception.writer,
-        perception.worker,
-        perception.tracker,
-        perception.targets,
-    )
-    display = None
-    display_error = False
-    if config.qgc_video.enabled:
-        from .qgc import QgcVideoRuntime
-
-        display = QgcVideoRuntime(
+    try:
+        buffer, output_size = _build_replay_buffer(source, resolved)
+    except BaseException as exc:
+        try:
+            source.stop()
+        except BaseException as cleanup_error:  # noqa: BLE001 - 回滚必须保留构造原始异常
+            exc.add_note(f"回放源清理失败: {cleanup_error}")
+        raise
+    try:
+        perception = build_perception_components(
             config,
-            source,
             broker,
-            perception.camera,
-            worker,
-            replay_mode=True,
+            buffer,
+            capture=True,
+            recognize=True,
+            side_check_tolerance=(
+                DEFAULT_SIDE_TOLERANCE
+                if side_check_tolerance is None
+                else float(side_check_tolerance)
+            ),
         )
+    except BaseException as exc:
+        try:
+            buffer.close_cold_storage()
+        except BaseException as cleanup_error:  # noqa: BLE001 - 回滚必须保留构造原始异常
+            exc.add_note(f"回放缓冲清理失败: {cleanup_error}")
+        try:
+            source.stop()
+        except BaseException as cleanup_error:  # noqa: BLE001 - 回滚必须保留构造原始异常
+            exc.add_note(f"回放源清理失败: {cleanup_error}")
+        raise
+    display = None
+    try:
+        if (
+            perception.writer is None
+            or perception.worker is None
+            or perception.tracker is None
+            or perception.targets is None
+        ):
+            raise RuntimeError("回放感知组件未完整创建")
+        writer, worker, tracker, targets = (
+            perception.writer,
+            perception.worker,
+            perception.tracker,
+            perception.targets,
+        )
+        if config.qgc_video.enabled:
+            from .qgc import QgcVideoRuntime
+
+            display = QgcVideoRuntime(
+                config,
+                source,
+                broker,
+                perception.camera,
+                worker,
+                replay_mode=True,
+            )
+    except BaseException as exc:
+        if perception.worker is not None:
+            try:
+                perception.worker.stop()
+            except BaseException as cleanup_error:  # noqa: BLE001 - 回滚必须保留构造原始异常
+                exc.add_note(f"感知工作器清理失败: {cleanup_error}")
+        try:
+            buffer.close_cold_storage()
+        except BaseException as cleanup_error:  # noqa: BLE001 - 回滚必须保留构造原始异常
+            exc.add_note(f"回放缓冲清理失败: {cleanup_error}")
+        try:
+            source.stop()
+        except BaseException as cleanup_error:  # noqa: BLE001 - 回滚必须保留构造原始异常
+            exc.add_note(f"回放源清理失败: {cleanup_error}")
+        raise
+    display_error = False
 
     drained = False
     ready = False
     source_failed = False
+    worker_started = False
     try:
-        configure_opencv_threads(worker, config.perception.opencv_threads)
+        prepare_perception_components(
+            perception,
+            output_size=output_size,
+            opencv_threads=config.perception.opencv_threads,
+        )
         worker.start()
+        worker_started = True
         if display is not None:
             try:
                 display.start()
@@ -242,8 +306,10 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
         if ready:
             while not source.wait_finished(timeout=0.1):
                 worker.raise_if_failed()
+                buffer.raise_if_failed()
             source.join(timeout=1.0)
             worker.raise_if_failed()
+            buffer.raise_if_failed()
             if source.stats.state == "error":
                 raise RuntimeError(source.stats.last_error or "回放源异常")
     except (FrameSizeMismatchError, RuntimeError) as exc:
@@ -259,7 +325,7 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
             callback: Callable[[], object],
             *,
             display_step: bool = False,
-        ) -> None:
+        ) -> bool:
             nonlocal source_failed, display_error
             try:
                 callback()
@@ -272,22 +338,37 @@ def main(  # noqa: PLR0912, PLR0913, PLR0915 - CLI 参数和统一回放生命�
                         source_failed = True
                 else:
                     interruptions.append(exc)
+                return False
+            return True
 
         cleanup("source.stop", source.stop)
-        if not source.running:
+        if worker_started and not source.running:
+            input_finished = True
+
+            def finish_worker_input() -> None:
+                nonlocal input_finished
+                worker.finish_input()
+
+            input_finished = cleanup("worker.finish_input", finish_worker_input)
 
             def drain_worker() -> None:
                 nonlocal drained
+                if not input_finished:
+                    return
                 drained = worker.drain(timeout=drain_timeout_s)
 
             cleanup("worker.drain", drain_worker)
-        else:
+        elif worker_started:
             source_failed = True
             LOGGER.error("回放源未确认停止，无法排空感知工作器")
         cleanup("worker.stop", worker.stop)
+        if worker_started and getattr(worker, "running", False):
+            source_failed = True
+            LOGGER.error("回放感知工作器未确认停止")
         cleanup("targets.pump", targets.pump)
         if display is not None:
             cleanup("display.stop", display.stop, display_step=True)
+        cleanup("buffer.close_cold_storage", buffer.close_cold_storage)
         if active_exception is not None:
             raise active_exception
         if interruptions:

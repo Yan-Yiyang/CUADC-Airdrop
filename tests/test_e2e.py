@@ -233,7 +233,11 @@ class ScriptedDetector:
             code=code,
             side_px=self.side_px,
             mode=mode,
-            extra={"undistorted": True, "class_name": "target"},
+            extra={
+                "undistorted": True,
+                "class_name": "target",
+                "image_size": (image.shape[1], image.shape[0]),
+            },
         )
         return DetectionBatch(image=image, detections=(detection,), undistorted=True)
 
@@ -545,6 +549,7 @@ def _detection_for(tracker: TargetTracker, stamp: float) -> Detection:
         box=PixelBox(0, 0, 10, 10),
         confidence=0.9,
         telemetry=_pose_snapshot(stamp),
+        extra={"image_size": (320, 180)},
     )
 
 
@@ -583,7 +588,7 @@ def test_tracker_skips_points_without_attitude_and_without_position() -> None:
             telemetry=snapshot,
             code=56,
             side_px=0.0,
-            extra={"undistorted": True},
+            extra={"undistorted": True, "image_size": (320, 180)},
         )
 
     assert tracker.add(_detection(no_attitude)) is None
@@ -624,7 +629,7 @@ def test_tracker_side_check_is_off_by_default() -> None:
         code=56,
         # 20 m 处的 1 m 目标在主点附近约 14 px（fx≈277），100 px 差一个数量级 → 必不通过
         side_px=100.0,
-        extra={"undistorted": True},
+        extra={"undistorted": True, "image_size": (320, 180)},
     )
 
     events: list[str] = []
@@ -768,7 +773,11 @@ class RealYoloOcrDetector:
                     code=number,
                     side_px=float(max(detection.box.width, detection.box.height)),
                     mode="ocr",
-                    extra={"undistorted": False, "class_name": "target"},
+                    extra={
+                        "undistorted": False,
+                        "class_name": "target",
+                        "image_size": detection.extra["image_size"],
+                    },
                 )
             )
         return DetectionBatch(image=batch.image, detections=tuple(detections), undistorted=False)

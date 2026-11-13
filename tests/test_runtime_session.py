@@ -175,24 +175,26 @@ def test_crop_storage_path_is_injected_after_recorder_start(tmp_path) -> None:
     assert calls.index(f"worker.crop_storage:{flight_dir / 'crops'}") < calls.index("worker.start")
 
 
-def test_passive_session_uses_explicit_video_readiness_timeout() -> None:
+@pytest.mark.parametrize(
+    ("readiness_timeout_s", "expected_timeout"),
+    [(None, 10.0), (35.0, 35.0)],
+    ids=["default", "explicit"],
+)
+def test_passive_session_uses_video_readiness_timeout(
+    readiness_timeout_s: float | None, expected_timeout: float
+) -> None:
     calls: list[str] = []
     source = _Source(calls)
-    components = LiveComponents(thread=_Thread(calls), source=source, readiness_timeout_s=35.0)
+    if readiness_timeout_s is None:
+        components = LiveComponents(thread=_Thread(calls), source=source)
+    else:
+        components = LiveComponents(
+            thread=_Thread(calls), source=source, readiness_timeout_s=readiness_timeout_s
+        )
     options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
 
     assert LiveSession(options, components).run() == 0
-    assert source.readiness_timeouts == [35.0]
-
-
-def test_passive_session_default_video_readiness_timeout_is_ten_seconds() -> None:
-    calls: list[str] = []
-    source = _Source(calls)
-    components = LiveComponents(thread=_Thread(calls), source=source)
-    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
-
-    assert LiveSession(options, components).run() == 0
-    assert source.readiness_timeouts == [10.0]
+    assert source.readiness_timeouts == [expected_timeout]
 
 
 def test_ts_session_binds_temporary_directory_and_cleans_after_stop(tmp_path, monkeypatch) -> None:
@@ -305,6 +307,28 @@ def test_session_drains_before_result_pump_and_stops_thread_last() -> None:
         < calls.index("finish")
         < calls.index("thread.stop")
     )
+
+
+def test_buffer_close_failure_still_finishes_and_stops_thread() -> None:
+    calls: list[str] = []
+    buffer = AlignmentBuffer(10)
+
+    def close_cold_storage(timeout: float = 5.0) -> None:
+        del timeout
+        calls.append("buffer.close")
+        raise OSError("模拟冷存储关闭失败")
+
+    buffer.close_cold_storage = close_cold_storage
+    components = LiveComponents(
+        thread=_Thread(calls),
+        source=_Source(calls),
+        buffer=buffer,
+        on_finish=lambda: calls.append("finish"),
+    )
+    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
+
+    assert LiveSession(options, components).run() == 1
+    assert calls.index("buffer.close") < calls.index("finish") < calls.index("thread.stop")
 
 
 def test_stuck_video_source_fails_and_still_releases_everything() -> None:
@@ -464,14 +488,6 @@ def test_passive_video_stopping_after_first_frame_fails() -> None:
         thread=_Thread(calls), source=source, on_start=stop_during_passive_wait
     )
     assert LiveSession(options, components).run() == 1
-
-
-def test_passive_video_recovery_can_finish_with_streaming_state() -> None:
-    calls: list[str] = []
-    source = _Source(calls)
-    options = RunOptions(mode="real", run_mission=False, recognize=False, max_seconds=0.001)
-    components = LiveComponents(thread=_Thread(calls), source=source)
-    assert LiveSession(options, components).run() == 0
 
 
 def test_passive_video_still_reconnecting_at_deadline_fails() -> None:

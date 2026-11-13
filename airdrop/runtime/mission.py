@@ -112,10 +112,13 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         TelemetryBroker,
         capacity_for,
     )
-    from airdrop.video.cold import TsRangeDecoder
     from airdrop.video.source import Hm30VideoSource as PyavSource
 
-    from .components import build_perception_components, configure_opencv_threads
+    from .components import (
+        build_alignment_buffer,
+        build_perception_components,
+        prepare_perception_components,
+    )
     from .session import LiveComponents
 
     if options.capture:
@@ -162,21 +165,8 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
     on_drop = append_drop if recorder is not None else None
 
     if options.capture:
-        decoder = TsRangeDecoder(Path("."), max_cache_bytes=64 * 1024 * 1024)
-        try:
-            buffer = AlignmentBuffer(
-                capacity_for(30.0, 180.0),
-                storage="raw",
-                cold_decoder=decoder,
-                hot_seconds=1.0,
-                max_hot_bytes=128 * 1024 * 1024,
-            )
-        except BaseException as exc:
-            try:
-                decoder.close()
-            except BaseException as cleanup_error:  # noqa: BLE001 - 保留缓冲构造异常
-                exc.add_note(f"历史解码器清理失败: {cleanup_error}")
-            raise
+        buffer = build_alignment_buffer(capture=True)
+        assert buffer is not None
     else:
         buffer = AlignmentBuffer(capacity_for(30.0, 180.0), storage="jpeg")
     try:
@@ -199,7 +189,6 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
         )
         prepare_perception: Callable[[], None] | None = None
         if worker is not None:
-            selected_worker = worker
             output_size = (int(config.video.width), int(config.video.height))
             warmup_lock = threading.Lock()
             warmed = False
@@ -209,18 +198,11 @@ def build_live_components(options: RunOptions, config: Config) -> LiveComponents
                 with warmup_lock:
                     if warmed:
                         return
-                    if camera is not None and camera.image_size is not None:
-                        calib_size = tuple(int(value) for value in camera.image_size)
-                        if calib_size != output_size:
-                            raise RuntimeError(
-                                f"相机标定尺寸 {calib_size} 与视频输出尺寸 {output_size} 不一致"
-                            )
-                    configure_opencv_threads(
-                        selected_worker,
-                        config.perception.opencv_threads,
+                    prepare_perception_components(
+                        perception,
+                        output_size=output_size,
+                        opencv_threads=config.perception.opencv_threads,
                     )
-                    if not selected_worker.detector.warmup(*output_size):
-                        raise RuntimeError(f"YOLO 按视频输出尺寸 {output_size} 预热失败")
                     warmed = True
 
             prepare_perception = prepare_selected_perception

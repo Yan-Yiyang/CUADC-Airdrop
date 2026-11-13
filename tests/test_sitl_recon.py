@@ -79,18 +79,35 @@ def test_sitl_recon_accuracy(tmp_path: Path) -> None:
     if not _sitl_is_up():
         pytest.skip("SITL 没在跑（先 bash vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh r2）")
 
+    from dataclasses import replace
+
     from airdrop.runtime import sitl
+
+    manifest_path = os.environ.get("AIRDROP_SITL_MANIFEST") or None
+    flight_root = tmp_path / "flights"
+
+    def components_factory(options, config):
+        config = replace(config, record=replace(config.record, dir=str(flight_root)))
+        return sitl.build_live_components(options, config)
 
     exit_code = sitl.main(
         work_dir=str(tmp_path),
         qgc_video=False,
-        manifest_path=os.environ.get("AIRDROP_SITL_MANIFEST") or None,
+        manifest_path=manifest_path,
+        components_factory=components_factory,
         source_time_alignment=os.environ.get("AIRDROP_SITL_SOURCE_TIME_ALIGNMENT", "1") == "1",
     )
     # 先断言退出码：否则退出码非 0 时下面读 report 会先抛 FileNotFoundError /
     # JSONDecodeError，把真正的失败原因盖掉
     assert exit_code == 0, f"退出码 {exit_code}"
     report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    flight_dirs = list(flight_root.iterdir())
+    assert len(flight_dirs) == 1, f"架次目录数应为 1：{flight_dirs}"
+    _assert_sitl_sortie(report, flight_dirs[0])
+
+
+def _assert_sitl_sortie(report: dict[str, Any], flight_dir: Path) -> None:
+    """核对同一航次的运行时决策、释放、录制及报告精度。"""
 
     # ⚠ 键名是 "mission"（运行时分析模块 写的就是它）；曾经这里读的是
     # "runner_stats"——那个名字只是 _RunOutcome 的字段名，report.json 里根本没有，
@@ -106,6 +123,70 @@ def test_sitl_recon_accuracy(tmp_path: Path) -> None:
     calibration = report.get("lag_calibration") or {}
     holdout = calibration.get("holdout_error_m")
     assert holdout is not None and holdout < 2.0, f"留一验证缺失或超 2 m：{calibration}"
+
+    # 以本架次 EKF 原点下的场景真值核对运行时实际选点与飞掠计划。
+    event_rows = [
+        json.loads(line)
+        for line in (flight_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    truth_north, truth_east = report["truth_ned"]["56"]
+    targeting = [row for row in event_rows if row.get("kind") == "targeting"]
+    assert len(targeting) == 1, targeting
+    assert {c["code"] for c in targeting[0]["targeting"]["clusters"]} >= {12, 56, 94}
+    runtime_target = targeting[0]["targeting"]["selected"]
+    assert runtime_target["code"] == 56, runtime_target
+    assert (
+        math.hypot(
+            runtime_target["north_m"] - truth_north,
+            runtime_target["east_m"] - truth_east,
+        )
+        < 2.0
+    ), f"运行时选靶偏离本架次真值：{runtime_target} vs {(truth_north, truth_east)}"
+    drop_plans = [row for row in event_rows if row.get("kind") == "drop_plan"]
+    assert len(drop_plans) == 1 and drop_plans[0].get("source") == "target", drop_plans
+    plan_north, plan_east, _ = drop_plans[0]["target_ned"]
+    assert math.hypot(plan_north - truth_north, plan_east - truth_east) < 2.0, (
+        f"飞掠计划偏离本架次真值：{drop_plans[0]} vs {(truth_north, truth_east)}"
+    )
+
+    for kind in ("drop_command_pending", "drop_command_sent", "drop_released"):
+        matches = [row for row in event_rows if row.get("kind") == kind]
+        assert len(matches) == 1 and matches[0].get("count") == 1, (kind, matches)
+        assert matches[0].get("simulated") is True, (kind, matches)
+    assert not any(
+        row.get("kind") in {"drop_command_failed", "drop_command_unknown"} for row in event_rows
+    )
+    drop_rows = [
+        json.loads(line)
+        for line in (flight_dir / "drops.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(drop_rows) == 1, drop_rows
+    assert drop_rows[0]["target_ned"] == pytest.approx(drop_plans[0]["target_ned"], abs=0.001)
+
+    stopped = [row for row in event_rows if row.get("kind") == "recorder_stopped"]
+    assert len(stopped) == 1, stopped
+    accounting = stopped[0]
+    assert accounting == event_rows[-1]
+    for field in (
+        "frames_skipped",
+        "frame_encode_errors",
+        "frame_write_errors",
+        "telemetry_write_errors",
+        "finalize_errors",
+        "telemetry_dropped",
+        "telemetry_pending",
+    ):
+        assert accounting.get(field) == 0, f"{field} 非零：{accounting}"
+    frame_rows = (flight_dir / "frames_index.jsonl").read_text(encoding="utf-8").splitlines()
+    assert accounting["frames_written"] == len(frame_rows) > 0, accounting
+    segments = set()
+    for expected_index, line in enumerate(frame_rows, start=1):
+        frame = json.loads(line)
+        assert frame["index"] == expected_index
+        segments.add(frame["segment"])
+    for segment in segments:
+        stem = flight_dir / "video" / f"segment-{segment:06d}"
+        assert stem.with_suffix(".ts").is_file() and stem.with_suffix(".complete").is_file()
 
 
 def test_zero_test_params_keeps_original_value_when_write_fails(
@@ -127,10 +208,10 @@ def test_zero_test_params_keeps_original_value_when_write_fails(
     assert ledger == {"NAV_DLL_ACT": 7}
 
 
-def test_zero_test_params_returns_original_values_for_legacy_call(
+def test_zero_test_params_returns_and_updates_the_required_ledger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """不传账本时保留原有的 dict 返回接口；传入时返回完整账本。"""
+    """首次读到的原值写入必传账本，已有原值通过 setdefault 保留。"""
     from airdrop.runtime import sitl_operations
 
     monkeypatch.setattr(
@@ -138,7 +219,6 @@ def test_zero_test_params_returns_original_values_for_legacy_call(
     )
     monkeypatch.setattr(sitl_operations, "_write_param", lambda *_args, **_kwargs: None)
 
-    assert sitl_operations.zero_test_params(object(), ("A", "B")) == {"A": 2, "B": 5}
     ledger = {"A": 8}
     assert sitl_operations.zero_test_params(object(), ("A", "B"), ledger=ledger) is ledger
     assert ledger == {"A": 8, "B": 5}

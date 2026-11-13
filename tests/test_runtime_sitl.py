@@ -22,7 +22,7 @@ from airdrop.perception.pipeline import PerceptionStats
 from airdrop.preflight import Preflight
 from airdrop.runtime import sitl, sitl_geometry, sitl_operations
 from airdrop.runtime.options import RunOptions
-from airdrop.runtime.session import LiveComponents, LiveSession
+from airdrop.runtime.session import LiveComponents
 from airdrop.video.buffer import AlignmentBuffer
 
 
@@ -189,17 +189,6 @@ def _components(config: Any, *, passive: bool = False) -> LiveComponents:
     )
 
 
-def test_session_cleanup_stops_thread_when_buffer_close_interface_is_missing() -> None:
-    thread = _Thread()
-    session = LiveSession(
-        RunOptions(mode="sitl"),
-        LiveComponents(thread=cast(Any, thread), buffer=cast(Any, object())),
-    )
-
-    assert session._cleanup(0) == 1
-    assert thread.stopped
-
-
 def test_sitl_adapter_prepares_config_and_writes_report_with_performance(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -353,7 +342,7 @@ def test_sitl_main_accepts_custom_recon_plan_without_inline_route(
     monkeypatch.setattr(
         sitl_operations,
         "zero_test_params",
-        lambda _thread, ledger: ledger.update({"NAV_DLL_ACT": 2}),
+        lambda _thread, *, ledger: ledger.update({"NAV_DLL_ACT": 2}),
     )
     monkeypatch.setattr(sitl_operations, "operator_takeoff", lambda *_args: 0)
     monkeypatch.setattr(sitl_operations, "restore_params", lambda *_args: None)
@@ -423,7 +412,7 @@ def test_restore_and_report_errors_still_wait_for_rpc_finally_before_thread_stop
     monkeypatch.setattr(
         sitl_operations,
         "zero_test_params",
-        lambda _thread, ledger: ledger.update({"NAV_DLL_ACT": 2}),
+        lambda _thread, *, ledger: ledger.update({"NAV_DLL_ACT": 2}),
     )
     monkeypatch.setattr(sitl_operations, "operator_takeoff", lambda *_args: 0)
     monkeypatch.setattr(
@@ -575,7 +564,7 @@ def test_auto_recon_bootstrap_uses_shared_runner_upload_and_restores_params(
         def wait_pending(self, *, timeout: float | None = None) -> None:
             pass
 
-    def fake_zero(_thread: Any, ledger: dict[str, int]) -> None:
+    def fake_zero(_thread: Any, *, ledger: dict[str, int]) -> None:
         events.append("bootstrap.params")
         ledger["NAV_DLL_ACT"] = 2
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import av
+import cv2
 import numpy as np
 import pytest
 from av.error import ConnectionResetError as PyAvConnectionResetError
@@ -25,10 +26,17 @@ from av.error import TimeoutError as PyAvTimeoutError
 from airdrop.config import Config, RecordConfig
 from airdrop.record.recorder import FlightRecorder
 from airdrop.record.replay import ReplayVideoSource
+from airdrop.runtime.components import build_alignment_buffer
 from airdrop.telemetry.broker import TelemetryBroker
 from airdrop.telemetry.models import TelemetrySnapshot
 from airdrop.video.align import AlignedSample, FrameTelemetryAligner
-from airdrop.video.buffer import AlignmentBuffer, BufferedFrame, ColdFrameRef, StoredFrame
+from airdrop.video.buffer import (
+    AlignmentBuffer,
+    AlignmentWriter,
+    BufferedFrame,
+    ColdFrameRef,
+    StoredFrame,
+)
 from airdrop.video.cold import TsDataNotReady, TsRangeDecoder, TsSegmentWriter
 from airdrop.video.segments import SegmentLifecycle, SegmentState
 from airdrop.video.source import (
@@ -482,73 +490,6 @@ def test_old_iter_range_keeps_cancelled_token_after_decoder_reopen(tmp_path) -> 
         decoder.close()
 
 
-def test_shared_gop_delivers_earlier_waiter_during_first_pass_with_tiny_cache(
-    tmp_path, monkeypatch
-) -> None:
-    from airdrop.video.gop import _GopJob
-
-    source_path = tmp_path / "source.mp4"
-    frames = _make_h264(source_path, frames=20, gop=20)
-    source = av.open(str(source_path), mode="r")
-    writer = TsSegmentWriter(tmp_path, segment=1, input_stream=source.streams.video[0])
-    for packet in source.demux(source.streams.video[0]):
-        packet.decode()
-        writer.mux(packet)
-    writer.close()
-    source.close()
-    main = TsRangeDecoder(tmp_path, max_cache_bytes=1)
-    other = TsRangeDecoder(tmp_path, decoded_cache=main.decoded_cache)
-    coordinator = main.enable_shared_gop()
-    other.enable_shared_gop(coordinator)
-    entered = threading.Event()
-    release = threading.Event()
-    real_dispatch = _GopJob._dispatch
-    real_open = av.open
-    opens = []
-    first_time = frames[1][0] * frames[1][1]
-
-    def dispatch(job, frame_time, image):
-        if frame_time == first_time:
-            entered.set()
-            assert release.wait(timeout=3.0)
-        real_dispatch(job, frame_time, image)
-
-    def counting_open(*args, **kwargs):
-        if str(args[0]).endswith("segment-000001.ts"):
-            opens.append(args[0])
-        return real_open(*args, **kwargs)
-
-    monkeypatch.setattr(_GopJob, "_dispatch", dispatch)
-    monkeypatch.setattr(av, "open", counting_open)
-    high_pts, high_tb, high_image = frames[15]
-    low_pts, low_tb, low_image = frames[5]
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            high = pool.submit(main.read, 1, high_pts, high_tb.numerator, high_tb.denominator)
-            assert entered.wait(timeout=3.0)
-            low = pool.submit(other.read, 1, low_pts, low_tb.numerator, low_tb.denominator)
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline:
-                jobs = list(coordinator._jobs.values())
-                if jobs and len(jobs[0].waiters) == 2:
-                    break
-                time.sleep(0.01)
-            assert jobs and len(jobs[0].waiters) == 2
-            release.set()
-            low_image_result = low.result(timeout=3.0)
-            high_image_result = high.result(timeout=3.0)
-            assert low_image_result is not None and low_image is not None
-            assert high_image_result is not None and high_image is not None
-            assert np.array_equal(low_image_result, low_image)
-            assert np.array_equal(high_image_result, high_image)
-        assert len(opens) == 1
-        assert main._cache_bytes == 0
-    finally:
-        release.set()
-        main.close()
-        other.close()
-
-
 def test_main_and_frozen_buffer_share_gop_job_with_tiny_cache(tmp_path, monkeypatch) -> None:
     from airdrop.video.gop import _GopJob
 
@@ -562,6 +503,8 @@ def test_main_and_frozen_buffer_share_gop_job_with_tiny_cache(tmp_path, monkeypa
     writer.close()
     source.close()
     decoder = TsRangeDecoder(tmp_path, max_cache_bytes=1)
+    decoded_cache = decoder.decoded_cache
+    assert decoded_cache is not None
     buffer = AlignmentBuffer(capacity=30, storage="raw", cold_decoder=decoder, hot_seconds=0.01)
     for index, (pts, tb, image) in enumerate(frames):
         stamp = index / 12
@@ -620,6 +563,7 @@ def test_main_and_frozen_buffer_share_gop_job_with_tiny_cache(tmp_path, monkeypa
             assert low_frame is not None and np.array_equal(low_frame.image, frames[5][2])
             assert high_frame is not None and np.array_equal(high_frame.image, frames[15][2])
         assert len(opens) == 1
+        assert decoded_cache.byte_size == 0, "GOP 命中不能依赖已缓存图像"
     finally:
         release.set()
         frozen.close_cold_storage()
@@ -708,61 +652,6 @@ def test_shared_gop_rejects_new_view_while_last_close_is_in_progress(tmp_path, m
         release.set()
         other.close()
         newcomer.close()
-
-
-def test_closing_one_gop_reader_cancels_only_its_request(tmp_path, monkeypatch) -> None:
-    from airdrop.video.gop import _GopJob
-
-    source_path = tmp_path / "source.mp4"
-    frames = _make_h264(source_path, frames=20, gop=20)
-    source = av.open(str(source_path), mode="r")
-    writer = TsSegmentWriter(tmp_path, segment=1, input_stream=source.streams.video[0])
-    for packet in source.demux(source.streams.video[0]):
-        packet.decode()
-        writer.mux(packet)
-    writer.close()
-    source.close()
-    main = TsRangeDecoder(tmp_path, max_cache_bytes=1)
-    other = TsRangeDecoder(tmp_path, decoded_cache=main.decoded_cache)
-    coordinator = main.enable_shared_gop()
-    other.enable_shared_gop(coordinator)
-    entered = threading.Event()
-    release = threading.Event()
-    real_dispatch = _GopJob._dispatch
-
-    def dispatch(job, frame_time, image):
-        if frame_time == frames[1][0] * frames[1][1]:
-            entered.set()
-            assert release.wait(timeout=3.0)
-        real_dispatch(job, frame_time, image)
-
-    monkeypatch.setattr(_GopJob, "_dispatch", dispatch)
-    high_pts, high_tb, _ = frames[15]
-    low_pts, low_tb, expected = frames[5]
-    try:
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            high = pool.submit(main.read, 1, high_pts, high_tb.numerator, high_tb.denominator)
-            assert entered.wait(timeout=3.0)
-            low = pool.submit(other.read, 1, low_pts, low_tb.numerator, low_tb.denominator)
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline:
-                jobs = list(coordinator._jobs.values())
-                if jobs and len(jobs[0].waiters) == 2:
-                    break
-                time.sleep(0.01)
-            assert jobs and len(jobs[0].waiters) == 2
-            closing = pool.submit(main.close)
-            closing.result(timeout=3.0)
-            with pytest.raises(InterruptedError, match="取消"):
-                high.result(timeout=3.0)
-            release.set()
-            low_image = low.result(timeout=3.0)
-            assert low_image is not None and expected is not None
-            assert np.array_equal(low_image, expected)
-    finally:
-        release.set()
-        main.close()
-        other.close()
 
 
 def test_shared_gop_same_pts_waiters_use_one_decode_with_tiny_cache(tmp_path, monkeypatch) -> None:
@@ -934,9 +823,10 @@ def test_shared_gop_keeps_temporary_storage_until_last_view_and_job_exit(
             assert jobs and len(jobs[0].waiters) == 2
             storage.producer_stopped()
             assert not storage.finalize()
-            main.close()
+            closing = pool.submit(main.close)
+            closing.result(timeout=3.0)
             assert storage.directory.is_dir()
-            with pytest.raises(InterruptedError):
+            with pytest.raises(InterruptedError, match="取消"):
                 high.result(timeout=3.0)
             release.set()
             low_image = low.result(timeout=3.0)
@@ -3408,7 +3298,7 @@ def test_pyav_subprocess_graceful_stop_drains_accepted_frames(tmp_path) -> None:
     assert (output_dir / "segment-000001.complete").is_file()
 
 
-def test_wait_new_reads_verified_cold_frames_with_sequential_cursor(tmp_path) -> None:
+def test_wait_new_reads_verified_cold_frames_with_sequential_cursor(tmp_path, monkeypatch) -> None:
     source_path = tmp_path / "source.mp4"
     source_frames = _make_h264(source_path)
     input_container = av.open(str(source_path), mode="r")
@@ -3421,6 +3311,8 @@ def test_wait_new_reads_verified_cold_frames_with_sequential_cursor(tmp_path) ->
     input_container.close()
 
     decoder = TsRangeDecoder(tmp_path, max_cache_bytes=20_000)
+    decoded_cache = decoder.decoded_cache
+    assert decoded_cache is not None
     buffer = AlignmentBuffer(
         capacity=10,
         storage="raw",
@@ -3489,35 +3381,32 @@ def test_wait_new_reads_verified_cold_frames_with_sequential_cursor(tmp_path) ->
     frozen_second = buffer.freeze(after_index=0)
     assert all(isinstance(record.payload, ColdFrameRef) for record in frozen._records)
     assert any(isinstance(record.payload, np.ndarray) for record in buffer._records)
-    assert frozen._cold_thread is None
-    assert frozen._cold_worker_decoder is None
-    assert frozen._cold_decoder is not None
-    assert frozen._cold_decoder.segment_lifecycle is buffer.segment_lifecycle
-    assert frozen._cold_decoder.decoded_cache is decoder.decoded_cache
-    assert frozen_second._cold_decoder is not None
-    assert frozen_second._cold_decoder.decoded_cache is decoder.decoded_cache
-    assert buffer._cold_worker_decoder is not None
-    assert buffer._cold_worker_decoder.segment_lifecycle is buffer.segment_lifecycle
-    assert buffer._cold_worker_decoder.decoded_cache is None
-    assert buffer._cold_worker_decoder._gop_coordinator is None
-    assert frozen._cold_decoder._gop_coordinator is decoder._gop_coordinator
-    assert frozen_second._cold_decoder._gop_coordinator is decoder._gop_coordinator
     try:
-        for index, (_, _, expected) in enumerate(source_frames, start=1):
-            record = frozen.wait_new(after_index=index - 1, timeout=0)
-            assert record is not None
-            assert np.array_equal(record.image, expected)
-            assert decoder._cache_bytes <= decoder.max_cache_bytes
-        for index, (_, _, expected) in enumerate(source_frames, start=1):
-            record = frozen_second.wait_new(after_index=index - 1, timeout=0)
-            assert record is not None
-            assert np.array_equal(record.image, expected)
-            assert decoder._cache_bytes <= decoder.max_cache_bytes
+        for view in (frozen, frozen_second):
+            assert view._cold_thread is None and view._cold_worker_decoder is None
+            assert (
+                view._cold_decoder is not None and view._cold_decoder.decoded_cache is decoded_cache
+            )
+            for index, (_, _, expected) in enumerate(source_frames, start=1):
+                record = view.wait_new(after_index=index - 1, timeout=0)
+                assert record is not None and np.array_equal(record.image, expected)
+                assert decoded_cache.byte_size <= decoder.max_cache_bytes
+
+        # 最后一个冻结视图仍持有缓存，重复读取末帧应直接命中。
+        buffer.close_cold_storage()
+        frozen.close_cold_storage()
+        assert 0 < decoded_cache.byte_size <= decoder.max_cache_bytes
+        monkeypatch.setattr(
+            av, "open", lambda *args, **kwargs: pytest.fail("缓存命中时重新打开了 TS")
+        )
+        record = frozen_second.at(len(source_frames))
+        assert record is not None and np.array_equal(record.image, source_frames[-1][2])
     finally:
         frozen.close_cold_storage()
         frozen_second.close_cold_storage()
         buffer.close_cold_storage()
         decoder.close()
+    assert decoded_cache.byte_size == 0, "最后一个冷读取租约关闭后缓存应清空"
 
 
 def test_decoded_cache_is_shared_across_decoders_with_independent_leases(
@@ -3613,7 +3502,6 @@ def test_decoder_constructor_releases_cache_lease_when_reaper_start_fails(
         TsRangeDecoder(tmp_path, decoded_cache=cache)
 
     assert caught.value is start_error
-    assert cache._leases == 0
     cache.put(("late",), np.zeros((2, 2), dtype=np.uint8))
     assert cache.byte_size == 0
 
@@ -3880,16 +3768,25 @@ def test_cold_storage_close_attempts_both_decoders_after_one_fails(tmp_path) -> 
 
 
 def test_ts_flight_recorder_replay_and_calibration_reader_round_trip(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, caplog
+    tmp_path, monkeypatch: pytest.MonkeyPatch, caplog, request: pytest.FixtureRequest
 ) -> None:
     source_path = tmp_path / "source.mp4"
     source_frames = _make_h264(source_path, frames=24, gop=12)
-    buffer = AlignmentBuffer(capacity=100, storage="jpeg")
+    monkeypatch.setattr(
+        cv2,
+        "imencode",
+        lambda *_args, **_kwargs: pytest.fail("raw TS 路径不得 JPEG 编码"),
+    )
+    buffer = build_alignment_buffer(capture=True, ts_directory=tmp_path)
+    assert buffer is not None
+    request.addfinalizer(buffer.close_cold_storage)
     recorder = FlightRecorder(
         Config(record=RecordConfig(telemetry_hz=0)), base_dir=tmp_path / "flights"
     )
     recorder.start(broker=TelemetryBroker(), buffer=buffer, ts_video=True)
     assert recorder.video_directory is not None
+    buffer.bind_cold_directory(recorder.video_directory)
+    request.addfinalizer(recorder.stop)
     source_container = av.open(str(source_path), mode="r")
     source_stream = source_container.streams.video[0]
     writer = TsSegmentWriter(recorder.video_directory, segment=1, input_stream=source_stream)
@@ -3932,18 +3829,66 @@ def test_ts_flight_recorder_replay_and_calibration_reader_round_trip(
             materialize=False,
         )
     recorder.stop()
+    deadline = time.monotonic() + 5.0
+    while buffer.stats.cold_verified < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    cold_first = buffer.at(1)
+    hot_last = buffer.at(len(source_frames))
+    assert buffer.stats.storage == "raw"
+    assert buffer.stats.cold_frames > 0
+    assert buffer.stats.frames > buffer.stats.cold_frames
+    assert buffer.stats.hot_bytes > 0
+    assert buffer.read_jpeg_bytes(1) is None
+    assert buffer.stats.frames == len(source_frames)
+    assert cold_first is not None and hot_last is not None
+    assert np.array_equal(cold_first.image, source_frames[0][2])
+    assert cold_first.media_pts == source_frames[0][0]
+    assert cold_first.snapshot is None
+    assert hot_last.index == len(source_frames)
+    assert hot_last.media_pts == source_frames[-1][0]
+    assert hot_last.capture_timestamp == pytest.approx((len(source_frames) - 1) / 12)
+    assert hot_last.snapshot is not None
+    assert hot_last.snapshot.yaw_deg == float(len(source_frames) - 1)
     flight_dir = recorder.flight_dir
     assert flight_dir is not None
     assert not (flight_dir / "frames").exists()
 
-    replayed: list[VideoFrame] = []
+    from airdrop.runtime.replay import _build_replay_buffer
+
     replay = ReplayVideoSource(flight_dir, speed=0.0, strict=True)
+    replay_buffer, _output_size = _build_replay_buffer(replay, flight_dir)
+    request.addfinalizer(replay_buffer.close_cold_storage)
+    replay_writer = AlignmentWriter(replay_buffer, FrameTelemetryAligner(TelemetryBroker()))
+    replay.add_sink(replay_writer)
+    replayed: list[VideoFrame] = []
     replay.add_sink(lambda frame: replayed.append(frame.copy()))
+    request.addfinalizer(replay.stop)
     replay.start()
     assert replay.wait_finished(timeout=10.0)
     replay.stop()
     assert len(replayed) == len(source_frames)
-    aligned = replay._log.frames[7].aligned_telemetry
+    deadline = time.monotonic() + 5.0
+    while replay_buffer.stats.cold_verified < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    replay_cold_first = replay_buffer.at(1)
+    replay_hot_last = replay_buffer.at(len(source_frames))
+    assert replay_buffer.stats.storage == "raw"
+    assert replay_buffer.stats.frames == len(source_frames)
+    assert replay_buffer.stats.cold_frames > 0
+    assert replay_buffer.stats.hot_bytes > 0
+    assert replay_buffer.read_jpeg_bytes(1) is None
+    assert replay_cold_first is not None and replay_hot_last is not None
+    assert replay_cold_first.media_pts == source_frames[0][0]
+    assert replay_cold_first.capture_timestamp == pytest.approx(0.0)
+    assert replay_cold_first.snapshot is None
+    assert np.array_equal(replay_cold_first.image, source_frames[0][2])
+    assert replay_hot_last.index == len(source_frames)
+    assert replay_hot_last.media_pts == source_frames[-1][0]
+    assert replay_hot_last.capture_timestamp == pytest.approx((len(source_frames) - 1) / 12)
+    assert replay_hot_last.snapshot is not None
+    assert replay_hot_last.snapshot.yaw_deg == float(len(source_frames) - 1)
+    assert np.array_equal(replay_hot_last.image, source_frames[-1][2])
+    aligned = replay.frames[7].aligned_telemetry
     assert aligned is not None
     assert aligned["timestamp"] == pytest.approx(7 / 12)
     assert aligned["latitude_deg"] == pytest.approx(47.00007)

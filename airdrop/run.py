@@ -194,13 +194,6 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 source="DRAIN_TIMEOUT_S",
             ),
             Option(
-                ("--buffer-seconds",),
-                "buffer_seconds",
-                "环形缓冲保留时长（秒）",
-                kind="float",
-                source="BUFFER_SECONDS",
-            ),
-            Option(
                 ("--perception-mode",),
                 "perception_mode",
                 "感知模式",

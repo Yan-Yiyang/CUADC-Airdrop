@@ -588,85 +588,77 @@ def test_postprocess_empty_image_is_safe() -> None:
     assert result.number is None and result.stage == "empty"
 
 
-def test_engine_config_paths() -> None:
-    config = OcrEngineConfig(model_dir="m", det_model="d.pth", rec_model="r.pth", rec_keys="k.txt")
-    assert config.det_path() == Path("m/d.pth")
-    assert config.rec_path() == Path("m/r.pth")
-    assert config.keys_path() == Path("m/k.txt")
-
-
 # ----------------------------------------------------------------------
 # 方向分类（Cls）：接线与方向 API（不加载任何权重）
 # ----------------------------------------------------------------------
-class _FakeEngineType:
-    """假的 ``rapidocr.EngineType``——只为在不 import rapidocr 的前提下验参数。"""
-
-    TORCH = "engine:torch"
-    ONNXRUNTIME = "engine:onnxruntime"
 
 
-def _cls_params(config: OcrEngineConfig) -> dict:
-    return OcrEngine(config)._cls_params(_FakeEngineType)
+@pytest.mark.parametrize(
+    ("overrides", "expected_cls", "autorotate", "cuda"),
+    [
+        pytest.param({}, "onnx", False, True, id="default-diagnostic"),
+        pytest.param({"cls_autorotate": True}, "onnx", True, True, id="onnx-autorotate"),
+        pytest.param(
+            {"cls_engine": "torch", "cls_use_cuda": False}, "torch", False, False, id="torch-cpu"
+        ),
+        pytest.param({"cls_engine": "off"}, None, False, None, id="off"),
+    ],
+)
+def test_ocr_engine_assembles_model_paths_and_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides, expected_cls, autorotate, cuda
+) -> None:
+    """通过公开初始化入口核对交给 RapidOCR 的路径、引擎与方向开关。"""
+    for name in ("det.pth", "rec.pth", "keys.txt", "direction.onnx", "direction.pth"):
+        (tmp_path / name).touch()
+    config = OcrEngineConfig(
+        model_dir=str(tmp_path),
+        det_model="det.pth",
+        rec_model="rec.pth",
+        rec_keys="keys.txt",
+        cls_onnx_model="direction.onnx",
+        cls_torch_model="direction.pth",
+        **overrides,
+    )
+    received = []
+    backend = object()
 
+    def create_engine(*, params):
+        received.append(params)
+        return backend
 
-def test_cls_engine_selects_engine_and_model() -> None:
-    """``cls_engine`` 决定引擎与权重文件；``cls_autorotate`` 决定它是否参与识别。
-
-    ⚠ 这里**显式**写 ``cls_autorotate=True``：本用例测的是"引擎选择"，不该依赖默认值
-    （默认是 False，见下一条用例）。
-    """
-    onnx = _cls_params(OcrEngineConfig(cls_engine="onnx", cls_use_cuda=True, cls_autorotate=True))
-    assert onnx["Cls.engine_type"] == "engine:onnxruntime"
-    assert onnx["EngineConfig.onnxruntime.use_cuda"] is True
-    assert onnx["Global.use_cls"] is True
-    assert onnx["Cls.model_path"].endswith("ch_ppocr_mobile_v2.0_cls_mobile.onnx")
-
-    torch = _cls_params(OcrEngineConfig(cls_engine="torch", cls_use_cuda=False))
-    assert torch["Cls.engine_type"] == "engine:torch"
-    assert torch["EngineConfig.torch.use_cuda"] is False
-    # ⚠ 权重文件名里的 ptocr 是 RapidOCR 的拼写错误，与 arch_config.yaml 的键一致，
-    #   改名会直接加载失败（见 cropproc 模块 docstring）
-    assert torch["Cls.model_path"].endswith("ch_ptocr_mobile_v2.0_cls_mobile.pth")
-
-    off = _cls_params(OcrEngineConfig(cls_engine="off"))
-    assert off["Global.use_cls"] is False
-    assert "Cls.engine_type" not in off, "off 时不该选引擎（仍会给本地路径避免联网下载）"
-
-
-def test_cls_is_diagnostic_only_by_default() -> None:
-    """方向分类默认**不参与识别**：正式流程靠几何转正，cls 只作诊断/交叉验证。
-
-    方向分类默认关闭，不参与正式链路；仅在任务数据验证后，才应启用自动转正。
-    引擎与方向 API 都保留，复盘时仍可
-    ``classify_orientation()`` 核对方向（真要连会话都不建就设 ``cls_engine="off"``）。
-    """
-    default = OcrEngineConfig()
-    assert default.cls_autorotate is False
-    assert default.cls_enabled() is True, "默认只是不参与识别，不是禁用方向 API"
-    params = _cls_params(default)
-    assert params["Global.use_cls"] is False
-    assert params["Cls.engine_type"] == "engine:onnxruntime", "引擎仍在，供诊断用"
+    module = ModuleType("rapidocr")
+    module.__dict__.update(
+        EngineType=SimpleNamespace(TORCH="torch", ONNXRUNTIME="onnx"), RapidOCR=create_engine
+    )
+    monkeypatch.setitem(sys.modules, "rapidocr", module)
+    engine = OcrEngine(config)
+    assert engine.ensure() is backend
+    assert len(received) == 1
+    params = received[0]
+    assert params["Det.model_path"] == str(tmp_path / "det.pth")
+    assert params["Rec.model_path"] == str(tmp_path / "rec.pth")
+    assert params["Rec.rec_keys_path"] == str(tmp_path / "keys.txt")
+    assert params["Det.engine_type"] == params["Rec.engine_type"] == "torch"
+    assert params["Global.use_cls"] is autorotate
+    if expected_cls is None:
+        assert "Cls.engine_type" not in params
+        assert params["Cls.model_path"] == str(tmp_path / "direction.onnx")
+    else:
+        assert params["Cls.engine_type"] == expected_cls
+        assert params["Cls.model_path"] == str(
+            tmp_path / ("direction.pth" if expected_cls == "torch" else "direction.onnx")
+        )
+        device_key = (
+            "EngineConfig.torch.use_cuda"
+            if expected_cls == "torch"
+            else "EngineConfig.onnxruntime.use_cuda"
+        )
+        assert params[device_key] is cuda
 
 
 def test_cls_engine_rejects_unknown_name() -> None:
     with pytest.raises(ValueError, match="cls_engine"):
-        _cls_params(OcrEngineConfig(cls_engine="openvino"))
-
-
-def test_cls_config_paths_follow_engine() -> None:
-    config = OcrEngineConfig(model_dir="m", cls_engine="torch")
-    assert (
-        config.cls_path()
-        == config.cls_torch_path()
-        == Path("m/ch_ptocr_mobile_v2.0_cls_mobile.pth")
-    )
-    config = OcrEngineConfig(model_dir="m", cls_engine="onnx")
-    assert (
-        config.cls_path()
-        == config.cls_onnx_path()
-        == Path("m/ch_ppocr_mobile_v2.0_cls_mobile.onnx")
-    )
-    assert config.cls_enabled() and not OcrEngineConfig(cls_engine="off").cls_enabled()
+        OcrEngine(OcrEngineConfig(cls_engine="openvino"))._cls_params(None)
 
 
 def test_cls_weight_is_required_when_enabled() -> None:
@@ -1055,9 +1047,9 @@ def test_pipeline_config_validates_mode_and_color() -> None:
 def test_config_bridges_to_perception() -> None:
     from airdrop import Config
 
-    config = Config().validated()
+    config = Config().replace(perception=replace(Config().perception, mode="cls12"))
     pipeline_config = config.perception.to_pipeline_config()
-    assert pipeline_config.mode == config.perception.mode
+    assert pipeline_config.mode == "cls12"
     assert pipeline_config.model_path == config.perception.model_path
     assert pipeline_config.engine.model_dir == config.perception.models_dir
     assert pipeline_config.engine.use_cuda == config.perception.ocr_use_cuda
@@ -1066,10 +1058,11 @@ def test_config_bridges_to_perception() -> None:
 # ----------------------------------------------------------------------
 # Pipeline（假 detector + 假 pool）
 # ----------------------------------------------------------------------
-class _FakeDetector:
+class _FakeDetector(Detector):
     """按脚本产出检测框的假 detector（不加载权重、不跑 GPU）。"""
 
     def __init__(self, detections_per_frame: int = 1) -> None:
+        super().__init__()
         self.detections_per_frame = detections_per_frame
         self.calls: list[int] = []
 
@@ -1090,24 +1083,32 @@ class _FakeDetector:
 
         self.calls.append(frame_index)
         snapshot = telemetry if telemetry is not None else TelemetrySnapshot()
+        height, width = image.shape[:2]
+        # 每个目标占一列，框取该列中间的一半，裁切和去重都使用画面内坐标。
+        boxes = [
+            PixelBox(
+                width * (i + 0.25) / self.detections_per_frame,
+                height / 4,
+                width * (i + 0.75) / self.detections_per_frame,
+                3 * height / 4,
+            )
+            for i in range(self.detections_per_frame)
+        ]
         detections = tuple(
             Detection(
                 frame_index=frame_index,
                 capture_timestamp=capture_timestamp,
-                pixel=(100.0 + 200.0 * i, 200.0),
-                box=PixelBox(90.0 + 200.0 * i, 190.0, 110.0 + 200.0 * i, 210.0),
+                pixel=box.center,
+                box=box,
                 confidence=0.9 - 0.1 * i,
                 telemetry=snapshot,
                 # cls12：类别直出编号（类别 0 → 1 起编号）
                 code=(0 + 1) if mode == "cls12" else None,
                 mode=mode,
             )
-            for i in range(self.detections_per_frame)
+            for i, box in enumerate(boxes)
         )
         return DetectionBatch(image=image, detections=detections)
-
-    def crop(self, batch, detection):
-        return np.full((32, 32, 3), 200, np.uint8)
 
 
 class _FakePool:
@@ -1620,7 +1621,7 @@ def test_replay_entry_drains_tail_and_preserves_failure(
     expected,
     fatal,
 ) -> None:
-    """真实回放入口在播放完成后才放行检测，确定性复现尾帧积压。"""
+    """隔离 TS 装配，验证真实回放协调器的尾帧排空与故障语义。"""
     import cv2
 
     import airdrop
@@ -1677,6 +1678,10 @@ def test_replay_entry_drains_tail_and_preserves_failure(
             release.set()
 
     class Detector(_FakeDetector):
+        def warmup(self, width: int, height: int) -> bool:
+            assert (width, height) == (64, 64)
+            return True
+
         def detect(self, *args, **kwargs):
             if fatal:
                 return RealDetector(DetectorConfig(calib_size=(128, 128))).detect(args[0])
@@ -1703,6 +1708,22 @@ def test_replay_entry_drains_tail_and_preserves_failure(
         return worker
 
     monkeypatch.setattr(airdrop, "ReplayVideoSource", Source)
+    config = Config()
+    monkeypatch.setattr(
+        replay_flight,
+        "build_config",
+        lambda **overrides: config.replace(
+            perception=replace(config.perception, mode=overrides["perception_mode"]),
+            camera=replace(config.camera, fallback_width=64, fallback_height=64),
+            qgc_video=replace(config.qgc_video, enabled=False),
+        ),
+    )
+    monkeypatch.setattr(
+        replay_flight,
+        "_build_replay_buffer",
+        # 本用例使用轻量 JPEG fixture，只覆盖回放收尾协调，不覆盖 TS 工厂。
+        lambda _source, _resolved: (AlignmentBuffer(capacity=16, storage="jpeg"), (64, 64)),
+    )
     monkeypatch.setattr(perception_pipeline, "PerceptionWorker", create_worker)
     caplog.set_level(logging.INFO)
     assert (
@@ -1815,7 +1836,7 @@ def test_pipeline_cls12_mode_emits_without_ocr() -> None:
 
 def test_pipeline_cls12_without_crop_storage_does_not_crop() -> None:
     class NoCropDetector(_FakeDetector):
-        def crop(self, batch, detection):
+        def crop_with_bounds(self, batch, detection):
             del batch, detection
             raise AssertionError("未启用裁切归档时不应生成 cls12 裁切图")
 
@@ -1968,6 +1989,63 @@ def test_pipeline_sends_every_frame_to_ocr_by_default() -> None:
     assert len(pool.submitted) == 5
     stats = worker.stats
     assert stats.deduped == 0
+
+
+def test_pipeline_passes_expanded_edge_crop_and_bounds_to_ocr_and_store(tmp_path: Path) -> None:
+    """管线传给 OCR 和归档的裁切像素、边界必须与贴边外扩区域一致。"""
+    from airdrop.perception.detector import DetectionBatch, Detector, DetectorConfig
+
+    image = np.arange(64 * 64 * 3, dtype=np.uint8).reshape(64, 64, 3)
+    box = PixelBox(1.0, 2.0, 11.0, 14.0)
+    detection = Detection(
+        frame_index=1,
+        capture_timestamp=1000.1,
+        pixel=box.center,
+        box=box,
+        confidence=0.9,
+        telemetry=TelemetrySnapshot(north_m=1.0, east_m=2.0, down_m=-10.0),
+        extra={"image_size": (64, 64)},
+    )
+    batch = DetectionBatch(image=image, detections=(detection,))
+
+    class DetectorWithScriptedBatch(Detector):
+        def detect(self, *_args, **_kwargs):
+            return batch
+
+    detector = DetectorWithScriptedBatch(DetectorConfig(crop_expand_ratio=0.5))
+    direct_crop, bounds = detector.crop_with_bounds(batch, detection)
+    assert bounds == (0, 0, 14, 17)
+    np.testing.assert_array_equal(direct_crop, image[0:17, 0:14])
+
+    class CropCapturingPool(_FakePool):
+        def __init__(self) -> None:
+            super().__init__(numbers=[56])
+            self.crops: list[np.ndarray] = []
+
+        def submit(self, crop, **kwargs):
+            self.crops.append(crop.copy())
+            return super().submit(crop, **kwargs)
+
+    pool = CropCapturingPool()
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="ocr"), buffer=_buffer_with(0), detector=detector, pool=pool
+    )
+    worker.configure_crop_storage(tmp_path)
+    frame = _buffer_with(1).latest()
+    assert frame is not None
+    try:
+        worker._process_frame(frame)
+    finally:
+        assert worker._crop_store is not None
+        worker._crop_store.close()
+
+    # 独立按扩框比例得到 [-1.5, -1, 13.5, 17]，贴边后半开范围为 [0:17, 0:14]。
+    expected = image[0:17, 0:14]
+    assert len(pool.crops) == 1
+    np.testing.assert_array_equal(pool.crops[0], expected)
+    record = json.loads((tmp_path / "index.jsonl").read_text(encoding="utf-8"))
+    assert record["crop_bounds"] == [0, 0, 14, 17]
+    assert (tmp_path / record["crop"]).is_file()
 
 
 def test_pipeline_dedupe_when_enabled() -> None:

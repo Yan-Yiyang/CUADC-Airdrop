@@ -26,6 +26,13 @@ def test_qgc_video_defaults_off_without_capture_but_explicit_request_fails() -> 
         prepare_config(replace(options, qgc_video=True), Config())
 
 
+def test_qgc_video_default_with_capture_and_explicit_disable() -> None:
+    options = RunOptions(mode="sitl", run_mission=False, recognize=False, capture=True)
+
+    assert prepare_config(options, Config()).qgc_video.enabled is True
+    assert prepare_config(replace(options, qgc_video=False), Config()).qgc_video.enabled is False
+
+
 @pytest.mark.parametrize(
     "updates",
     [

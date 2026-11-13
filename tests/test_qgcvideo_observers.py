@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from airdrop.perception.detector import DetectionBatch
+from airdrop.perception.detector import DetectionBatch, Detector
 from airdrop.perception.models import Detection, PixelBox, ProcessedFrame
 from airdrop.perception.pipeline import PerceptionConfigLike, PerceptionWorker
 from airdrop.telemetry.models import TelemetrySnapshot
@@ -20,17 +20,13 @@ class _Buffer:
         return 10
 
 
-class _Detector:
-    config = SimpleNamespace(camera_matrix=None)
-
+class _Detector(Detector):
     def __init__(self, detections: tuple[Detection, ...]) -> None:
+        super().__init__()
         self._detections = detections
 
     def detect(self, image: np.ndarray, **_: object) -> DetectionBatch:
         return DetectionBatch(image=image, detections=self._detections)
-
-    def crop(self, *_: object) -> np.ndarray:
-        return np.ones((2, 2, 3), np.uint8)
 
 
 def _detection(index: int = 3) -> Detection:
@@ -43,7 +39,7 @@ def _detection(index: int = 3) -> Detection:
         confidence=0.8,
         telemetry=TelemetrySnapshot(north_m=1.0),
         code=2,
-        extra={"mutable": [1]},
+        extra={"mutable": [1], "image_size": (16, 16)},
         mode="cls12",
     )
 
@@ -141,9 +137,7 @@ def test_blocked_display_preserves_fixed_perception_cutoff_and_full_recording(
     from airdrop.qgcvideo.publisher import QgcVideoPublisher
     from airdrop.qgcvideo.state import DisplayState
 
-    class Detector:
-        config = SimpleNamespace(camera_matrix=None)
-
+    class FixedCodeDetector(Detector):
         def load(self):
             return self
 
@@ -161,6 +155,7 @@ def test_blocked_display_preserves_fixed_perception_cutoff_and_full_recording(
                         confidence=0.9,
                         code=12,
                         mode="cls12",
+                        extra={"image_size": (image.shape[1], image.shape[0])},
                     ),
                 ),
             )
@@ -204,7 +199,7 @@ def test_blocked_display_preserves_fixed_perception_cutoff_and_full_recording(
     worker = PerceptionWorker(
         PerceptionConfigLike(mode="cls12"),
         buffer=buffer,
-        detector=Detector(),  # type: ignore[arg-type]
+        detector=FixedCodeDetector(),
     )
     state = DisplayState(config, camera)
     worker.add_frame_observer(state.on_frame)

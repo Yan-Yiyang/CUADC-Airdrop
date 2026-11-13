@@ -42,12 +42,6 @@ def drain_for(source: Hm30VideoSource, seconds: float) -> int:
     return seen
 
 
-def wait_reconnect(source: Hm30VideoSource, timeout: float = 15.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and source.stats.reconnects == 0:
-        time.sleep(0.2)
-
-
 @pytest.mark.stream
 def test_stream_basic(live_source) -> None:
     source = live_source()
@@ -160,35 +154,45 @@ def test_sink_failure_is_fatal(make_source, sender, stream_config) -> None:
 
 @pytest.mark.stream
 def test_stream_reconnect(make_source, sender, stream_config) -> None:
-    """断流判定与 stop() 脱身能力。
-
-    ``-timeout`` 是让 ffmpeg 在断流时退出的关键 flag；缺了它，管道读会
-    永久阻塞，拉流线程既检测不到断流，stop() 也退不掉。
-    """
+    """用不同颜色区分两段 UDP 流，核对重连后新帧及限时停止。"""
     config = replace(stream_config, read_timeout=2.0, reconnect_delay=1.0, max_reconnect_delay=2.0)
     source = make_source(config)
     source.start()
     time.sleep(0.8)
-    process = sender.start()
-    assert source.wait_ready(timeout=12.0), "首次连接失败"
+    process = sender.start(color="red")
+    first = source.read(timeout=12.0)
+    assert first is not None, "首次连接失败"
+    np.testing.assert_allclose(first.image[0, 0], (0, 0, 255), atol=10)
+    before = source.stats.reconnects
+    sender.stop(process)
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        stats = source.stats
+        if stats.reconnects > before and stats.state == "reconnecting":
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"断流后未观察到重连，最终状态 {source.stats}")
 
-    sender.stop(process)  # 掐掉流：UDP 没有 EOF，只能靠 -timeout 判定
-    wait_reconnect(source)
-    assert source.stats.reconnects >= 1, (
-        f"未检测到断流 reconnects={source.stats.reconnects} state={source.stats.state}"
-    )
-
-    sender.start()
-    assert source.wait_ready(timeout=20.0), (
-        f"未自动恢复 state={source.stats.state} err={source.stats.last_error}"
-    )
+    # 重连前可能还有未消费的红色帧。只接受第二个发送端启动后产生的蓝色帧。
+    last = source.latest()
+    assert last is not None
+    sender.start(color="blue")
+    deadline = time.monotonic() + 20.0
+    while (remaining := deadline - time.monotonic()) > 0:
+        restored = source.read(timeout=remaining)
+        if restored is not None and restored.index > last.index:
+            np.testing.assert_allclose(restored.image[0, 0], (255, 0, 0), atol=10)
+            break
+    else:
+        pytest.fail(f"恢复发送后未收到新帧，最终状态 {source.stats}")
 
     # 管道里可能正卡着一次读，stop() 必须能杀掉子进程把它解开
     started = time.monotonic()
     source.stop()
     elapsed = time.monotonic() - started
     assert elapsed < 5.5, f"stop() 被阻塞的管道读卡住，耗时 {elapsed:.2f}s"
-    assert source._process is None, "ffmpeg 子进程未回收"
+    assert not source.running and source._pyav_process is None
 
 
 @pytest.mark.network

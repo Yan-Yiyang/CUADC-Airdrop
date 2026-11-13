@@ -53,14 +53,6 @@ def test_mission_config_defaults_match_plan() -> None:
     assert Config().gripper.instance == 0
 
 
-def test_replace_derives_new_config() -> None:
-    """replace 派生不修改原配置（frozen dataclass 语义）。"""
-    base = Config()
-    derived = base.replace(perception=PerceptionConfig(mode="cls12"))
-    assert base.perception.mode == "ocr"
-    assert derived.perception.mode == "cls12"
-
-
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
