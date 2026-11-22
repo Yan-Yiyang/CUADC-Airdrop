@@ -166,7 +166,8 @@ class TsRangeDecoder:
             raise ValueError("解码游标空闲超时必须为正有限秒数")
         if decoded_cache is not None and not cache_enabled:
             raise ValueError("禁用缓存的解码器不能绑定共享缓存")
-        self.directory = Path(directory)
+        self._directory = Path(directory)
+        self._resolved_directory = str(self._directory.resolve())
         self.max_cache_bytes = (
             decoded_cache.max_bytes if decoded_cache is not None else max_cache_bytes
         )
@@ -711,13 +712,29 @@ class TsRangeDecoder:
             return ()
         return (
             cache.storage_identity,
-            str(self.directory.resolve()),
+            self._resolved_directory,
             segment,
             media_time.numerator,
             media_time.denominator,
             width,
             height,
         )
+
+    @property
+    def directory(self) -> Path:
+        """TS 分段所在目录。"""
+        return self._directory
+
+    @directory.setter
+    def directory(self, value: str | Path) -> None:
+        path = Path(value)
+        self._directory = path
+        self._resolved_directory = str(path.resolve())
+
+    @property
+    def resolved_directory(self) -> str:
+        """缓存规范化后的目录路径字符串，避免热路径每帧调用 Path.resolve()。"""
+        return self._resolved_directory
 
     @property
     def _cache_bytes(self) -> int:

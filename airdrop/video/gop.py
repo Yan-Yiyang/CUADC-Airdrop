@@ -142,7 +142,7 @@ class _GopJob:
         self.cache.put(
             (
                 self.cache.storage_identity,
-                str(self.decoder.directory.resolve()),
+                self.decoder.resolved_directory,
                 self.segment,
                 frame_time.numerator,
                 frame_time.denominator,
@@ -300,7 +300,7 @@ class GopCoordinator:
             if lifecycle is not None and lifecycle.snapshot(segment).state is SegmentState.ACTIVE:
                 raise TsDataNotReady(f"活动 MPEG-TS 段尚未写出随机访问点: {path}")
             raise ValueError(f"目标时间 {target} 之前没有可用关键帧: {path}")
-        key = (str(decoder.directory.resolve()), segment, before[-1][1], size)
+        key = (decoder.resolved_directory, segment, before[-1][1], size)
         waiter = _Waiter(target, (pts, num, den), decoder)
         with self._condition:
             if decoder not in self._views:

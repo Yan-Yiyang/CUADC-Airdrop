@@ -4259,3 +4259,40 @@ def test_storage_fatal_does_not_enter_network_reconnect_loop(monkeypatch) -> Non
     assert source.stats.reconnects == 0
     assert source.stats.state == "stopped"
     assert source.stats.last_error == "TS index failed"
+
+
+def test_ts_range_decoder_caches_resolved_directory(tmp_path: Path, monkeypatch) -> None:
+    """热路径构造缓存键复用规范化目录缓存，且更换目录后同步更新。"""
+    from fractions import Fraction
+
+    from airdrop.video.cold import TsRangeDecoder
+
+    first_dir = tmp_path / "run-a"
+    second_dir = tmp_path / "run-b"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    decoder = TsRangeDecoder(first_dir)
+    try:
+        expected_first = str(first_dir.resolve())
+        assert decoder.resolved_directory == expected_first
+        original_resolve = Path.resolve
+        calls = 0
+
+        def counted_resolve(self: Path, *args, **kwargs) -> Path:
+            nonlocal calls
+            calls += 1
+            return original_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", counted_resolve)
+        key = decoder._make_cache_key(1, Fraction(1, 30), 1280, 720)
+        assert key[1] == expected_first
+        assert calls == 0
+
+        decoder.directory = second_dir
+        assert calls == 1
+        assert decoder.resolved_directory == str(second_dir.resolve())
+        key_after = decoder._make_cache_key(1, Fraction(1, 30), 1280, 720)
+        assert key_after[1] == decoder.resolved_directory
+        assert calls == 2
+    finally:
+        decoder.close()
