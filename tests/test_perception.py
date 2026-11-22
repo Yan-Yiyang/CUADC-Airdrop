@@ -3263,3 +3263,292 @@ def test_ocr_dispatch_full_queue_retries_without_rereading_sidecar(
         assert read_calls == 1
     finally:
         _close_pool_queues(pool)
+
+
+def test_ocr_spool_index_uses_wal_and_closes_on_init_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SQLite 积压索引启用 WAL/NORMAL/MEMORY，初始化失败时不泄漏连接。"""
+    import sqlite3
+
+    from airdrop.perception import ocr_worker
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    pool = OcrWorkerPool(workers=1)
+    initial_spool = pool._spool_dir
+    try:
+        pool.set_spool_directory(tmp_path / "wal-spool")
+        with pool._spool_index_lock:
+            index = pool._spool_index_connection_locked()
+            journal_mode = index.execute("PRAGMA journal_mode").fetchone()[0]
+            synchronous = index.execute("PRAGMA synchronous").fetchone()[0]
+            temp_store = index.execute("PRAGMA temp_store").fetchone()[0]
+        assert str(journal_mode).lower() == "wal"
+        assert synchronous == 1  # NORMAL
+        assert temp_store == 2  # MEMORY
+
+        pool._close_spool_index()
+
+        closed = False
+
+        class _BrokenInitConnection:
+            def execute(self, statement: str):
+                if statement.startswith("CREATE TABLE"):
+                    raise sqlite3.OperationalError("injected init error")
+                return self
+
+            def close(self) -> None:
+                nonlocal closed
+                closed = True
+
+        monkeypatch.setattr(ocr_worker.sqlite3, "connect", lambda *a, **kw: _BrokenInitConnection())
+        with pool._spool_index_lock, pytest.raises(sqlite3.OperationalError, match="injected init"):
+            pool._spool_index_connection_locked()
+        assert closed is True
+        assert pool._spool_index is None
+        assert pool._spool_index_path is None
+    finally:
+        pool._close_spool_index()
+        _close_pool_queues(pool)
+        shutil_rmtree = ocr_worker.shutil.rmtree
+        shutil_rmtree(initial_spool, ignore_errors=True)
+
+
+def test_ocr_ack_sync_cleanup_without_thread_and_async_drain_before_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """未启动清理线程时 ack() 同步删除；启用后异步删除，满队列回退同步，stop() 先排空再删目录。"""
+    import shutil
+
+    from airdrop.perception import ocr_worker
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    # 1. 未调用 start()（无 _cleanup_thread）：ack() 仍同步清理 .png 与 .request
+    sync_pool = OcrWorkerPool(workers=1)
+    sync_initial_spool = sync_pool._spool_dir
+    try:
+        sync_spool = tmp_path / "sync-spool"
+        sync_pool.set_spool_directory(sync_spool)
+        sync_pool._started = True
+        request_id = sync_pool.submit(
+            np.zeros((2, 2, 3), np.uint8), frame_index=1, capture_timestamp=1.0
+        )
+        assert request_id == 1
+        assert sync_pool._cleanup_thread is None
+        crop_path = sync_spool / "000000000001.png"
+        meta_path = sync_spool / "000000000001.request"
+        assert crop_path.is_file() and meta_path.is_file()
+        sync_pool.ack(OcrResult(request_id=1, frame_index=1, capture_timestamp=1.0, number=42))
+        assert (sync_spool / "000000000001.ack").is_file()
+        assert not crop_path.exists() and not meta_path.exists()
+    finally:
+        sync_pool._close_spool_index()
+        _close_pool_queues(sync_pool)
+        shutil.rmtree(sync_initial_spool, ignore_errors=True)
+
+    # 2. start() 启动异步清理线程：ack() 异步卸盘，满队列回退同步，stop() 先排空再 rmtree
+    pool, _ = _startup_pool(["ready"])
+    initial_spool = pool._spool_dir
+    owned_spool = tmp_path / "owned-spool"
+    owned_spool.mkdir()
+    pool._spool_dir = owned_spool
+    pool._owns_spool_dir = True
+    unlink_entered = threading.Event()
+    release_unlink = threading.Event()
+    cleaned: list[tuple[int, str]] = []
+    rmtree_observations: list[tuple[list[tuple[int, str]], bool, bool, bool]] = []
+    real_unlink = OcrWorkerPool._unlink_request_files
+    real_rmtree = shutil.rmtree
+    main_thread_name = threading.current_thread().name
+
+    def observed_unlink(req_id: int, c_path: Path, m_path: Path) -> None:
+        if req_id == 1:
+            unlink_entered.set()
+            assert release_unlink.wait(5.0)
+        real_unlink(req_id, c_path, m_path)
+        cleaned.append((req_id, threading.current_thread().name))
+
+    def observed_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+        if Path(path) == owned_spool:
+            rmtree_observations.append(
+                (
+                    list(cleaned),
+                    not (owned_spool / "000000000001.png").exists(),
+                    not (owned_spool / "000000000001.request").exists(),
+                    pool._cleanup_thread is None,
+                )
+            )
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(pool, "_unlink_request_files", observed_unlink)
+    monkeypatch.setattr(ocr_worker.shutil, "rmtree", observed_rmtree)
+
+    pool.start(timeout=2.0)
+    try:
+        cleanup_thread = pool._cleanup_thread
+        assert cleanup_thread is not None and cleanup_thread.is_alive()
+        assert cleanup_thread.name == "ocr-spool-cleanup"
+        assert cleanup_thread.daemon is True
+
+        req1 = pool.submit(np.zeros((2, 2, 3), np.uint8), frame_index=1, capture_timestamp=1.0)
+        req2 = pool.submit(np.zeros((2, 2, 3), np.uint8), frame_index=2, capture_timestamp=2.0)
+        assert (req1, req2) == (1, 2)
+        assert pool._request_q.get(timeout=2.0).request_id == 1
+        assert pool._request_q.get(timeout=2.0).request_id == 2
+
+        pool._result_q.put(OcrResult(request_id=1, frame_index=1, capture_timestamp=1.0, number=11))
+        res1 = pool.poll(timeout=1.0)
+        assert res1 is not None
+        pool.ack(res1)
+        assert unlink_entered.wait(2.0), "ack() 应已将 #1 交给后台清理线程且自身已返回"
+
+        # 清理队列满时 ack() 回退为当前线程同步删除。
+        real_put_nowait = pool._cleanup_q.put_nowait
+
+        def full_put_nowait(_item: Any) -> None:
+            raise queue.Full
+
+        monkeypatch.setattr(pool._cleanup_q, "put_nowait", full_put_nowait)
+        pool._result_q.put(OcrResult(request_id=2, frame_index=2, capture_timestamp=2.0, number=22))
+        res2 = pool.poll(timeout=1.0)
+        assert res2 is not None
+        pool.ack(res2)
+        monkeypatch.setattr(pool._cleanup_q, "put_nowait", real_put_nowait)
+        assert not (owned_spool / "000000000002.png").exists()
+        assert not (owned_spool / "000000000002.request").exists()
+        assert cleaned == [(2, main_thread_name)]
+
+        stop_thread = threading.Thread(target=pool.stop, kwargs={"timeout": 5.0})
+        stop_thread.start()
+        release_unlink.set()
+        stop_thread.join(5.0)
+        assert not stop_thread.is_alive()
+        assert pool._cleanup_thread is None
+        assert not owned_spool.exists()
+        assert rmtree_observations == [
+            ([(2, main_thread_name), (1, "ocr-spool-cleanup")], True, True, True)
+        ]
+    finally:
+        release_unlink.set()
+        pool.stop(timeout=2.0)
+        real_rmtree(initial_spool, ignore_errors=True)
+
+
+def test_ocr_stop_timeout_retains_cleanup_thread_and_skips_rmtree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """清理线程超时未退出时保留引用、跳过目录删除且禁止重启，排空后可正常收尾。"""
+    import shutil
+
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    pool, _ = _startup_pool(["ready"])
+    initial_spool = pool._spool_dir
+    owned_spool = tmp_path / "owned-timeout-spool"
+    owned_spool.mkdir()
+    pool._spool_dir = owned_spool
+    pool._owns_spool_dir = True
+    unlink_entered = threading.Event()
+    release_unlink = threading.Event()
+    real_unlink = OcrWorkerPool._unlink_request_files
+
+    def slow_unlink(req_id: int, c_path: Path, m_path: Path) -> None:
+        unlink_entered.set()
+        assert release_unlink.wait(5.0)
+        real_unlink(req_id, c_path, m_path)
+
+    monkeypatch.setattr(pool, "_unlink_request_files", slow_unlink)
+    pool.start(timeout=2.0)
+    try:
+        cleanup_thread = pool._cleanup_thread
+        assert cleanup_thread is not None
+        req_id = pool.submit(np.zeros((2, 2, 3), np.uint8), frame_index=1, capture_timestamp=1.0)
+        assert req_id == 1
+        assert pool._request_q.get(timeout=2.0).request_id == 1
+        pool._result_q.put(OcrResult(request_id=1, frame_index=1, capture_timestamp=1.0, number=7))
+        res = pool.poll(timeout=1.0)
+        assert res is not None
+        pool.ack(res)
+        assert unlink_entered.wait(2.0)
+
+        pool.stop(timeout=0.05)
+        assert pool._cleanup_thread is cleanup_thread
+        assert cleanup_thread.is_alive()
+        assert owned_spool.exists(), "清理线程仍在运行时不得并发执行 shutil.rmtree"
+        with pytest.raises(RuntimeError, match="清理线程尚未退出"):
+            pool.start(timeout=0.1)
+
+        release_unlink.set()
+        pool.stop(timeout=5.0)
+        assert pool._cleanup_thread is None
+        assert not cleanup_thread.is_alive()
+        assert not owned_spool.exists()
+    finally:
+        release_unlink.set()
+        pool.stop(timeout=2.0)
+        shutil.rmtree(initial_spool, ignore_errors=True)
+
+
+def test_ocr_submit_wakes_dispatch_loop_immediately_via_wakeup_event(tmp_path: Path) -> None:
+    """submit() 落索引后与 stop()/_set_dispatch_error() 应通过 _dispatch_wakeup 立即唤醒派发循环。"""
+    import shutil
+
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    class _ObservedWakeup(threading.Event):
+        def __init__(self) -> None:
+            super().__init__()
+            self.waiting = threading.Event()
+            self.timeouts: list[float | None] = []
+            self.wait_results: list[bool] = []
+
+        def wait(self, timeout: float | None = None) -> bool:
+            self.timeouts.append(timeout)
+            self.waiting.set()
+            # 放宽真实等待时长：若未被主动 set() 唤醒，则无法借 20ms 轮询误通过。
+            woken = super().wait(5.0)
+            self.wait_results.append(woken)
+            return woken
+
+    pool = OcrWorkerPool(workers=1)
+    initial_spool = pool._spool_dir
+    wakeup = _ObservedWakeup()
+    pool.set_spool_directory(tmp_path / "wakeup-spool")
+    pool._dispatch_wakeup = wakeup
+    pool._started = True
+    pool._dispatch_stop.clear()
+    thread = threading.Thread(target=pool._dispatch_spool)
+    pool._dispatch_thread = thread
+    thread.start()
+    try:
+        assert wakeup.waiting.wait(2.0)
+        wakeup.waiting.clear()
+        request_id = pool.submit(
+            np.zeros((2, 2, 3), np.uint8),
+            frame_index=1,
+            capture_timestamp=1.0,
+        )
+        assert request_id == 1
+        request = pool._request_q.get(timeout=1.0)
+        assert request.request_id == 1
+        assert wakeup.timeouts[0] == pytest.approx(0.02)
+        assert wakeup.wait_results[0] is True
+
+        # 请求派发完后回到空等；stop() 也必须通过 _dispatch_wakeup 立即唤醒退出。
+        assert wakeup.waiting.wait(2.0)
+        pool.stop(timeout=2.0)
+        assert not thread.is_alive()
+        assert pool._dispatch_thread is None
+        assert wakeup.wait_results[-1] is True
+
+        # _set_dispatch_error() 也必须置位 _dispatch_wakeup。
+        wakeup.clear()
+        pool._set_dispatch_error("injected dispatch error")
+        assert wakeup.is_set()
+    finally:
+        pool._dispatch_stop.set()
+        wakeup.set()
+        thread.join(2.0)
+        pool._close_spool_index()
+        _close_pool_queues(pool)
+        shutil.rmtree(initial_spool, ignore_errors=True)

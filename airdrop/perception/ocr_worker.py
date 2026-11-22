@@ -269,9 +269,14 @@ class OcrWorkerPool:
         self._owns_spool_dir = True
         self._dispatch_thread: threading.Thread | None = None
         self._dispatch_stop = threading.Event()
+        self._dispatch_wakeup = threading.Event()
         self._dispatch_id = 1
         self._dispatch_error: str | None = None
         self._dispatch_error_reported = False
+        self._cleanup_q: queue.Queue[tuple[int, Path, Path] | None] = queue.Queue(
+            maxsize=max(self._queue_size, 1024)
+        )
+        self._cleanup_thread: threading.Thread | None = None
         self._submit_lock = threading.Lock()
         self._spool_index_lock = threading.Lock()
         self._spool_index: sqlite3.Connection | None = None
@@ -351,6 +356,20 @@ class OcrWorkerPool:
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
+    def _clear_or_reject_stale_threads(self) -> None:
+        """重启前确认上次的派发和清理线程均已退出，并清理已结束的线程引用。"""
+        for attr, label in (
+            ("_dispatch_thread", "派发"),
+            ("_cleanup_thread", "清理"),
+        ):
+            thread: threading.Thread | None = getattr(self, attr)
+            if thread is None:
+                continue
+            if thread.is_alive() and not self._started:
+                raise RuntimeError(f"上次 OCR 磁盘{label}线程尚未退出，不能重新启动")
+            if not thread.is_alive():
+                setattr(self, attr, None)
+
     def start(self, timeout: float = 120.0) -> "OcrWorkerPool":
         """并行初始化全部工作进程，收到预热成功确认后返回；失败回滚。
 
@@ -358,11 +377,7 @@ class OcrWorkerPool:
         """
         if not math.isfinite(timeout) or timeout < 0:
             raise ValueError("OCR 初始化超时必须是非负有限秒数")
-        dispatch_thread = self._dispatch_thread
-        if dispatch_thread is not None and dispatch_thread.is_alive() and not self._started:
-            raise RuntimeError("上次 OCR 磁盘派发线程尚未退出，不能重新启动")
-        if dispatch_thread is not None and not dispatch_thread.is_alive():
-            self._dispatch_thread = None
+        self._clear_or_reject_stale_threads()
         if self._started:
             return self
         if self._processes:
@@ -374,6 +389,7 @@ class OcrWorkerPool:
             self._request_q = self._context.Queue(maxsize=self._workers)
             self._result_q = self._context.Queue(maxsize=self._workers * 2)
             self._status_q = self._context.Queue(maxsize=self._workers)
+            self._cleanup_q = queue.Queue(maxsize=max(self._queue_size, 1024))
             self._submitted = self._results = self._dropped = 0
             self._backlog_warned = False
             maximum, pending_count, first_pending = self._scan_spool_state()
@@ -410,10 +426,15 @@ class OcrWorkerPool:
         self._dispatch_error = None
         self._dispatch_error_reported = False
         self._dispatch_stop.clear()
+        self._dispatch_wakeup.clear()
         self._dispatch_thread = threading.Thread(
             target=self._dispatch_spool, name="ocr-spool-dispatch", daemon=True
         )
         self._dispatch_thread.start()
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_spool, name="ocr-spool-cleanup", daemon=True
+        )
+        self._cleanup_thread.start()
         LOGGER.info("OCR 工作进程池已就绪：%d 个", self._workers)
         return self
 
@@ -438,6 +459,30 @@ class OcrWorkerPool:
         if self.alive != self._workers:
             raise RuntimeError("OCR 工作进程在初始化确认后退出")
 
+    def _stop_cleanup_thread(self, deadline: float) -> None:
+        """发送退出哨兵并等待异步清理线程在截止时间内排空退出。"""
+        cleanup_thread = self._cleanup_thread
+        if cleanup_thread is None:
+            return
+        if cleanup_thread.is_alive():
+            while cleanup_thread.is_alive():
+                remaining = deadline - time.monotonic()
+                try:
+                    if remaining <= 0:
+                        self._cleanup_q.put_nowait(None)
+                    else:
+                        self._cleanup_q.put(None, timeout=min(0.1, remaining))
+                    break
+                except queue.Full:
+                    if remaining <= 0:
+                        break
+                    continue
+            cleanup_thread.join(max(0.0, deadline - time.monotonic()))
+        if not cleanup_thread.is_alive():
+            self._cleanup_thread = None
+        else:
+            LOGGER.error("OCR 磁盘清理线程未能按时退出；保留线程引用并跳过目录删除")
+
     def stop(self, timeout: float = 5.0) -> None:
         """发退出指令并等进程结束（幂等）。
 
@@ -445,11 +490,17 @@ class OcrWorkerPool:
         等不完的（``timeout`` 内没退）会被强制终止，这也是"关闭时不再保证
         处理完积压"的唯一场合。
         """
-        if not self._started and not self._processes:
+        if (
+            not self._started
+            and not self._processes
+            and self._dispatch_thread is None
+            and self._cleanup_thread is None
+        ):
             self._close_spool_index()
             return
         deadline = time.monotonic() + timeout
         self._dispatch_stop.set()
+        self._dispatch_wakeup.set()
         dispatch_thread = self._dispatch_thread
         if dispatch_thread is not None:
             dispatch_thread.join(max(0.0, deadline - time.monotonic()))
@@ -471,6 +522,7 @@ class OcrWorkerPool:
                 process.terminate()
                 process.join(1.0)
         self._processes = [p for p in self._processes if p.is_alive()]
+        self._stop_cleanup_thread(deadline)
         self._started = False
         self._dead_reported = None
         if self._submitted > self._results:
@@ -480,9 +532,12 @@ class OcrWorkerPool:
                 self._spool_dir,
             )
             self._close_spool_index()
+        elif self._dispatch_thread is not None or self._cleanup_thread is not None:
+            self._close_spool_index()
         elif self._owns_spool_dir:
             self._close_spool_index()
-            shutil.rmtree(self._spool_dir, ignore_errors=False)
+            if self._spool_dir.exists():
+                shutil.rmtree(self._spool_dir, ignore_errors=False)
         else:
             self._close_spool_index()
 
@@ -549,6 +604,7 @@ class OcrWorkerPool:
                         )
                 self._next_id = request_id
                 self._submitted += 1
+                self._dispatch_wakeup.set()
                 if timing.ENABLED:
                     timing.emit(
                         "ocr_submit",
@@ -587,13 +643,16 @@ class OcrWorkerPool:
     def _dispatch_spool_loop(self) -> None:
         """执行派发；索引错误由外层转换成可巡检的致命状态。"""
         while not self._dispatch_stop.is_set():
+            self._dispatch_wakeup.clear()
             with self._spool_index_lock:
                 index = self._spool_index_connection_locked()
                 row = index.execute(
                     "SELECT request_id FROM pending ORDER BY request_id LIMIT 1"
                 ).fetchone()
             if row is None:
-                self._dispatch_stop.wait(0.02)
+                if self._dispatch_stop.is_set():
+                    return
+                self._dispatch_wakeup.wait(0.02)
                 continue
             request_id = int(row[0])
             self._dispatch_id = request_id
@@ -697,8 +756,17 @@ class OcrWorkerPool:
             return self._spool_index
         if self._spool_index is not None:
             self._spool_index.close()
+            self._spool_index = None
+            self._spool_index_path = None
         index = sqlite3.connect(path, timeout=30.0, check_same_thread=False)
-        index.execute("CREATE TABLE IF NOT EXISTS pending (request_id INTEGER PRIMARY KEY)")
+        try:
+            index.execute("PRAGMA journal_mode=WAL")
+            index.execute("PRAGMA synchronous=NORMAL")
+            index.execute("PRAGMA temp_store=MEMORY")
+            index.execute("CREATE TABLE IF NOT EXISTS pending (request_id INTEGER PRIMARY KEY)")
+        except BaseException:
+            index.close()
+            raise
         self._spool_index = index
         self._spool_index_path = path
         return index
@@ -724,7 +792,27 @@ class OcrWorkerPool:
     def _set_dispatch_error(self, message: str) -> None:
         self._dispatch_error = message
         self._dispatch_stop.set()
+        self._dispatch_wakeup.set()
         LOGGER.error("OCR 磁盘请求派发失败，保留原文件：%s", message)
+
+    @staticmethod
+    def _unlink_request_files(request_id: int, crop_path: Path, meta_path: Path) -> None:
+        """删除已确认请求的输入裁切图和元数据文件；失败仅记日志，不中断确认流程。"""
+        try:
+            crop_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.exception("OCR 已确认请求的临时文件清理失败 #%d", request_id)
+
+    def _cleanup_spool(self) -> None:
+        """后台异步清理已确认请求的 .png 与 .request 文件，收到 None 哨兵后退出。"""
+        cleanup_q = self._cleanup_q
+        while True:
+            item = cleanup_q.get()
+            if item is None:
+                return
+            request_id, crop_path, meta_path = item
+            self._unlink_request_files(request_id, crop_path, meta_path)
 
     def _recover_acknowledged(self) -> None:
         """清理已完成结果在强制终止窗口留下的输入文件。"""
@@ -791,11 +879,14 @@ class OcrWorkerPool:
             self._queue_size // 2, 1
         ):
             self._backlog_warned = False
-        try:
-            crop_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
-        except OSError:
-            LOGGER.exception("OCR 已确认请求的临时文件清理失败 #%d", result.request_id)
+        cleanup_thread = self._cleanup_thread
+        if cleanup_thread is not None and cleanup_thread.is_alive():
+            try:
+                self._cleanup_q.put_nowait((result.request_id, crop_path, meta_path))
+            except queue.Full:
+                self._unlink_request_files(result.request_id, crop_path, meta_path)
+        else:
+            self._unlink_request_files(result.request_id, crop_path, meta_path)
         if timing.ENABLED:
             timing.emit(
                 "ocr_ack",
