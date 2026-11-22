@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from airdrop.perception.detector import DetectionBatch, Detector
+from airdrop.perception.detector import DetectionBatch, Detector, DetectorConfig
 from airdrop.perception.models import Detection, PixelBox, ProcessedFrame
 from airdrop.perception.pipeline import PerceptionConfigLike, PerceptionWorker
 from airdrop.telemetry.models import TelemetrySnapshot
@@ -88,6 +88,116 @@ def test_frame_observer_gets_zero_detection_frame_and_cannot_mutate_image() -> N
     assert not frame.image.flags.writeable
     with pytest.raises(ValueError):
         frame.image.flags.writeable = True
+
+
+def test_frame_observer_uses_zero_copy_readonly_snapshot_when_batch_owns_image() -> None:
+    """检测器返回独占连续图像时，帧快照共享底层内存且禁止恢复写权限。"""
+    owned = np.full((4, 5, 3), 77, np.uint8)
+    assert owned.base is None and owned.flags.c_contiguous
+
+    class _OwnedDetector(Detector):
+        def detect(self, image: np.ndarray, **_: object) -> DetectionBatch:
+            return DetectionBatch(
+                image=owned,
+                detections=(),
+                undistorted=True,
+                owns_image=True,
+            )
+
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=_Buffer(),  # type: ignore[arg-type]
+        detector=_OwnedDetector(),
+    )
+    observed: list[ProcessedFrame] = []
+    worker.add_frame_observer(observed.append)
+    source = np.zeros((4, 5, 3), np.uint8)
+    worker._process_frame(_buffered_frame(image=source))  # type: ignore[arg-type]
+
+    assert len(observed) == 1
+    frame = observed[0]
+    assert np.shares_memory(owned, frame.image)
+    assert not np.shares_memory(source, frame.image)
+    assert np.array_equal(frame.image, owned)
+    assert not frame.image.flags.writeable
+    with pytest.raises(ValueError):
+        frame.image.flags.writeable = True
+
+
+def test_frame_observer_falls_back_to_copy_for_non_owning_view() -> None:
+    """即使标记 owns_image，非独占视图仍须拷贝到不可变字节以避免外部别名写入。"""
+    backing = np.zeros((4, 10, 3), np.uint8)
+    view = backing[:, ::2]
+    assert view.base is not None
+
+    class _ViewDetector(Detector):
+        def detect(self, image: np.ndarray, **_: object) -> DetectionBatch:
+            return DetectionBatch(image=view, detections=(), owns_image=True)
+
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=_Buffer(),  # type: ignore[arg-type]
+        detector=_ViewDetector(),
+    )
+    observed: list[ProcessedFrame] = []
+    worker.add_frame_observer(observed.append)
+    worker._process_frame(_buffered_frame(image=backing))  # type: ignore[arg-type]
+
+    frame = observed[0]
+    assert not np.shares_memory(backing, frame.image)
+    backing[:] = 255
+    assert int(frame.image.max()) == 0
+    with pytest.raises(ValueError):
+        frame.image.flags.writeable = True
+
+
+def test_detector_marks_owns_image_only_after_rectification() -> None:
+    """只有真正执行 cv2.remap 去畸变生成新图时才标记 owns_image=True。"""
+
+    class _EmptyModel:
+        def predict(self, image: np.ndarray, **kwargs: object) -> list[object]:
+            del image, kwargs
+            return []
+
+    detector = Detector(
+        DetectorConfig(
+            camera_matrix=np.array([[80.0, 0.0, 8.0], [0.0, 80.0, 6.0], [0.0, 0.0, 1.0]]),
+            dist_coeffs=np.zeros(5, dtype=np.float64),
+            calib_size=(16, 12),
+        )
+    )
+    detector._model = _EmptyModel()
+    source = np.zeros((12, 16, 3), np.uint8)
+
+    rectified = detector.detect(source, undistort=True)
+    assert rectified.undistorted is True
+    assert rectified.owns_image is True
+    assert rectified.image is not source
+    assert rectified.image.base is None and rectified.image.flags.c_contiguous
+
+    raw = detector.detect(source, undistort=False)
+    assert raw.undistorted is False
+    assert raw.owns_image is False
+    assert raw.image is source
+
+
+def test_emit_skips_detection_snapshot_without_result_observers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有结果观察者时，_emit 不应构造只读 DetectionSnapshot。"""
+    import airdrop.perception.pipeline as pipeline_module
+
+    detection = _detection()
+    worker = _worker((detection,))
+    monkeypatch.setattr(
+        pipeline_module,
+        "snapshot_detection",
+        lambda _: pytest.fail("无结果观察者时不应调用 snapshot_detection"),
+    )
+    worker._process_frame(_buffered_frame())  # type: ignore[arg-type]
+    assert worker.queued_results == 1
+    queued = worker.poll_result()
+    assert queued is not None and queued.code == detection.code
 
 
 def test_result_observers_are_additive_isolated_and_do_not_consume_queue() -> None:

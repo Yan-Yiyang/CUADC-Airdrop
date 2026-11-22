@@ -338,7 +338,7 @@ class PerceptionWorker:
             raise RuntimeError("裁切存储必须在感知工作器启动前配置")
         if self._crop_store is not None:
             self._crop_store.close()
-        self._crop_store = CropStore(directory)
+        self._crop_store = CropStore(directory, async_write=True)
         self._ocr_spool_directory = Path(directory).parent / "ocr_spool"
         self._ocr_spool_directory.mkdir(parents=True, exist_ok=True)
 
@@ -361,11 +361,32 @@ class PerceptionWorker:
                 self._thread = None
         if self._owns_pool and self._pool is not None:
             self._pool.stop()
-        self._collect_remaining(timeout=0.5)
-        if self._crop_store is not None:
-            self._crop_store.close()
+        stop_error: BaseException | None = None
+        try:
+            self._collect_remaining(timeout=0.5)
+        except BaseException as exc:  # noqa: BLE001 - 保留收尾异常并继续释放其余资源
+            stop_error = exc
+        finally:
+            store = self._crop_store
             self._crop_store = None
-        self._close_frozen_buffer()
+            if store is not None:
+                try:
+                    store.close()
+                except Exception as exc:  # noqa: BLE001 - 记录关闭错误并继续释放冻结视图
+                    message = f"{type(exc).__name__}: {exc}"
+                    with self._stats_lock:
+                        self._stats.last_error = message
+                        if self._fatal_error is None:
+                            self._fatal_error = message
+                    if stop_error is None:
+                        stop_error = exc
+            try:
+                self._close_frozen_buffer()
+            except BaseException as exc:  # noqa: BLE001 - 保留首个收尾异常并统一重抛
+                if stop_error is None:
+                    stop_error = exc
+        if stop_error is not None:
+            raise stop_error
 
     def drain(self, timeout: float = 120.0) -> bool:
         """先停止生产者，再等待既有帧与 OCR 完成；失败或超时返回 False。
@@ -388,14 +409,31 @@ class PerceptionWorker:
 
     def _check_drained(self) -> None:
         """仅工作线程在帧处理与结果回填之后确认排空。"""
-        if self._drain_to is None:
-            return
         with self._stats_lock:
+            drain_to = self._drain_to
+            if drain_to is None or self._drained.is_set():
+                return
             pool_stats = {} if self._pool is None else self._pool.stats
             pool_pending = int(pool_stats.get("pending", 0))
-            if self._cursor >= self._drain_to and pool_pending == 0:
-                self._drain_ok = self._stats.last_error is None
-                self._drained.set()
+            ready = self._cursor >= drain_to and pool_pending == 0
+        if not ready:
+            return
+        crop_store = self._crop_store
+        if crop_store is not None:
+            try:
+                crop_store.flush()
+            except Exception as exc:
+                LOGGER.exception("排空裁切存储失败")
+                message = f"{type(exc).__name__}: {exc}"
+                with self._stats_lock:
+                    self._stats.last_error = message
+                    if self._fatal_error is None:
+                        self._fatal_error = message
+        with self._stats_lock:
+            if self._drain_to != drain_to:
+                return
+            self._drain_ok = self._stats.last_error is None
+            self._drained.set()
 
     def __enter__(self) -> "PerceptionWorker":
         return self.start()
@@ -467,6 +505,7 @@ class PerceptionWorker:
                     self._collect_remaining(timeout=0.0)
                     self._check_pool_health()
                     self._check_drained()
+                    self._check_crop_store()
                     continue
                 with self._input_lock:
                     # 截止可能发生在等待或解码期间；改从固定快照重新取，不能送检新帧。
@@ -505,6 +544,7 @@ class PerceptionWorker:
                     self._close_frozen_buffer()
                 self._check_pool_health()
                 self._check_drained()
+                self._check_crop_store()
         except Exception as exc:
             LOGGER.exception("感知线程异常退出")
             with self._stats_lock:
@@ -561,6 +601,28 @@ class PerceptionWorker:
             self._stop_event.set()
             self._buffer.wake_waiters()
 
+    def _check_crop_store(self) -> None:
+        """非阻塞巡检异步裁切存储的后台错误，确保被动运行也能及时中止。"""
+        crop_store = self._crop_store
+        if crop_store is None:
+            return
+        with self._stats_lock:
+            if self._fatal_error is not None:
+                return
+        try:
+            crop_store.raise_if_failed()
+        except Exception as exc:  # noqa: BLE001 - 后台写盘任意异常均须中止感知并上报主线程
+            message = f"{type(exc).__name__}: {exc}"
+            with self._stats_lock:
+                self._stats.last_error = message
+                if self._fatal_error is None:
+                    self._fatal_error = message
+            LOGGER.error("异步裁切存储失败：%s", message)
+            self._stop_event.set()
+            with self._input_lock:
+                self._wait_cancel.set()
+                self._buffer.wake_waiters()
+
     def _process_frame(self, frame: BufferedFrame) -> None:
         """一帧的完整处理：检测 → 按模式产出。"""
         if frame.snapshot is None:
@@ -581,7 +643,13 @@ class PerceptionWorker:
 
         if self._config.mode == "cls12":
             # 编号已由类别给出，直接产出
-            self._notify_frame_observers(frame, batch.image, batch.undistorted, batch.detections)
+            self._notify_frame_observers(
+                frame,
+                batch.image,
+                batch.undistorted,
+                batch.detections,
+                owns_image=batch.owns_image,
+            )
             for ordinal, detection in enumerate(batch.detections):
                 if self._crop_store is not None:
                     crop, bounds = self._detector.crop_with_bounds(batch, detection)
@@ -634,7 +702,13 @@ class PerceptionWorker:
                     start_ns=crop_start,
                     end_ns=timing.now_ns(),
                 )
-        self._notify_frame_observers(frame, batch.image, batch.undistorted, batch.detections)
+        self._notify_frame_observers(
+            frame,
+            batch.image,
+            batch.undistorted,
+            batch.detections,
+            owns_image=batch.owns_image,
+        )
         if timing.ENABLED:
             timing.emit(
                 "frame_processing",
@@ -652,8 +726,10 @@ class PerceptionWorker:
         image: np.ndarray,
         undistorted: bool,
         detections: tuple[Detection, ...],
+        *,
+        owns_image: bool = False,
     ) -> ProcessedFrame:
-        """复制图像和姿态标量，构造与业务对象无共享可变引用的帧快照。"""
+        """构造与业务对象无共享可变引用的帧快照；独占连续图像零拷贝锁为只读。"""
         snapshot = frame.snapshot
         if snapshot is None:
             raise ValueError("感知帧快照缺少对齐遥测")
@@ -675,8 +751,14 @@ class PerceptionWorker:
             self._snapshot_matrix_source = configured_matrix
             self._snapshot_matrix = matrix
         height, width = image.shape[:2]
-        immutable_image = np.frombuffer(image.tobytes(), dtype=image.dtype).reshape(image.shape)
-        immutable_image.flags.writeable = False
+        if owns_image and image.base is None and image.flags.c_contiguous:
+            image.flags.writeable = False
+            immutable_image = np.frombuffer(
+                memoryview(image).toreadonly(), dtype=image.dtype
+            ).reshape(image.shape)
+        else:
+            immutable_image = np.frombuffer(image.tobytes(), dtype=image.dtype).reshape(image.shape)
+            immutable_image.flags.writeable = False
         return ProcessedFrame(
             frame_index=frame.index,
             received_timestamp=float(frame.received_timestamp),
@@ -696,12 +778,20 @@ class PerceptionWorker:
         image: np.ndarray,
         undistorted: bool,
         detections: tuple[Detection, ...],
+        *,
+        owns_image: bool = False,
     ) -> None:
         with self._observer_lock:
             observers = tuple(self._frame_observers)
         if not observers:
             return
-        frame = self._make_frame_snapshot(source_frame, image, undistorted, detections)
+        frame = self._make_frame_snapshot(
+            source_frame,
+            image,
+            undistorted,
+            detections,
+            owns_image=owns_image,
+        )
         for observer in observers:
             try:
                 observer(frame)
@@ -919,6 +1009,8 @@ class PerceptionWorker:
                 LOGGER.exception("检测结果回调异常")
         with self._observer_lock:
             observers = tuple(self._result_observers)
+        if not observers:
+            return
         display_snapshot = snapshot_detection(detection)
         for observer in observers:
             try:

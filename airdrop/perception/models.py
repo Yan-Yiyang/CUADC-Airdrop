@@ -216,7 +216,7 @@ class DetectionSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class ProcessedFrame:
-    """跨线程传递的单帧只读快照。图像由不可变 bytes 支撑，无法恢复写权限。"""
+    """跨线程传递的单帧只读快照。图像由不可变 bytes 或只读 memoryview 支撑，无法恢复写权限。"""
 
     frame_index: int
     received_timestamp: float

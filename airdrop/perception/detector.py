@@ -66,12 +66,14 @@ class DetectionBatch:
     """一帧的检测输出：画面尺寸 + 各目标。
 
     ``image`` 是**已去畸变**的画面（若启用了去畸变）——下游裁剪必须用同一张，
-    否则像素坐标与解算所用的内参对不上。
+    否则像素坐标与解算所用的内参对不上。``owns_image`` 为 ``True`` 表示
+    ``image`` 由本次检测新分配且独占，无外部可变别名。
     """
 
     image: np.ndarray
     detections: tuple[Detection, ...]
     undistorted: bool = False
+    owns_image: bool = False
 
 
 class Detector:
@@ -347,6 +349,7 @@ class Detector:
             image=picture,
             detections=tuple(detections),
             undistorted=rectified,
+            owns_image=bool(rectified),
         )
 
     def crop(self, batch: DetectionBatch, detection: Detection) -> np.ndarray:
