@@ -66,6 +66,16 @@ class QgcVideoRuntime:
         self.predictor = LiveImpactPredictor(config)
         self._predictor_enabled = False
         self.last_snapshot: DisplaySnapshot | None = None
+        self._camera_matrix: tuple[tuple[float, float, float], ...] | None = None
+        if camera is not None:
+            matrix = camera.camera_matrix
+            self._camera_matrix = (
+                (float(matrix[0, 0]), float(matrix[0, 1]), float(matrix[0, 2])),
+                (float(matrix[1, 0]), float(matrix[1, 1]), float(matrix[1, 2])),
+                (float(matrix[2, 0]), float(matrix[2, 1]), float(matrix[2, 2])),
+            )
+        self._cached_live_key: tuple[int, float, float] | None = None
+        self._cached_live_frame: ProcessedFrame | None = None
         self.publisher = QgcVideoPublisher(
             config.qgc_video,
             self._snapshot,
@@ -130,15 +140,6 @@ class QgcVideoRuntime:
             LOGGER.exception("QGC 显示事件更新失败：%s", kind)
 
     def _snapshot(self) -> DisplaySnapshot:
-        frame = self.source.latest()
-        if frame is not None:
-            try:
-                live_frame = self._make_live_snapshot(frame.copy())
-            except Exception:
-                LOGGER.exception("QGC 实时帧快照创建失败")
-                live_frame = None
-        else:
-            live_frame = None
         worker = self.worker
         telemetry = self.broker.get_snapshot()
         try:
@@ -170,6 +171,14 @@ class QgcVideoRuntime:
                 )
         except Exception:
             LOGGER.exception("QGC 只读处理进度更新失败")
+        frame = self.source.latest()
+        live_frame: ProcessedFrame | None = None
+        if frame is not None and self.state.needs_live_frame():
+            try:
+                live_frame = self._make_live_snapshot(frame)
+            except Exception:
+                LOGGER.exception("QGC 实时帧快照创建失败")
+                live_frame = None
         if self._predictor_enabled:
             token, target, stage = self.state.prediction_context()
             self.predictor.submit(telemetry, target, stage, lifecycle_token=token)
@@ -191,28 +200,35 @@ class QgcVideoRuntime:
         return result
 
     def _make_live_snapshot(self, frame: VideoFrame) -> ProcessedFrame:
-        from airdrop.perception.models import ProcessedFrame, readonly_image, snapshot_pose
+        from airdrop.perception.models import ProcessedFrame, snapshot_pose
 
-        image = readonly_image(frame.image)
+        # 同一源帧在高频显示轮询下且已有有效姿态时直接复用，避免重复复制整幅图像。
+        key = (int(frame.index), float(frame.capture_timestamp), float(frame.timestamp))
+        cached = self._cached_live_frame
+        if (
+            cached is not None
+            and self._cached_live_key == key
+            and cached.pose is not None
+            and cached.pose.position_ned is not None
+        ):
+            return cached
+        # 仅复制一次图像像素并设为只读，消除旧路径 frame.copy() + readonly_image() 的双重拷贝。
+        image = frame.image.copy()
+        image.flags.writeable = False
         aligned = self.aligner.align(frame)
         pose = snapshot_pose(None if aligned is None else aligned.snapshot)
-        camera_matrix: tuple[tuple[float, float, float], ...] | None = None
-        if self.camera is not None:
-            matrix = self.camera.camera_matrix
-            camera_matrix = (
-                (float(matrix[0, 0]), float(matrix[0, 1]), float(matrix[0, 2])),
-                (float(matrix[1, 0]), float(matrix[1, 1]), float(matrix[1, 2])),
-                (float(matrix[2, 0]), float(matrix[2, 1]), float(matrix[2, 2])),
-            )
-        return ProcessedFrame(
+        snapshot = ProcessedFrame(
             frame_index=frame.index,
             received_timestamp=frame.timestamp,
             capture_timestamp=frame.capture_timestamp,
             processed_timestamp=time.time(),
             image=image,
             image_size=(frame.width, frame.height),
-            camera_matrix=camera_matrix,
+            camera_matrix=self._camera_matrix,
             undistorted=False,
             pose=pose,
             detections=(),
         )
+        self._cached_live_key = key
+        self._cached_live_frame = snapshot
+        return snapshot

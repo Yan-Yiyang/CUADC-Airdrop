@@ -90,6 +90,8 @@ class QgcVideoPublisher:
         self._last_latency_s: float | None = None
         self._write_started: float | None = None
         self._ffmpeg: str | None = None
+        self._last_offered_key: tuple[int, int] | None = None
+        self._last_offered_copy: np.ndarray | None = None
 
     @property
     def running(self) -> bool:
@@ -280,7 +282,21 @@ class QgcVideoPublisher:
         valid_capture_time = (
             float(capture_time) if capture_time is not None and np.isfinite(capture_time) else None
         )
-        item = (np.ascontiguousarray(frame).copy(), submitted_at, valid_capture_time)
+        # 合成器画面未变更时复用已隔离的只读副本，省去每帧 5.23 MiB 整画布拷贝。
+        revision = getattr(self.composer, "revision", None)
+        if (
+            isinstance(revision, int)
+            and self._last_offered_copy is not None
+            and self._last_offered_key == (id(frame), revision)
+        ):
+            isolated = self._last_offered_copy
+        else:
+            isolated = np.ascontiguousarray(frame).copy()
+            isolated.flags.writeable = False
+            if isinstance(revision, int):
+                self._last_offered_key = (id(frame), revision)
+                self._last_offered_copy = isolated
+        item = (isolated, submitted_at, valid_capture_time)
         with self._lock:
             self._submitted += 1
         try:

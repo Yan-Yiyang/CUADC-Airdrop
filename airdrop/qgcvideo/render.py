@@ -9,13 +9,15 @@ from dataclasses import fields, is_dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from airdrop.qgcvideo.models import DisplaySnapshot
+from airdrop.georef.project import ProjectedPoint
+from airdrop.perception.models import DetectionSnapshot
+from airdrop.qgcvideo.models import DisplayObservation, DisplaySnapshot, PanelEntry
 
 LOGGER = logging.getLogger(__name__)
 
@@ -102,19 +104,80 @@ def _whole_second(seconds: float | None) -> int | None:
     return max(0, int(seconds))
 
 
+def _num_key(value: float | None) -> float | str | None:
+    if value is None:
+        return None
+    return value if math.isfinite(value) else str(value)
+
+
+def _float_tuple_key(values: tuple[float, ...] | None) -> tuple[float | str, ...] | None:
+    if values is None:
+        return None
+    return tuple(v if math.isfinite(v) else str(v) for v in values)
+
+
 def _stable_key(value: Any) -> Any:
-    """构造不比较图像像素的渲染依赖键。"""
-    if isinstance(value, np.ndarray):
-        return ("ndarray", id(value), value.shape, value.dtype.str)
-    if is_dataclass(value):
-        return tuple((item.name, _stable_key(getattr(value, item.name))) for item in fields(value))
-    if isinstance(value, dict):
-        return tuple(sorted((key, _stable_key(item)) for key, item in value.items()))
-    if isinstance(value, (tuple, list)):
-        return tuple(_stable_key(item) for item in value)
-    if isinstance(value, float):
-        return value if math.isfinite(value) else str(value)
-    return value
+    """构造不比较图像像素的渲染依赖键（对高频渲染类型走零反射快路径）。"""
+    if isinstance(value, DisplayObservation):
+        result: Any = (
+            value.frame_index,
+            _num_key(value.capture_timestamp),
+            _float_tuple_key(value.position_ned),
+            value.code,
+            _num_key(value.confidence),
+            _float_tuple_key(value.pixel),
+            _float_tuple_key(value.box),
+            value.has_thumbnail,
+        )
+    elif isinstance(value, ProjectedPoint):
+        result = (
+            _float_tuple_key(value.ned),
+            _float_tuple_key(value.pixel),
+            value.valid,
+            value.in_bounds,
+            value.reason,
+        )
+    elif isinstance(value, DetectionSnapshot):
+        result = (
+            value.frame_index,
+            _num_key(value.capture_timestamp),
+            _float_tuple_key(value.pixel),
+            _float_tuple_key(value.box),
+            _num_key(value.confidence),
+            value.code,
+            _num_key(value.side_px),
+            value.raw_text,
+            _num_key(value.ocr_confidence),
+            value.mode,
+        )
+    elif isinstance(value, PanelEntry):
+        thumb = value.thumbnail
+        thumb_key = None if thumb is None else ("ndarray", id(thumb), thumb.shape, thumb.dtype.str)
+        result = (
+            value.code,
+            value.count,
+            _float_tuple_key(value.position_ned),
+            _float_tuple_key(value.position_lla),
+            value.thumbnail_frame_index,
+            _float_tuple_key(value.thumbnail_box),
+            thumb_key,
+            _num_key(value.thumbnail_capture_timestamp),
+        )
+    elif isinstance(value, np.ndarray):
+        result = ("ndarray", id(value), value.shape, value.dtype.str)
+    elif isinstance(value, (tuple, list)):
+        result = tuple(_stable_key(item) for item in value)
+    elif isinstance(value, float):
+        result = value if math.isfinite(value) else str(value)
+    elif is_dataclass(value):
+        result = tuple(
+            (item.name, _stable_key(getattr(value, item.name))) for item in fields(value)
+        )
+    elif isinstance(value, dict):
+        result = tuple(sorted((key, _stable_key(item)) for key, item in value.items()))
+    else:
+        result = value
+    return result
 
 
 def _format_clock(timestamp: float | None) -> str:
@@ -173,6 +236,19 @@ def _font(size: int) -> ImageFont.FreeTypeFont:
     raise RuntimeError("找不到可用的中文字体（微软雅黑、黑体或 Noto Sans CJK）")
 
 
+@lru_cache(maxsize=512)
+def _glyph_mask(text: str, size: int) -> tuple[np.ndarray, int, int, int, int] | None:
+    """缓存单行无裁切文字的灰度字形蒙版，避免每帧重复 FreeType 光栅化与 PIL 拷贝。"""
+    font = _font(size)
+    mask, (ox, oy) = font.getmask2(text, anchor="ls")
+    width, height = mask.size
+    if width <= 0 or height <= 0:
+        return None
+    raw_bytes: bytes = bytes(cast(Any, mask))
+    alpha = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(height, width).astype(np.uint16)
+    return alpha[:, :, None], int(ox), int(oy), int(width), int(height)
+
+
 class FrameComposer:
     """把只读显示快照渲染为 1760×990 BGR 画布。"""
 
@@ -190,6 +266,13 @@ class FrameComposer:
         cv2.line(self._canvas, (0, 850), (1759, 850), (60, 49, 38), 1)
         self._region_keys: dict[str, Any] = {}
         self._active_text_x_range: tuple[int, int] | None = None
+        self._measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        self._revision = 0
+
+    @property
+    def revision(self) -> int:
+        """画布实际重绘的版本号；无区域变化时不变，供发布器跳过重复整帧拷贝。"""
+        return self._revision
 
     def set_publisher_stats(self, stats: Any) -> None:
         """接收发布线程的只读统计快照。"""
@@ -341,22 +424,37 @@ class FrameComposer:
                 if self._region_keys.get(name) == key:
                     continue
                 changed_regions.append((x1, y1, x2, y2, canvas[y1:y2, x1:x2].copy()))
-                canvas[y1:y2, x1:x2] = self._region_background(name)
+                if not (
+                    name == "video"
+                    and image is not None
+                    and getattr(image, "ndim", 0) == 3
+                    and image.shape == (720, 1280, 3)
+                ):
+                    cv2.rectangle(
+                        canvas,
+                        (x1, y1),
+                        (x2 - 1, y2 - 1),
+                        self._region_background(name),
+                        -1,
+                    )
                 self._active_text_x_range = text_range
                 try:
                     renderer(canvas, snapshot)
                 finally:
                     self._active_text_x_range = None
                 rendered_keys[name] = key
-            cv2.line(canvas, (1280, 130), (1280, 849), (60, 49, 38), 1)
-            cv2.line(canvas, (0, 850), (1759, 850), (60, 49, 38), 1)
-            self._draw_text_commands(canvas)
+            if rendered_keys:
+                cv2.line(canvas, (1280, 130), (1280, 849), (60, 49, 38), 1)
+                cv2.line(canvas, (0, 850), (1759, 850), (60, 49, 38), 1)
+                self._draw_text_commands(canvas)
         except Exception:
             LOGGER.exception("QGC 画面渲染失败；恢复画布以便下一帧重试")
             for x1, y1, x2, y2, previous in changed_regions:
                 canvas[y1:y2, x1:x2] = previous
             raise
-        self._region_keys.update(rendered_keys)
+        if rendered_keys:
+            self._region_keys.update(rendered_keys)
+            self._revision += 1
         return canvas
 
     @staticmethod
@@ -384,8 +482,11 @@ class FrameComposer:
         scale = min(1280 / w, 720 / h)
         out_w, out_h = max(1, round(w * scale)), max(1, round(h * scale))
         ox, oy = (1280 - out_w) // 2, (720 - out_h) // 2
-        resized = cv2.resize(image, (out_w, out_h), interpolation=cv2.INTER_AREA)
-        canvas[130 + oy : 130 + oy + out_h, ox : ox + out_w] = resized
+        if (w, h) == (out_w, out_h):
+            canvas[130 + oy : 130 + oy + out_h, ox : ox + out_w] = image
+        else:
+            resized = cv2.resize(image, (out_w, out_h), interpolation=cv2.INTER_AREA)
+            canvas[130 + oy : 130 + oy + out_h, ox : ox + out_w] = resized
 
         mode = str(getattr(snapshot, "mode", ""))
         if mode in {"recon", "hold_follow"}:
@@ -490,27 +591,31 @@ class FrameComposer:
         scale, out_w, out_h, ox, oy = viewport
         observations: Sequence[Any] = getattr(snapshot, "projected_observations", ())
         codes = tuple(getattr(snapshot, "observations", ()))
-        roi = canvas[130 + oy : 130 + oy + out_h, ox : ox + out_w]
-        overlay = roi.copy()
+        points: list[tuple[int, int, tuple[int, int, int]]] = []
         for observed, point in zip(codes, observations, strict=False):
             if not getattr(point, "valid", False) or not getattr(point, "in_bounds", False):
                 continue
             pixel = getattr(point, "pixel", None)
             if pixel is None:
                 continue
-            x = ox + round(float(pixel[0]) * scale)
-            y = 130 + oy + round(float(pixel[1]) * scale)
-            if not (ox <= x < ox + out_w and 130 + oy <= y < 130 + oy + out_h):
+            lx = round(float(pixel[0]) * scale)
+            ly = round(float(pixel[1]) * scale)
+            if not (0 <= lx < out_w and 0 <= ly < out_h):
                 continue
-            cv2.circle(
-                overlay,
-                (x - ox, y - 130 - oy),
-                2,
-                _code_color(getattr(observed, "code", None)),
-                -1,
-                cv2.LINE_AA,
-            )
-        cv2.addWeighted(overlay, 0.55, roi, 0.45, 0, dst=roi)
+            points.append((lx, ly, _code_color(getattr(observed, "code", None))))
+        if not points:
+            return
+        # 仅拷贝与混合包含所有有效点的紧凑子区域，避免无点或稀疏点时复制整幅 2.76 MiB 画面。
+        pad = 4
+        bx1 = max(0, min(p[0] for p in points) - pad)
+        by1 = max(0, min(p[1] for p in points) - pad)
+        bx2 = min(out_w, max(p[0] for p in points) + pad + 1)
+        by2 = min(out_h, max(p[1] for p in points) + pad + 1)
+        sub_roi = canvas[130 + oy + by1 : 130 + oy + by2, ox + bx1 : ox + bx2]
+        overlay = sub_roi.copy()
+        for lx, ly, color in points:
+            cv2.circle(overlay, (lx - bx1, ly - by1), 2, color, -1, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.55, sub_roi, 0.45, 0, dst=sub_roi)
 
     def _render_projected(
         self,
@@ -1115,66 +1220,71 @@ class FrameComposer:
     def _draw_text_commands(self, canvas: np.ndarray) -> None:
         if not self._text_commands:
             return
-        measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        measure = self._measure
+        canvas_h, canvas_w = canvas.shape[:2]
         for text, origin, size, color, clip in self._text_commands:
-            font = _font(size)
             if clip is None:
-                anchor = origin
-                bounds = measure.textbbox(anchor, text, font=font, anchor="ls")
-            else:
-                left, top, right, bottom = clip
-                if right <= left or bottom <= top:
+                glyph = _glyph_mask(text, size)
+                if glyph is None:
                     continue
-                fitted = _fit_text_anchor(measure, text, font, origin, clip)
-                if fitted is None:
+                alpha, ox, oy, gw, gh = glyph
+                gx1 = origin[0] + ox
+                gy1 = origin[1] + oy
+                gx2 = gx1 + gw
+                gy2 = gy1 + gh
+                cx1, cy1 = max(0, gx1), max(0, gy1)
+                cx2, cy2 = min(canvas_w, gx2), min(canvas_h, gy2)
+                if cx2 <= cx1 or cy2 <= cy1:
                     continue
-                font, anchor, bounds = fitted
-            x1 = max(0, int(math.floor(bounds[0] - 9)))
-            y1 = max(0, int(math.floor(bounds[1] - 6)))
-            x2 = min(canvas.shape[1], int(math.ceil(bounds[2] + 9)))
-            y2 = min(canvas.shape[0], int(math.ceil(bounds[3] + 7)))
-            if clip is not None:
-                x1, y1 = max(x1, clip[0]), max(y1, clip[1])
-                x2, y2 = min(x2, clip[2]), min(y2, clip[3])
+                a = alpha[cy1 - gy1 : cy2 - gy1, cx1 - gx1 : cx2 - gx1]
+                roi = canvas[cy1:cy2, cx1:cx2]
+                col = np.array(color, dtype=np.uint16)
+                roi[:] = ((roi.astype(np.uint16) * (255 - a) + col * a + 127) // 255).astype(
+                    np.uint8
+                )
+                continue
+            left, top, right, bottom = clip
+            if right <= left or bottom <= top:
+                continue
+            font = _font(size)
+            fitted = _fit_text_anchor(measure, text, font, origin, clip)
+            if fitted is None:
+                continue
+            font, anchor, bounds = fitted
+            x1 = max(left, int(math.floor(bounds[0] - 9)), 0)
+            y1 = max(top, int(math.floor(bounds[1] - 6)), 0)
+            x2 = min(right, int(math.ceil(bounds[2] + 9)), canvas_w)
+            y2 = min(bottom, int(math.ceil(bounds[3] + 7)), canvas_h)
             if x2 <= x1 or y2 <= y1:
                 continue
+            # 直接在 BGR 像素块上用等价 BGR 颜色绘制，免去每条文字两次 cv2.cvtColor 往返。
             patch = canvas[y1:y2, x1:x2]
-            image = Image.fromarray(cv2.cvtColor(patch, cv2.COLOR_BGR2RGB))
+            image = Image.fromarray(patch)
             draw = ImageDraw.Draw(image)
             local_anchor = (anchor[0] - x1, anchor[1] - y1)
-            if clip is not None:
-                local_bounds = tuple(
-                    value - (x1 if index % 2 == 0 else y1) for index, value in enumerate(bounds)
-                )
-                draw.rounded_rectangle(
-                    (
-                        local_bounds[0] - 7,
-                        local_bounds[1] - 4,
-                        local_bounds[2] + 7,
-                        local_bounds[3] + 4,
-                    ),
-                    radius=4,
-                    fill=(12, 20, 28),
-                )
-                draw.text(
-                    local_anchor,
-                    text,
-                    font=font,
-                    anchor="ls",
-                    fill=(color[2], color[1], color[0], 255),
-                    stroke_width=1,
-                    stroke_fill=(17, 14, 12, 255),
-                )
-            else:
-                draw.text(
-                    local_anchor,
-                    text,
-                    font=font,
-                    anchor="ls",
-                    fill=(color[2], color[1], color[0]),
-                    stroke_width=0,
-                )
-            canvas[y1:y2, x1:x2] = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+            local_bounds = tuple(
+                value - (x1 if index % 2 == 0 else y1) for index, value in enumerate(bounds)
+            )
+            draw.rounded_rectangle(
+                (
+                    local_bounds[0] - 7,
+                    local_bounds[1] - 4,
+                    local_bounds[2] + 7,
+                    local_bounds[3] + 4,
+                ),
+                radius=4,
+                fill=(28, 20, 12),
+            )
+            draw.text(
+                local_anchor,
+                text,
+                font=font,
+                anchor="ls",
+                fill=color,
+                stroke_width=1,
+                stroke_fill=(12, 14, 17),
+            )
+            canvas[y1:y2, x1:x2] = np.asarray(image)
         self._text_commands.clear()
 
     @staticmethod

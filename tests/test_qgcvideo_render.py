@@ -141,13 +141,17 @@ def test_composer_reuses_unchanged_regions_and_clears_old_video_overlays() -> No
     composer._render_panel = count_panel
     first = composer.compose(snapshot).copy()
     assert rendered == {"video": 1, "panel": 1}
+    first_rev = composer.revision
+    assert first_rev == 1
 
     composer.compose(snapshot)
     assert rendered == {"video": 1, "panel": 1}
+    assert composer.revision == first_rev
 
     changed_panel = replace(snapshot, panel=(PanelEntry(17, 4, None, None, 4, (20, 20, 60, 60)),))
     composer.compose(changed_panel)
     assert rendered == {"video": 1, "panel": 2}
+    assert composer.revision == first_rev + 1
 
     cleared = composer.compose(replace(snapshot, mode="drop", detections=()))
     assert rendered["video"] == 2

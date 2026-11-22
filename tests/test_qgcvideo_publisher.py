@@ -431,3 +431,43 @@ def test_replay_latency_uses_local_submit_time_not_source_timestamp() -> None:
     assert publisher.stats.encoded > 0
     assert publisher.stats.last_latency_s is not None
     assert publisher.stats.last_latency_s < 1.0
+
+
+def test_offer_reuses_isolated_copy_when_composer_revision_is_unchanged() -> None:
+    """合成器 revision 不变时，_offer 应复用只读副本而不是重复拷贝 5.23 MiB 画布。"""
+
+    class _RevComposer:
+        def __init__(self) -> None:
+            self.revision = 1
+            self.canvas = np.zeros((990, 1760, 3), dtype=np.uint8)
+
+        def compose(self, snapshot: DisplaySnapshot) -> np.ndarray:
+            del snapshot
+            return self.canvas
+
+    composer = _RevComposer()
+    publisher = QgcVideoPublisher(
+        QgcVideoConfig(enabled=True, fps=20.0, ffmpeg_executable="test-ffmpeg"),
+        _snapshot,
+        composer,
+        subprocess_factory=lambda *_args, **_kwargs: _Process(_Pipe()),
+    )
+    publisher._offer(composer.canvas, 1.0, None)
+    first_item = publisher._frames.get_nowait()
+    assert first_item is not None
+    first_buf = first_item[0]
+    assert not first_buf.flags.writeable
+
+    publisher._offer(composer.canvas, 2.0, None)
+    second_item = publisher._frames.get_nowait()
+    assert second_item is not None
+    assert second_item[0] is first_buf
+
+    composer.canvas[0, 0] = (9, 8, 7)
+    composer.revision = 2
+    publisher._offer(composer.canvas, 3.0, None)
+    third_item = publisher._frames.get_nowait()
+    assert third_item is not None
+    assert third_item[0] is not first_buf
+    assert tuple(first_buf[0, 0]) == (0, 0, 0)
+    assert tuple(third_item[0][0, 0]) == (9, 8, 7)

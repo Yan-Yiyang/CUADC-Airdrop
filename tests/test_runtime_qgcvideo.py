@@ -379,3 +379,53 @@ def test_runtime_continues_publisher_cleanup_after_predictor_interrupt(
     with pytest.raises(BaseExceptionGroup):
         runtime.stop()
     assert instances[0].stopped
+
+
+def test_runtime_snapshot_skips_live_frame_copy_when_displaying_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """历史处理帧模式下，_snapshot 不得复制实时原帧图像。"""
+    import numpy as np
+
+    from airdrop.perception.models import PoseSnapshot, ProcessedFrame
+    from airdrop.qgcvideo import publisher
+
+    class FakePublisher:
+        def __init__(self, config, supplier, *, on_event=None) -> None:
+            del config, supplier, on_event
+            self.running = False
+
+    class CountingFrame(VideoFrame):
+        def copy(self) -> VideoFrame:
+            raise AssertionError("历史模式下不应调用 VideoFrame.copy()")
+
+    class GuardedArray(np.ndarray):
+        def copy(self, order="C"):
+            raise AssertionError("历史模式下不应复制实时帧像素")
+
+    raw = np.zeros((16, 16, 3), dtype=np.uint8).view(GuardedArray)
+    live = CountingFrame(10, raw, 100.0, 0.0)
+
+    class Source:
+        def latest(self) -> VideoFrame:
+            return live
+
+    monkeypatch.setattr(publisher, "QgcVideoPublisher", FakePublisher)
+    config = replace(Config(), qgc_video=replace(QgcVideoConfig(), enabled=True))
+    runtime = QgcVideoRuntime(config, Source(), TelemetryBroker(), None, None, replay_mode=True)
+    processed = ProcessedFrame(
+        frame_index=5,
+        received_timestamp=90.0,
+        capture_timestamp=90.0,
+        processed_timestamp=90.1,
+        image=np.zeros((16, 16, 3), dtype=np.uint8),
+        image_size=(16, 16),
+        camera_matrix=None,
+        undistorted=True,
+        pose=PoseSnapshot(None, None, None, None),
+        detections=(),
+    )
+    runtime.state.on_frame(processed)
+    snap = runtime._snapshot()
+    assert snap.frame is processed
+    assert snap.observed_at == pytest.approx(live.capture_timestamp)

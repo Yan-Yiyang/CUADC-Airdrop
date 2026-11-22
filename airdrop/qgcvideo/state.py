@@ -142,6 +142,12 @@ class DisplayState:
         with self._lock:
             return self._lifecycle_token, self._target_ned, self._stage
 
+    def needs_live_frame(self) -> bool:
+        """当前显示模式是否需要实时视频原帧（历史处理帧模式下跳过原帧复制）。"""
+        with self._lock:
+            mode = _display_mode(self._stage, self._progress)
+            return mode in {"hold_live", "drop"} or not self._history
+
     def invalidate_live_prediction(self) -> int:
         """使正在进行的预测和已取出的快照都不能再写回状态。"""
         with self._lock:
