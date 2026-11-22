@@ -596,12 +596,19 @@ def test_postprocess_empty_image_is_safe() -> None:
 @pytest.mark.parametrize(
     ("overrides", "expected_cls", "autorotate", "cuda"),
     [
-        pytest.param({}, "onnx", False, True, id="default-diagnostic"),
-        pytest.param({"cls_autorotate": True}, "onnx", True, True, id="onnx-autorotate"),
+        pytest.param({}, None, False, False, id="default-off"),
+        pytest.param({"cls_engine": "onnx"}, "onnx", False, True, id="onnx-diagnostic"),
+        pytest.param(
+            {"cls_engine": "onnx", "cls_autorotate": True},
+            "onnx",
+            True,
+            True,
+            id="onnx-autorotate",
+        ),
         pytest.param(
             {"cls_engine": "torch", "cls_use_cuda": False}, "torch", False, False, id="torch-cpu"
         ),
-        pytest.param({"cls_engine": "off"}, None, False, None, id="off"),
+        pytest.param({"cls_engine": "off"}, None, False, False, id="off"),
     ],
 )
 def test_ocr_engine_assembles_model_paths_and_options(
@@ -643,6 +650,7 @@ def test_ocr_engine_assembles_model_paths_and_options(
     if expected_cls is None:
         assert "Cls.engine_type" not in params
         assert params["Cls.model_path"] == str(tmp_path / "direction.onnx")
+        assert params["EngineConfig.onnxruntime.use_cuda"] is False
     else:
         assert params["Cls.engine_type"] == expected_cls
         assert params["Cls.model_path"] == str(
@@ -663,9 +671,54 @@ def test_cls_engine_rejects_unknown_name() -> None:
 
 def test_cls_weight_is_required_when_enabled() -> None:
     """启用方向分类时缺权重必须显式报错，且错误里点出是哪个文件。"""
-    engine = OcrEngine(OcrEngineConfig(model_dir="models/does-not-exist"))
+    engine = OcrEngine(OcrEngineConfig(model_dir="models/does-not-exist", cls_engine="onnx"))
     with pytest.raises(FileNotFoundError, match="cls_mobile"):
         engine.ensure()
+
+
+def test_ocr_engine_caps_elongated_det_input_and_remaps_boxes() -> None:
+    """狭长裁切图按 det_max_side_len 缩放并补黑边至 736，且文本框坐标还原回原图空间。"""
+    seen_shapes: list[tuple[int, ...]] = []
+
+    class FakeBackend:
+        def __call__(self, img: np.ndarray):
+            seen_shapes.append(img.shape)
+            # 在缩放+补边后的图像里返回一个文本框（长边 960，短边补边到 736）
+            return SimpleNamespace(
+                txts=["56"],
+                scores=[0.95],
+                boxes=[
+                    np.array([[142.22, 284.0], [284.44, 284.0], [284.44, 426.0], [142.22, 426.0]])
+                ],
+            )
+
+    ocr = OcrEngine(OcrEngineConfig(det_max_side_len=960))
+    ocr._engine = FakeBackend()
+
+    # 狭长图 259x675：若直接送 RapidOCR (min=736) 会放大到 1920x736；上限 960 应压到 736x960
+    elongated = np.full((259, 675, 3), 120, np.uint8)
+    texts = ocr.read_text(elongated)
+    assert seen_shapes == [(736, 960, 3)]
+    assert len(texts) == 1
+    assert texts[0].text == "56"
+    # scale = 960 / 675 = 1.4222..., new_h = 368, pad_top = (736 - 368) // 2 = 184
+    assert texts[0].box[0, 0] == pytest.approx(100.0, abs=0.5)
+    assert texts[0].box[0, 1] == pytest.approx((284.0 - 184.0) / (960.0 / 675.0), abs=0.5)
+    assert (texts[0].box[:, 0] <= 675.0).all() and (texts[0].box[:, 1] <= 259.0).all()
+
+    # 正常比例图 350x400（放大后长边 841 <= 960）不触发额外缩放与拷贝
+    normal = np.full((350, 400, 3), 120, np.uint8)
+    ocr.read_text(normal)
+    assert seen_shapes[-1] == (350, 400, 3)
+
+
+def test_ocr_engine_config_validates_det_max_side_len() -> None:
+    with pytest.raises(ValueError, match="det_max_side_len"):
+        OcrEngineConfig(det_max_side_len=-1)
+    with pytest.raises(ValueError, match="det_max_side_len"):
+        OcrEngineConfig(det_max_side_len=512)
+    assert OcrEngineConfig(det_max_side_len=0).det_max_side_len == 0
+    assert OcrEngineConfig(det_max_side_len=736).det_max_side_len == 736
 
 
 def test_classify_orientation_refuses_when_disabled() -> None:
@@ -899,13 +952,41 @@ def test_detector_prepares_remap_for_matrix() -> None:
     )
     image = np.zeros((480, 640, 3), np.uint8)
     out, done = detector.undistort(image)
-    assert done, "给了内参就应当真的做去畸变"
+    assert done, "给了内参就应当构建并执行去畸变映射（即使零畸变也保留一致路径）"
     assert out.shape == image.shape
     # 幂等：第二次不再重算
     assert detector._remap is not None
     first = detector._remap[0]
     detector.undistort(image)
     assert detector._remap[0] is first
+
+
+def test_detector_passes_quantize_16_only_on_cuda_when_half_enabled() -> None:
+    """CUDA 且 half=True 时向 Ultralytics 传 quantize=16；CPU 或 half=False 保持 FP32。"""
+    calls: list[dict[str, Any]] = []
+
+    class FakeModel:
+        def predict(self, image: np.ndarray, **kwargs: Any) -> list[Any]:
+            del image
+            calls.append(kwargs)
+            return []
+
+    image = np.zeros((48, 64, 3), np.uint8)
+
+    gpu_det = Detector(DetectorConfig(device="0", half=True, undistort=False))
+    gpu_det._model = FakeModel()
+    gpu_det.detect(image)
+    assert calls[-1]["quantize"] == 16
+
+    cpu_det = Detector(DetectorConfig(device="cpu", half=True, undistort=False))
+    cpu_det._model = FakeModel()
+    cpu_det.detect(image)
+    assert "quantize" not in calls[-1]
+
+    fp32_det = Detector(DetectorConfig(device="0", half=False, undistort=False))
+    fp32_det._model = FakeModel()
+    fp32_det.detect(image)
+    assert "quantize" not in calls[-1]
 
 
 def test_detector_undistort_skips_on_size_mismatch() -> None:
@@ -3128,5 +3209,57 @@ def test_ocr_pool_warns_when_backlog_exceeds_threshold(caplog, tmp_path) -> None
                     capture_timestamp=float(index),
                 )
         assert [record for record in caplog.records if "积压" in record.message], caplog.text
+    finally:
+        _close_pool_queues(pool)
+
+
+def test_ocr_dispatch_full_queue_retries_without_rereading_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """请求队列满时应直接重试 put，不得重复读盘和反序列化同一 sidecar。"""
+    from airdrop.perception.ocr_worker import OcrWorkerPool
+
+    pool = OcrWorkerPool(workers=1, queue_size=4)
+    pool.set_spool_directory(tmp_path / "spool")
+    pool._started = True
+    try:
+        request_id = pool.submit(
+            np.zeros((2, 2, 3), np.uint8),
+            frame_index=1,
+            capture_timestamp=1.0,
+        )
+        assert request_id == 1
+
+        read_calls = 0
+        original_read_bytes = Path.read_bytes
+
+        def counted_read(self: Path) -> bytes:
+            nonlocal read_calls
+            if self.suffix == ".request":
+                read_calls += 1
+            return original_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", counted_read)
+
+        attempts = 0
+        dispatched: list[object] = []
+
+        class _BackpressureQueue:
+            def put(self, item: object, timeout: float | None = None) -> None:
+                nonlocal attempts
+                del timeout
+                attempts += 1
+                if attempts < 4:
+                    raise queue.Full
+                dispatched.append(item)
+                pool._dispatch_stop.set()
+
+        pool._request_q = _BackpressureQueue()
+        pool._dispatch_stop.clear()
+        pool._dispatch_spool_loop()
+
+        assert attempts == 4
+        assert len(dispatched) == 1
+        assert read_calls == 1
     finally:
         _close_pool_queues(pool)

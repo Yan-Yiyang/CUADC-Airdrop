@@ -627,7 +627,7 @@ FlightLog.iter_telemetry() -> Iterator[TelemetrySnapshot]
 ```python
 Detector(config: DetectorConfig | None = None)
 DetectorConfig(model_path='models/best2.pt', device='0', conf_threshold=0.25,
-               iou_threshold=0.45, imgsz=1280, max_detections=300,
+               iou_threshold=0.45, imgsz=1280, max_detections=300, half=True,
                crop_expand_ratio=0.2, camera_matrix=None, dist_coeffs=None,
                undistort=True, calib_size=None)
 ```
@@ -724,8 +724,8 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 `OcrEngine(config: OcrEngineConfig | None = None)`，方法：`ensure()`（惰性建 RapidOCR 实例）、`cls_providers()`（当前可用的方向分类后端）、`classify_orientation(image)`（返回 `OcrOrientation(label, score)`；**诊断/调试入口**，正式流程不调用，要求 `cls_engine != 'off'`）、`warmup(size=320)`、`read_text(image)`（返回 `list[OcrText]`，每项 `box`/`text`/`score`）。
 
 > **方向分类（Cls）的定位**：只用于**检查/调试**（几何转正的交叉验证与排故）。正式链路
-> 的方向由几何转正决定（平行边法 + 顶角 `60°±15°` 门限），所以 `cls_autorotate` 默认 `False`，
-> 逐帧不再跑分类；`cls_engine` 保留默认 `'onnx'` 仅为诊断时最快（要连会话都不建就设 `'off'`）。
+> 的方向由几何转正决定（平行边法 + 顶角 `60°±15°` 门限），所以 `cls_autorotate` 默认 `False`、
+> `cls_engine` 默认 `'off'`（关闭未使用的 ONNXRuntime CUDA 会话以省显存；诊断交叉验证时显式传 `'onnx'` 或 `'torch'`）。
 
 `OcrEngineConfig` 默认值（走 `airdrop.perception.cropproc`）：
 
@@ -735,13 +735,14 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 | `det_model` | `'PP-OCRv6_det_medium.pth'` | 检测权重 |
 | `rec_model` | `'PP-OCRv6_rec_medium.pth'` | 识别权重 |
 | `rec_keys` | `'ppocrv6_dict.txt'` | 字符集字典（在 git 里） |
-| `cls_engine` | `'onnx'` | 方向分类后端（实测最快）；**只在启用方向分类时生效**（默认不参与识别，见下） |
+| `cls_engine` | `'off'` | 方向分类后端（`'off'`/`'onnx'`/`'torch'`）；默认关闭以省去未使用的 ORT CUDA 显存，诊断时显式启用 |
 | `cls_onnx_model` | `'ch_ppocr_mobile_v2.0_cls_mobile.onnx'` | ONNX 版分类权重 |
 | `cls_torch_model` | `'ch_ptocr_mobile_v2.0_cls_mobile.pth'` | TORCH 版分类权重（**注意这个错拼**） |
 | `cls_use_cuda` | `True` | 分类是否用 CUDA |
 | `cls_thresh` | `0.9` | 方向判定阈值 |
 | `cls_autorotate` | `False` | **默认关**：方向分类只作诊断/交叉验证，不参与识别——正式流程的方向由几何转正（顶角 60°±15° 门限）保证。设为 `True` 才会按判定把倒置文本行转正再识别（2026-10 实测：开/关读号逐位相同，关掉每帧约省一成耗时） |
 | `use_cuda` | `True` | det/rec 是否用 CUDA |
+| `det_max_side_len` | `960` | 检测输入有效长边上限（0 为不限，非 0 须 ≥ 736；约束狭长裁切图显存尖峰并还原框坐标） |
 | `device_id` | `0` | GPU 序号 |
 | `text_score` | `0.1` | RapidOCR 的 `Global.text_score` |
 | `rec_batch_num` | `6` | 识别批大小 |
@@ -2063,7 +2064,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | --- | --- | --- |
 | `models/best2.pt` | YOLO 检测权重（**唯一可用**；`best.pt`/`best1.pt` 是废弃权重，零检出） | ❌（`*.pt` 忽略） |
 | `models/ppocr/PP-OCRv6_det_medium.pth`、`PP-OCRv6_rec_medium.pth` | RapidOCR TORCH 引擎权重（det/rec） | ❌（`*.pth`） |
-| `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 方向分类 ONNX（默认 `cls_engine="onnx"`） | ❌（`*.onnx`） |
+| `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 方向分类 ONNX（诊断交叉验证按需传 `cls_engine="onnx"`） | ❌（`*.onnx`） |
 | `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 方向分类 TORCH 权重（**`pt` 是 RapidOCR 的拼写，别规范化**） | ❌ |
 | `models/ppocr/*.txt` | 字符集字典——**入库**：它决定 rec 的字符集，跟着版本走才能复现识别结果 | ✅ |
 

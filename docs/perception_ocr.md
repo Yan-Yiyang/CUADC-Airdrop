@@ -29,9 +29,11 @@
   **方向分类（Cls）已接入，但只作检查/调试（交叉验证与排故），默认不参与识别**：正式链路的转向由
   几何转正保证（平行边法 + 顶角 `60°±15°` 门限），所以 `cls_autorotate` 默认 `False`，省掉逐帧
   分类计算；要它按判定把倒置文本行转正再识别就显式设 `True`。
-  `cls_engine` 决定用哪个后端（`"onnx"` 默认，另有 `"torch"`/`"off"`），**只在启用它时才生效**；
-  `"off"` 连会话都不建，但 `classify_orientation()` 会明确拒绝（不静默给值）。对外只多一个
+  `cls_engine` 决定用哪个后端（`"off"` 默认，另有 `"onnx"`/`"torch"`），**只在启用它时才生效**；
+  `"off"` 禁用 ONNXRuntime CUDA 会话以节省显存，但 `classify_orientation()` 会明确拒绝（不静默给值）。对外只多一个
   `classify_orientation(image) -> OcrOrientation`（**诊断入口**，给几何转正做交叉验证用）。
+  通过 `det_max_side_len=960` 约束狭长裁切图在 `limit_type="min"`（736）下的等比放大上限
+  （超限时缩放并在短边补黑边至 736，检测框自动映射回原图坐标）。
   置信度过滤走 `Global.text_score`（3.9.2 的 `__call__` 只收图像，旧调用中的
   `allowlist`/`low_text`/`text_threshold` 参数**已不存在**）。
 
@@ -48,13 +50,12 @@
   项目的 `OcrEngine._report_cls_device()` 会检查首个 provider 并告警，不能把静默退回 CPU
   当作 CUDA 正常工作。
   本项目 det/rec 走 TORCH 引擎、天然满足，但**别把它当成理所当然**：
-  `cls_engine="onnx"` 是配置默认值；不同运行环境需核对实际 provider。
-- **方向分类默认关（`cls_autorotate=False`），只作检查/调试**：正式链路的方向由几何转正保证，
+  正式默认 `cls_engine="off"` 以避免未使用的 ORT CUDA 会话占显存；显式开启 `cls_engine="onnx"` 诊断时需核对实际 provider。
+- **方向分类默认关（`cls_engine="off"`、`cls_autorotate=False`），只作检查/调试**：正式链路的方向由几何转正保证，
   Cls 用于交叉验证与排故，不参与默认识别。
   * **边界**：阈值筛选不能保证方向判定正确；如果几何转正方向错误，OCR 仍可能读错编号。
     `classify_orientation()` 是诊断接口。
-  * **旋钮**：`cls_autorotate=True` 恢复自动转正；`cls_engine="off"` 连会话都不建（进一步省
-    onnxruntime/GPU 开销），代价是方向 API 不可用。
+  * **旋钮**：诊断交叉验证显式设 `cls_engine="onnx"`（或 `"torch"`）；`cls_autorotate=True` 恢复自动转正。
 - **几何转正曾差 180°，已修（根因：平行边法缺一道形态门限）**：
   以下复盘来自旧样本，不构成通用识别准确率验收。
   * **根因**：`_find_apex_by_parallel` 只验证"存在一对平行边"，**不验证这是不是房子**。

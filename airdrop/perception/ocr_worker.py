@@ -619,7 +619,15 @@ class OcrWorkerPool:
                     request_id, frame_index, capture_timestamp, str(crop_path), rectified_path
                 )
                 dispatch_start = timing.now_ns() if timing.ENABLED else 0
-                self._request_q.put(request, timeout=0.1)
+                # 队列满时复用已加载的请求直接等待空位，避免每 100ms 重复查 SQLite 与读盘。
+                while not self._dispatch_stop.is_set():
+                    try:
+                        self._request_q.put(request, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                else:
+                    return
                 if timing.ENABLED:
                     timing.emit(
                         "ocr_dispatch",
@@ -630,8 +638,6 @@ class OcrWorkerPool:
                     )
                 self._dispatch_id = request_id + 1
                 self._remove_spool_index_id(request_id)
-            except queue.Full:
-                continue
             except _OcrSpoolIndexError:
                 raise
             except sqlite3.Error:

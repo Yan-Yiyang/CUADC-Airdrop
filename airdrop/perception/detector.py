@@ -47,6 +47,8 @@ class DetectorConfig:
     iou_threshold: float = 0.45
     imgsz: int = 1280  # 权重按 imgsz=640 训练；实测 640/1280 检出一致
     max_detections: int = 300
+    #: CUDA 上是否启用 FP16 推理（对应 Ultralytics ``quantize=16``；CPU/MPS 自动保持 FP32）。
+    half: bool = True
     # 目标框外扩比例（裁剪时保留完整轮廓）
     crop_expand_ratio: float = 0.2
     # 去畸变（标定产出；为 None 表示不做）
@@ -138,6 +140,29 @@ class Detector:
             LOGGER.info("权重类别 %d 个: %s", len(names), names)
             return self
 
+    @staticmethod
+    def _is_cuda_device(device: str) -> bool:
+        normalized = str(device).strip().lower()
+        if not normalized or normalized in ("cpu", "mps"):
+            return False
+        if normalized.startswith("cuda"):
+            return True
+        return all(part.strip().isdigit() for part in normalized.split(","))
+
+    def _predict_kwargs(self) -> dict[str, Any]:
+        config = self._config
+        kwargs: dict[str, Any] = {
+            "device": config.device,
+            "conf": config.conf_threshold,
+            "iou": config.iou_threshold,
+            "imgsz": config.imgsz,
+            "max_det": config.max_detections,
+            "verbose": False,
+        }
+        if config.half and self._is_cuda_device(config.device):
+            kwargs["quantize"] = 16
+        return kwargs
+
     def warmup(self, width: int, height: int) -> bool:
         """按目标分辨率跑一次空推理，把 CUDA 上下文/内核编译开销挪到起飞前。
 
@@ -147,15 +172,7 @@ class Detector:
         try:
             self.load()
             blank = np.zeros((height, width, 3), np.uint8)
-            self._model.predict(
-                blank,
-                device=self._config.device,
-                conf=self._config.conf_threshold,
-                iou=self._config.iou_threshold,
-                imgsz=self._config.imgsz,
-                max_det=self._config.max_detections,
-                verbose=False,
-            )
+            self._model.predict(blank, **self._predict_kwargs())
             return True
         except Exception:
             LOGGER.exception("YOLO 预热失败")
@@ -207,7 +224,7 @@ class Detector:
             else np.asarray(config.dist_coeffs, dtype=np.float64).reshape(-1)
         )
         # 保留标定 K：下游 georef 用同一 K 反投影，不能只在这里改变焦距/主点。
-        # 映射仍只构建一次，逐帧复用定点查表；不额外裁剪或缩放纠正后的画面。
+        # 映射仍只构建一次，逐帧复用定点查表；即使畸变系数为零也保持相同重采样路径以贴合真实相机。
         map_x, map_y = cv2.initUndistortRectifyMap(matrix, dist, None, matrix, size, cv2.CV_16SC2)
         self._remap = (map_x, map_y)
         self._remap_shape = size
@@ -277,15 +294,7 @@ class Detector:
             picture, rectified = image, False
 
         predict_start = timing.now_ns() if timing.ENABLED else 0
-        results = self._model.predict(
-            picture,
-            device=config.device,
-            conf=config.conf_threshold,
-            iou=config.iou_threshold,
-            imgsz=config.imgsz,
-            max_det=config.max_detections,
-            verbose=False,
-        )
+        results = self._model.predict(picture, **self._predict_kwargs())
         predict_end = timing.now_ns() if timing.ENABLED else 0
         snapshot = telemetry if telemetry is not None else TelemetrySnapshot()
         height, width = picture.shape[:2]

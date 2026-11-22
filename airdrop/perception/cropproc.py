@@ -37,7 +37,8 @@
   显式启用 ``cls_autorotate=True``。
 * 方向分类（Cls）的权重文件名保持 RapidOCR 原样（TORCH 版是
   ``ch_ptocr_mobile_v2.0_cls_mobile.pth``，引擎按文件名 stem 查架构）；
-  用哪个引擎由 :class:`OcrEngineConfig` 的 ``cls_engine`` 决定（默认 ONNX）。
+  用哪个引擎由 :class:`OcrEngineConfig` 的 ``cls_engine`` 决定（默认 ``"off"``，
+  避免未使用的 ONNXRuntime CUDA 会话占用显存；诊断交叉验证时按需显式指定 ``"onnx"`` / ``"torch"``）。
 """
 
 from __future__ import annotations
@@ -72,6 +73,10 @@ _OCR_FAIL_LOG_EVERY = 30
 #: 与 s_min、与图像都无关。
 _MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
 
+#: RapidOCR 默认文本检测短边下限（Det.limit_type="min", Det.limit_side_len=736）。
+#: 用于在长宽比悬殊裁切图上预先约束送检长边上限，防止等比放大触发显存尖峰。
+_DET_MIN_SIDE_LEN = 736
+
 
 # ----------------------------------------------------------------------
 # RapidOCR 引擎封装
@@ -88,12 +93,12 @@ class OcrEngineConfig:
     det_model: str = "PP-OCRv6_det_medium.pth"
     rec_model: str = "PP-OCRv6_rec_medium.pth"
     rec_keys: str = "ppocrv6_dict.txt"
-    #: 方向分类（Cls）用哪个引擎：``"onnx"`` / ``"torch"`` / ``"off"``。
+    #: 方向分类（Cls）用哪个引擎：``"off"`` / ``"onnx"`` / ``"torch"``。
     #: ⚠ 只在**启用方向分类**时才有意义（诊断/交叉验证，或显式打开 ``cls_autorotate``）：
-    #: 正式流程不用它，方向由几何转正保证。想连会话都不建（进一步省 onnxruntime/GPU
-    #: 开销）就设 ``"off"``——代价是 ``classify_orientation()`` 会明确拒绝（不是静默给值）。
-    #: 默认 ONNX；可按部署环境选择方向分类引擎。
-    cls_engine: str = "onnx"
+    #: 正式流程不用它，方向由几何转正保证。默认 ``"off"`` 以避免在每个 OCR 进程里
+    #: 分配未使用的 ONNXRuntime CUDA 会话与显存——代价是 ``classify_orientation()`` 会明确拒绝
+    #: （不是静默给值）；离线诊断交叉验证时显式传 ``cls_engine="onnx"`` 或 ``"torch"`` 即可。
+    cls_engine: str = "off"
     cls_onnx_model: str = "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
     #: 文件名保持 RapidOCR 原拼写（``ptocr``），不要规范化
     cls_torch_model: str = "ch_ptocr_mobile_v2.0_cls_mobile.pth"
@@ -111,10 +116,20 @@ class OcrEngineConfig:
     #: 默认关闭；方向分类只作诊断或交叉验证，任务需要时应先使用对应数据验证。
     cls_autorotate: bool = False
     use_cuda: bool = True
+    #: 文本检测输入长边上限（像素）。RapidOCR 默认在短边 < 736 时按比例放大整图，
+    #: 狭长裁切图会被放大到如 1920×736 引发显存尖峰；设为 >= 736 时对超限图像先缩放到
+    #: 长边等于该上限并在短边补黑边至 736，保留正常裁切图不变。设为 0 表示不限制。
+    det_max_side_len: int = 960
     device_id: int = 0
     text_score: float = 0.1
     rec_batch_num: int = 6
     log_level: str = "error"
+
+    def __post_init__(self) -> None:
+        if self.det_max_side_len < 0 or (0 < self.det_max_side_len < _DET_MIN_SIDE_LEN):
+            raise ValueError(
+                f"det_max_side_len 必须为 0 或 >= {_DET_MIN_SIDE_LEN}: {self.det_max_side_len}"
+            )
 
     def det_path(self) -> Path:
         return Path(self.model_dir) / self.det_model
@@ -267,13 +282,16 @@ class OcrEngine:
         return self._engine
 
     def _cls_params(self, engine_type: Any) -> dict[str, Any]:
-        """方向分类（Cls）的构造参数；``cls_engine="off"`` 只关自动旋转、不加载权重。"""
+        """方向分类（Cls）的构造参数；``cls_engine="off"`` 关闭自动旋转并禁用 ORT CUDA 会话。"""
         config = self._config
         if not config.cls_enabled():
             # rapidocr 会无条件构造 det/cls/rec 三个模块（Global.use_cls 只管流水线），
-            # 所以"关掉"也得给它一个本地路径：Cls.model_path 为空时它会去 modelscope
-            # 下载默认 Cls 模型——离线机器上就是启动失败。
-            params: dict[str, Any] = {"Global.use_cls": False}
+            # 所以"关掉"仍需提供本地路径（防 modelscope 下载），同时显式关闭 ONNXRuntime CUDA
+            # 以免每个 OCR 进程白白分配一套未使用的 CUDA 上下文与显存。
+            params: dict[str, Any] = {
+                "Global.use_cls": False,
+                "EngineConfig.onnxruntime.use_cuda": False,
+            }
             local = next(
                 (
                     path
@@ -394,6 +412,47 @@ class OcrEngine:
             LOGGER.exception("OCR 模型预热失败")
             return False
 
+    def _prepare_det_image(self, image: np.ndarray) -> tuple[np.ndarray, float, int, int]:
+        """约束送入检测网络的有效长边上限，防止狭长裁切图触发显存尖峰。
+
+        返回 ``(送检图像, 缩放比例, 左补边像素, 上补边像素)``。未触发上限时原样返回。
+        """
+        max_side = self._config.det_max_side_len
+        if max_side <= 0 or image.ndim < 2:
+            return image, 1.0, 0, 0
+        height, width = image.shape[:2]
+        if height <= 0 or width <= 0:
+            return image, 1.0, 0, 0
+        short_side = min(height, width)
+        long_side = max(height, width)
+        effective_long = (
+            long_side * (_DET_MIN_SIDE_LEN / short_side)
+            if short_side < _DET_MIN_SIDE_LEN
+            else float(long_side)
+        )
+        if effective_long <= max_side:
+            return image, 1.0, 0, 0
+        scale = max_side / long_side
+        new_h = max(1, int(round(height * scale)))
+        new_w = max(1, int(round(width * scale)))
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
+        pad_h = max(0, _DET_MIN_SIDE_LEN - new_h)
+        pad_w = max(0, _DET_MIN_SIDE_LEN - new_w)
+        pad_top = pad_h // 2
+        pad_left = pad_w // 2
+        if pad_h > 0 or pad_w > 0:
+            resized = cv2.copyMakeBorder(
+                resized,
+                pad_top,
+                pad_h - pad_top,
+                pad_left,
+                pad_w - pad_left,
+                cv2.BORDER_CONSTANT,
+                value=(0, 0, 0),
+            )
+        return resized, scale, pad_left, pad_top
+
     def read_text(self, image: np.ndarray) -> list[OcrText]:
         """整图识别，返回文本列表；引擎不可用或识别失败时返回空列表。
 
@@ -411,8 +470,9 @@ class OcrEngine:
         except Exception as exc:  # noqa: BLE001 - 必须兜住一切并降级为"没读出编号"
             self._log_ocr_failure("OCR 引擎不可用", exc)
             return []
+        prepared, scale, pad_left, pad_top = self._prepare_det_image(image)
         try:
-            result = engine(image)
+            result = engine(prepared)
         except Exception as exc:  # noqa: BLE001 - 同上：单帧失败不打断整条链路
             self._log_ocr_failure("OCR 单帧识别失败", exc)
             return []
@@ -423,6 +483,8 @@ class OcrEngine:
         boxes = getattr(result, "boxes", None)
         if texts is None or boxes is None:
             return []
+        orig_h, orig_w = image.shape[:2]
+        remap_box = scale != 1.0 or pad_left != 0 or pad_top != 0
         out: list[OcrText] = []
         for index, text in enumerate(texts):
             if not text:
@@ -430,8 +492,13 @@ class OcrEngine:
             box = np.asarray(boxes[index], dtype=np.float64).reshape(-1, 2)
             if len(box) < 4:
                 continue
+            box4 = box[:4]
+            if remap_box:
+                box4 = box4.copy()
+                box4[:, 0] = np.clip((box4[:, 0] - pad_left) / scale, 0.0, float(orig_w))
+                box4[:, 1] = np.clip((box4[:, 1] - pad_top) / scale, 0.0, float(orig_h))
             score = 1.0 if scores is None else float(scores[index])
-            out.append(OcrText(box=box[:4], text=str(text), score=score))
+            out.append(OcrText(box=box4, text=str(text), score=score))
         return out
 
 

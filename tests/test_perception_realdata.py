@@ -191,7 +191,7 @@ def test_rectification_cross_checked_by_orientation_cls(annotated_video: Path) -
     from airdrop.perception.cropproc import OcrEngine, OcrEngineConfig, OpenCvPostProcess
     from airdrop.perception.detector import Detector, DetectorConfig
 
-    engine = OcrEngine(OcrEngineConfig())
+    engine = OcrEngine(OcrEngineConfig(cls_engine="onnx"))
     engine.ensure()  # cls_providers() 只在加载后才有内容
     if not engine.cls_providers():
         pytest.skip("方向分类未就绪")

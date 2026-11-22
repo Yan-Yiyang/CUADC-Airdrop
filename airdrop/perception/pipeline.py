@@ -34,7 +34,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -202,6 +202,8 @@ class PerceptionWorker:
         self._result_observers: set[Callable[[DetectionSnapshot], None]] = set()
         self._frozen_buffer: AlignmentBuffer | None = None
         self._frozen_buffer_closed = False
+        self._snapshot_matrix_source: Any = None
+        self._snapshot_matrix: tuple[tuple[float, float, float], ...] | None = None
 
     # ------------------------------------------------------------------
     # 状态
@@ -304,17 +306,7 @@ class PerceptionWorker:
                     config={
                         "color": self._config.target_color,
                         "ocr_conf_threshold": self._config.ocr_conf_threshold,
-                        "engine": {
-                            "model_dir": self._config.engine.model_dir,
-                            "det_model": self._config.engine.det_model,
-                            "rec_model": self._config.engine.rec_model,
-                            "rec_keys": self._config.engine.rec_keys,
-                            "use_cuda": self._config.engine.use_cuda,
-                            "device_id": self._config.engine.device_id,
-                            "text_score": self._config.engine.text_score,
-                            "rec_batch_num": self._config.engine.rec_batch_num,
-                            "log_level": self._config.engine.log_level,
-                        },
+                        "engine": asdict(self._config.engine),
                     },
                 )
                 if self._ocr_spool_directory is not None:
@@ -668,14 +660,20 @@ class PerceptionWorker:
         pose = snapshot_pose(snapshot)
         detector_config = getattr(self._detector, "config", None)
         configured_matrix = getattr(detector_config, "camera_matrix", None)
-        matrix = None
-        if configured_matrix is not None:
+        if configured_matrix is None:
+            matrix = None
+        elif configured_matrix is self._snapshot_matrix_source:
+            matrix = self._snapshot_matrix
+        else:
+            matrix = None
             values = np.asarray(configured_matrix, dtype=np.float64).reshape(3, 3)
             if np.isfinite(values).all():
                 matrix = cast(
                     tuple[tuple[float, float, float], ...],
                     tuple(tuple(float(value) for value in row) for row in values),
                 )
+            self._snapshot_matrix_source = configured_matrix
+            self._snapshot_matrix = matrix
         height, width = image.shape[:2]
         immutable_image = np.frombuffer(image.tobytes(), dtype=image.dtype).reshape(image.shape)
         immutable_image.flags.writeable = False
