@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from .segments import SegmentState
+
 if TYPE_CHECKING:
     from .cache import DecodedFrameCache
     from .cold import TsRangeDecoder
@@ -21,8 +23,10 @@ class _Waiter:
     target: Fraction
     request: tuple[int, int, int]
     owner: object
+    readonly: bool = False
     ready: threading.Event = field(default_factory=threading.Event)
     image: np.ndarray | None = None
+    shared: bool = False
     error: BaseException | None = None
 
 
@@ -139,28 +143,41 @@ class _GopJob:
             if self.stopping:
                 raise InterruptedError("GOP 解码作业已关闭")
         width, height = self.size or (0, 0)
-        self.cache.put(
-            (
-                self.cache.storage_identity,
-                self.decoder.resolved_directory,
-                self.segment,
-                frame_time.numerator,
-                frame_time.denominator,
-                width,
-                height,
-            ),
-            image,
+        cache_key = (
+            self.cache.storage_identity,
+            self.decoder.resolved_directory,
+            self.segment,
+            frame_time.numerator,
+            frame_time.denominator,
+            width,
+            height,
         )
+        self.cache.put(cache_key, image)
         with self.condition:
             matching = [w for w in self.waiters if w.target == frame_time]
             if not matching:
                 return
-            # 所有并发等待者共享一份在途副本，调用方取结果时再各自复制。
-            result = image.copy()
-            for waiter in matching:
-                self.waiters.remove(waiter)
-                waiter.image = result
-                waiter.ready.set()
+            readonly_waiters = [w for w in matching if w.readonly]
+            writable_waiters = [w for w in matching if not w.readonly]
+            if readonly_waiters:
+                readonly_view = self.cache.get_readonly(cache_key)
+                if readonly_view is None:
+                    fallback = image.copy()
+                    fallback.flags.writeable = False
+                    readonly_view = fallback
+                for waiter in readonly_waiters:
+                    self.waiters.remove(waiter)
+                    waiter.image = readonly_view
+                    waiter.shared = True
+                    waiter.ready.set()
+            if writable_waiters:
+                writable_copy = image.copy()
+                shared_writable = len(writable_waiters) > 1
+                for waiter in writable_waiters:
+                    self.waiters.remove(waiter)
+                    waiter.image = writable_copy
+                    waiter.shared = shared_writable
+                    waiter.ready.set()
 
     def _run(self) -> None:
         cursor: Any = None
@@ -277,31 +294,30 @@ class GopCoordinator:
         den: int,
         size: tuple[int, int] | None,
         cancelled: threading.Event,
+        *,
+        readonly: bool = False,
     ) -> np.ndarray:
-        from .cold import TsDataNotReady, TsRangeDecoder
-        from .segments import SegmentState
-
         if cancelled.is_set():
             raise InterruptedError("历史解码读取已取消")
         target = Fraction(pts * num, den)
         width, height = size or (0, 0)
         cache_key = decoder._make_cache_key(segment, target, width, height)  # noqa: SLF001
-        cached = self.cache.get(cache_key)
+        cached = self.cache.get_readonly(cache_key) if readonly else self.cache.get(cache_key)
         if cached is not None:
             if cancelled.is_set():
                 raise InterruptedError("历史解码读取已取消")
             return cached
+        from .cold import TsDataNotReady, TsRangeDecoder
+
         path = decoder.directory / f"segment-{segment:06d}.ts"
-        with decoder._lock:  # noqa: SLF001 - 协调器共享该 decoder 的随机访问索引锁
-            points = decoder._get_keyframes(segment, path)  # noqa: SLF001
-        before = [item for item in points if item[0] <= target]
-        if not before:
+        dts_time = decoder._find_random_access_dts(segment, path, target)  # noqa: SLF001
+        if dts_time is None:
             lifecycle = decoder.segment_lifecycle
             if lifecycle is not None and lifecycle.snapshot(segment).state is SegmentState.ACTIVE:
                 raise TsDataNotReady(f"活动 MPEG-TS 段尚未写出随机访问点: {path}")
             raise ValueError(f"目标时间 {target} 之前没有可用关键帧: {path}")
-        key = (decoder.resolved_directory, segment, before[-1][1], size)
-        waiter = _Waiter(target, (pts, num, den), decoder)
+        key = (decoder.resolved_directory, segment, dts_time, size)
+        waiter = _Waiter(target, (pts, num, den), decoder, readonly=readonly)
         with self._condition:
             if decoder not in self._views:
                 raise InterruptedError("历史解码读取已取消")
@@ -391,6 +407,8 @@ class GopCoordinator:
                 raise waiter.error
             if waiter.image is None:
                 raise RuntimeError("GOP 请求结束但没有图像")
-            return waiter.image.copy()
+            if waiter.shared and not readonly:
+                return waiter.image.copy()
+            return waiter.image
         finally:
             job.finish(waiter)

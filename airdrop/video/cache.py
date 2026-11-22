@@ -51,6 +51,19 @@ class DecodedFrameCache:
             self._entries.move_to_end(key)
             return image.copy()
 
+    def get_readonly(self, key: tuple[object, ...]) -> np.ndarray | None:
+        """返回缓存图像的零拷贝只读视图，并更新 LRU 顺序。"""
+        with self._lock:
+            if self._leases == 0:
+                return None
+            image = self._entries.get(key)
+            if image is None:
+                return None
+            self._entries.move_to_end(key)
+            view = image.view()
+            view.flags.writeable = False
+            return view
+
     def put(self, key: tuple[object, ...], image: np.ndarray) -> None:
         """在复制图像前预留额度；超大图像不进入缓存。"""
         size = image.nbytes

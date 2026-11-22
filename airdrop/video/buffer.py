@@ -476,8 +476,8 @@ class AlignmentBuffer:
             self._log_estimate_locked(nbytes)
             if self._cold_decoder is not None:
                 self._schedule_through_locked(self._next_index)
+            else:
                 self._condition.notify_all()
-            self._condition.notify_all()
 
         if not materialize:
             return None
@@ -914,6 +914,7 @@ class AlignmentBuffer:
                 output_size=(stored.image_width, stored.image_height)
                 if stored.image_width is not None and stored.image_height is not None
                 else None,
+                readonly=True,
             )
             if image is None:
                 raise RuntimeError(f"TS 帧读取失败：缓冲序号 #{stored.index}")
@@ -1041,12 +1042,14 @@ class AlignmentBuffer:
                     self._condition.notify_all()
                 continue
 
+            # 像素对比放在锁外，避免全帧比较阻塞采集线程 put()。
+            matches = recovered is not None and np.array_equal(recovered, payload)
             with self._condition:
                 current = self._find_by_index_locked(index)
                 if current is None or current.payload is not payload:
                     self._finish_cold_locked(index)
                     continue
-                if recovered is None or not np.array_equal(recovered, payload):
+                if not matches:
                     self._cold_error = f"帧 #{index} TS 冷读校验不一致，保留热帧"
                     self._cold_active_index = None
                     self._condition.notify_all()

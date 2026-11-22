@@ -4296,3 +4296,336 @@ def test_ts_range_decoder_caches_resolved_directory(tmp_path: Path, monkeypatch)
         assert calls == 2
     finally:
         decoder.close()
+
+
+def test_decoded_cache_get_readonly_returns_zero_copy_view_and_updates_lru() -> None:
+    """get_readonly 应返回零拷贝只读视图、更新 LRU，且不影响 get 的隔离语义。"""
+    from airdrop.video.cache import DecodedFrameCache
+
+    cache = DecodedFrameCache(8)
+    cache.acquire()
+    img1 = np.array([[1, 2], [3, 4]], dtype=np.uint8)
+    img2 = np.array([[5, 6], [7, 8]], dtype=np.uint8)
+    img3 = np.array([[9, 10], [11, 12]], dtype=np.uint8)
+    cache.put(("k1",), img1)
+    cache.put(("k2",), img2)
+
+    view1 = cache.get_readonly(("k1",))
+    view1_again = cache.get_readonly(("k1",))
+    assert view1 is not None and view1_again is not None
+    assert not view1.flags.writeable
+    assert not view1_again.flags.writeable
+    assert np.array_equal(view1, img1)
+    assert np.shares_memory(view1, view1_again)
+    with pytest.raises(ValueError):
+        view1[0, 0] = 0
+
+    # k1 刚被 get_readonly 访问，插入 k3 应驱逐更旧的 k2 而保留 k1。
+    cache.put(("k3",), img3)
+    assert cache.get_readonly(("k2",)) is None
+    assert cache.get_readonly(("k1",)) is not None
+
+    # get() 仍须返回独立可写副本，修改它不得污染缓存或既有只读视图。
+    writable = cache.get(("k1",))
+    assert writable is not None and writable.flags.writeable
+    assert not np.shares_memory(writable, view1)
+    writable[:] = 99
+    assert np.array_equal(view1, img1)
+    fresh = cache.get(("k1",))
+    assert fresh is not None and np.array_equal(fresh, img1)
+
+    cache.release()
+    assert cache.get_readonly(("k1",)) is None
+
+
+def test_ts_range_decoder_readonly_cold_and_gop_reads(tmp_path: Path, monkeypatch) -> None:
+    """非 GOP 与共享 GOP 路径下 readonly=True 返回只读视图，readonly=False 保持可写隔离。"""
+    from airdrop.video.gop import _GopJob
+
+    source_path = tmp_path / "source.mp4"
+    frames = _make_h264(source_path, frames=12, gop=12)
+    source = av.open(str(source_path), mode="r")
+    writer = TsSegmentWriter(tmp_path, segment=1, input_stream=source.streams.video[0])
+    for packet in source.demux(source.streams.video[0]):
+        packet.decode()
+        writer.mux(packet)
+    writer.close()
+    source.close()
+
+    # 非 GOP 解码器：缓存未命中和命中在 readonly=True 下均不可写，readonly=False 保持可写隔离。
+    standalone = TsRangeDecoder(tmp_path, max_cache_bytes=1_000_000)
+    try:
+        pts, tb, expected = frames[4]
+        ro_miss = standalone.read(1, pts, tb.numerator, tb.denominator, readonly=True)
+        assert ro_miss is not None
+        assert not ro_miss.flags.writeable
+        assert np.array_equal(ro_miss, expected)
+
+        ro_hit1 = standalone.read(1, pts, tb.numerator, tb.denominator, readonly=True)
+        ro_hit2 = standalone.read(1, pts, tb.numerator, tb.denominator, readonly=True)
+        assert ro_hit1 is not None and ro_hit2 is not None
+        assert not ro_hit1.flags.writeable
+        assert np.shares_memory(ro_hit1, ro_hit2)
+
+        rw_hit = standalone.read(1, pts, tb.numerator, tb.denominator, readonly=False)
+        assert rw_hit is not None and rw_hit.flags.writeable
+        assert not np.shares_memory(rw_hit, ro_hit1)
+        rw_hit[:] = 0
+        assert np.array_equal(ro_hit1, expected)
+        rw_again = standalone.read(1, pts, tb.numerator, tb.denominator, readonly=False)
+        assert rw_again is not None and np.array_equal(rw_again, expected)
+    finally:
+        standalone.close()
+
+    # 共享 GOP 协调器：同帧混合只读/可写并发等待者互不干扰，且小缓存回退仍只读。
+    main = TsRangeDecoder(tmp_path, max_cache_bytes=1_000_000)
+    other = TsRangeDecoder(tmp_path, decoded_cache=main.decoded_cache)
+    coordinator = main.enable_shared_gop()
+    other.enable_shared_gop(coordinator)
+    entered = threading.Event()
+    release = threading.Event()
+    real_dispatch = _GopJob._dispatch
+    barrier_time = frames[1][0] * frames[1][1]
+
+    def dispatch(job, frame_time, image) -> None:
+        if frame_time == barrier_time:
+            entered.set()
+            assert release.wait(timeout=3.0)
+        real_dispatch(job, frame_time, image)
+
+    monkeypatch.setattr(_GopJob, "_dispatch", dispatch)
+    pts, tb, expected = frames[7]
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ro_future = pool.submit(main.read, 1, pts, tb.numerator, tb.denominator, readonly=True)
+            assert entered.wait(timeout=3.0)
+            rw_future = pool.submit(
+                other.read, 1, pts, tb.numerator, tb.denominator, readonly=False
+            )
+            deadline = time.monotonic() + 3.0
+            jobs: list[Any] = []
+            while time.monotonic() < deadline:
+                jobs = list(coordinator._jobs.values())
+                if jobs and len(jobs[0].waiters) == 2:
+                    break
+                time.sleep(0.01)
+            assert jobs and len(jobs[0].waiters) == 2
+            release.set()
+            ro_img = ro_future.result(timeout=3.0)
+            rw_img = rw_future.result(timeout=3.0)
+        assert ro_img is not None and rw_img is not None
+        assert not ro_img.flags.writeable
+        assert rw_img.flags.writeable
+        assert np.array_equal(ro_img, expected)
+        assert np.array_equal(rw_img, expected)
+
+        rw_img[:] = 0
+        assert np.array_equal(ro_img, expected)
+        cached_ro = other.read(1, pts, tb.numerator, tb.denominator, readonly=True)
+        assert cached_ro is not None and not cached_ro.flags.writeable
+        assert np.shares_memory(cached_ro, ro_img)
+        assert np.array_equal(cached_ro, expected)
+
+        # 单一可写等待者（无缓存命中）仍返回可写且与缓存隔离的数组。
+        monkeypatch.setattr(_GopJob, "_dispatch", real_dispatch)
+        pts2, tb2, expected2 = frames[10]
+        single_rw = main.read(1, pts2, tb2.numerator, tb2.denominator, readonly=False)
+        assert single_rw is not None and single_rw.flags.writeable
+        single_rw[:] = 0
+        cached_ro2 = other.read(1, pts2, tb2.numerator, tb2.denominator, readonly=True)
+        assert cached_ro2 is not None and np.array_equal(cached_ro2, expected2)
+    finally:
+        release.set()
+        main.close()
+        other.close()
+
+    # 微小缓存未保留帧时，GOP readonly=True 仍返回不可写副本。
+    tiny = TsRangeDecoder(tmp_path, max_cache_bytes=1)
+    tiny.enable_shared_gop()
+    try:
+        pts3, tb3, expected3 = frames[5]
+        tiny_ro = tiny.read(1, pts3, tb3.numerator, tb3.denominator, readonly=True)
+        assert tiny_ro is not None
+        assert not tiny_ro.flags.writeable
+        assert np.array_equal(tiny_ro, expected3)
+        assert tiny._cache_bytes == 0
+    finally:
+        tiny.close()
+
+
+def test_ts_range_decoder_caches_closed_segment_keyframes_and_bisects(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """已封口分段的关键帧索引应零系统调用命中，并按单调/非单调分别走二分或线性查找。"""
+    lifecycle = SegmentLifecycle()
+    decoder = TsRangeDecoder(tmp_path, segment_lifecycle=lifecycle)
+    seg1 = tmp_path / "segment-000001.ts"
+    seg1.write_bytes(b"ts")
+    rap1 = seg1.with_suffix(".rap.jsonl")
+    rap1.write_text(
+        '{"pts":12,"dts":10,"time_base_num":1,"time_base_den":12}\n'
+        '{"pts":24,"dts":22,"time_base_num":1,"time_base_den":12}\n',
+        encoding="utf-8",
+    )
+
+    seg2 = tmp_path / "segment-000002.ts"
+    seg2.write_bytes(b"ts")
+    seg2.with_suffix(".rap.jsonl").write_text(
+        '{"pts":0,"dts":0,"time_base_num":1,"time_base_den":12}\n',
+        encoding="utf-8",
+    )
+    lifecycle.opened(2)
+    lifecycle.closed(2, complete=True)
+
+    seg3 = tmp_path / "segment-000003.ts"
+    seg3.write_bytes(b"ts")
+    seg3.with_suffix(".rap.jsonl").write_text(
+        '{"pts":0,"dts":0,"time_base_num":1,"time_base_den":12}\n'
+        '{"pts":36,"dts":34,"time_base_num":1,"time_base_den":12}\n'
+        '{"pts":12,"dts":11,"time_base_num":1,"time_base_den":12}\n',
+        encoding="utf-8",
+    )
+    seg3.with_suffix(".complete").touch()
+
+    try:
+        # 活动段尚未封口：不锁进 _keyframe_complete，可增量读到新增关键帧。
+        assert len(decoder._get_keyframes(1, seg1)) == 2
+        assert 1 not in decoder._keyframe_complete
+        with rap1.open("a", encoding="utf-8") as handle:
+            handle.write('{"pts":36,"dts":34,"time_base_num":1,"time_base_den":12}\n')
+        assert len(decoder._get_keyframes(1, seg1)) == 3
+        assert 1 not in decoder._keyframe_complete
+
+        # 封口后再次读取（即使文件大小未变）应锁定为完整分段。
+        seg1.with_suffix(".complete").touch()
+        assert len(decoder._get_keyframes(1, seg1)) == 3
+        assert 1 in decoder._keyframe_complete
+        assert decoder._keyframe_sorted[1] is True
+
+        # 生命周期为 CLOSED_COMPLETE 时（无 .complete 文件）同样锁定完整缓存。
+        assert len(decoder._get_keyframes(2, seg2)) == 1
+        assert 2 in decoder._keyframe_complete
+
+        # 非单调关键帧标记为 unsorted，并走线性回退返回最后一个 <= target 的 DTS。
+        assert len(decoder._get_keyframes(3, seg3)) == 3
+        assert 3 in decoder._keyframe_complete
+        assert decoder._keyframe_sorted[3] is False
+
+        # 后续查询已封口分段不得触发任何 Path.stat / Path.is_file / Path.open 系统调用。
+        original_stat = Path.stat
+        original_is_file = Path.is_file
+        original_open = Path.open
+        syscalls = 0
+
+        def forbid_stat(self: Path, *args, **kwargs):
+            nonlocal syscalls
+            syscalls += 1
+            return original_stat(self, *args, **kwargs)
+
+        def forbid_is_file(self: Path, *args, **kwargs):
+            nonlocal syscalls
+            syscalls += 1
+            return original_is_file(self, *args, **kwargs)
+
+        def forbid_open(self: Path, *args, **kwargs):
+            nonlocal syscalls
+            syscalls += 1
+            return original_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", forbid_stat)
+        monkeypatch.setattr(Path, "is_file", forbid_is_file)
+        monkeypatch.setattr(Path, "open", forbid_open)
+
+        assert decoder._find_random_access_dts(1, seg1, Fraction(11, 12)) is None
+        assert decoder._find_random_access_dts(1, seg1, Fraction(12, 12)) == Fraction(10, 12)
+        assert decoder._find_random_access_dts(1, seg1, Fraction(30, 12)) == Fraction(22, 12)
+        assert decoder._find_random_access_dts(1, seg1, Fraction(99, 12)) == Fraction(34, 12)
+        assert decoder._find_random_access_dts(2, seg2, Fraction(0, 12)) == Fraction(0, 12)
+        assert decoder._find_random_access_dts(3, seg3, Fraction(18, 12)) == Fraction(11, 12)
+        assert syscalls == 0
+
+        # 切换目录时必须清空所有关键帧索引缓存。
+        monkeypatch.setattr(Path, "stat", original_stat)
+        monkeypatch.setattr(Path, "is_file", original_is_file)
+        monkeypatch.setattr(Path, "open", original_open)
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        decoder.directory = other_dir
+        assert not decoder._keyframe_complete
+        assert not decoder._keyframe_pts
+        assert not decoder._keyframe_sorted
+    finally:
+        decoder.close()
+        assert not decoder._keyframe_complete
+        assert not decoder._keyframe_pts
+        assert not decoder._keyframe_sorted
+
+
+def test_ts_range_decoder_skips_non_target_conversion_when_uncached(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """无缓存且无 on_decoded 时，非目标帧应跳过 YUV->BGR 转换。"""
+    segment = tmp_path / "segment-000001.ts"
+    segment.write_bytes(b"ts")
+    segment.with_suffix(".rap.jsonl").write_text(
+        '{"pts":0,"dts":0,"time_base_num":1,"time_base_den":30}\n',
+        encoding="utf-8",
+    )
+    segment.with_suffix(".complete").touch()
+    converted: list[int] = []
+
+    class FakeFrame:
+        time_base = Fraction(1, 30)
+        is_corrupt = False
+
+        def __init__(self, pts: int) -> None:
+            self.pts = pts
+
+        def to_ndarray(self, *, format: str) -> np.ndarray:
+            assert format == "bgr24"
+            converted.append(self.pts)
+            return np.full((2, 2, 3), self.pts, dtype=np.uint8)
+
+    class FakePacket:
+        size = 1
+        is_corrupt = False
+
+        def __init__(self, pts: int) -> None:
+            self.pts = pts
+
+        def decode(self) -> list[FakeFrame]:
+            return [FakeFrame(self.pts)]
+
+    class FakeContainer:
+        streams = type(
+            "Streams", (), {"video": [type("Stream", (), {"time_base": Fraction(1, 30)})()]}
+        )()
+
+        def seek(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def demux(self, stream):
+            del stream
+            for pts in range(4):
+                yield FakePacket(pts)
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr(av, "open", lambda *args, **kwargs: FakeContainer())
+    uncached = TsRangeDecoder(tmp_path, cache_enabled=False)
+    try:
+        image = uncached.read(1, 3, 1, 30)
+        assert image is not None and np.all(image == 3)
+        assert converted == [3]
+    finally:
+        uncached.close()
+
+    converted.clear()
+    cached = TsRangeDecoder(tmp_path, cache_enabled=True)
+    try:
+        image = cached.read(1, 3, 1, 30)
+        assert image is not None and np.all(image == 3)
+        assert converted == [0, 1, 2, 3]
+    finally:
+        cached.close()

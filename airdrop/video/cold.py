@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import math
@@ -55,6 +56,7 @@ class TsSegmentWriter:
             raise FileExistsError(f"拒绝覆盖现有 TS 分段文件: {existing[0]}")
         import av
 
+        self._av = av
         self._file = self.path.open("xb")
         self._container: Any = None
         self._index_file: Any = None
@@ -95,9 +97,7 @@ class TsSegmentWriter:
         """将输入包交给 TS muxer，保留包的时间戳与关键帧标记。"""
         if packet.size <= 0 or (packet.pts is None and packet.dts is None):
             return
-        import av
-
-        copied = av.Packet(bytes(packet))
+        copied = self._av.Packet(bytes(packet))
         copied.pts = packet.pts
         copied.dts = packet.dts
         copied.duration = packet.duration
@@ -190,6 +190,9 @@ class TsRangeDecoder:
         self._keyframe_cache: dict[int, list[tuple[Fraction, Fraction]]] = {}
         self._keyframe_signatures: dict[int, int] = {}
         self._keyframe_offsets: dict[int, int] = {}
+        self._keyframe_complete: set[int] = set()
+        self._keyframe_pts: dict[int, list[Fraction]] = {}
+        self._keyframe_sorted: dict[int, bool] = {}
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         # close 在等待生命周期锁之前先发出取消信号，避免等待中的读取阻止退出。
@@ -236,6 +239,7 @@ class TsRangeDecoder:
         den: int,
         *,
         output_size: tuple[int, int] | None = None,
+        readonly: bool = False,
     ) -> np.ndarray | None:
         """返回指定 PTS 的 BGR 图像；同一关键帧范围连续读取复用解码结果。"""
         with self._lifecycle_lock:
@@ -253,9 +257,13 @@ class TsRangeDecoder:
                     self._closed = False
             coordinator = self._gop_coordinator
             if coordinator is None:
-                return self._read(segment, pts, num, den, output_size=output_size)
+                return self._read(
+                    segment, pts, num, den, output_size=output_size, readonly=readonly
+                )
             cancelled = self._read_cancelled
-        return coordinator.read(self, segment, pts, num, den, output_size, cancelled)
+        return coordinator.read(
+            self, segment, pts, num, den, output_size, cancelled, readonly=readonly
+        )
 
     def enable_shared_gop(self, coordinator=None):
         """使该读取者与其他冻结视图共享按随机访问点组织的解码作业。"""
@@ -290,13 +298,15 @@ class TsRangeDecoder:
         den: int,
         *,
         output_size: tuple[int, int] | None = None,
+        readonly: bool = False,
     ) -> np.ndarray | None:
         target_time = Fraction(pts * num, den)
         width, height = output_size or (0, 0)
         cache = self._decoded_cache
+        key: tuple[object, ...] = ()
         if cache is not None:
             self._acquire_cache_lease()
-        key = self._make_cache_key(segment, target_time, width, height)
+            key = self._make_cache_key(segment, target_time, width, height)
         with self._lock:
             with self._cancel_lock:
                 if self._close_incomplete:
@@ -309,7 +319,7 @@ class TsRangeDecoder:
                 and time.monotonic() - self._cursor_last_used >= self.cursor_idle_timeout_s
             ):
                 self._reset_cursor_locked()
-            cached = self._get_cache(key)
+            cached = self._get_cache(key, readonly=readonly) if cache is not None else None
             if cached is not None:
                 return cached
             if (
@@ -348,6 +358,8 @@ class TsRangeDecoder:
                 raise
             self._cursor_time = target_time
             self._cursor_last_used = time.monotonic()
+            if readonly:
+                image.flags.writeable = False
             return image
 
     def iter_range(
@@ -442,14 +454,11 @@ class TsRangeDecoder:
         active_at_open = not complete_at_open and (
             status is not None and status.state is SegmentState.ACTIVE
         )
-        with self._lock:
-            keyframes = self._get_keyframes(segment, path)
-        random_access = [item for item in keyframes if item[0] <= target_time]
-        if not random_access:
+        dts_time = self._find_random_access_dts(segment, path, target_time)
+        if dts_time is None:
             if active_at_open:
                 raise TsDataNotReady(f"活动 MPEG-TS 段尚未写出随机访问点: {path}")
             raise ValueError(f"目标时间 {target_time} 之前没有可用关键帧: {path}")
-        _, dts_time = random_access[-1]
         import av
 
         container = av.open(str(path), mode="r")
@@ -465,6 +474,12 @@ class TsRangeDecoder:
             container.seek(offset, stream=stream, backward=True, any_frame=False)
             current_request = request
             current_time = target_time
+            width, height = output_size or (0, 0)
+            cv2_module: Any = None
+            if output_size is not None:
+                import cv2
+
+                cv2_module = cv2
             for packet in container.demux(stream):
                 if cancelled.is_set():
                     raise InterruptedError("历史解码读取已取消")
@@ -485,30 +500,34 @@ class TsRangeDecoder:
                         raise ValueError(f"MPEG-TS 解码帧标记为损坏: PTS={frame.pts}: {path}")
                     if frame.pts is None or frame.time_base is None:
                         continue
-                    frame_time = Fraction(frame.pts) * Fraction(
-                        frame.time_base.numerator, frame.time_base.denominator
-                    )
+                    tb = frame.time_base
+                    frame_time = Fraction(frame.pts * tb.numerator, tb.denominator)
                     if current_time < frame_time:
                         if active_at_open:
                             raise TsDataNotReady(
                                 f"活动 MPEG-TS 解码游标尚未读到目标 PTS {current_time}: {path}"
                             )
                         raise ValueError(f"MPEG-TS 中找不到精确 PTS {current_time}: {path}")
+                    if (
+                        current_time != frame_time
+                        and self._decoded_cache is None
+                        and on_decoded is None
+                    ):
+                        continue
                     image = frame.to_ndarray(format="bgr24")
                     if output_size is not None and (image.shape[1], image.shape[0]) != output_size:
-                        import cv2
-
-                        image = cv2.resize(image, output_size)
-                    width, height = output_size or (0, 0)
-                    cache_key = self._make_cache_key(segment, frame_time, width, height)
-                    self._put_cache(cache_key, image)
+                        assert cv2_module is not None
+                        image = cv2_module.resize(image, output_size)
+                    if self._decoded_cache is not None:
+                        cache_key = self._make_cache_key(segment, frame_time, width, height)
+                        self._put_cache(cache_key, image)
                     if on_decoded is not None:
                         decoded_view = image.view()
                         decoded_view.flags.writeable = False
                         on_decoded(frame_time, decoded_view)
                     if current_time != frame_time:
                         continue
-                    yield current_request, image.copy()
+                    yield current_request, image
                     try:
                         current_request = next(pending)
                     except StopIteration:
@@ -591,6 +610,9 @@ class TsRangeDecoder:
                             self._keyframe_cache.clear()
                             self._keyframe_signatures.clear()
                             self._keyframe_offsets.clear()
+                            self._keyframe_complete.clear()
+                            self._keyframe_pts.clear()
+                            self._keyframe_sorted.clear()
                 except BaseException as close_error:
                     if cursor is not None and (
                         not isinstance(cursor, GeneratorType) or cursor.gi_frame is not None
@@ -635,50 +657,108 @@ class TsRangeDecoder:
         )
         self._reaper.start()
 
+    def _is_segment_complete(self, segment: int, path: Path) -> bool:
+        """判断分段是否已封口完成，便于锁定关键帧索引缓存。"""
+        lifecycle = self.segment_lifecycle
+        if (
+            lifecycle is not None
+            and lifecycle.snapshot(segment).state is SegmentState.CLOSED_COMPLETE
+        ):
+            return True
+        return path.with_suffix(".complete").is_file()
+
     def _get_keyframes(self, segment: int, path: Path) -> list[tuple[Fraction, Fraction]]:
         """扫描包头元数据建立随机访问索引，不解码图像。"""
-        index_path = path.with_suffix(".rap.jsonl")
-        if index_path.is_file():
-            size = index_path.stat().st_size
-            with self._lock:
+        with self._lock:
+            if segment in self._keyframe_complete:
                 cached = self._keyframe_cache.get(segment)
-                offset = self._keyframe_offsets.get(segment, 0)
-                if cached is not None and offset == size:
+                if cached is not None:
                     return cached
-            result = list(cached or [])
-            if offset > size:
-                result.clear()
-                offset = 0
-            with index_path.open("rb") as handle:
-                handle.seek(offset)
-                raw = handle.read()
-            lines = raw.splitlines(keepends=True)
-            consumed = 0
-            for line in lines:
-                if not line.endswith((b"\n", b"\r")):
-                    break
-                try:
-                    item = json.loads(line)
-                    num, den = int(item["time_base_num"]), int(item["time_base_den"])
-                    if den <= 0:
-                        raise ValueError("time_base_den 必须为正")
-                    time_base = Fraction(num, den)
-                    result.append((int(item["pts"]) * time_base, int(item["dts"]) * time_base))
-                    consumed += len(line)
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise ValueError(
-                        f"随机访问索引损坏: {index_path}:{offset + consumed + 1}: {exc}"
-                    ) from exc
-            if result:
-                with self._lock:
-                    self._keyframe_cache[segment] = result
-                    self._keyframe_signatures[segment] = offset + consumed
-                    self._keyframe_offsets[segment] = offset + consumed
-                return result
+        # 先检查封口状态再 stat 索引文件，防止把写入中途的旧大小锁成终态。
+        is_complete = self._is_segment_complete(segment, path)
+        index_path = path.with_suffix(".rap.jsonl")
+        try:
+            size: int | None = index_path.stat().st_size
+        except FileNotFoundError:
+            size = None
+        if size is not None:
+            indexed = self._read_rap_index(segment, index_path, size, is_complete=is_complete)
+            if indexed is not None:
+                return indexed
         with self._lock:
             cached = self._keyframe_cache.get(segment)
             if cached is not None:
+                if is_complete and size is None:
+                    self._keyframe_complete.add(segment)
                 return cached
+        return self._scan_ts_keyframes(segment, path, mark_complete=is_complete and size is None)
+
+    def _read_rap_index(
+        self, segment: int, index_path: Path, size: int, *, is_complete: bool
+    ) -> list[tuple[Fraction, Fraction]] | None:
+        """增量读取 .rap.jsonl 关键帧索引并更新缓存。"""
+        with self._lock:
+            cached = self._keyframe_cache.get(segment)
+            offset = self._keyframe_offsets.get(segment, 0)
+            if cached is not None and offset == size:
+                if is_complete:
+                    self._keyframe_complete.add(segment)
+                return cached
+            cached_pts = self._keyframe_pts.get(segment)
+            cached_sorted = self._keyframe_sorted.get(segment, True)
+        if cached is not None and offset <= size:
+            result = list(cached)
+            pts_list = (
+                list(cached_pts)
+                if cached_pts is not None and len(cached_pts) == len(result)
+                else [item[0] for item in result]
+            )
+            is_sorted = cached_sorted
+        else:
+            result = []
+            pts_list = []
+            is_sorted = True
+            offset = 0
+        with index_path.open("rb") as handle:
+            handle.seek(offset)
+            raw = handle.read()
+        consumed = 0
+        for line in raw.splitlines(keepends=True):
+            if not line.endswith((b"\n", b"\r")):
+                break
+            try:
+                item = json.loads(line)
+                num, den = int(item["time_base_num"]), int(item["time_base_den"])
+                if den <= 0:
+                    raise ValueError("time_base_den 必须为正")
+                pts_time = Fraction(int(item["pts"]) * num, den)
+                dts_time = Fraction(int(item["dts"]) * num, den)
+                if is_sorted and pts_list and pts_time < pts_list[-1]:
+                    is_sorted = False
+                result.append((pts_time, dts_time))
+                pts_list.append(pts_time)
+                consumed += len(line)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"随机访问索引损坏: {index_path}:{offset + consumed + 1}: {exc}"
+                ) from exc
+        if not result:
+            return None
+        new_offset = offset + consumed
+        with self._lock:
+            self._keyframe_cache[segment] = result
+            self._keyframe_pts[segment] = pts_list
+            self._keyframe_sorted[segment] = is_sorted
+            self._keyframe_signatures[segment] = new_offset
+            self._keyframe_offsets[segment] = new_offset
+            if is_complete and new_offset == size:
+                self._keyframe_complete.add(segment)
+        return result
+
+    def _scan_ts_keyframes(
+        self, segment: int, path: Path, *, mark_complete: bool
+    ) -> list[tuple[Fraction, Fraction]]:
+        """缺少 .rap.jsonl 索引时回退扫描 TS 包头提取关键帧。"""
         import av
 
         container = av.open(str(path), mode="r")
@@ -689,20 +769,51 @@ class TsRangeDecoder:
                 raise ValueError(f"MPEG-TS 分段没有视频流: {path}")
             stream = container.streams.video[0]
             result: list[tuple[Fraction, Fraction]] = []
+            pts_list: list[Fraction] = []
+            is_sorted = True
             for packet in container.demux(stream):
                 if not packet.is_keyframe or packet.pts is None or packet.dts is None:
                     continue
-                time_base = Fraction(packet.time_base.numerator, packet.time_base.denominator)
-                result.append((packet.pts * time_base, packet.dts * time_base))
+                tb = packet.time_base
+                pts_time = Fraction(packet.pts * tb.numerator, tb.denominator)
+                dts_time = Fraction(packet.dts * tb.numerator, tb.denominator)
+                if is_sorted and pts_list and pts_time < pts_list[-1]:
+                    is_sorted = False
+                result.append((pts_time, dts_time))
+                pts_list.append(pts_time)
             if not result:
                 raise ValueError(f"MPEG-TS 分段缺少随机访问包: {path}")
             with self._lock:
                 self._keyframe_cache[segment] = result
+                self._keyframe_pts[segment] = pts_list
+                self._keyframe_sorted[segment] = is_sorted
+                if mark_complete:
+                    self._keyframe_complete.add(segment)
             return result
         finally:
             container.close()
             with self._lock:
                 self._open_containers.pop(id(container), None)
+
+    def _find_random_access_dts(
+        self, segment: int, path: Path, target_time: Fraction
+    ) -> Fraction | None:
+        """查找目标媒体时间之前（含相等）最后一个关键帧的 DTS。"""
+        with self._lock:
+            keyframes = self._get_keyframes(segment, path)
+            pts_list = self._keyframe_pts.get(segment)
+            if (
+                self._keyframe_sorted.get(segment, False)
+                and self._keyframe_cache.get(segment) is keyframes
+                and pts_list is not None
+                and len(pts_list) == len(keyframes)
+            ):
+                idx = bisect.bisect_right(pts_list, target_time)
+                return None if idx == 0 else keyframes[idx - 1][1]
+        for pts_time, dts_time in reversed(keyframes):
+            if pts_time <= target_time:
+                return dts_time
+        return None
 
     def _make_cache_key(
         self, segment: int, media_time: Fraction, width: int, height: int
@@ -728,8 +839,18 @@ class TsRangeDecoder:
     @directory.setter
     def directory(self, value: str | Path) -> None:
         path = Path(value)
-        self._directory = path
-        self._resolved_directory = str(path.resolve())
+        resolved = str(path.resolve())
+        with self._lock:
+            changed = resolved != self._resolved_directory
+            self._directory = path
+            self._resolved_directory = resolved
+            if changed:
+                self._keyframe_cache.clear()
+                self._keyframe_signatures.clear()
+                self._keyframe_offsets.clear()
+                self._keyframe_complete.clear()
+                self._keyframe_pts.clear()
+                self._keyframe_sorted.clear()
 
     @property
     def resolved_directory(self) -> str:
@@ -789,14 +910,14 @@ class TsRangeDecoder:
                 if self._cache_lease_active:
                     cache.put(key, image)
 
-    def _get_cache(self, key: tuple[object, ...]) -> np.ndarray | None:
+    def _get_cache(self, key: tuple[object, ...], *, readonly: bool = False) -> np.ndarray | None:
         cache = self._decoded_cache
         if cache is None:
             return None
         with self._cache_lease_lock:
             if not self._cache_lease_active:
                 return None
-            return cache.get(key)
+            return cache.get_readonly(key) if readonly else cache.get(key)
 
     def _acquire_cache_lease(self) -> None:
         cache = self._decoded_cache

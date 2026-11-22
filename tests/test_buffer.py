@@ -822,3 +822,183 @@ def test_stats_and_clear() -> None:
     assert buffer.latest() is None
     assert buffer.indices() is None
     assert buffer.at(1) is None
+
+
+def test_cold_worker_verifies_pixels_outside_lock_and_handles_mismatch_or_replaced_record(
+    tmp_path, monkeypatch
+) -> None:
+    """后台冷区校验应在锁外比较像素，并正确处理不匹配与锁外期间被替换的记录。"""
+    from airdrop.video import buffer as buffer_module
+    from airdrop.video.cold import TsRangeDecoder
+
+    def make_cold_sample(index: int, value: int) -> AlignedSample:
+        image = np.full((8, 8, 3), value, dtype=np.uint8)
+        frame = VideoFrame(
+            index=index,
+            image=image,
+            timestamp=1000.0 + index,
+            lag=0.0,
+            media_pts=index,
+            time_base_num=1,
+            time_base_den=30,
+            segment=1,
+        )
+        return AlignedSample(
+            frame=frame,
+            snapshot=TelemetrySnapshot(timestamp=1000.0 + index),
+            timestamp=1000.0 + index,
+            lag=0.0,
+            mode="test",
+        )
+
+    # 1. 像素对比在锁外执行：另一个线程在 array_equal 期间可以立即拿到 buffer._lock。
+    decoder = TsRangeDecoder(tmp_path)
+    buffer = AlignmentBuffer(10, storage="raw", cold_decoder=decoder)
+    assert buffer._cold_worker_decoder is not None
+    expected_image = np.full((8, 8, 3), 77, dtype=np.uint8)
+    monkeypatch.setattr(
+        buffer._cold_worker_decoder,
+        "read",
+        lambda *args, **kwargs: expected_image.copy(),
+    )
+    lock_free: list[bool] = []
+    real_array_equal = np.array_equal
+
+    def probing_array_equal(a, b) -> bool:
+        if threading.current_thread().name == "video-cold-watermark":
+            acquired: list[bool] = []
+
+            def try_lock() -> None:
+                if buffer._lock.acquire(timeout=0.05):
+                    buffer._lock.release()
+                    acquired.append(True)
+                else:
+                    acquired.append(False)
+
+            probe = threading.Thread(target=try_lock)
+            probe.start()
+            probe.join(timeout=2.0)
+            lock_free.append(acquired[0] if acquired else False)
+        return real_array_equal(a, b)
+
+    monkeypatch.setattr(buffer_module.np, "array_equal", probing_array_equal)
+    try:
+        buffer.put(make_cold_sample(1, 77), materialize=False)
+        deadline = time.monotonic() + 3.0
+        while buffer.stats.cold_verified < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert buffer.stats.cold_verified == 1
+        assert lock_free == [True], "_cold_worker 执行 np.array_equal 时不得持有 Condition 锁"
+    finally:
+        monkeypatch.setattr(buffer_module.np, "array_equal", real_array_equal)
+        buffer.close_cold_storage()
+
+    # 2. 像素不匹配时记录冷区错误并通过 raise_if_failed 暴露。
+    mismatch_decoder = TsRangeDecoder(tmp_path)
+    mismatch_buffer = AlignmentBuffer(10, storage="raw", cold_decoder=mismatch_decoder)
+    assert mismatch_buffer._cold_worker_decoder is not None
+    monkeypatch.setattr(
+        mismatch_buffer._cold_worker_decoder,
+        "read",
+        lambda *args, **kwargs: np.full((8, 8, 3), 12, dtype=np.uint8),
+    )
+    try:
+        mismatch_buffer.put(make_cold_sample(1, 99), materialize=False)
+        deadline = time.monotonic() + 3.0
+        while mismatch_buffer._cold_error is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert mismatch_buffer._cold_error is not None
+        assert "校验不一致" in mismatch_buffer._cold_error
+        with pytest.raises(OSError, match="校验不一致"):
+            mismatch_buffer.raise_if_failed()
+        assert mismatch_buffer.stats.cold_verified == 0
+    finally:
+        with pytest.raises(RuntimeError, match="冷区排空失败"):
+            mismatch_buffer.close_cold_storage()
+
+    # 3. 锁外比较期间原记录被替换时，重新检查 payload 身份并忽略过期的不匹配结果。
+    replaced_decoder = TsRangeDecoder(tmp_path)
+    replaced_buffer = AlignmentBuffer(10, storage="raw", cold_decoder=replaced_decoder)
+    assert replaced_buffer._cold_worker_decoder is not None
+    entered = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(
+        replaced_buffer._cold_worker_decoder,
+        "read",
+        lambda *args, **kwargs: np.full((8, 8, 3), 1, dtype=np.uint8),
+    )
+
+    def gated_array_equal(a, b) -> bool:
+        if threading.current_thread().name == "video-cold-watermark":
+            entered.set()
+            assert release.wait(timeout=3.0)
+        return real_array_equal(a, b)
+
+    monkeypatch.setattr(buffer_module.np, "array_equal", gated_array_equal)
+    try:
+        replaced_buffer.put(make_cold_sample(1, 2), materialize=False)
+        assert entered.wait(timeout=3.0)
+        with replaced_buffer._condition:
+            old_record = replaced_buffer._records[0]
+            replaced_buffer._records[0] = replace(
+                old_record, payload=np.full((8, 8, 3), 2, dtype=np.uint8)
+            )
+        release.set()
+        deadline = time.monotonic() + 3.0
+        while replaced_buffer.stats.cold_pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert replaced_buffer._cold_error is None
+        assert replaced_buffer.stats.cold_verified == 0
+    finally:
+        release.set()
+        monkeypatch.setattr(buffer_module.np, "array_equal", real_array_equal)
+        with replaced_buffer._condition:
+            replaced_buffer._cold_stopping = True
+            replaced_buffer._condition.notify_all()
+        assert replaced_buffer._cold_thread is not None
+        replaced_buffer._cold_thread.join(timeout=2.0)
+        assert replaced_buffer._cold_worker_decoder is not None
+        replaced_buffer._cold_worker_decoder.close()
+        replaced_decoder.close()
+
+
+def test_cold_materialize_passes_readonly_and_put_coalesces_notify(tmp_path, monkeypatch) -> None:
+    """冷帧还原透传 readonly=True，且 put() 单次写入只发一次 notify_all。"""
+    from airdrop.video.buffer import ColdFrameRef
+    from airdrop.video.cold import TsRangeDecoder
+
+    decoder = TsRangeDecoder(tmp_path)
+    buffer = AlignmentBuffer(10, storage="raw", cold_decoder=decoder, _start_cold_worker=False)
+    notify_calls = 0
+    original_notify = buffer._condition.notify_all
+
+    def counted_notify() -> None:
+        nonlocal notify_calls
+        notify_calls += 1
+        original_notify()
+
+    monkeypatch.setattr(buffer._condition, "notify_all", counted_notify)
+    try:
+        buffer.put(make_sample(1000.0), materialize=False)
+        assert notify_calls == 1
+
+        seen_kwargs: list[dict[str, object]] = []
+        raw_image = np.full((8, 8, 3), 42, dtype=np.uint8)
+        raw_image.flags.writeable = False
+
+        def fake_read(*args, **kwargs):
+            del args
+            seen_kwargs.append(kwargs)
+            return raw_image
+
+        monkeypatch.setattr(decoder, "read", fake_read)
+        ref = ColdFrameRef(segment=1, pts=10, time_base_num=1, time_base_den=30)
+        with buffer._condition:
+            buffer._records[0] = replace(buffer._records[0], payload=ref, cold_locator=ref)
+        frame = buffer.at(1)
+        assert frame is not None
+        assert not frame.image.flags.writeable
+        assert np.array_equal(frame.image, raw_image)
+        assert seen_kwargs == [{"output_size": (8, 8), "readonly": True}]
+    finally:
+        buffer.close_cold_storage()
