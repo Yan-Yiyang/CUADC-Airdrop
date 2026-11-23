@@ -19,7 +19,7 @@ from .._lazy import lazy_dir, lazy_exports
 
 __getattr__ = lazy_exports(
     __name__,
-    ("models", "number", "cropproc", "detector", "ocr_worker", "pipeline"),
+    ("models", "number", "trt_runtime", "cropproc", "detector", "ocr_worker", "pipeline"),
 )
 __dir__ = lazy_dir(__name__)
 
@@ -45,6 +45,8 @@ __all__ = [
     "PixelBox",
     "PoseSnapshot",
     "ProcessedFrame",
+    "TrtEngineError",
+    "TrtShapeOutOfRangeError",
     "correct_ocr_number",
     "ocr_worker_main",
 ]

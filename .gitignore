@@ -46,6 +46,8 @@ _e2e/
 models/**/*.pt
 models/**/*.pth
 models/**/*.onnx
+models/**/*.engine
+models/**/*.engine.manifest.json
 !models/**/.gitkeep
 docs/api_reference.md
 
