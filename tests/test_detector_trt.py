@@ -618,6 +618,59 @@ def test_trt_runner_rejects_multi_io_manifest() -> None:
         )
 
 
+def test_trt_runner_clone_context_shares_engine_with_independent_context_and_stream() -> None:
+    manifest = _make_manifest(
+        kind="ocr_det",
+        input_spec=TensorSpec(
+            name="x",
+            dtype="float32",
+            shape=(1, 3, -1, -1),
+            min_shape=(1, 3, 32, 32),
+            opt_shape=(1, 3, 736, 736),
+            max_shape=(1, 3, 960, 960),
+        ),
+        output_spec=TensorSpec(name="y", dtype="float32", shape=(1, 1, -1, -1)),
+    )
+    fake_torch = _FakeTorchCudaModule()
+    runtime = object()
+    created_contexts: list[_FakeTrtContext] = []
+
+    class _FakeEngine:
+        def __init__(self, *, fail_clone: bool = False) -> None:
+            self.fail_clone = fail_clone
+
+        def create_execution_context(self) -> _FakeTrtContext | None:
+            if self.fail_clone:
+                return None
+            ctx = _FakeTrtContext(output_shape=(1, 1, 64, 64))
+            created_contexts.append(ctx)
+            return ctx
+
+    engine = _FakeEngine()
+    base = TrtExecutionRunner(
+        manifest=manifest,
+        runtime=runtime,
+        engine=engine,
+        context=_FakeTrtContext(output_shape=(1, 1, 64, 64)),
+        device_id=0,
+        torch_module=fake_torch,
+    )
+    cloned = base.clone_context()
+
+    assert cloned.manifest is base.manifest
+    assert cloned._runtime is base._runtime
+    assert cloned._engine is base._engine
+    assert cloned._context is created_contexts[0]
+    assert cloned._context is not base._context
+    assert cloned._stream is not base._stream
+    assert cloned.device_id == base.device_id == 0
+    assert len(fake_torch.created_streams) == 2
+
+    engine.fail_clone = True
+    with pytest.raises(TrtEngineError, match="独立 ExecutionContext"):
+        base.clone_context()
+
+
 def test_trt_runner_static_shape_out_of_range() -> None:
     manifest = _make_manifest(
         input_spec=TensorSpec("images", "float16", (1, 3, 736, 1280)),

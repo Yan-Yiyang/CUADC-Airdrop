@@ -63,6 +63,9 @@ class _MockTrtRunner:
         h, w = array.shape[2], array.shape[3]
         return np.zeros((array.shape[0], 1, h, w), dtype=np.float32)
 
+    def clone_context(self) -> _MockTrtRunner:
+        return _MockTrtRunner(self._manifest, fn=self._fn)
+
 
 def _make_det_manifest(
     *,
@@ -853,3 +856,149 @@ def test_perception_worker_preserves_frame_size_mismatch_error() -> None:
             worker.raise_if_failed()
     finally:
         worker.stop()
+
+
+def test_ocr_worker_pool_uses_inprocess_shared_engine_threads_for_trt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TensorRT OCR 池应在进程内只加载一次引擎并克隆独立上下文供多线程并发推理。"""
+    from dataclasses import asdict
+
+    config, dict_sha = _write_trt_dummy_files(tmp_path)
+    chars = ["blank", *[str(i) for i in range(10)], " "]
+    load_calls: list[str] = []
+
+    def fake_det_fn(pre: np.ndarray) -> np.ndarray:
+        _, _, h, w = pre.shape
+        prob = np.zeros((1, 1, h, w), dtype=np.float32)
+        prob[0, 0, 120:200, 120:300] = 0.95
+        return prob
+
+    def fake_rec_fn(batch: np.ndarray) -> np.ndarray:
+        return _encode_ctc_logits(chars, [("56", 0.94)] * batch.shape[0])
+
+    def fake_load_trt_runner(
+        engine_path: str | Path, *, expected_kind: str, device_id: int = 0
+    ) -> _MockTrtRunner:
+        del engine_path, device_id
+        load_calls.append(expected_kind)
+        if expected_kind == "ocr_det":
+            return _MockTrtRunner(_make_det_manifest(), fn=fake_det_fn)
+        if expected_kind == "ocr_rec":
+            return _MockTrtRunner(_make_rec_manifest(dict_sha256=dict_sha), fn=fake_rec_fn)
+        raise AssertionError(f"意外 kind: {expected_kind}")
+
+    monkeypatch.setattr("airdrop.perception.trt_runtime.load_trt_runner", fake_load_trt_runner)
+
+    pool = OcrWorkerPool(
+        workers=2,
+        queue_size=16,
+        config={"color": "blue", "ocr_conf_threshold": 0.6, "engine": asdict(config)},
+    )
+    pool.set_spool_directory(tmp_path / "spool")
+    assert pool.inprocess_trt is True
+
+    pool.start(timeout=10.0)
+    try:
+        assert pool.started is True
+        assert pool.alive == 2
+        assert load_calls == ["ocr_det", "ocr_rec"]
+        assert pool._processes == []
+        assert len(pool._worker_threads) == 2
+
+        crop = _blue_pentagon_image()
+        req_ids = [
+            pool.submit(crop, frame_index=idx, capture_timestamp=100.0 + idx, payload={"f": idx})
+            for idx in range(1, 5)
+        ]
+        assert req_ids == [1, 2, 3, 4]
+
+        got: list[OcrResult] = []
+        for _ in range(4):
+            res = pool.poll(timeout=5.0)
+            assert res is not None
+            pool.ack(res)
+            got.append(res)
+        assert sorted(r.request_id for r in got) == [1, 2, 3, 4]
+        assert all(r.number == 56 for r in got)
+        assert all(r.fatal is False for r in got)
+        assert pool.stats["pending"] == 0
+    finally:
+        pool.stop(timeout=5.0)
+    assert pool.started is False
+    assert pool.alive == 0
+
+
+def test_ocr_worker_pool_inprocess_trt_rolls_back_on_warmup_failure_and_propagates_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """进程内 TRT 工作池在预热失败时应干净回滚，在推理越界时应回报 fatal 结果。"""
+    from dataclasses import asdict
+
+    config, dict_sha = _write_trt_dummy_files(tmp_path)
+
+    # 场景 1：预热抛异常 -> start() 失败并回滚全部工作线程
+    def fail_warmup_det(pre: np.ndarray) -> np.ndarray:
+        del pre
+        raise RuntimeError("warmup boom")
+
+    def fake_load_fail(
+        engine_path: str | Path, *, expected_kind: str, device_id: int = 0
+    ) -> _MockTrtRunner:
+        del engine_path, device_id
+        if expected_kind == "ocr_det":
+            return _MockTrtRunner(_make_det_manifest(), fn=fail_warmup_det)
+        return _MockTrtRunner(_make_rec_manifest(dict_sha256=dict_sha))
+
+    monkeypatch.setattr("airdrop.perception.trt_runtime.load_trt_runner", fake_load_fail)
+    bad_pool = OcrWorkerPool(
+        workers=2,
+        config={"color": "blue", "ocr_conf_threshold": 0.6, "engine": asdict(config)},
+    )
+    bad_pool.set_spool_directory(tmp_path / "spool_fail")
+    with pytest.raises(RuntimeError, match="初始化失败"):
+        bad_pool.start(timeout=5.0)
+    assert bad_pool.started is False
+    assert bad_pool.alive == 0
+    bad_pool.stop()
+
+    # 场景 2：预热成功但推理阶段触发 TrtShapeOutOfRangeError -> 回传 fatal=True
+    calls = {"n": 0}
+
+    def fail_after_warmup_det(pre: np.ndarray) -> np.ndarray:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            _, _, h, w = pre.shape
+            return np.zeros((1, 1, h, w), dtype=np.float32)
+        raise TrtShapeOutOfRangeError("det shape exceeded")
+
+    chars = ["blank", *[str(i) for i in range(10)], " "]
+
+    def fake_load_runtime_err(
+        engine_path: str | Path, *, expected_kind: str, device_id: int = 0
+    ) -> _MockTrtRunner:
+        del engine_path, device_id
+        if expected_kind == "ocr_det":
+            return _MockTrtRunner(_make_det_manifest(), fn=fail_after_warmup_det)
+        return _MockTrtRunner(
+            _make_rec_manifest(dict_sha256=dict_sha),
+            fn=lambda batch: _encode_ctc_logits(chars, [("00", 0.5)] * batch.shape[0]),
+        )
+
+    monkeypatch.setattr("airdrop.perception.trt_runtime.load_trt_runner", fake_load_runtime_err)
+    pool = OcrWorkerPool(
+        workers=2,
+        config={"color": "blue", "ocr_conf_threshold": 0.6, "engine": asdict(config)},
+    )
+    pool.set_spool_directory(tmp_path / "spool_fatal")
+    pool.start(timeout=10.0)
+    try:
+        pool.submit(_blue_pentagon_image(), frame_index=10, capture_timestamp=1.0)
+        res = pool.poll(timeout=5.0)
+        assert res is not None
+        assert res.fatal is True
+        assert res.stage == "trt_error"
+        assert res.error is not None and "TrtShapeOutOfRangeError" in res.error
+        pool.ack(res)
+    finally:
+        pool.stop(timeout=5.0)

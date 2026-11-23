@@ -425,6 +425,20 @@ class TrtOcrBackend:
         self.text_det = text_det if text_det is not None else TrtTextDetector(config)
         self.text_rec = text_rec if text_rec is not None else TrtTextRecognizer(config)
 
+    def clone_context(self) -> TrtOcrBackend:
+        """复用已反序列化引擎，创建带独立执行上下文、CUDA stream 与前后处理状态的副本。"""
+        return TrtOcrBackend(
+            self._config,
+            text_det=TrtTextDetector(
+                self._config,
+                runner=self.text_det.runner.clone_context(),
+            ),
+            text_rec=TrtTextRecognizer(
+                self._config,
+                runner=self.text_rec.runner.clone_context(),
+            ),
+        )
+
     def recognize_txt(self, images: Sequence[np.ndarray] | np.ndarray) -> TrtRecOutput:
         """执行纯识别阶段（供 :meth:`OcrEngine.warmup` 与流水线内部复用）。"""
         return self.text_rec(images)

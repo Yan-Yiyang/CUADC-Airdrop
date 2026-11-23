@@ -214,9 +214,14 @@ class OcrEngine:
     TORCH 引擎需要通过 ``model_path`` 显式指定本地权重。
     """
 
-    def __init__(self, config: OcrEngineConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: OcrEngineConfig | None = None,
+        *,
+        backend: Any = None,
+    ) -> None:
         self._config = config or OcrEngineConfig()
-        self._engine: Any = None
+        self._engine: Any = backend
         self._failed = False
         self._failed_trt_error: TrtEngineError | None = None
         #: 失败日志节流用的状态（见 _log_ocr_failure）

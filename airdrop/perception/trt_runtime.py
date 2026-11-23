@@ -367,6 +367,7 @@ class TrtExecutionRunner:
         self._runtime = runtime
         self._engine = engine
         self._context = context
+        self._device_id = int(device_id)
         self._torch = torch_module
         self._device = torch_module.device(f"cuda:{device_id}")
         self._stream = torch_module.cuda.Stream(device=self._device)
@@ -396,8 +397,35 @@ class TrtExecutionRunner:
         return self._device
 
     @property
+    def device_id(self) -> int:
+        return self._device_id
+
+    @property
     def input_torch_dtype(self) -> Any:
         return self._input_dtype
+
+    def clone_context(self) -> TrtExecutionRunner:
+        """基于当前已反序列化引擎创建独立执行上下文与非默认 CUDA stream。
+
+        共享不可变的 ``runtime``、``engine`` 与 ``manifest``，供同进程多线程工作池
+        并发执行，避免重复反序列化引擎和创建额外 CUDA 主上下文。
+        """
+        set_device = getattr(self._torch.cuda, "set_device", None)
+        if callable(set_device):
+            set_device(self._device_id)
+        context = self._engine.create_execution_context()
+        if context is None:
+            raise TrtEngineError(
+                f"无法为 TensorRT 引擎创建独立 ExecutionContext（kind={self._manifest.kind}）"
+            )
+        return TrtExecutionRunner(
+            manifest=self._manifest,
+            runtime=self._runtime,
+            engine=self._engine,
+            context=context,
+            device_id=self._device_id,
+            torch_module=self._torch,
+        )
 
     def run_tensor(self, input_tensor: Any) -> Any:
         """执行一次前向推理并返回同设备上的输出 PyTorch 张量。"""

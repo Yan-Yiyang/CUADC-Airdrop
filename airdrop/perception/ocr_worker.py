@@ -1,13 +1,17 @@
-"""OCR 独立工作进程：消费裁剪图请求，回传编号。
+"""OCR 并发工作池：消费裁剪图请求，回传编号。
 
-**独立工作进程**
-----------------
-OCR 使用独立进程运行。请求和结果通过 ``multiprocessing`` 队列序列化传输图像与元数据；
-不传 ffmpeg 的复用缓冲视图，因为下一帧到达时该视图会被覆盖。
+执行模式
+--------
+* **PyTorch 后端（``.pth``）**：使用 ``multiprocessing`` 独立子进程池运行，隔离
+  Python GIL 与 RapidOCR 推理状态；
+* **TensorRT 后端（``.engine``）**：在当前进程内只反序列化一次检测/识别引擎，
+  各工作线程各自持有独立的 ``IExecutionContext``、非默认 CUDA stream 与
+  :class:`OpenCvPostProcess` 实例并发推理（TensorRT ``execute_async_v3`` 与
+  OpenCV 均在 C++ 层释放 GIL），避免多进程重复加载运行时与额外 CUDA 主上下文。
 
 磁盘积压、有界请求队列
 ----------------------
-提交时将 PNG 无损图像和请求元数据原子写入磁盘；进程队列只传文件引用，队列容量
+提交时将 PNG 无损图像和请求元数据原子写入磁盘；工作队列只传有界文件引用，容量
 按 worker 数限制。结果队列也有界并通过阻塞回压保证结果不丢。成功关联结果后才删除
 请求文件；异常中断留下的文件保留供诊断或重启恢复。
 """
@@ -25,6 +29,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from multiprocessing.context import SpawnProcess
 from pathlib import Path
@@ -35,10 +40,35 @@ import numpy as np
 
 import airdrop.perception.timing as timing  # noqa: PLR0402 - 避免惰性包循环导入
 
-from .cropproc import CropResult, OcrEngineConfig, OpenCvPostProcess
+from .cropproc import CropResult, OcrEngine, OcrEngineConfig, OpenCvPostProcess
 from .trt_runtime import TrtEngineError
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_trt_engine_config(config: Mapping[str, Any]) -> bool:
+    """判断工作池配置是否显式指定了 TensorRT ``.engine`` OCR 后端。"""
+    engine = config.get("engine")
+    if not isinstance(engine, Mapping):
+        return False
+    det = engine.get("det_model")
+    rec = engine.get("rec_model")
+    return (
+        isinstance(det, str)
+        and isinstance(rec, str)
+        and Path(det).suffix.lower() == ".engine"
+        and Path(rec).suffix.lower() == ".engine"
+    )
+
+
+def _bind_cuda_device_for_current_thread(device_id: int) -> None:
+    """在工作线程内显式绑定目标 CUDA 设备，避免非零卡号下沿用线程默认卡 0。"""
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device_id)
 
 
 def _write_jpeg_atomic(image: np.ndarray, path: Path) -> None:
@@ -99,55 +129,23 @@ class _OcrSpoolIndexError(OSError):
     """索引持久化故障，须沿感知主循环的 I/O 致命路径传播。"""
 
 
-def ocr_worker_main(  # noqa: PLR0912, PLR0915 - 请求处理及诊断保持顺序
+def _run_ocr_worker_loop(
     request_q: Any,
     result_q: Any,
-    config_dict: dict[str, Any],
-    worker_id: int = 0,
-    status_q: Any = None,
-) -> None:  # pragma: no cover - 子进程入口，由集成测试覆盖
-    """OCR 工作进程入口（``multiprocessing`` target，必须是模块级函数）。
-
-    进程内自建 :class:`OpenCvPostProcess`（连同 RapidOCR 引擎）——句柄不能跨
-    进程继承，每个 worker 各加载一份权重（约 2s、显存几百 MB）。
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format=f"%(asctime)s %(levelname)-7s ocr{worker_id} %(message)s",
-    )
-    log = logging.getLogger(f"ocr{worker_id}")
-    try:
-        engine_config = OcrEngineConfig(**config_dict.get("engine", {}))
-        post = OpenCvPostProcess(
-            color=config_dict.get("color", "blue"),
-            ocr_conf_threshold=config_dict.get("ocr_conf_threshold", 0.6),
-            engine_config=engine_config,
-        )
-        if not post.warmup():
-            raise RuntimeError("OCR 模型预热失败，请检查权重、引擎及设备配置")
-    except Exception as exc:
-        log.exception("OCR 工作进程 %d 初始化失败", worker_id)
-        if status_q is not None:
-            status_q.put((worker_id, f"{type(exc).__name__}: {exc}"))
-        return
-    if status_q is not None:
-        status_q.put((worker_id, None))
-    log.info("OCR 工作进程 %d 初始化完成（color=%s）", worker_id, post.color)
-    if timing.ENABLED:
-        try:
-            engine = post.engine.ensure()
-            timing.instrument_call_class(engine.text_det, "ocr_text_det")
-            timing.instrument_call_class(engine.text_rec, "ocr_text_rec")
-        except Exception:  # 诊断不影响 OCR 初始化
-            log.exception("OCR 分段计时不可用，继续正常识别")
-
-    while True:
+    post: OpenCvPostProcess,
+    worker_id: int,
+    log: logging.Logger,
+    *,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """消费裁剪图请求并回传结果；供进程模式与进程内 TensorRT 线程模式共用。"""
+    while stop_event is None or not stop_event.is_set():
         try:
             request = request_q.get(timeout=0.5)
         except queue.Empty:
             continue
         if request is None:
-            log.info("OCR 工作进程 %d 收到退出指令", worker_id)
+            log.info("OCR 工作单元 %d 收到退出指令", worker_id)
             timing.flush()
             break
         if timing.ENABLED:
@@ -247,13 +245,90 @@ def ocr_worker_main(  # noqa: PLR0912, PLR0915 - 请求处理及诊断保持顺�
                 elapsed_ms=(time.perf_counter() - started) * 1000.0,
                 error=f"{type(exc).__name__}: {exc}",
             )
-        # 结果队列有界；阻塞回压由父进程 poll 解除，不丢弃 OCR 结果。
-        while True:
+        # 结果队列有界；阻塞回压由主侧 poll 解除，不丢弃 OCR 结果。
+        while stop_event is None or not stop_event.is_set():
             try:
-                result_q.put(result, timeout=0.5)
+                result_q.put(result, timeout=0.1 if stop_event is not None else 0.5)
                 break
             except queue.Full:
                 continue
+
+
+def _ocr_thread_worker(
+    request_q: Any,
+    result_q: Any,
+    post: OpenCvPostProcess,
+    worker_id: int,
+    *,
+    status_q: Any,
+    stop_event: threading.Event,
+    device_id: int,
+) -> None:
+    """进程内 TensorRT OCR 工作线程入口（独立 ExecutionContext 与非默认 CUDA stream）。"""
+    log = logging.getLogger(f"ocr{worker_id}")
+    try:
+        _bind_cuda_device_for_current_thread(device_id)
+        if not post.warmup():
+            raise RuntimeError("OCR 模型预热失败，请检查权重、引擎及设备配置")
+    except Exception as exc:
+        log.exception("OCR 工作线程 %d 初始化失败", worker_id)
+        status_q.put((worker_id, f"{type(exc).__name__}: {exc}"))
+        return
+    status_q.put((worker_id, None))
+    log.info("OCR 工作线程 %d 初始化完成（TensorRT，color=%s）", worker_id, post.color)
+    _run_ocr_worker_loop(
+        request_q,
+        result_q,
+        post,
+        worker_id,
+        log,
+        stop_event=stop_event,
+    )
+
+
+def ocr_worker_main(
+    request_q: Any,
+    result_q: Any,
+    config_dict: dict[str, Any],
+    worker_id: int = 0,
+    status_q: Any = None,
+) -> None:  # pragma: no cover - 子进程入口，由集成测试覆盖
+    """OCR 工作进程入口（``multiprocessing`` target，必须是模块级函数）。
+
+    进程内自建 :class:`OpenCvPostProcess`（连同 RapidOCR 引擎），供 PyTorch
+    子进程模式使用。
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s %(levelname)-7s ocr{worker_id} %(message)s",
+    )
+    log = logging.getLogger(f"ocr{worker_id}")
+    try:
+        engine_config = OcrEngineConfig(**config_dict.get("engine", {}))
+        post = OpenCvPostProcess(
+            color=config_dict.get("color", "blue"),
+            ocr_conf_threshold=config_dict.get("ocr_conf_threshold", 0.6),
+            engine_config=engine_config,
+        )
+        if not post.warmup():
+            raise RuntimeError("OCR 模型预热失败，请检查权重、引擎及设备配置")
+    except Exception as exc:
+        log.exception("OCR 工作进程 %d 初始化失败", worker_id)
+        if status_q is not None:
+            status_q.put((worker_id, f"{type(exc).__name__}: {exc}"))
+        return
+    if status_q is not None:
+        status_q.put((worker_id, None))
+    log.info("OCR 工作进程 %d 初始化完成（color=%s）", worker_id, post.color)
+    if timing.ENABLED:
+        try:
+            engine = post.engine.ensure()
+            timing.instrument_call_class(engine.text_det, "ocr_text_det")
+            timing.instrument_call_class(engine.text_rec, "ocr_text_rec")
+        except Exception:  # 诊断不影响 OCR 初始化
+            log.exception("OCR 分段计时不可用，继续正常识别")
+
+    _run_ocr_worker_loop(request_q, result_q, post, worker_id, log)
 
 
 class OcrWorkerPool:
@@ -279,14 +354,29 @@ class OcrWorkerPool:
         self._workers = int(workers)
         self._config = dict(config or {})
         self._queue_size = int(queue_size)
-        self._context = mp.get_context("spawn")  # Windows 默认；显式声明意图
-        self._request_q: Any = self._context.Queue(maxsize=workers)
-        self._result_q: Any = self._context.Queue(maxsize=workers * 2)
-        self._status_q: Any = self._context.Queue(maxsize=workers)
+        self._inprocess_trt = _is_trt_engine_config(self._config)
+        self._context: Any = None if self._inprocess_trt else mp.get_context("spawn")
+        self._request_q: Any = (
+            queue.Queue(maxsize=workers)
+            if self._inprocess_trt
+            else self._context.Queue(maxsize=workers)
+        )
+        self._result_q: Any = (
+            queue.Queue(maxsize=workers * 2)
+            if self._inprocess_trt
+            else self._context.Queue(maxsize=workers * 2)
+        )
+        self._status_q: Any = (
+            queue.Queue(maxsize=workers)
+            if self._inprocess_trt
+            else self._context.Queue(maxsize=workers)
+        )
         self._used = False
         # spawn 上下文的 Process 是 SpawnProcess（`mp.Process` 只是基类名），
         # 按实际类型标注才不会被类型检查判成"装不进去"
         self._processes: list[SpawnProcess] = []
+        self._worker_threads: list[threading.Thread] = []
+        self._worker_stop = threading.Event()
         self._next_id = 0
         self._submitted = 0
         self._dropped = 0  # 保留计数：不丢弃策略下恒为 0（一旦非 0 说明有新的丢弃路径）
@@ -322,15 +412,22 @@ class OcrWorkerPool:
         return self._started
 
     @property
+    def inprocess_trt(self) -> bool:
+        """是否使用进程内共享引擎的 TensorRT 工作线程模式。"""
+        return self._inprocess_trt
+
+    @property
     def alive(self) -> int:
-        """当前**活着**的 worker 进程数（运行期可随时取）。
+        """当前**活着**的 worker 数量（运行期可随时取）。
 
         ⚠ 这个数必须能被外部看见：worker 死亡的路径是真实存在的（CUDA OOM、
-        RapidOCR/torch 的原生崩溃、``result_q.put_nowait`` 自身抛错——那行不在
-        try 内）。一旦某个 worker 死了，它名下的请求永远不返回 → ``pending``
-        单调上升；而积压告警 ``_backlog_warned`` 只打**一条**就置位不再打 ⇒
-        全死时表现为"永远零产出"，而操作手从日志里看不出已经死了。
+        RapidOCR/torch 的原生崩溃、队列异常）。一旦某个 worker 死了，它名下的请求
+        永远不返回 → ``pending`` 单调上升；而积压告警 ``_backlog_warned`` 只打
+        **一条**就置位不再打 ⇒ 全死时表现为"永远零产出"，而操作手从日志里看不出
+        已经死了。
         """
+        if self._inprocess_trt:
+            return sum(1 for thread in self._worker_threads if thread.is_alive())
         return sum(1 for process in self._processes if process.is_alive())
 
     @property
@@ -402,8 +499,101 @@ class OcrWorkerPool:
             if not thread.is_alive():
                 setattr(self, attr, None)
 
+    def _reset_channels(self) -> None:
+        """重启前创建全新请求/结果/状态通道，避免旧哨兵污染新工作单元。"""
+        if self._inprocess_trt:
+            self._request_q = queue.Queue(maxsize=self._workers)
+            self._result_q = queue.Queue(maxsize=self._workers * 2)
+            self._status_q = queue.Queue(maxsize=self._workers)
+        else:
+            for channel in (self._request_q, self._result_q, self._status_q):
+                channel.close()
+            self._request_q = self._context.Queue(maxsize=self._workers)
+            self._result_q = self._context.Queue(maxsize=self._workers * 2)
+            self._status_q = self._context.Queue(maxsize=self._workers)
+
+    def _start_trt_threads(self, deadline: float) -> None:
+        """单次反序列化 TensorRT 引擎并启动独立上下文工作线程；失败时回滚。"""
+        engine_config = OcrEngineConfig(**self._config.get("engine", {}))
+        base_engine = OcrEngine(engine_config)
+        base_backend = base_engine.ensure()
+        if timing.ENABLED:
+            try:
+                timing.instrument_call_class(base_backend.text_det, "ocr_text_det")
+                timing.instrument_call_class(base_backend.text_rec, "ocr_text_rec")
+            except Exception:  # 诊断不影响 OCR 初始化
+                LOGGER.exception("OCR 分段计时不可用，继续正常识别")
+
+        color = self._config.get("color", "blue")
+        ocr_conf_threshold = self._config.get("ocr_conf_threshold", 0.6)
+        posts: list[OpenCvPostProcess] = [
+            OpenCvPostProcess(
+                color=color,
+                ocr_conf_threshold=ocr_conf_threshold,
+                engine=base_engine,
+            )
+        ]
+        for _ in range(1, self._workers):
+            cloned_backend = base_backend.clone_context()
+            posts.append(
+                OpenCvPostProcess(
+                    color=color,
+                    ocr_conf_threshold=ocr_conf_threshold,
+                    engine=OcrEngine(engine_config, backend=cloned_backend),
+                )
+            )
+
+        self._worker_stop.clear()
+        for index, post in enumerate(posts):
+            thread = threading.Thread(
+                target=_ocr_thread_worker,
+                args=(self._request_q, self._result_q, post, index),
+                kwargs={
+                    "status_q": self._status_q,
+                    "stop_event": self._worker_stop,
+                    "device_id": engine_config.device_id,
+                },
+                name=f"ocr-worker-{index}",
+                daemon=True,
+            )
+            thread.start()
+            self._worker_threads.append(thread)
+        self._wait_ready(deadline)
+
+    def _start_worker_processes(self, deadline: float) -> None:
+        """并行启动 PyTorch 独立工作进程并等待全部预热确认。"""
+        for index in range(self._workers):
+            process = self._context.Process(
+                target=ocr_worker_main,
+                args=(self._request_q, self._result_q, self._config, index, self._status_q),
+                name=f"ocr-worker-{index}",
+                daemon=True,
+            )
+            process.start()
+            self._processes.append(process)
+        self._wait_ready(deadline)
+
+    def _rollback_workers(self) -> None:
+        """初始化失败或中断时回收已启动的全部工作线程或子进程。"""
+        if self._inprocess_trt:
+            self._worker_stop.set()
+            for _ in self._worker_threads:
+                try:
+                    self._request_q.put_nowait(None)
+                except queue.Full:
+                    break
+            for thread in self._worker_threads:
+                thread.join(2.0)
+            self._worker_threads = [t for t in self._worker_threads if t.is_alive()]
+            return
+        for process in self._processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(1.0)
+        self._processes = [p for p in self._processes if p.is_alive()]
+
     def start(self, timeout: float = 120.0) -> "OcrWorkerPool":
-        """并行初始化全部工作进程，收到预热成功确认后返回；失败回滚。
+        """并行初始化全部工作单元，收到预热成功确认后返回；失败回滚。
 
         timeout 是整池初始化的总时限。状态走独立队列，不混入识别结果。
         """
@@ -412,15 +602,11 @@ class OcrWorkerPool:
         self._clear_or_reject_stale_threads()
         if self._started:
             return self
-        if self._processes:
-            raise RuntimeError("上次 OCR 进程尚未退出，不能重新启动")
+        if self._processes or self._worker_threads:
+            raise RuntimeError("上次 OCR 工作单元尚未退出，不能重新启动")
         if self._used:
-            # 不把上次关闭的哨兵或失败启动的消息交给新进程。
-            for channel in (self._request_q, self._result_q, self._status_q):
-                channel.close()
-            self._request_q = self._context.Queue(maxsize=self._workers)
-            self._result_q = self._context.Queue(maxsize=self._workers * 2)
-            self._status_q = self._context.Queue(maxsize=self._workers)
+            # 不把上次关闭的哨兵或失败启动的消息交给新工作单元。
+            self._reset_channels()
             self._cleanup_q = queue.Queue(maxsize=max(self._queue_size, 1024))
             self._submitted = self._results = self._dropped = 0
             self._backlog_warned = False
@@ -435,23 +621,13 @@ class OcrWorkerPool:
         self._used = True
         deadline = time.monotonic() + timeout
         try:
-            for index in range(self._workers):
-                process = self._context.Process(
-                    target=ocr_worker_main,
-                    args=(self._request_q, self._result_q, self._config, index, self._status_q),
-                    name=f"ocr-worker-{index}",
-                    daemon=True,
-                )
-                process.start()
-                self._processes.append(process)
-            self._wait_ready(deadline)
+            if self._inprocess_trt:
+                self._start_trt_threads(deadline)
+            else:
+                self._start_worker_processes(deadline)
         except BaseException:
-            # 覆盖部分 Process.start 失败、初始化失败、超时及操作手中断。
-            for process in self._processes:
-                if process.is_alive():
-                    process.terminate()
-                process.join(1.0)
-            self._processes = [p for p in self._processes if p.is_alive()]
+            # 覆盖部分启动失败、初始化失败、超时及操作手中断。
+            self._rollback_workers()
             self._close_spool_index()
             raise
         self._started = True
@@ -467,7 +643,10 @@ class OcrWorkerPool:
             target=self._cleanup_spool, name="ocr-spool-cleanup", daemon=True
         )
         self._cleanup_thread.start()
-        LOGGER.info("OCR 工作进程池已就绪：%d 个", self._workers)
+        if self._inprocess_trt:
+            LOGGER.info("OCR 工作线程池已就绪（TensorRT 进程内共享引擎）：%d 个", self._workers)
+        else:
+            LOGGER.info("OCR 工作进程池已就绪：%d 个", self._workers)
         return self
 
     def _wait_ready(self, deadline: float) -> None:
@@ -515,16 +694,54 @@ class OcrWorkerPool:
         else:
             LOGGER.error("OCR 磁盘清理线程未能按时退出；保留线程引用并跳过目录删除")
 
+    def _push_stop_sentinels(self, count: int, deadline: float) -> None:
+        """向请求队列投递与工作单元等量的退出哨兵。"""
+        for _ in range(count):
+            while time.monotonic() < deadline:
+                try:
+                    self._request_q.put(None, timeout=min(0.1, deadline - time.monotonic()))
+                    break
+                except queue.Full:
+                    continue
+
+    def _stop_workers(self, deadline: float, timeout: float) -> None:
+        """按当前执行模式通知并回收工作线程或子进程。"""
+        if self._inprocess_trt:
+            self._push_stop_sentinels(len(self._worker_threads), deadline)
+            for thread in self._worker_threads:
+                thread.join(max(0.0, deadline - time.monotonic()))
+            if any(thread.is_alive() for thread in self._worker_threads):
+                self._worker_stop.set()
+                for thread in self._worker_threads:
+                    if thread.is_alive():
+                        LOGGER.warning(
+                            "OCR 工作线程 %s 未在 %.1fs 内退出，触发停止信号",
+                            thread.name,
+                            timeout,
+                        )
+                        thread.join(1.0)
+            self._worker_threads = [t for t in self._worker_threads if t.is_alive()]
+            return
+        self._push_stop_sentinels(len(self._processes), deadline)
+        for process in self._processes:
+            process.join(max(0.0, deadline - time.monotonic()))
+            if process.is_alive():
+                LOGGER.warning("OCR 工作进程 %s 未在 %.1fs 内退出，强制终止", process.name, timeout)
+                process.terminate()
+                process.join(1.0)
+        self._processes = [p for p in self._processes if p.is_alive()]
+
     def stop(self, timeout: float = 5.0) -> None:
-        """发退出指令并等进程结束（幂等）。
+        """发退出指令并等工作单元结束（幂等）。
 
         退出指令排在已有请求**之后**：worker 会先把积压处理完再退出；
-        等不完的（``timeout`` 内没退）会被强制终止，这也是"关闭时不再保证
+        等不完的（``timeout`` 内没退）会被强制停止，这也是"关闭时不再保证
         处理完积压"的唯一场合。
         """
         if (
             not self._started
             and not self._processes
+            and not self._worker_threads
             and self._dispatch_thread is None
             and self._cleanup_thread is None
         ):
@@ -540,20 +757,7 @@ class OcrWorkerPool:
                 self._dispatch_thread = None
             else:
                 LOGGER.error("OCR 磁盘派发线程未能按时退出；保留线程引用")
-        for _ in self._processes:
-            while time.monotonic() < deadline:
-                try:
-                    self._request_q.put(None, timeout=min(0.1, deadline - time.monotonic()))
-                    break
-                except queue.Full:
-                    continue
-        for process in self._processes:
-            process.join(max(0.0, deadline - time.monotonic()))
-            if process.is_alive():
-                LOGGER.warning("OCR 工作进程 %s 未在 %.1fs 内退出，强制终止", process.name, timeout)
-                process.terminate()
-                process.join(1.0)
-        self._processes = [p for p in self._processes if p.is_alive()]
+        self._stop_workers(deadline, timeout)
         self._stop_cleanup_thread(deadline)
         self._started = False
         self._dead_reported = None
