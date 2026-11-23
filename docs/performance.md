@@ -22,7 +22,7 @@ python -m airdrop.run benchmark-perception --images-dir input/frames --calib inp
 
 设置环境变量 `AIRDROP_PERF_TRACE_DIR` 后再启动任务或回放，可将逐帧检测、OCR 提交与持久化、调度、文字检测与识别、结果确认等阶段写入该目录。各进程分别追加 `perf-<进程号>.jsonl`，应为每次测试指定新目录；未设置时关闭诊断。正常退出会刷新缓冲，强制终止可能丢失末尾诊断记录；写入失败会警告并停止该进程的诊断，不中断任务。分析时应核对帧和请求的事件数量及日志警告。
 
-例如 PowerShell 中设置 `$env:AIRDROP_PERF_TRACE_DIR = '.local/perf/run-01'`，随后在同一进程环境中启动任务；结束后使用 `Remove-Item Env:AIRDROP_PERF_TRACE_DIR` 关闭。时间为单调时钟墙钟时间，同一请求的阶段可能相互嵌套，不能直接相加；文字检测调用时间包括运行库及设备同步和资源争用，不等同纯 GPU 内核时间。诊断本身有开销，比较吞吐和识别结果时应增加同输入、同配置的关闭诊断对照。
+例如在 PowerShell 中设置 `$env:AIRDROP_PERF_TRACE_DIR = '<追踪输出目录>'`，随后在同一进程环境中启动任务；结束后使用 `Remove-Item Env:AIRDROP_PERF_TRACE_DIR` 关闭。时间为单调时钟墙钟时间，同一请求的阶段可能相互嵌套，不能直接相加；文字检测调用时间包括运行库及设备同步和资源争用，不等同纯 GPU 内核时间。诊断本身有开销，比较吞吐和识别结果时应增加同输入、同配置的关闭诊断对照。
 
 `perception.opencv_threads` 是主进程设置，默认4。Ultralytics导入会关闭OpenCV多线程，因此运行入口在加载YOLO后、启动工作线程前应用配置；不在逐帧路径反复设置。该值影响整个主进程，不能按不同任务线程分别配置；OCR子进程与PyTorch线程配置不因此变化。线程数增加可能引入CPU争用，需结合完整任务的尾延迟判断。
 
@@ -50,7 +50,7 @@ UDP 没有流结束标志。接收器被有界停止时，容器可能未写出�
 
 ## 姿态订阅评估
 
-当前仍同时请求和订阅 Euler 与 Quaternion，本轮只完成评估。当前 PX4 的 `ATTITUDE` 和 `ATTITUDE_QUATERNION` 都来自同一 `vehicle_attitude`，Euler 由原四元数换算，并非独立姿态估计。对本项目固定翼的姿态、投影、标定和显示用途，可以收敛为只获取四元数。
+当前仍同时请求和订阅欧拉角与四元数。PX4 的 `ATTITUDE` 和 `ATTITUDE_QUATERNION` 均来自同一 `vehicle_attitude`，欧拉角由四元数换算得到，并非独立姿态估计。对本项目固定翼的姿态、投影、标定和显示用途，可收敛为仅订阅四元数。
 
 实施时保留 `roll_deg/pitch_deg/yaw_deg` 业务字段，在最新快照和源时标插值后都从归一化四元数派生，统一时间参照。当前源时标插值已会派生 Euler，但最新快照仍依赖独立 Euler 流，因此只删订阅会让部分业务字段停更；须一并调整字段来源与姿态时标命名。验收覆盖 q/−q、非单位四元数、航向跨界及接近俯仰奇异点时的旋转等价性。
 

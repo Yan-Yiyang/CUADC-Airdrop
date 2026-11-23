@@ -56,7 +56,7 @@
 
 | 路径 | 用途 | 关键文件 | 进 git？ |
 | --- | --- | --- | --- |
-| `airdrop/` | 唯一的运行时代码包（9 个子包，见 §3） | `__init__.py`（171 个公开名）、`config.py`（全部参数） | 是 |
+| `airdrop/` | 唯一的运行时代码包（按职责拆分子包，见 §3） | `__init__.py`（公开 API 统一导出）、`config.py`（全部参数） | 是 |
 | `airdrop/config.py` | **全部参数的唯一集中处**（frozen dataclass + 取值域校验） | `Config`、`Config.validated` | 是 |
 | `tools/` | 一次性离线工具（**纯库模块**：文件内常量 = 默认值，暴露 `build_config(**覆盖)` / `main(**kwargs)`；命令行解析归 §6.2 的 `airdrop/run.py`） | `fetch_models.py`、`fit_ballistics.py`、`dump_api.py`、`check_docs.py`、性能诊断工具 | 是 |
 | `airdrop/runtime/` | real/SITL 在线任务、运行参数、共享组件与生命周期；离线回放复用感知组件 | `options.py`、`components.py`、`session.py` | 是 |
@@ -72,8 +72,7 @@
 | `flights/` | **运行期产物**：`record.dir` 默认值，每次飞行一个子目录 | 见 §5.1 | 否（已 ignore） |
 | 飞行记录目录内 `crops/`、`ocr_spool/` | 裁切 JPG、JSONL 索引及 OCR 磁盘积压 | — | 随飞行记录保留 |
 | pytest `tmp_path` | 测试用的系统临时工作目录，每个用例隔离（见 §5.6） | — | 否 |
-| `.sitl-test-tmp/` | SITL 演练的临时产物（演练日志、机上任务备份、ulog 探查脚本） | — | 否（已 ignore） |
-| `.idea/`、`.vscode/`、`.workbuddy/` | 编辑器/工具配置 | — | 否（已 ignore） |
+| `.idea/`、`.vscode/` | 常见编辑器配置目录 | — | 否（已 ignore） |
 
 ### 1.2 `airdrop/` 包内布局
 
@@ -90,44 +89,41 @@
 | `airdrop/preflight.py` | 起飞前自检：载入模型（detector/ocr/camera）→ 视频自检（各项可关） | `Preflight`、`PreflightCheck`、`PreflightError`、`PreflightLike`、`PreflightConfig` |
 | `airdrop/mission/items.py` | **任务项的唯一表示**（MAVLink 级：command/frame/params/位置）与 `MAV_CMD_*`/`MAV_FRAME_*` 常量 | `MissionItem`、`UNSET`、`command_name` |
 | `airdrop/mission/plan_file.py` | QGC `.plan` 解析（含复杂项展开）+ 固定翼降落预检（纯 JSON，离线） | `load_plan`、`QgcPlan`、`PlanError`、`check_fixed_wing_landing` |
-| `airdrop/config.py` | 全部参数（15 个 frozen dataclass） | `Config` 及 14 个片段 |
+| `airdrop/config.py` | 全部配置参数（冻结 dataclass） | `Config` 及各配置片段 |
 
-### 1.3 什么进 git、什么不进（实测口径）
+### 1.3 版本控制忽略约定
 
-用 `git check-ignore` 验过，`.gitignore` 的关键规则：
+`.gitignore` 的主要规则如下：
 
-| 规则 | 覆盖的东西 |
+| 规则 | 覆盖范围 |
 | --- | --- |
-| `models/**/*.pt` / `*.pth` / `*.onnx` | YOLO 与 PP-OCR 权重（约 177 MB）**不进库**；`models/**/.gitkeep` 保留 |
-| `!models/**/.gitkeep` + 字典例外 | `models/ppocr/ppocrv6_dict.txt`、`ppocrv6_tiny_dict.txt`（约 100 KB）**进库**——它们决定 rec 的字符集，必须随版本走 |
+| `models/**/*.pt` / `*.pth` / `*.onnx` | YOLO 与 PP-OCR 本地权重**不入库**；`models/**/.gitkeep` 保留 |
+| `!models/**/.gitkeep` + 字典例外 | `models/ppocr/ppocrv6_dict.txt`、`ppocrv6_tiny_dict.txt` **入库**，用于固定识别字符集 |
 | `log/`、`_cropdiag/`、`_e2e/`、`*.log` | 排故产物与文本日志 |
-| `flights/` | **飞行记录产物**（`FlightRecorder` 的输出目录，一次飞行几十~几百 MB） |
+| `flights/` | **飞行记录产物**（`FlightRecorder` 的输出目录） |
 | `.coverage*`、`coverage.xml`、`htmlcov/` | 覆盖率产物 |
 | `.venv/`、`__pycache__/`、`*.py[cod]`、`.pytest_cache/` 等 | 环境与缓存 |
-| `.sitl-test-tmp/`、`pytest-cache-files-*/` | SITL 演练与 pytest 缓存临时目录 |
-| `PX4-Autopilot-1.17.0/`、`qgroundcontrol-master/`、`px4.tar.gz`、`qgc.tar.gz` | 参考源码与压缩包 |
+| `.*-tmp/`、`pytest-cache-files-*/` | 本地临时演练目录与测试缓存目录 |
+| `PX4-Autopilot-1.17.0/`、`qgroundcontrol-master/` | 第三方参考源码目录 |
 
-⚠ **一处没有被 ignore、需要人工注意**：
+注意：
 
-* **`camera_calib.json`（标定产物）未被 ignore**——它是要跟着任务走的配置产物，
-  是否入库由使用方决定（本仓库默认不入库、也不忽略）。
-
-`flights/` 曾长期未被 ignore（`git status` 会列出整个飞行目录），现在已进 `.gitignore`；
-`.plan` 是操作手本地输入，默认忽略；应随具体任务记录其版本或散列，仓库不分发实际场地航线。
+* **`camera_calib.json`（标定产物）未被 `.gitignore` 忽略**：属于随任务使用的标定配置，是否入库由使用方自行决定（本仓库默认不入库、也不忽略）。
+* `flights/` 与操作手 `.plan` 航线文件均默认忽略；实际任务需自行记录所用航线版本或散列，仓库不分发具体场地航线。
 
 ### 1.4 `models/` 目录与模型文件（文件是否可用以实际安装为准）
 
-| 文件 | 大小 | 进 git | 用途 |
-| --- | --- | --- | --- |
-| `models/.gitkeep` | 0 | 是 | 占位 |
-| `models/best2.pt` | 5.95 MB | 否 | **唯一可用的 YOLO 权重**（单类 `target`）；`best.pt` / `best1.pt` 已废弃（零检出） |
-| `models/ppocr/PP-OCRv6_det_medium.pth` | 60.6 MB | 否 | OCR 检测模型（默认） |
-| `models/ppocr/PP-OCRv6_rec_medium.pth` | 73.4 MB | 否 | OCR 识别模型（默认） |
-| `models/ppocr/PP-OCRv6_{det,rec}_{small,tiny}.pth` | 1.9–20 MB | 否 | 备选尺度（`OcrEngineConfig` 可切） |
-| `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 0.56 MB | 否 | 方向分类 TORCH 版（**文件名不许规范化**，见笔记） |
-| `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 0.56 MB | 否 | 方向分类 ONNX 版（**启用方向分类时**默认用它，最快；默认 `cls_autorotate=False` 不参与识别） |
-| `models/ppocr/ppocrv6_dict.txt` | 70 KB | **是** | rec 字符集字典（固定识别字符集） |
-| `models/ppocr/ppocrv6_tiny_dict.txt` | 30 KB | **是** | tiny 模型字典 |
+| 文件 | 进 git | 用途 |
+| --- | --- | --- |
+| `models/.gitkeep` | 是 | 目录占位 |
+| `models/best2.pt` | 否 | 默认 YOLO 检测权重（单类 `target`，由使用者自备） |
+| `models/ppocr/PP-OCRv6_det_medium.pth` | 否 | OCR 文本检测默认模型 |
+| `models/ppocr/PP-OCRv6_rec_medium.pth` | 否 | OCR 文本识别默认模型 |
+| `models/ppocr/PP-OCRv6_{det,rec}_{small,tiny}.pth` | 否 | 备选尺度（`OcrEngineConfig` 可切换） |
+| `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 否 | 方向分类 TORCH 版（须保持 RapidOCR 的 `ptocr` 拼写，不可改名） |
+| `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 否 | 方向分类 ONNX 版（仅诊断显式启用 `cls_engine="onnx"` 时使用） |
+| `models/ppocr/ppocrv6_dict.txt` | **是** | 识别字符集字典（固定识别字符集） |
+| `models/ppocr/ppocrv6_tiny_dict.txt` | **是** | tiny 模型字典 |
 
 取权重：`python -m airdrop.run fetch-models`（**只复制、不联网**；源路径是文件内常量，可由 `--source-dir` 覆盖）。
 > Cls 权重命名与 onnxruntime 的 CUDA 前提见 [docs/perception_ocr.md](perception_ocr.md)。
@@ -255,11 +251,9 @@
 
 * **跨线程只传不可变值或拷贝**：`TelemetrySnapshot` 是 dataclass、字段全标量，broker 里
   publish/get 都做浅拷贝；`BufferedFrame.image` 是拷贝出来的 ndarray（§7 第 9 条）。
-* **跨进程只传图像 ndarray 与轻量结果**（`OcrRequest`/`OcrResult`），靠 `multiprocessing`
-  的 pickle 管道；OCR 进程池是唯一的多进程组件（`airdrop/perception/ocr_worker.py:1` 的
-  docstring 说明了"为什么单独开进程"以及复测前的保守默认）。
-* **谁也不用共享内存**：没有全局可变状态；`config` 是 frozen dataclass，构造后不可变。
-* **优先"每帧路径不阻塞"**：OCR 在独立进程池、事件/检测写盘和 PyAV 采集隔离。
+* **跨进程边界隔离**：PyAV 视频采集运行在独立子进程，经有界共享帧槽向主进程交付图像；OCR 进程池通过磁盘 `ocr_spool/` 与有界文件引用/结果队列通信，避免重型识别与采集解码阻塞主循环。
+* **配置不可变**：`config` 为冻结 dataclass，构造后不可变；避免跨线程共享可变业务状态。
+* **主帧路径非阻塞**：OCR 在独立进程池执行，事件/检测写盘与视频采集线程相互隔离。
 
 ---
 
@@ -294,7 +288,7 @@ TelemetryBroker(history_maxlen: int = 1200, history_interval: float = 0.1)
 | `publish(snapshot)` | 直接发布一条**完整快照**（保留它自己的 `timestamp`、不节流）——回放用它 |
 | `reset` | 清空快照与历史（重连前调用） |
 
-**最小示例**（真跑通）：
+**最小示例**：
 
 ```python
 import time
@@ -456,8 +450,8 @@ align(frame: VideoFrame | None) -> AlignedSample | None
 （`on_timeout="drop"`）；超出 `max_extrapolation` 的硬保护。
 `AlignedSample` 带 `extrapolated` / `offset`，如实标记这次查询是不是外推。
 
-**最小示例**（真跑通；注意帧的"收到时间"必须比遥测晚 `lag` 秒，否则历史没覆盖拍摄时刻，
-对齐器会等满 `max_wait` 后丢帧并在日志里警告）：
+**最小示例**（注意帧的“收到时间”须比遥测晚 `lag` 秒，否则历史未覆盖拍摄时刻，
+对齐器将等待 `max_wait` 后丢帧并记录警告日志）：
 
 ```python
 import time
@@ -502,7 +496,7 @@ AlignmentWriter(buffer, aligner, *, defer_until_airborne=False)  # 可调用对�
 | --- | --- |
 | `put(sample)` | 存入一条对齐结果（内部会拷贝图像），返回 `BufferedFrame` |
 | `latest()` / `at(index)` / `latest_index()` / `indices()` | 取最新 / 按序号取 / 序号范围 |
-| `iter_between(start=None, end=None, *, batch=16)` | **按时间区间分批迭代**（回看历史的正道） |
+| `iter_between(start=None, end=None, *, batch=16)` | 按时间区间分批迭代历史帧 |
 | `wait_new(after_index=0, timeout=None, *, cancel_event=None)` | 等一条更新记录，返回**最早**满足条件的那条（读者各自持游标）；取消事件已置位时返回 `None` |
 | `wake_waiters()` | 仅唤醒等待线程，让它们检查各自的取消事件；不改缓存或读者游标 |
 | `read_jpeg_bytes(index)` | JPEG 缓冲模式的内部读取接口 |
@@ -717,7 +711,7 @@ approx, ok = post.edge_detection()
 print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_min))
 ```
 
-实测输出：`五边形顶点 5 个，ok=True（s_min=100）`。
+示例输出：`五边形顶点 5 个，ok=True（s_min=100）`。
 
 #### 3.4.4 `OcrEngine` 与 `OcrEngineConfig`
 
@@ -737,10 +731,10 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 | `rec_keys` | `'ppocrv6_dict.txt'` | 字符集字典（在 git 里） |
 | `cls_engine` | `'off'` | 方向分类后端（`'off'`/`'onnx'`/`'torch'`）；默认关闭以省去未使用的 ORT CUDA 显存，诊断时显式启用 |
 | `cls_onnx_model` | `'ch_ppocr_mobile_v2.0_cls_mobile.onnx'` | ONNX 版分类权重 |
-| `cls_torch_model` | `'ch_ptocr_mobile_v2.0_cls_mobile.pth'` | TORCH 版分类权重（**注意这个错拼**） |
+| `cls_torch_model` | `'ch_ptocr_mobile_v2.0_cls_mobile.pth'` | TORCH 版分类权重（须保持 RapidOCR 的 `ptocr` 命名） |
 | `cls_use_cuda` | `True` | 分类是否用 CUDA |
 | `cls_thresh` | `0.9` | 方向判定阈值 |
-| `cls_autorotate` | `False` | **默认关**：方向分类只作诊断/交叉验证，不参与识别——正式流程的方向由几何转正（顶角 60°±15° 门限）保证。设为 `True` 才会按判定把倒置文本行转正再识别（2026-10 实测：开/关读号逐位相同，关掉每帧约省一成耗时） |
+| `cls_autorotate` | `False` | **默认关闭**：方向分类仅作诊断/交叉验证，不参与正式识别——正式链路的方向由几何转正（顶角 60°±15° 门限）保证；显式设为 `True` 时才按分类结果旋转倒置文本行 |
 | `use_cuda` | `True` | det/rec 是否用 CUDA |
 | `det_max_side_len` | `960` | 检测输入有效长边上限（0 为不限，非 0 须 ≥ 736；约束狭长裁切图显存尖峰并还原框坐标） |
 | `device_id` | `0` | GPU 序号 |
@@ -748,7 +742,7 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 | `rec_batch_num` | `6` | 识别批大小 |
 | `log_level` | `'error'` | RapidOCR 日志级别 |
 
-两个前提条件写在 [`docs/perception_ocr.md`](perception_ocr.md)：权重文件名必须保持 RapidOCR 那个错拼（`ch_ptocr_`…），`onnxruntime-gpu` 要用 CUDA 得在进程里**先 `import torch`**。
+两个前提条件见 [`docs/perception_ocr.md`](perception_ocr.md)：TORCH 版方向分类权重文件名须保持 RapidOCR 的 `ch_ptocr_` 拼写；`onnxruntime-gpu` 使用 CUDA 前须在进程中先导入 `torch`。
 
 #### 3.4.5 `OcrWorkerPool` —— OCR 独立进程池
 
@@ -759,7 +753,7 @@ OcrWorkerPool(workers=2, *, queue_size=500, config: dict | None = None)
 ```
 
 - `submit` 先将 PNG 无损裁切图与请求元数据写入磁盘，进程请求队列只传有界文件引用；结果队列也有界并阻塞回压。成功关联结果后清理请求文件。启动/恢复时流式扫描磁盘积压一次并重建 SQLite 磁盘顺序索引；运行期间只查询下一个编号，跳过空洞无需逐号探测，也不把积压请求载入内存。sidecar 与 ack 标记仍是恢复依据，索引可重建。`queue_size` 是**积压告警阈值**，不是内存队列容量；超阈值告警同时仍保留磁盘请求。`PerceptionStats.ocr_dropped` 记录丢弃数。
-- OCR 放独立进程的理由：RapidOCR 单帧几十到几百毫秒，放主循环里会直接拖垮逐帧检测。进程参数经 `config`（字典）传给 `ocr_worker_main`。
+- OCR 放独立进程的原因：单次裁剪转正与 OCR 推理耗时较长，若置于感知主循环内会直接阻塞逐帧检测；进程初始化参数经 `config`（字典）传给 `ocr_worker_main`。
 - `start` 并行启动所有进程，等待每个进程完成模型预热并确认就绪才返回；120 秒是整池初始化总时限。预热返回 `False`、初始化异常、进程提前退出或超时均失败，并回收本轮已启动进程。`PerceptionWorker.start()` 将错误传给自检，不能仅凭进程已创建就报告通过。初始化消息使用独立队列，不混入识别结果，也不增加逐帧消息。重启使用新队列并重置队列统计，防止旧退出哨兵或结果进入新一轮。
 - Windows 是 spawn 语义：**入口脚本必须放在 `if __name__ == "__main__":` 之下**，否则子进程会重复导入主模块。受限沙箱里命名管道不可用，进程池会起不来（见 §8）。
 
@@ -865,7 +859,7 @@ finally:
 print("结果 %d 条，编号 %s" % (len(results), [d.code for d in results]))
 ```
 
-实测输出：`结果 3 条，编号 [7, 7, 7]`。
+示例输出：`结果 3 条，编号 [7, 7, 7]`。
 
 ### 3.5 `airdrop.georef` —— 像素到 NED 坐标
 
@@ -895,7 +889,7 @@ CameraModel(camera_matrix, dist_coeffs=<全零>, r_bc=<DEFAULT_R_BC>, t_bc=<零�
 
 两个构造入口：
 
-- `default_camera_model(width=1280, height=720)`：按视场角凑出的占位内参（`is_calibrated()` 为 `False`）。它只够"能跑通"，精度靠标定。
+- `default_camera_model(width=1280, height=720)`：按默认视场角估算的占位内参（`is_calibrated()` 为 `False`），仅用于未标定场景跑通接口，定位精度依赖真实标定。
 - `load_camera_model(path, *, fallback_size=(1280, 720))`：读标定工具写出的相机文件；有效标定必须包含 `R_bc`。文件缺失或无效时返回未标定的默认模型，`fallback_size` 指定该默认模型的尺寸。
 
 #### 3.5.2 像素 → 坐标
@@ -958,7 +952,7 @@ check = cross_check_by_side(
 print("边长法 ok=%s 相对误差 %.4f（side_px=%.2f）" % (check.ok, check.relative_error, side_px))
 ```
 
-实测输出：`地面交点 NED: (100.0, 200.0, 0.0) 深度 50.0 m`；`边长法交叉验证 ok=True 相对误差 0.0000（side_px=5.54）`。
+示例输出：`地面交点 NED: (100.0, 200.0, 0.0) 深度 50.0 m`；`边长法交叉验证 ok=True 相对误差 0.0000（side_px=5.54）`。
 
 ### 3.6 `airdrop.targeting` —— 目标统计（多点 → 唯一结果）
 
@@ -1011,7 +1005,7 @@ print(
 )
 ```
 
-实测输出：`选中编号 56 @ NED (10.10, 20.00)`；`候选类 1 个，噪声 1，剔除 0`（第四点离得太远，成了噪声；读 12 的那帧投给了 56，众数生效）。
+示例输出：`选中编号 56 @ NED (10.10, 20.00)`；`候选类 1 个，噪声 1，剔除 0`（第四点离得太远，成了噪声；读 12 的那帧投给了 56，众数生效）。
 
 ### 3.7 `airdrop.ballistics` —— 弹道、投放判据、投放记录与反演
 
@@ -1134,7 +1128,7 @@ print(
 )
 ```
 
-实测输出：`落点 (34.5662493172948, 0.0, 0.0)，飞行时间 2.07s`；第二拍预测落点约为 `(0, 0.57, 0)`，沿向从负值过零，`reason='predict'`（同时 stderr 会有一条"遥测里没有风估计…按零风预测"的提示，属预期）。
+示例输出：`落点 (34.5662493172948, 0.0, 0.0)，飞行时间 2.07s`；第二拍预测落点约为 `(0, 0.57, 0)`，沿向从负值过零，`reason='predict'`（同时 stderr 会有一条"遥测里没有风估计…按零风预测"的提示，属预期）。
 
 ```python
 """投放记录 + 反演：合成两条样本，反演出 Cd。"""
@@ -1178,7 +1172,7 @@ print(
 )
 ```
 
-实测输出：`ok=True reliable=True（拟合参数 ['drag_coefficient']）`；`Cd=0.8000（真值 0.8），κ=Cd·A/m=0.00877，RMS=4.5e-13 m`。
+示例输出：`ok=True reliable=True（拟合参数 ['drag_coefficient']）`；`Cd=0.8000（真值 0.8），κ=Cd·A/m=0.00877，RMS=4.5e-13 m`。
 
 ### 3.8 `airdrop.mission` —— 状态机、航线、目标跟踪与主循环
 
@@ -1288,8 +1282,7 @@ FW_DEFAULT_LAND_ANGLE_DEG = 8.0       # 本项目离线预检默认值，不代�
   `FW_LND_ANG` 调用 `check_fixed_wing_landing`。离线函数默认角度为 8°；已核对的 SIH 配置为 5°，不能把默认值
   当作该机型参数。只有隔离 SITL 且任务确实没有降落航线时，才在该 SITL 配置中设 `MIS_TKO_LAND_REQ=0`；
   不要据此修改真机配置或关闭其他 failsafe。
-- 不合格的航线在**规划阶段**就带着原因失败（`PlanningError`），而不是上传后被飞控整条拒掉、
-  飞机原地盘旋——2026-09 的 SITL 演练里为此空等了 15 分钟。
+- 不合格的航线在**规划阶段**即携带原因抛出 `PlanningError`，避免上传后被飞控整条拒绝导致飞机持续盘旋。
 
 #### 3.8.4 `planner` —— 纯函数航线规划
 
@@ -1451,7 +1444,7 @@ print(
 print("  飞掠 entry/exit: %.6f / %.6f" % (plan.entry.lat, plan.exit.lat))
 ```
 
-实测输出：`  侦查任务项 2 个，首项命令 NAV_TAKEOFF`；`  投放任务：来源 target，任务项 3 个，目标 NED (300.0, 0.0, 0.0)`；`  飞掠 entry/exit: 47.002698 / 47.002698`（航向 90° 时 entry/exit 差在**经度**上，纬度与目标相同）。
+示例输出：`  侦查任务项 2 个，首项命令 NAV_TAKEOFF`；`  投放任务：来源 target，任务项 3 个，目标 NED (300.0, 0.0, 0.0)`；`  飞掠 entry/exit: 47.002698 / 47.002698`（航向 90° 时 entry/exit 差在**经度**上，纬度与目标相同）。
 
 ```python
 """主循环：假控制器 + 假时钟（分钟级任务在毫秒级跑完）。"""
@@ -1524,7 +1517,7 @@ print(
 )
 ```
 
-实测输出（`config` 沿用 3.8.4 那份）：
+示例输出（`config` 沿用 3.8.4 示例）：
 
 ```text
   状态 HOLD_PROCESS，上传 1 次，历史 4 条
@@ -1557,7 +1550,7 @@ print(
 
 ### 3.9 `airdrop.config` 与顶层导出面
 
-`Config` 是唯一的参数集合：全部 frozen dataclass，15 个分块字段（`telemetry`、`video`、`align`、`perception`、`camera`、`ground`、`targeting`、`ballistics`、`drop`、`overfly`、`gripper`、`routes`、`mission`、`preflight`、`record`），逐字段说明见 §4。
+`Config` 是唯一的参数集合：全部冻结 dataclass，按功能拆分为各配置片段（`telemetry`、`video`、`align`、`perception`、`camera`、`ground`、`targeting`、`ballistics`、`drop`、`overfly`、`gripper`、`routes`、`mission`、`preflight`、`record`、`qgc_video`），逐字段说明见 §4。
 
 ```python
 Config(...)  # 直接构造；分块各自有默认值
@@ -1565,9 +1558,9 @@ config.validated()  # 返回校验通过的同一个对象；不合法抛 ValueE
 config.replace(**changes)  # 派生一个变体（改哪个传哪个，如 drop=DropConfig(radius_m=3.0)）
 ```
 
-`validated()` 的校验清单（`airdrop/config.py` 的 `Config.validated`，行 381–462）：枚举字段取值（`mode`、`target_color`、`selection_rule`、`on_timeout`、`wind_source`、`abort_action`）、`ocr_workers >= 1`、`ocr_queue_size >= 1`、`imgsz >= 32`、`min_side_px < max_side_px`、去重参数 `>= 0`、`eps_m > 0`、`radius_m > 0`、各任务时长/频率为正、`hold_process_min_s <= hold_process_max_s`、gripper 参数 `>= 0`，最后调 `self.video.validated()`（传输方式与编码参数）。**校验只在调用 `validated()` 时发生**：直接构造的 `Config()` 不校验，装配函数里记得调。
+`validated()` 的校验清单（`airdrop/config.py` 的 `Config.validated`）：枚举字段取值（`mode`、`target_color`、`selection_rule`、`on_timeout`、`wind_source`、`abort_action`）、`ocr_workers >= 1`、`ocr_queue_size >= 1`、`opencv_threads >= 1`、`imgsz >= 32`、`min_side_px < max_side_px`、去重参数 `>= 0`、`eps_m > 0`、`radius_m > 0`、各任务时长/频率为正、`hold_process_min_s <= hold_process_max_s`、gripper 参数 `>= 0`，最后调用 `self.video.validated()` 与 `self.qgc_video.validated()`。**校验只在调用 `validated()` 时发生**：直接构造的 `Config()` 不校验，装配入口须显式调用。
 
-顶层 `airdrop` 把常用名字重新导出（`airdrop.__all__` 共 176 个）。分组清单如下（要 `import` 什么都从这里找）：
+顶层 `airdrop` 统一重新导出常用符号（见 `airdrop.__all__`）。分组清单如下：
 
 - 分包与版本：`Config`、`__version__`
 - 遥测：`TelemetryBroker`、`TelemetrySnapshot`、`MavsdkThread`、`DroneController`、`DryRunController`、`Command`、`CommandResult`、`ControllerError`、`MissionController`、`NedOrigin`、`to_raw_item`、`MISSION_TYPE_MISSION`
@@ -1717,7 +1710,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `mode` | str | `'ocr'` | `ocr` / `cls12`（`PERCEPTION_MODES`） |
-| `model_path` | str | `'models/best2.pt'` | YOLO 权重（`best.pt` / `best1.pt` 已废弃） |
+| `model_path` | str | `'models/best2.pt'` | YOLO 检测权重默认路径（由使用者提供） |
 | `device` | str | `'0'` | YOLO 设备，显式指定 |
 | `conf_threshold` | float | `0.25` | 检测置信度门限 |
 | `imgsz` | int | `1280` | 推理尺寸（校验要求 ≥ 32） |
@@ -1817,7 +1810,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `recon_route` | tuple | `()` | 侦查段航点；为空且没给 `recon_plan` → `PlanningError` |
-| `backup_point` | Waypoint / None | `None` | 无目标时用的备用点（Q11 分支） |
+| `backup_point` | Waypoint / None | `None` | 无目标时使用的备用投放点 |
 | `landing_route` | tuple | `()` | 降落段航点，接在飞掠段之后；为空且没给 `land_plan` → `PlanningError` |
 | `recon_plan` | str | `''` | 侦查段用的 QGC `.plan` 路径（**原样使用**，不自动补起飞项） |
 | `land_plan` | str | `''` | 降落段用的 QGC `.plan` 路径（**飞掠段插在它前面**，含复杂项展开与降落预检） |
@@ -1983,7 +1976,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `telemetry.jsonl` | recorder 的 telemetry writer 线程；默认按 10Hz 节流，`telemetry_hz=0` 时通过有界队列记录每次已接纳更新，并在 `recorder_stopped` 写计数 | 每行一份 `TelemetrySnapshot.as_dict()`（位置/速度/欧拉角/四元数/源时标/接收时刻/原点/风/**任务进度、飞行模式与是否在空中**等） | `record.replay.load_broker_from_log`、人、标定工具 | 默认记录可删可裁；标定全量记录需保留完整行数与收尾事件，不能编辑或裁剪 |
 | `detections.jsonl` | `PerceptionWorker` → `recorder.detections.append(Detection)` | `Detection.as_dict()`：`frame_index`、`capture_timestamp`、`pixel`、`box`、`confidence`、`code`、`side_px`、`raw_text`、`ocr_confidence`、`mode`、`extra`（含 `undistorted`/`ocr_stage`/`ocr_worker`）+ 精简遥测字段 | 人、脚本 | ✅ 追加字段不影响解析 |
 | `events.jsonl` | 各模块经 `recorder.events.emit(kind, **data)`（线程安全、写完即 flush） | `{timestamp, kind, ...}`，`kind` 目录见 §5.2 | 人、复盘脚本 | ⚠ 建议只读（这是任务时间线） |
-| `drops.jsonl` | `MissionRunner(on_drop=…)` → `recorder.drops.append(DropRecord)` | 投放瞬间**原始状态**：位置/速度/姿态（欧拉角+四元数）/风/离地高度/NED 原点/目标点/判据前推位置与预测落点（**数值不四舍五入**） | `tools/fit_ballistics.py`、人 | ⚠ 只读；实测落点写在 `impacts.jsonl`，别改这个文件 |
+| `drops.jsonl` | `MissionRunner(on_drop=…)` → `recorder.drops.append(DropRecord)` | 投放瞬间**原始状态**：位置/速度/姿态（欧拉角+四元数）/风/离地高度/NED 原点/目标点/判据前推位置与预测落点（**数值不四舍五入**） | `tools/fit_ballistics.py`、人 | ⚠ 只读；实测落点应写入 `impacts.jsonl`，勿修改本文件 |
 | `video/segment-*.ts`、`segment-*.rap.jsonl`、`segment-*.complete` | PyAV 采集子进程复制压缩流，按连接周期生成分段和随机访问索引 | MPEG-TS 与分段索引、正常封口标记 | `record.replay.ReplayVideoSource`、标定工具 | ⚠ 删除或修改分段会使对应帧无法回读 |
 | `frames_index.jsonl` | recorder 帧索引线程 | 业务帧序号、分段和 PTS、随机访问点、尺寸、时间、对齐遥测及标记；`capture = received − lag` | `record.replay.FlightLog`、`vendor/airdrop-calibration/airdrop_calibration/calibrate.py` | ⚠ 只读；损坏尾行会报告并恢复可用前缀 |
 | `config_snapshot.json` | `start()` 时立刻写 | `asdict(Config)` 全量（含视频地址、标定文件路径） | 人、审查 | ⚠ 只读（"当时怎么配的"证据） |
@@ -2062,11 +2055,11 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 
 | 文件 | 用途 | 进 git |
 | --- | --- | --- |
-| `models/best2.pt` | YOLO 检测权重（**唯一可用**；`best.pt`/`best1.pt` 是废弃权重，零检出） | ❌（`*.pt` 忽略） |
+| `models/best2.pt` | YOLO 检测权重默认路径（由使用者自备） | ❌（`*.pt` 忽略） |
 | `models/ppocr/PP-OCRv6_det_medium.pth`、`PP-OCRv6_rec_medium.pth` | RapidOCR TORCH 引擎权重（det/rec） | ❌（`*.pth`） |
 | `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 方向分类 ONNX（诊断交叉验证按需传 `cls_engine="onnx"`） | ❌（`*.onnx`） |
-| `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 方向分类 TORCH 权重（**`pt` 是 RapidOCR 的拼写，别规范化**） | ❌ |
-| `models/ppocr/*.txt` | 字符集字典——**入库**：它决定 rec 的字符集，跟着版本走才能复现识别结果 | ✅ |
+| `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 方向分类 TORCH 权重（须保持 RapidOCR 的 `ptocr` 拼写，不可改名） | ❌ |
+| `models/ppocr/*.txt` | 字符集字典——**入库**：固定识别字符集以保证结果可复现 | ✅ |
 
 取权重：`python -m airdrop.run fetch-models --source-dir <本地素材目录>`。
 
@@ -2074,7 +2067,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 
 测试默认使用 `fast` tier，只收未标记用例，不启动 ffmpeg、WSL、GPU 或飞控。依赖 pytest `tmp_path`、`tmp_path_factory`、`tmpdir`、`tmpdir_factory`、`workdir` 或 `core_checkout` fixture 的测试在收集时自动标记为 `integration`，由 `offline` 层运行；该规则按 fixture 依赖分类，不依据测试文件名。纯配置、数学和受控线程测试仍可留在 `fast`。`offline` 也包含显式标记的跨模块、跨仓或真实子进程测试；`platform` 再加入 `stream`、`network` 与 `wsl`；`all` 还包括 `realdata` 和 `sitl`。fixture 自动标记在 pytest 原生 `-m` 过滤前完成，`-m` 只会进一步筛选当前 tier，不会扩大 tier。覆盖率默认关闭，需要时显式传 `--cov=airdrop --cov-branch`。
 
-测试临时文件通过 pytest `tmp_path` 创建，测试结束后由 pytest 清理，不在仓库根目录创建固定工作目录。SITL 人工演练目录 `.sitl-test-tmp/` 与测试 fixture 无关。
+测试临时文件统一通过 pytest `tmp_path` 创建，测试结束后由 pytest 清理，不在仓库根目录创建固定工作目录。
 
 ⚠ **同一时刻只能有一个 `mavsdk_server`**（它固定占用 gRPC 50051）：一边跑示例/演练，一边想再起一个
 `System()` 去查状态会争抢端口。调试时用
@@ -2240,7 +2233,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | # | 规则 | 代码位置 | 违反的后果 |
 | --- | --- | --- | --- |
 | 1 | `mavsdk` 没有公开 `close()`，会话结束必须显式释放，**且释放要有超时兜底**（守护线程 + `RELEASE_TIMEOUT_S`） | `telemetry/mavsdk_thread.py` 的 `stop()` / `_release_drone()` | mavsdk_server 子进程（固定 gRPC 端口 50051）变僵尸，新会话连上它并级联断连；⚠ 无飞控时这条释放路径实测会**永久阻塞**（gRPC poller 报 `Event loop is closed`），没有兜底就会把 `stop()` 的调用方一起拖死 |
-| 2 | 历史按时间查询用 `bisect(key=attrgetter("timestamp"))` 直接探 deque | `telemetry/broker.py` | 每次查询重建整张时间表（曾 22µs → 0.42µs） |
+| 2 | 历史按时间查询用 `bisect(key=attrgetter("timestamp"))` 直接探 deque | `telemetry/broker.py` | 避免每次查询重建整张时间戳列表（保持 `O(log n)` 查找） |
 | 3 | 留存（`add_sink` 逐帧）与实时（`read()`/`latest()`）是两条路 | `video/source.py`、`video/buffer.py` | 用 `read()` 送入推理＝把丢帧引回来 |
 | 4 | 跨帧持有画面必须 copy | `video/source.py` 的 `VideoFrame.copy()`、`video/buffer.py` | 跨帧持有图像时要按接口约定复制，避免复用缓存导致图像变化 |
 | 5 | 取遥测用 `frame.capture_timestamp`（= 收到时间 − `telemetry_lag`） | `video/source.py`、`video/align.py` | 目标坐标顺航迹偏一个链路延时（10 m/s → 1.5 m） |
@@ -2266,12 +2259,12 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | 25 | 状态在**某一拍结束时**进入 | `mission/runner.py`、`mission/states.py` | 测试断言写成"进了状态就已经调用过" |
 | 26 | `DroneController` 不在导入期读 `config` | `telemetry/controller.py`（装配走 `from_config`） | `config → video.source → telemetry` 成环 |
 | 27 | 事件写入失败绝不影响控制流 | `mission/states.py` 的 `emit_event` | recorder 关闭后抛 RuntimeError 使状态机崩溃 |
-| 28 | 权重必须 `best2.pt`；`cls12` 无 12 类权重（编号恒 1） | `config.py`、`docs/perception_ocr.md` | 换了废弃权重 → 零检出 |
-| 29 | 转正形态门限 60°±15° 是**量出来的** | `perception/cropproc.py` 的 `HOUSE_APEX_ANGLE_DEG/TOL` | 凭主观判断调门限 → 误转正（曾把 56 读成 95） |
-| 30 | 方向判别器只是**提示器**，不能当裁判 | `perception/cropproc.py`、`docs/perception_ocr.md` | 它会把目视正立的图判成倒置（帧 1160 实测 P(正立)=0.186） |
+| 28 | 检测权重须匹配所选模式（单类权重仅用于 `ocr` 模式，`cls12` 须配备 12 类权重） | `config.py`、`docs/perception_ocr.md` | 权重与模式不匹配导致零检出或编号恒为 1 |
+| 29 | 转正形态门限采用等边三角形顶角 `60°±15°` | `perception/cropproc.py` 的 `HOUSE_APEX_ANGLE_DEG/TOL` | 随意放宽或修改门限会导致编号底板误判为五边形并错转正 |
+| 30 | 方向判别器仅作诊断提示，不作为正式识别裁判 | `perception/cropproc.py`、`docs/perception_ocr.md` | 小目标或低清文本行可能触发误判，不能直接替代几何转正 |
 | 31 | 任务项一律走 **`mission_raw`**，不用 MAVSDK 的 `vehicle_action` 翻译 | `mission/items.py`、`telemetry/controller.py` 的 `to_raw_item`/`_upload` | `vehicle_action=LAND` 被拆成"同坐标航点 + `NAV_LAND`"⇒ PX4 固定翼拒**整条任务**，而 `start_mission()` 仍回成功 |
 | 32 | 降落段必须过 `check_fixed_wing_landing`：紧前一项**严格高于**落点，且下滑角 ≤ `tan(FW_LND_ANG+0.1°)` | `mission/plan_file.py`、`mission/planner.py` | 上传后被飞控整条拒掉（`No valid mission available, loitering`），飞机原地盘旋 |
-| 33 | 上传启动后**必须确认**飞控真进了 `MISSION`（`mission_start_timeout_s`） | `mission/runner.py` 的 `_confirm_started`、`telemetry/controller.py` 的 `in_mission_mode` | "命令回成功"当成"在飞"⇒ 空等到状态超时（实测 15 分钟） |
+| 33 | 上传启动后**必须确认**飞控真进了 `MISSION`（`mission_start_timeout_s`） | `mission/runner.py` 的 `_confirm_started`、`telemetry/controller.py` 的 `in_mission_mode` | 仅凭命令返回成功误判为已启动，导致持续空等至状态超时 |
 | 34 | 完成判定读快照 `mission_current == mission_total`（`mission_raw` 进度流） | `telemetry/controller.py` 的 `mission_finished`、`telemetry/_mission_sync.py` 的 `MissionSync` | 用 MAVSDK `mission.is_mission_finished()`：raw 上传下**永远回 False**，状态机卡在 RECON |
 | 35 | 上传前**先 `set_current_mission_item(0)`** 再启动 | `telemetry/controller.py` 的 `start_mission` | 同 CRC 的任务再启动时飞控不清"已飞完"锁存 ⇒ 停在 `HOLD` |
 | 36 | 每条腿的航线来源**二选一**（waypoint 配置 / QGC `.plan`），同时给两个直接报错 | `config.py` 的 `validated`、`mission/planner.py` | 飞的可能不是你以为的那条航线 |
@@ -2280,7 +2273,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | 39 | 正式流程 `INIT → PREFLIGHT → WAIT_AIRBORNE → RECON`：先自检（载入模型 + 视频自检），再等"在空中"，最后才进侦查；等待起飞的检查有**临时放行开关** `MissionConfig.require_airborne`（默认 `True`），置 `False`（**只给地面演练/离线测试**）时该检查立即放行，且**必须留痕**——记 `airborne_skipped` 事件（带 `reason`）+ WARNING 日志，绝不静默通过 | `mission/runner.py` 的 `_tick_preflight`/`_tick_airborne`、`config.py` 的 `MissionConfig.require_airborne`、`airdrop/preflight.py` | 在停机坪上就进侦查：PX4 会在地面"追"第一个航点，或因任务不可行直接盘旋；演练则相反——飞不飞都空等到 `airborne_timeout_s`（1800s）才失败 |
 | 40 | 侦查航线**默认由操作手在 QGC 上传并启动**（`MissionConfig.recon_upload='operator'`）；`'auto'` 只用于自动测试 | `config.py` 的 `RECON_UPLOAD_MODES`、`runner._begin_recon` | 自动上传会覆盖操作手刚画好的航线 |
 | 41 | 自检**关掉 ≠ 通过**：关掉的项记 `preflight` 事件（`ok=null`）；**开着却没注入回调 = 装配错误**，直接判失败 | `airdrop/preflight.py` 的 `PreflightCheck.skipped` / `PreflightError` | 把"漏了装配"当成"检查通过"，正式任务带着没自检的系统起飞 |
-| 42 | OCR 请求 / OCR 结果 / 检测结果三条队列都**无界、不丢弃**；积压只告警（`ocr_queue_size` 与结果队列 2000 条阈值），绝不因为"队列满"丢数据 | `perception/ocr_worker.py` 的 `submit`/`_warn_if_backlogged`、`perception/pipeline.py` 的 `_emit`/`_collect_remaining` | 丢掉一个送检请求或一条结果 ⇒ 可能漏掉只清晰一瞬的目标编号（编号是坐标解算的输入） |
+| 42 | OCR 请求经磁盘 `ocr_spool/` 持久化、进程间队列有界回压，检测结果队列无界不丢弃；积压仅告警（`ocr_queue_size` 与结果队列 2000 条阈值） | `perception/ocr_worker.py` 的 `submit`/`_warn_if_backlogged`、`perception/pipeline.py` 的 `_emit`/`_collect_remaining` | 丢弃送检请求或识别结果会漏掉仅短时清晰的目标编号 |
 | 43 | 弹道密度以**真实海拔**为基准：`ground_altitude_m` 来自 GPS 原点/地面点（反演取记录 `origin.alt_m − ground_z`）；关闭 ISA 也在投放海拔算一次常密度 | `ballistics/model.py` 的 `predict_impact`、`mission/runner.py` 的 `_ground_altitude`、`ballistics/drops.py` 的 `predict_record_impact` | 把地面当海平面：1500 m 站点高估密度 ~16% ⇒ 高估阻力、预测落点偏近；反演参数迁移到别的海拔也会错 |
 
 ### 7.2 失败语义一览（"到底怎么算失败"）
@@ -2353,7 +2346,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | 断了流仍在读旧画面 / `read()` 阻塞不返回 | 链路超时或消费者没有等待新帧 | 检查 `read_timeout`、进程状态及重连；详见 `docs/video_hm30_ffmpeg.md` |
 | 新会话连不上飞控 / 端口 50051 被占 | 旧 mavsdk_server 僵尸进程 | 必须走 `MavsdkThread.stop()`（内部 `_release_drone()`）；必要时手动结束残留进程 |
 | ONNX/TORCH 报 CUDA 不可用，静默退回 CPU | 进程里没有先 `import torch`（cuDNN/cuBLAS DLL 不在搜索路径） | 本项目 det/rec 走 TORCH 天然满足；`OcrEngine._report_cls_device()` 会告警——看日志 |
-| OCR 读出 `95` 而目视是 `56` | 转正差 180°（形态门限被绕过） | 已修（形态判据 + `house_ok` 优先）；别改 60°±15°，要改先重新量分布（`docs/perception_ocr.md`） |
+| OCR 读出倒置编号（如 `56` 读成 `95`） | 几何转正差 180°（形态门限被绕过） | 保持 `60°±15°` 顶角形态判据与 `house_ok` 优先策略；调整门限前须基于目标样本重新验证（见 `docs/perception_ocr.md`） |
 | 单帧编号错（如 `01`） | OCR 单帧误读 | 由 `targeting` 的**类内众数**兜底；多帧观测足够时自动纠正 |
 | `drops.jsonl` 是空的 | 本次没有实际投放（判据没触发/未接判据 `no_judge`/投放被拒） | 看 `events.jsonl` 的 `drop_skipped`/`error`/`abort_action` |
 | 反演报"参数不可辨识（条件数 …）" | 同高同速投放 → Cd 与释放延迟分不开 | 拉开各次投放的速度/高度；或先只拟合 Cd；有风反而更容易分离（`docs/ballistics_fit.md`） |
@@ -2381,7 +2374,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 
 ## 9. 已知边界与维护约定
 
-### 9.1 已知边界与未验证项（别当成已完成）
+### 9.1 已知边界与未验证项
 
 | 项 | 现状 |
 | --- | --- |
