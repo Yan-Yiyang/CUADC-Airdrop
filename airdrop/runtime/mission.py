@@ -9,7 +9,7 @@ import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
 
 from airdrop import HM30_DEFAULT_RTSP, Config, Waypoint
@@ -64,7 +64,7 @@ def _raise_live_input_failures(
             check_recorder()
 
 
-def build_config(
+def build_config(  # noqa: PLR0913 - 配置装配入口保持与 CLI 一一对应的具名覆盖参数
     *,
     system_address: str | None = SYSTEM_ADDRESS,
     rtsp_url: str = RTSP_URL,
@@ -72,6 +72,11 @@ def build_config(
     recon_plan: str = RECON_PLAN,
     land_plan: str = LAND_PLAN,
     backup_point: Waypoint | None = None,
+    model_path: str | Path | None = None,
+    ocr_models_dir: str | Path | None = None,
+    ocr_det_model: str | None = None,
+    ocr_rec_model: str | None = None,
+    ocr_workers: int | None = None,
 ) -> Config:
     """用真实场地参数生成配置；场地航线不含内置坐标，须由调用方提供。"""
     base = Config()
@@ -87,13 +92,21 @@ def build_config(
         land_plan=land_plan,
         backup_point=backup_point,
     )
-    return replace(
+    config = replace(
         base,
         telemetry=telemetry,
         video=replace(base.video, url=rtsp_url),
         camera=camera,
         routes=routes,
     ).validated()
+    return _apply_perception_overrides(
+        config,
+        model_path=model_path,
+        ocr_models_dir=ocr_models_dir,
+        ocr_det_model=ocr_det_model,
+        ocr_rec_model=ocr_rec_model,
+        ocr_workers=ocr_workers,
+    )
 
 
 def build_live_components(options: RunOptions, config: Config) -> LiveComponents:  # noqa: PLR0915 - 阶段资源按依赖顺序装配
@@ -312,6 +325,11 @@ def main(  # noqa: PLR0913
     qgc_transport: str | None = None,
     qgc_fps: float | None = None,
     qgc_bitrate_kbps: int | None = None,
+    model_path: str | Path | None = None,
+    ocr_models_dir: str | Path | None = None,
+    ocr_det_model: str | None = None,
+    ocr_rec_model: str | None = None,
+    ocr_workers: int | None = None,
     calibration_capture: bool = False,
     config: Config | None = None,
     components_factory: Callable[[RunOptions, Config], LiveComponents] | None = None,
@@ -356,6 +374,11 @@ def main(  # noqa: PLR0913
             qgc_transport=qgc_transport,
             qgc_fps=qgc_fps,
             qgc_bitrate_kbps=qgc_bitrate_kbps,
+            model_path=model_path,
+            ocr_models_dir=ocr_models_dir,
+            ocr_det_model=ocr_det_model,
+            ocr_rec_model=ocr_rec_model,
+            ocr_workers=ocr_workers,
             manifest_path=manifest_path,
             work_dir=WORK_DIR if work_dir is None else work_dir,
             lag_s=lag_s,
@@ -374,6 +397,14 @@ def main(  # noqa: PLR0913
     if config is not None and config_overrides:
         raise ValueError("传入 config 时不能再混用配置覆盖参数")
     config = config or build_config(**config_overrides)
+    config = _apply_perception_overrides(
+        config,
+        model_path=model_path,
+        ocr_models_dir=ocr_models_dir,
+        ocr_det_model=ocr_det_model,
+        ocr_rec_model=ocr_rec_model,
+        ocr_workers=ocr_workers,
+    )
     config = _apply_qgc_video_overrides(
         config,
         enabled=qgc_video,
@@ -384,6 +415,32 @@ def main(  # noqa: PLR0913
         bitrate_kbps=qgc_bitrate_kbps,
     )
     return run_configured(options, config, components_factory=components_factory)
+
+
+def _apply_perception_overrides(
+    config: Config,
+    *,
+    model_path: str | Path | None = None,
+    ocr_models_dir: str | Path | None = None,
+    ocr_det_model: str | None = None,
+    ocr_rec_model: str | None = None,
+    ocr_workers: int | None = None,
+) -> Config:
+    """只覆盖命令行明确给出的感知参数，保留基础或注入配置的其它字段。"""
+    updates: dict[str, Any] = {
+        name: value
+        for name, value in {
+            "model_path": None if model_path is None else str(model_path),
+            "models_dir": None if ocr_models_dir is None else str(ocr_models_dir),
+            "det_model": ocr_det_model,
+            "rec_model": ocr_rec_model,
+            "ocr_workers": ocr_workers,
+        }.items()
+        if value is not None
+    }
+    if not updates:
+        return config
+    return replace(config, perception=replace(config.perception, **updates)).validated()
 
 
 def _apply_qgc_video_overrides(

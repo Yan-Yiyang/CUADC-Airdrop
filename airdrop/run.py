@@ -142,6 +142,15 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(("--qgc-fps",), "qgc_fps", "QGC 视频帧率", kind="float"),
             Option(("--qgc-bitrate-kbps",), "qgc_bitrate_kbps", "QGC 视频码率", kind="int"),
             Option(("--calib",), "calib_file", "相机标定 JSON 文件"),
+            Option(("--model",), "model_path", "YOLO 权重路径（.pt 或 .engine）"),
+            Option(("--ocr-models-dir",), "ocr_models_dir", "OCR 权重与字典目录"),
+            Option(
+                ("--ocr-det-model",), "ocr_det_model", "OCR 文本检测权重文件名（.pth 或 .engine）"
+            ),
+            Option(
+                ("--ocr-rec-model",), "ocr_rec_model", "OCR 文本识别权重文件名（.pth 或 .engine）"
+            ),
+            Option(("--ocr-workers",), "ocr_workers", "OCR 工作进程数", kind="int"),
             Option(
                 ("--recon-plan",),
                 "recon_plan",
@@ -210,6 +219,15 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 source="SELECTION_RULE",
             ),
             Option(("--calib",), "calib_file", "相机标定文件", source="CALIB_FILE"),
+            Option(("--model",), "model_path", "YOLO 权重路径（.pt 或 .engine）"),
+            Option(("--ocr-models-dir",), "ocr_models_dir", "OCR 权重与字典目录"),
+            Option(
+                ("--ocr-det-model",), "ocr_det_model", "OCR 文本检测权重文件名（.pth 或 .engine）"
+            ),
+            Option(
+                ("--ocr-rec-model",), "ocr_rec_model", "OCR 文本识别权重文件名（.pth 或 .engine）"
+            ),
+            Option(("--ocr-workers",), "ocr_workers", "OCR 工作进程数", kind="int"),
             Option(("--qgc-video",), "qgc_video", "向 QGroundControl 发布回放视频", kind="bool"),
             Option(("--qgc-host",), "qgc_host", "QGC 视频接收主机"),
             Option(("--qgc-port",), "qgc_port", "QGC 视频接收端口", kind="int"),
@@ -258,6 +276,114 @@ SUBCOMMANDS: dict[str, Subcommand] = {
         name="fetch-models",
         module="tools.fetch_models",
         help="把外部模型权重复制进 models/（只复制、不联网）",
+    ),
+    "build-trt": Subcommand(
+        name="build-trt",
+        module="tools.build_trt_engines",
+        help="离线构建并校验 YOLO / PP-OCR TensorRT 引擎与伴随清单",
+        options=(
+            Option(
+                ("--target",),
+                "target",
+                "构建目标",
+                kind="choice",
+                choices=("all", "yolo", "ocr"),
+                source="TARGET",
+            ),
+            Option(("--out-dir",), "out_dir", "引擎与清单输出目录", kind="path", source="OUT_DIR"),
+            Option(("--device",), "device", "单一 CUDA 设备编号", source="DEVICE"),
+            Option(
+                ("--yolo-model",),
+                "yolo_model",
+                "YOLO 源权重路径（.pt）",
+                kind="path",
+                source="YOLO_MODEL",
+            ),
+            Option(("--imgsz",), "imgsz", "YOLO 推理尺寸元数据", kind="int", source="IMGSZ"),
+            Option(
+                ("--yolo-input-hw",),
+                "yolo_input_hw",
+                "YOLO 引擎静态输入尺寸（高,宽）",
+                kind="pair",
+                metavar="H,W",
+                source="YOLO_INPUT_HW",
+            ),
+            Option(
+                ("--ocr-models-dir",),
+                "ocr_models_dir",
+                "OCR 源权重与字典目录",
+                kind="path",
+                source="OCR_MODELS_DIR",
+            ),
+            Option(
+                ("--ocr-det-model",),
+                "ocr_det_model",
+                "OCR 文本检测源权重文件名（.pth）",
+                source="OCR_DET_MODEL",
+            ),
+            Option(
+                ("--ocr-rec-model",),
+                "ocr_rec_model",
+                "OCR 文本识别源权重文件名（.pth）",
+                source="OCR_REC_MODEL",
+            ),
+            Option(
+                ("--ocr-rec-keys",),
+                "ocr_rec_keys",
+                "OCR 识别字符集字典文件名",
+                source="OCR_REC_KEYS",
+            ),
+            Option(
+                ("--det-max-side-len",),
+                "det_max_side_len",
+                "OCR 检测引擎动态输入最大边长",
+                kind="int",
+                source="DET_MAX_SIDE_LEN",
+            ),
+            Option(
+                ("--rec-max-batch",),
+                "rec_max_batch",
+                "OCR 识别引擎最大 batch",
+                kind="int",
+                source="REC_MAX_BATCH",
+            ),
+            Option(
+                ("--rec-max-width",),
+                "rec_max_width",
+                "OCR 识别引擎最大输入宽度",
+                kind="int",
+                source="REC_MAX_WIDTH",
+            ),
+            Option(
+                ("--workspace-mb",),
+                "workspace_mb",
+                "TensorRT 构建工作空间上限（MiB）",
+                kind="int",
+                source="WORKSPACE_MB",
+            ),
+            Option(
+                ("--precision",),
+                "precision",
+                "构建精度",
+                kind="choice",
+                choices=("fp16", "fp32"),
+                source="PRECISION",
+            ),
+            Option(
+                ("--verify",),
+                "verify",
+                "发布前对照 PyTorch 离线校验引擎输出",
+                kind="bool",
+                source="VERIFY",
+            ),
+            Option(
+                ("--force",),
+                "force",
+                "允许覆盖已有引擎与伴随清单",
+                kind="bool",
+                source="FORCE",
+            ),
+        ),
     ),
     "make-world": Subcommand(name="make-world", module="airdrop_sim.cli", help="生成仿真世界"),
     "make-vehicle": Subcommand(
@@ -383,7 +509,7 @@ def _add_option(parser: argparse.ArgumentParser, module: Any, option: Option) ->
     elif option.kind == "path":
         parser.add_argument(*option.flags, type=Path, **common)
     elif option.kind == "pair":
-        parser.add_argument(*option.flags, type=_pair, metavar="A,B", **common)
+        parser.add_argument(*option.flags, type=_pair, metavar=option.metavar or "A,B", **common)
     elif option.kind == "vec2":
         parser.add_argument(*option.flags, type=_vec2, metavar="AZ,EL", **common)
     elif option.kind == "vec3":

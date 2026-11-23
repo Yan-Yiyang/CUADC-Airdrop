@@ -23,6 +23,7 @@ import ipaddress
 import math
 import re
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 from .video.source import HM30_DEFAULT_RTSP, VideoConfig
 
@@ -583,6 +584,7 @@ class Config:
                 f"{self.ballistics.wind_source!r}"
             )
         self._validated_ballistics()
+        self._validated_perception_backends()
         for name in (
             "position_rate_hz",
             "position_velocity_ned_rate_hz",
@@ -704,6 +706,40 @@ class Config:
             raise ValueError(f"ballistics.cross_area_m2 不能为负: {b.cross_area_m2}")
         if b.rk_dt <= 0:
             raise ValueError(f"ballistics.rk_dt 必须为正: {b.rk_dt}")
+
+    def _validated_perception_backends(self) -> None:
+        """基于后缀与设备配置校验 YOLO / OCR 推理后端契约（不触发重库导入）。"""
+        p = self.perception
+        if not isinstance(p.model_path, str) or not p.model_path.strip():
+            raise ValueError(f"perception.model_path 不能为空: {p.model_path!r}")
+        model_suffix = Path(p.model_path).suffix.lower()
+        if model_suffix not in (".pt", ".engine"):
+            raise ValueError(f"perception.model_path 仅支持 .pt 或 .engine 权重: {p.model_path!r}")
+        if model_suffix == ".engine":
+            from .perception.trt_runtime import parse_cuda_device_id
+
+            parse_cuda_device_id(p.device)
+
+        if not isinstance(p.det_model, str) or not p.det_model.strip():
+            raise ValueError(f"perception.det_model 不能为空: {p.det_model!r}")
+        if not isinstance(p.rec_model, str) or not p.rec_model.strip():
+            raise ValueError(f"perception.rec_model 不能为空: {p.rec_model!r}")
+        det_suffix = Path(p.det_model).suffix.lower()
+        rec_suffix = Path(p.rec_model).suffix.lower()
+        if det_suffix not in (".pth", ".engine") or rec_suffix not in (".pth", ".engine"):
+            raise ValueError(
+                "perception.det_model 与 rec_model 仅支持 .pth 或 .engine 权重: "
+                f"{p.det_model!r} / {p.rec_model!r}"
+            )
+        if det_suffix != rec_suffix:
+            raise ValueError(
+                "perception.det_model 与 rec_model 必须同为 .pth 或同为 .engine: "
+                f"{p.det_model!r} / {p.rec_model!r}"
+            )
+        if det_suffix == ".engine" and p.ocr_use_cuda is not True:
+            raise ValueError(
+                "perception.det_model / rec_model 使用 .engine 时必须启用 perception.ocr_use_cuda"
+            )
 
     def replace(self, **changes) -> "Config":
         """派生新配置（浅层替换顶层片段）。"""

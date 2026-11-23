@@ -14,7 +14,16 @@ from airdrop.runtime.mission import main as run_mission
 from airdrop.runtime.session import LiveComponents
 
 ROOT = Path(__file__).resolve().parents[1]
-HEAVY_MODULES = ("torch", "cv2", "mavsdk", "ultralytics", "rapidocr", "onnxruntime")
+HEAVY_MODULES = (
+    "torch",
+    "cv2",
+    "mavsdk",
+    "ultralytics",
+    "rapidocr",
+    "onnxruntime",
+    "tensorrt",
+    "onnx",
+)
 
 
 def _run(code: str) -> subprocess.CompletedProcess[str]:
@@ -33,6 +42,7 @@ def _run(code: str) -> subprocess.CompletedProcess[str]:
 def test_registry_has_one_mission_and_offline_commands() -> None:
     assert "mission" in run.SUBCOMMANDS
     assert "replay" in run.SUBCOMMANDS
+    assert "build-trt" in run.SUBCOMMANDS
     assert not set(run.SUBCOMMANDS) & {
         "full-mission",
         "sitl",
@@ -43,11 +53,18 @@ def test_registry_has_one_mission_and_offline_commands() -> None:
         "calibration-capture",
     }
     assert run.SUBCOMMANDS["mission"].module == "airdrop.runtime.mission"
+    assert run.SUBCOMMANDS["build-trt"].module == "tools.build_trt_engines"
 
 
 @pytest.mark.parametrize(
     "argv",
-    [["--help"], ["mission", "--help"], ["replay", "--help"], ["qgc-video-test", "--help"]],
+    [
+        ["--help"],
+        ["mission", "--help"],
+        ["replay", "--help"],
+        ["qgc-video-test", "--help"],
+        ["build-trt", "--help"],
+    ],
 )
 @pytest.mark.integration
 def test_help_does_not_load_heavy_libraries(argv: list[str]) -> None:
@@ -97,8 +114,79 @@ def test_mission_options_parse_to_runtime_keywords() -> None:
             "qgc_transport",
             "qgc_fps",
             "qgc_bitrate_kbps",
+            "model_path",
+            "ocr_models_dir",
+            "ocr_det_model",
+            "ocr_rec_model",
+            "ocr_workers",
         )
     )
+    replay_defaults = run.resolve_kwargs("replay", [])
+    assert all(
+        replay_defaults[key] is None
+        for key in (
+            "model_path",
+            "ocr_models_dir",
+            "ocr_det_model",
+            "ocr_rec_model",
+            "ocr_workers",
+        )
+    )
+
+
+def test_perception_override_cli_options_parse_symmetrically() -> None:
+    args = [
+        "--model",
+        "engines/best2_736x1280_fp16.engine",
+        "--ocr-models-dir",
+        "engines/ppocr",
+        "--ocr-det-model",
+        "PP-OCRv6_det_medium_fp16.engine",
+        "--ocr-rec-model",
+        "PP-OCRv6_rec_medium_fp16.engine",
+        "--ocr-workers",
+        "1",
+    ]
+    for command in ("mission", "replay"):
+        resolved = run.resolve_kwargs(command, args)
+        assert resolved["model_path"] == "engines/best2_736x1280_fp16.engine"
+        assert resolved["ocr_models_dir"] == "engines/ppocr"
+        assert resolved["ocr_det_model"] == "PP-OCRv6_det_medium_fp16.engine"
+        assert resolved["ocr_rec_model"] == "PP-OCRv6_rec_medium_fp16.engine"
+        assert resolved["ocr_workers"] == 1
+
+
+def test_build_trt_cli_options_resolve_defaults_and_overrides() -> None:
+    defaults = run.resolve_kwargs("build-trt", [])
+    assert defaults["target"] == "all"
+    assert defaults["out_dir"] == Path(".local/trt")
+    assert defaults["device"] == "0"
+    assert defaults["yolo_input_hw"] == (736, 1280)
+    assert defaults["precision"] == "fp16"
+    assert defaults["verify"] is True
+    assert defaults["force"] is False
+
+    custom = run.resolve_kwargs(
+        "build-trt",
+        [
+            "--target",
+            "yolo",
+            "--out-dir",
+            "custom/trt",
+            "--yolo-input-hw",
+            "640,640",
+            "--precision",
+            "fp32",
+            "--no-verify",
+            "--force",
+        ],
+    )
+    assert custom["target"] == "yolo"
+    assert custom["out_dir"] == Path("custom/trt")
+    assert custom["yolo_input_hw"] == (640, 640)
+    assert custom["precision"] == "fp32"
+    assert custom["verify"] is False
+    assert custom["force"] is True
 
 
 def test_real_release_has_explicit_positive_and_negative_flags() -> None:

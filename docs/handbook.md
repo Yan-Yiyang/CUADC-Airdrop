@@ -2097,6 +2097,7 @@ uv sync                                                # 依赖（清华镜像�
 | `python -m airdrop.run calibrate` | 转发独立标定工具，读取标准飞行目录并输出 `camera_calib.json` |
 | `python -m airdrop.run fit-ballistics` | 读取 `drops.jsonl` 与实测落点，输出 `ballistics_fit.json` |
 | `python -m airdrop.run fetch-models` | 获取识别模型 |
+| `python -m airdrop.run build-trt` | 离线构建并校验 YOLO / PP-OCR TensorRT 引擎（`.engine`）及伴随清单 |
 | `python -m airdrop.run make-world` | 转发仿真世界生成工具 |
 | `python -m airdrop.run make-vehicle` | 转发机型/相机生成工具 |
 | `python -m airdrop.run make-backdrops` | 转发程序化底图工具 |
@@ -2106,6 +2107,8 @@ uv sync                                                # 依赖（清华镜像�
 | `python -m airdrop.run check-docs` | 检查手册与主包 API、配置、记录文件和 CLI 的一致性 |
 
 `mission` / `replay` 默认启用合成显示；用 `--no-qgc-video` 关闭，目的主机/端口/封装分别用 `--qgc-host`、`--qgc-port`、`--qgc-transport` 配置。默认使用 GPU 的 `h264_nvenc`，需本机 NVIDIA 编码器支持。画面和编码故障隔离见 [QGC 视频](qgc_video.md)。
+
+`mission` / `replay` 均支持通过 `--model`、`--ocr-models-dir`、`--ocr-det-model`、`--ocr-rec-model` 与 `--ocr-workers` 显式覆盖感知权重路径、OCR 目录及工作进程数（未传入时不覆盖；`replay` 在严格恢复 `config_snapshot.json` 之后再应用显式覆盖）。
 
 完整选项见各命令 `--help`。运行参数语义、相互约束和生命周期见 [统一运行说明](runtime.md)。工具仓初始化与升级见 [独立工具](tool_repositories.md)。
 

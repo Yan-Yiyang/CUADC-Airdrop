@@ -100,12 +100,19 @@ def build_config(
     selection_rule: str | None = SELECTION_RULE,
     calib_file: str | None = CALIB_FILE,
     land_plan: str | None = LAND_PLAN,
+    model_path: str | Path | None = None,
+    ocr_models_dir: str | Path | None = None,
+    ocr_det_model: str | None = None,
+    ocr_rec_model: str | None = None,
+    ocr_workers: int | None = None,
 ) -> Config:
-    """回放用的配置（感知模式 / 选唯一规则 / 相机标定 / 降落航线可覆盖）。
+    """回放用的配置（感知模式 / 感知模型与 OCR 进程数 / 选唯一规则 / 相机标定 / 降落航线可覆盖）。
 
     CLI 参数的 ``None`` = 不覆盖；记录快照中的 ``None`` 则表示字段原值为空。
     """
     from airdrop.record.replay import load_config_snapshot
+
+    from .mission import _apply_perception_overrides
 
     base = load_config_snapshot(flight_dir)
     if perception_mode is not None:
@@ -116,7 +123,15 @@ def build_config(
         base = base.replace(camera=replace(base.camera, calib_file=calib_file))
     if land_plan is not None:
         base = base.replace(routes=replace(base.routes, land_plan=land_plan))
-    return base.validated()
+    validated = base.validated()
+    return _apply_perception_overrides(
+        validated,
+        model_path=model_path,
+        ocr_models_dir=ocr_models_dir,
+        ocr_det_model=ocr_det_model,
+        ocr_rec_model=ocr_rec_model,
+        ocr_workers=ocr_workers,
+    )
 
 
 def resolve_flight_dir(flight_dir: Path = FLIGHT_DIR) -> Path:
