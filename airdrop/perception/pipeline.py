@@ -54,6 +54,7 @@ from .models import (
     snapshot_pose,
 )
 from .ocr_worker import OcrResult, OcrWorkerPool
+from .trt_runtime import TrtEngineError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -184,6 +185,7 @@ class PerceptionWorker:
         self._drain_to: int | None = None
         self._drain_ok = False
         self._fatal_error: str | None = None
+        self._fatal_exception: Exception | None = None
         self._run_finished = False
         self._thread: threading.Thread | None = None
         self._cursor = self._start_index
@@ -283,10 +285,22 @@ class PerceptionWorker:
                 old_buffer.wake_waiters()
             return self._cutoff
 
+    def _record_fatal(self, exc: Exception, *, preserve_type: bool = False) -> None:
+        """记录后台致命异常与错误文本，供主线程通过 :meth:`raise_if_failed` 获取。"""
+        with self._stats_lock:
+            if preserve_type and self._fatal_exception is None:
+                self._fatal_exception = exc
+            if self._fatal_error is None:
+                self._fatal_error = str(exc)
+            self._stats.last_error = str(exc)
+
     def raise_if_failed(self) -> None:
         """将后台致命错误交给主线程，避免感知已停而任务继续。"""
         with self._stats_lock:
+            exc = self._fatal_exception
             error = self._fatal_error
+        if exc is not None:
+            raise exc
         if error is not None:
             raise FrameSizeMismatchError(error)
 
@@ -520,9 +534,12 @@ class PerceptionWorker:
                 try:
                     self._process_frame(frame)
                 except FrameSizeMismatchError as exc:
-                    with self._stats_lock:
-                        self._fatal_error = self._stats.last_error = str(exc)
+                    self._record_fatal(exc)
                     LOGGER.error("%s", exc)
+                    return
+                except TrtEngineError as exc:
+                    self._record_fatal(exc, preserve_type=True)
+                    LOGGER.error("TensorRT 推理致命错误：%s", exc)
                     return
                 except Exception as exc:
                     LOGGER.exception("处理帧 #%d 失败", frame.index)
@@ -881,6 +898,8 @@ class PerceptionWorker:
         # 池侧丢弃计数同步进统计（不丢弃策略下恒为 0；留着是为了万一将来
         # 又出现丢弃路径，监控里能立刻看见）
         with self._stats_lock:
+            if self._fatal_exception is not None:
+                return
             self._stats.ocr_dropped = int(pool.stats.get("dropped", 0))
         while True:
             result = pool.poll(timeout=timeout) if timeout else pool.poll()
@@ -888,9 +907,25 @@ class PerceptionWorker:
                 break
             timeout = 0.0  # 只在第一次调用时允许等待
             self._apply_result(result)
+            if result.fatal:
+                break
 
     def _apply_result(self, result: OcrResult) -> None:
         """先完成识别回填与裁切归档，最后向进程池确认已消费。"""
+        if result.fatal:
+            exc = TrtEngineError(result.error or "OCR TensorRT 执行失败")
+            self._record_fatal(exc, preserve_type=True)
+            LOGGER.error(
+                "帧 #%d 请求 #%d 收到 OCR TensorRT 致命错误，停止感知：%s",
+                result.frame_index,
+                result.request_id,
+                exc,
+            )
+            self._stop_event.set()
+            with self._input_lock:
+                self._wait_cancel.set()
+                self._buffer.wake_waiters()
+            return
         if not isinstance(result.payload, Detection):
             raise OSError(f"OCR 结果缺少对应检测对象 #{result.request_id}")
         self._apply_result_payload(result)

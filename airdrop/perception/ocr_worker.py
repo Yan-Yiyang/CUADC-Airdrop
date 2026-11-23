@@ -36,6 +36,7 @@ import numpy as np
 import airdrop.perception.timing as timing  # noqa: PLR0402 - 避免惰性包循环导入
 
 from .cropproc import CropResult, OcrEngineConfig, OpenCvPostProcess
+from .trt_runtime import TrtEngineError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ class OcrResult:
     error: str | None = None
     archive_error: str | None = None
     rectified_written: bool = False
+    fatal: bool = False
     # 这里不回传 rectified 图像：结果消费端不使用它，避免额外序列化和队列内存占用。
     # 排故要转正图请在**进程内**直接调 OpenCvPostProcess.recognize
     # （tests/test_perception_realdata.py 就是这么做的）。
@@ -196,6 +198,36 @@ def ocr_worker_main(  # noqa: PLR0912, PLR0915 - 请求处理及诊断保持顺�
                 rectified_written=rectified_written,
                 worker_id=worker_id,
                 elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            )
+        except TrtEngineError as exc:
+            log.error(
+                "OCR TensorRT 致命异常 帧#%d 请求#%d: %s: %s",
+                request.frame_index,
+                request.request_id,
+                type(exc).__name__,
+                exc,
+            )
+            if timing.ENABLED:
+                timing.emit(
+                    "ocr_worker_error",
+                    start_ns=worker_start,
+                    end_ns=timing.now_ns(),
+                    error=f"{type(exc).__name__}: {exc}",
+                    fatal=True,
+                )
+            result = OcrResult(
+                request_id=request.request_id,
+                frame_index=request.frame_index,
+                capture_timestamp=request.capture_timestamp,
+                number=None,
+                raw_text="",
+                confidence=0.0,
+                side_px=-1.0,
+                stage="trt_error",
+                worker_id=worker_id,
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                error=f"{type(exc).__name__}: {exc}",
+                fatal=True,
             )
         except Exception as exc:
             log.exception("OCR 处理异常 帧#%d", request.frame_index)

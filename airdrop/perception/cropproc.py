@@ -54,6 +54,7 @@ import numpy as np
 import airdrop.perception.timing as timing  # noqa: PLR0402 - 避免惰性包循环导入
 
 from .number import correct_ocr_number
+from .trt_runtime import TrtEngineError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ _DET_MIN_SIDE_LEN = 736
 # ----------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class OcrEngineConfig:
-    """RapidOCR（TORCH 引擎）参数。
+    """OCR 推理引擎参数（支持 RapidOCR TORCH ``.pth`` 与 TensorRT ``.engine`` 后端）。
 
     默认值对应 PP-OCRv6 medium 检测与识别模型；推理耗时受设备、驱动、输入图像与运行时
     版本影响，应在目标部署环境测量。
@@ -130,15 +131,51 @@ class OcrEngineConfig:
             raise ValueError(
                 f"det_max_side_len 必须为 0 或 >= {_DET_MIN_SIDE_LEN}: {self.det_max_side_len}"
             )
+        det_suffix = Path(self.det_model).suffix.lower()
+        rec_suffix = Path(self.rec_model).suffix.lower()
+        supported = {".pth", ".engine"}
+        if det_suffix not in supported:
+            raise ValueError(f"det_model 仅支持 .pth 或 .engine 权重: {self.det_model!r}")
+        if rec_suffix not in supported:
+            raise ValueError(f"rec_model 仅支持 .pth 或 .engine 权重: {self.rec_model!r}")
+        if det_suffix != rec_suffix:
+            raise ValueError(
+                f"det_model ({self.det_model!r}) 与 rec_model ({self.rec_model!r}) "
+                "不允许混用不同后端权重后缀"
+            )
+        if det_suffix == ".engine":
+            if self.use_cuda is not True:
+                raise ValueError("TensorRT OCR 后端要求 use_cuda=True")
+            if self.cls_engine != "off":
+                raise ValueError(
+                    f"TensorRT OCR 后端要求 cls_engine='off'，实际为 {self.cls_engine!r}"
+                )
+            if self.cls_autorotate is not False:
+                raise ValueError("TensorRT OCR 后端要求 cls_autorotate=False")
+            if self.det_max_side_len < _DET_MIN_SIDE_LEN:
+                raise ValueError(
+                    f"TensorRT OCR 后端要求 det_max_side_len >= {_DET_MIN_SIDE_LEN}，"
+                    f"实际为 {self.det_max_side_len}"
+                )
+
+    def _resolve_path(self, value: str) -> Path:
+        path = Path(value)
+        if path.is_absolute() or path.parent != Path("."):
+            return path
+        return Path(self.model_dir) / path
+
+    def backend_kind(self) -> str:
+        """返回 OCR 推理后端类型：``"tensorrt"`` 或 ``"torch"``。"""
+        return "tensorrt" if Path(self.det_model).suffix.lower() == ".engine" else "torch"
 
     def det_path(self) -> Path:
-        return Path(self.model_dir) / self.det_model
+        return self._resolve_path(self.det_model)
 
     def rec_path(self) -> Path:
-        return Path(self.model_dir) / self.rec_model
+        return self._resolve_path(self.rec_model)
 
     def keys_path(self) -> Path:
-        return Path(self.model_dir) / self.rec_keys
+        return self._resolve_path(self.rec_keys)
 
     def cls_onnx_path(self) -> Path:
         return Path(self.model_dir) / self.cls_onnx_model
@@ -189,6 +226,7 @@ class OcrEngine:
         self._config = config or OcrEngineConfig()
         self._engine: Any = None
         self._failed = False
+        self._failed_trt_error: TrtEngineError | None = None
         #: 失败日志节流用的状态（见 _log_ocr_failure）
         self._ocr_fail_signature = ""
         self._ocr_fail_count = 0
@@ -238,6 +276,8 @@ class OcrEngine:
         if self._engine is not None:
             return self._engine
         if self._failed:
+            if self._failed_trt_error is not None:
+                raise self._failed_trt_error
             raise RuntimeError("OCR 引擎初始化失败，请检查模型文件与 CUDA")
         config = self._config
         missing = [
@@ -252,6 +292,25 @@ class OcrEngine:
             raise FileNotFoundError(
                 "OCR 模型文件缺失: " + ", ".join(missing) + "（见 OcrEngineConfig.model_dir）"
             )
+        if config.backend_kind() == "tensorrt":
+            try:
+                from .trt_ocr import TrtOcrBackend  # 惰性：不加载 RapidOCR 或 onnxruntime
+
+                self._engine = TrtOcrBackend(config)
+            except TrtEngineError as exc:
+                self._failed = True
+                self._failed_trt_error = exc
+                raise
+            except Exception:
+                self._failed = True
+                raise
+            LOGGER.info(
+                "OCR 引擎就绪（TensorRT，det=%s rec=%s device=%d）",
+                config.det_path(),
+                config.rec_path(),
+                config.device_id,
+            )
+            return self._engine
         try:
             from rapidocr import EngineType, RapidOCR  # 惰性：重型依赖
 
@@ -467,12 +526,16 @@ class OcrEngine:
         """
         try:
             engine = self.ensure()
+        except TrtEngineError:
+            raise
         except Exception as exc:  # noqa: BLE001 - 必须兜住一切并降级为"没读出编号"
             self._log_ocr_failure("OCR 引擎不可用", exc)
             return []
         prepared, scale, pad_left, pad_top = self._prepare_det_image(image)
         try:
             result = engine(prepared)
+        except TrtEngineError:
+            raise
         except Exception as exc:  # noqa: BLE001 - 同上：单帧失败不打断整条链路
             self._log_ocr_failure("OCR 单帧识别失败", exc)
             return []
@@ -984,6 +1047,8 @@ class OpenCvPostProcess:
                     house_ok=result.house_ok,
                 )
             return result
+        except TrtEngineError:
+            raise
         except Exception:
             LOGGER.exception("裁剪图识别异常")
             return CropResult(None, -1.0, None, "", 0.0, stage="error")
