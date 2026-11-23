@@ -1,26 +1,47 @@
 [project]
 name = "airdrop"
 version = "0.2.1"
+description = "CUADC 固定翼无人机侦查与空投控制系统"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "太原理工大学航模协会" }, { name = "燕羿洋" }]
 requires-python = ">=3.14"
 dependencies = [
     "av>=19.0.2",
     "imageio-ffmpeg",
     "mavsdk",
-    "onnxruntime-gpu>=1.30.0",
+    "numpy",
     "opencv-python",
     "pillow",
     "pyproj",
-    "pyyaml",
     "rapidocr",
     "scikit-learn>=1.9.1",
     "scipy",
     "torch",
     "torchvision>=0.28.0",
     "ultralytics>=8.4.120",
-    "vgamepad",
 ]
 
+[project.optional-dependencies]
+# TensorRT 推理运行时与离线引擎构建（python -m airdrop.run build-trt）所需可选依赖
+trt = [
+    "onnx>=1.23.0",
+    "tensorrt>=11.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.16.8",
+]
+
+# ======================================================================
+# uv —— 依赖索引与源绑定
+# ======================================================================
 [tool.uv]
 index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
@@ -33,29 +54,13 @@ explicit = true
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 
-[dependency-groups]
-dev = [
-    "pyright>=1.1.414",
-    "pytest>=9.1.1",
-    "pytest-cov>=7.1.0",
-    "pytest-timeout>=2.4.0",
-    "ruff>=0.16.8",
-]
-
 # ======================================================================
-# ruff —— 代码规范（lint + format）
+# Ruff —— 静态检查与代码格式化
 # ======================================================================
-# 跑法（都在项目根目录），三条都必须干净：
-#   ./.venv/Scripts/ruff.exe check .           # 只检查
-#   ./.venv/Scripts/ruff.exe check . --fix     # 自动修可修项
-#   ./.venv/Scripts/ruff.exe format .          # 统一格式
-#   ./.venv/Scripts/ruff.exe format --check .  # 只验证格式（CI/提交前）
 [tool.ruff]
 line-length = 100
 target-version = "py314"
-
-# 不参与检查的目录：外部源码（PX4/QGC，只读参考）、虚拟环境、飞行记录、
-# 模型权重，以及"派生产物 / 临时目录"（见 .gitignore 同名条目）。
+# 排除只读第三方参考源码、虚拟环境、本地运行/模型/航线目录、独立子仓与测试临时目录
 extend-exclude = [
     "PX4-Autopilot-1.17.0",
     "qgroundcontrol-master",
@@ -69,70 +74,54 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-# 说明：这里刻意不用 `select = ["ALL"]`——本项目注释/文档是中文，ALL 里
-# RUF001/RUF002/RUF003（易混 Unicode 字符）对全角标点一条就能报 7k+ 次，
-# 与项目语言直接冲突。下面是"能真跑成 0 告警"的务实集合。
+# 显式选择与中文工程代码兼容的规则集，避免与中文全角标点习惯冲突
 select = [
-    "E4",  # pycodestyle：import 相关
-    "E7",  # pycodestyle：语句级问题
-    "E9",  # pycodestyle：语法/运行时错误
-    "F",   # Pyflakes：未使用导入/变量、未定义名字
-    "W",   # pycodestyle：警告（含 W605 无效转义）
-    "I",   # isort：导入排序
-    "UP",  # pyupgrade：现代写法（X | None、内置泛型、collections.abc）
-    "B",   # flake8-bugbear：常见陷阱
-    "SIM", # flake8-simplify
-    "C4",  # flake8-comprehensions
-    "RUF", # Ruff 自有规则
-    "BLE", # flake8-blind-except：裸 except Exception（源码里的 noqa 就是为它写的）
-    "SLF", # flake8-self：访问私有成员（测试里就是要测内部状态）
-    "PL",  # Pylint
-    "PT",  # flake8-pytest-style
+    "E4",  # pycodestyle：模块导入规范
+    "E7",  # pycodestyle：语句级检查
+    "E9",  # pycodestyle：语法与解析错误
+    "F",   # Pyflakes：未使用导入/变量与未定义名称
+    "W",   # pycodestyle：常规警告（含 W605 无效转义）
+    "I",   # isort：导入分组与排序
+    "UP",  # pyupgrade：Python 3.14 现代语法与类型标注
+    "B",   # flake8-bugbear：常见缺陷与陷阱
+    "SIM", # flake8-simplify：控制流与表达式简化
+    "C4",  # flake8-comprehensions：推导式规范
+    "RUF", # Ruff 内置扩展规则
+    "BLE", # flake8-blind-except：约束未标注的宽泛异常捕获
+    "SLF", # flake8-self：私有成员访问约束
+    "PL",  # Pylint：复杂度与结构检查
+    "PT",  # flake8-pytest-style：pytest 用例规范
 ]
 ignore = [
-    # 中文注释/文档里全角标点是排版要求，`**强调**` 是 docstring 的既定写法；
-    # UP037 会连带把它们一起去掉（它按 token 找字符串字面量，分不清标注与文档），
-    # 实测 45 条修复里绝大多数是 docstring 被误改，因此整条关掉。
+    # UP037 按 token 扫描字符串字面量，易误伤中文 docstring 与排版标注
     "UP037",
-    # 科学计算/测试里到处是 0.0 / 1.0 / 100 这类有明确物理含义的字面量，
-    # 逐个提成常量反而更难读
+    # 科学计算、物理阈值与测试夹具中的数值字面量直接使用更具可读性
     "PLR2004",
-    # 「重依赖只在函数体内导入」是本项目的硬约定（见 AGENTS.md 第 17 条），
-    # 函数内 import 是刻意为之，不是风格问题
+    # 重型依赖遵循按需惰性导入契约，允许在函数体内导入
     "PLC0415",
-    # 复合断言（`assert x is not None and x.ok`）在测试里是守卫式写法，
-    # 拆成两句会丢掉"非空才可访问"的语义；源码里只剩 2 处（recorder.py）
+    # 允许在测试与源码中采用守卫式复合断言（assert x is not None and x.ok）
     "PT018",
-    # `int(round(x))` 的 `int()` 看着多余（round 单参在纯 Python 下已返回 int），
-    # 但本项目的量大多来自 numpy：`np.arange(...)` / `round(np.float64)` 返回的都是
-    # numpy 标量，去掉 int() 会把 np.float64 带进下游（calibrate.py:669 就是这么一处）。
-    # 保留这层显式收窄，比省掉两个字符有价值。
+    # 对 numpy 标量保留显式 int(round(...)) 收窄，防止 numpy 标量类型透传至下游
     "RUF046",
 ]
-
-# RUF001/RUF002/RUF003（易混 Unicode 字符）保留启用——它能抓住真正的形近字符
-# 误用（比如把 `l` 写成西里尔 `і`）。这里只放行本项目刻意的排版字符：
-# `allowed-confusables` 是**精确清单**，不按类别放宽。
-# 清单是实测出来的：全库跑一遍 RUF001/002/003，被点名的字符一共就这 12 个。
+# 保留 RUF001/RUF002/RUF003 以拦截形近字符误用，仅精准放行中文排版全角标点与常用符号
 allowed-confusables = [
-    "（",  # FULLWIDTH LEFT PARENTHESIS
-    "）",  # FULLWIDTH RIGHT PARENTHESIS
-    "，",  # FULLWIDTH COMMA
-    "：",  # FULLWIDTH COLON
-    "；",  # FULLWIDTH SEMICOLON
-    "？",  # FULLWIDTH QUESTION MARK
-    "×",  # MULTIPLICATION SIGN
-    "−",  # MINUS SIGN（数学式里的负号，与连字符区分）
-    "–",  # EN DASH（数值区间，如 100–200）
-    "α",  # GREEK SMALL LETTER ALPHA
-    "ρ",  # GREEK SMALL LETTER RHO
-    "σ",  # GREEK SMALL LETTER SIGMA
+    "（", # FULLWIDTH LEFT PARENTHESIS
+    "）", # FULLWIDTH RIGHT PARENTHESIS
+    "，", # FULLWIDTH COMMA
+    "：", # FULLWIDTH COLON
+    "；", # FULLWIDTH SEMICOLON
+    "？", # FULLWIDTH QUESTION MARK
+    "×", # MULTIPLICATION SIGN
+    "−", # MINUS SIGN
+    "–", # EN DASH
+    "α", # GREEK SMALL LETTER ALPHA
+    "ρ", # GREEK SMALL LETTER RHO
+    "σ", # GREEK SMALL LETTER SIGMA
 ]
 
 [tool.ruff.lint.pylint]
-# Pylint 的默认阈值（5 个参数 / 12 个分支 / 50 条语句）对一个
-# "数据类 + 标定流水线"的项目过严；这里放到实测既有代码的档位，
-# 再往上就该拆函数了。
+# 放宽多参数配置组装与计算流水线函数的复杂度上限
 max-args = 10
 max-positional-args = 6
 max-branches = 15
@@ -140,64 +129,46 @@ max-statements = 60
 max-returns = 8
 
 [tool.ruff.lint.per-file-ignores]
-# tests/conftest.py 要在临时目录建好之后再把 `airdrop` 加进 sys.path（沙箱相关），
-# 那两行 import 必须留在后面
+# tests/conftest.py 须在初始化测试环境后再导入被测模块，保留延迟顶部导入
 "tests/conftest.py" = ["E402"]
-# 测试：本来就要碰私有状态（`broker._history` 这类）与裸断言，
-# 复合断言是守卫式写法（`assert x is not None and x.ok`），拆开就丢了语义；
-# `pytest.raises(ValueError)` 的 `match=` 与 `dict()` 字面量也不值得为风格改写
+# 测试允许访问受测对象私有状态、使用宽泛异常匹配及参数较多的参数化夹具
 "tests/**" = [
-    "SLF001",
-    "PT011",
-    "PT018",
+    "B007",
+    "C408",
+    "E741",
     "PLR0913",
     "PLR0915",
     "PLR0917",
-    "E741",
-    "C408",
-    "RUF015",
-    "UP031",
+    "PLW2901",
+    "PT011",
     "RUF005",
     "RUF007",
-    "B007",
+    "RUF015",
     "RUF043",
     "RUF059",
-    "PLW2901",
     "SIM102",
+    "SLF001",
+    "UP031",
 ]
-# 开发工具：`print` 是输出方式；参数多是因为把配置摊平成关键字；
-# 打表输出用 `%` 占位符是既有写法
-"tools/**" = ["T201", "PLR0913", "PLR0915", "PLR0917", "INP001", "UP031", "PLW2901"]
-# 惰性导出包：`__all__` 的"常量 → 类 → 函数"分组是本项目的既定契约
-# （tools/dump_api.py 与 tools/check_docs.py 依赖它），不改成字典序
+# 开发脚本需展开较多配置参数与格式化输出，适当放宽函数复杂度限制
+"tools/**" = ["PLR0913", "PLR0915", "PLR0917", "PLW2901", "UP031"]
+# 惰性导出包按"常量 -> 类 -> 函数"分组组织 __all__（供接口导出与文档校验工具解析）
 "airdrop/__init__.py" = ["RUF022"]
-"airdrop/*/__init__.py" = ["RUF022", "F401"]
+"airdrop/*/__init__.py" = ["F401", "RUF022"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["airdrop", "tools"]
 
-# 派生产物（docs/api_reference.md）不进检查范围
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
-# 全库已按本配置格式化；`format --check` 应保持全绿。格式化**只许动排版**：
-# 验收判据是"格式化前后 AST（剥掉位置信息）完全一致"，不要只依赖测试通过。
-#
-# 两条结论（都别再"顺手"改）：
-# 1. `number` 一栏不需要配：Python 3.14 的 `except A, B:`（PEP 758）就是合法的
-#    元组写法，格式化会把 `except (A, B):` 收成它，不是语法错误。
-# 2. **E501 保持关闭**。`ruff format` 在时会自动压掉 E501，而格式化器对
-#    "拆不开的行"（长 URL、单条长字符串字面量、行尾 noqa）本就放弃限长——
-#    显式打开 E501 只会稳定报出 10 条它自己不愿拆的行（实测 101~108 列），
-#    纯噪声。line-length 的作用是**指导格式化器**，不是要求每行都 ≤100。
+# line-length 仅用于指导格式化器折行；保持 E501 关闭，避免不可折行的长 URL、
+# 长字符串字面量或行尾 noqa 触发误报。Python 3.14 按 PEP 758 支持不带括号的 except A, B:。
 
 # ======================================================================
-# pyright —— 类型检查
+# Pyright —— 静态类型检查
 # ======================================================================
-# basic 与 standard 在本仓库的报错一致（差异规则都落在第三方源码里），
-# 因此取兼容性更好、误报更少的 basic。
-# 跑法：./.venv/Scripts/pyright.exe（读本节配置；PKG 列表来自 include）
 [tool.pyright]
 extraPaths = ["vendor/airdrop-sim", "vendor/airdrop-calibration"]
 include = ["airdrop", "tests", "tools"]
@@ -217,22 +188,22 @@ exclude = [
     "models",
     "routes",
 ]
+# 第三方依赖类型桩覆盖不一，采用 basic 模式以减少外部噪声
 typeCheckingMode = "basic"
 pythonVersion = "3.14"
 venvPath = "."
 venv = ".venv"
-# 惰性导出（PEP 562）下 pyright 无法静态解析 `__all__` 里的名字，
-# 每个包都会报一遍（airdrop/__init__.py 一个文件就 175 条）。
-# `__all__` 与 `_EXPORTS` 的一致性由 tests/test_cli.py 真跑钉住，这里关掉噪音。
+# 顶层及子包采用 PEP 562 惰性导出，__all__ 一致性由单测校验
 reportUnsupportedDunderAll = "none"
-# 私有成员访问已在 ruff 侧按文件放行；pyright 的 reportPrivateUsage 也一并放宽
-# （测试里就是要碰 broker._history / stream._thread 这些内部状态）。
+# 与 Ruff 配置对齐，允许测试及包内跨模块访问受测私有成员
 reportPrivateUsage = "none"
 
+# ======================================================================
+# Pytest & Coverage —— 测试与覆盖率配置
+# ======================================================================
 [tool.pytest.ini_options]
-# 测试层级由 tests/conftest.py 的 --test-tier 选择；默认 fast，覆盖率按命令显式启用。
+# 测试分层由 tests/conftest.py 的 --test-tier 控制，默认执行 fast 层级
 testpaths = ["tests"]
-# -ra：汇总非通过用例的原因；--strict-*：标记/配置写错就直接报错，不许静默放过
 addopts = [
     "-ra",
     "--strict-markers",
@@ -243,11 +214,10 @@ markers = [
     "network: 走网络错误路径，需要等超时或连接被拒",
     "integration: 跨模块、跨仓库或真实子进程集成回归",
     "wsl: 需要 WSL 或 ext4 行为，仅平台 tier 运行",
-    "realdata: 需要 GPU + 真实素材/权重（视频路径用 AIRDROP_REALDATA_VIDEO 指定、PP-OCR 权重），分钟级",
-    "sitl: 需要 WSL 里已经起好的 PX4 SITL + Gazebo 图传（本测试只驱动，不负责启动；分钟级）",
+    "realdata: 需要 GPU 与真实素材/权重（如 AIRDROP_REALDATA_VIDEO 与 PP-OCR 权重）",
+    "sitl: 需要预先启动的 WSL PX4 SITL 与 Gazebo 图传环境",
 ]
-# 全局超时兜底：拉流用例一旦卡住（管道读不回、子进程不退）要能失败而不是挂死。
-# Windows 上没有 SIGALRM，必须用 thread 方式。
+# Windows 平台无 SIGALRM，统一使用线程超时防止拉流或子进程用例挂死
 timeout = 180
 timeout_method = "thread"
 

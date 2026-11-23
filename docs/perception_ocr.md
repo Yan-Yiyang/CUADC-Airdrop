@@ -1,7 +1,6 @@
-# 感知/OCR：转正形态判据、Cls 与 onnxruntime
+# 感知/OCR：转正形态判据与 Cls 方向诊断
 
-本文档说明：检测 → 裁剪 → 五边形转正 → OCR 的流水线细节与实测结论，含顶角形态门限的来龙
-去脉、RapidOCR 的 `Cls` 与权重命名、onnxruntime-gpu 的 CUDA 前提、几何转正缺陷与已知边界。
+本文档说明：检测 → 裁剪 → 五边形转正 → OCR 的流水线细节，含顶角形态门限、RapidOCR 的 `Cls` 与 PyTorch 权重命名、几何转正缺陷与已知边界。
 修改 `perception/cropproc.py`、换 OCR 权重/引擎、或复测真实素材准确率时请先阅读本文档。
 
 ---
@@ -21,13 +20,13 @@
   **顶点绕行与内角计算约束**：
   1. 轮廓顶点须按非自交顺序排列（`apex, tl, bl, br, tr`），避免自交多边形导致邻边错配；
   2. `_find_min_angle` 计算顶点 `pts[i]` 的内角时，必须使用其真实前后相邻顶点 `pts[i-1]` 与 `pts[i+1]`。
-- **OcrEngine**（`cropproc.py`）：RapidOCR 薄封装，**det/rec 走 TORCH 引擎 + 显式本地 `.pth` 路径**。
+- **OcrEngine**（`cropproc.py`）：RapidOCR 薄封装，**det/cls/rec 全程走 TORCH 引擎 + 显式本地 `.pth` 路径（不加载 ONNX 模型）**。
   `default_models.yaml` 里没有 `torch:` 段，TORCH 只能靠 `model_path` 指定本地权重。
   **方向分类（Cls）已接入，但只作检查/调试（交叉验证与排故），默认不参与识别**：正式链路的转向由
   几何转正保证（平行边法 + 顶角 `60°±15°` 门限），所以 `cls_autorotate` 默认 `False`，省掉逐帧
   分类计算；要它按判定把倒置文本行转正再识别就显式设 `True`。
-  `cls_engine` 决定用哪个后端（`"off"` 默认，另有 `"onnx"`/`"torch"`），**只在启用它时才生效**；
-  `"off"` 禁用 ONNXRuntime CUDA 会话以节省显存，但 `classify_orientation()` 会明确拒绝（不静默给值）。对外只多一个
+  `cls_engine` 决定是否启用方向分类（`"off"` 默认，启用诊断时设为 `"torch"`）；
+  `"off"` 下 `classify_orientation()` 会明确拒绝（不静默给值）。对外只多一个
   `classify_orientation(image) -> OcrOrientation`（**诊断入口**，给几何转正做交叉验证用）。
   通过 `det_max_side_len=960` 约束狭长裁切图在 `limit_type="min"`（736）下的等比放大上限
   （超限时缩放并在短边补黑边至 736，检测框自动映射回原图坐标）。
@@ -42,17 +41,11 @@
   `ch_ptocr_mobile_v2.0_cls_mobile`（`pt`）而正规模型名是 `ch_ppocr_...`（`pp`）。
   TORCH 引擎**按文件名 stem 查架构**（`networks/main.py` 的 `_load_arch_config`），
   所以权重文件名须使用该键名。`tools/fetch_models.py` 提供的 cls 权重文件名应保持不变。
-- **`onnxruntime-gpu` 的 CUDA 前提**：在该流程中，创建会话前先导入 `torch`，便于加载 CUDA
-  运行库；是否可用以实际 provider 为准。`onnxruntime-gpu` 与 CUDA/cuDNN 版本必须匹配。
-  项目的 `OcrEngine._report_cls_device()` 会检查首个 provider 并告警，不能把静默退回 CPU
-  当作 CUDA 正常工作。
-  本项目 det/rec 使用 TORCH 引擎，正常初始化顺序已满足上述前提；但正式配置默认
-  `cls_engine="off"` 以避免未使用的 ORT CUDA 会话占用显存，显式开启 `cls_engine="onnx"` 诊断时仍须核对实际 provider。
 - **方向分类默认关（`cls_engine="off"`、`cls_autorotate=False`），只作检查/调试**：正式链路的方向由几何转正保证，
   Cls 用于交叉验证与排故，不参与默认识别。
   * **边界**：阈值筛选不能保证方向判定正确；如果几何转正方向错误，OCR 仍可能读错编号。
     `classify_orientation()` 是诊断接口。
-  * **旋钮**：诊断交叉验证显式设 `cls_engine="onnx"`（或 `"torch"`）；`cls_autorotate=True` 恢复自动转正。
+  * **旋钮**：诊断交叉验证显式设 `cls_engine="torch"`；`cls_autorotate=True` 恢复自动转正。
 - **几何转正的顶角形态门限（60°±15°）**：
   * **设计意图**：`_find_apex_by_parallel` 仅验证轮廓中存在一对平行边，无法单独区分完整靶板与近方形编号底板。当高饱和度掩码仅提取到底板轮廓时，`approxPolyDP` 仍可能拟合出含一对平行边的五边形并给出错误转正角；若在首个读出数字的档位即提前返回，将遮蔽后续宽松饱和度档位上的真实靶板候选。
   * **实现机制**（`cropproc.py`）：① `_is_house_pentagon()` 以等边三角形顶角恒为 60° 作为形态判据（`HOUSE_APEX_ANGLE_DEG=60`、`TOL=15`）；② 形态不成立的档位不提前返回，继续尝试后续更宽松的饱和度档位；③ `CropResult.house_ok` 记录形态是否成立，`_best_candidate` 优先选择形态成立的候选，同形态下再比较置信度。

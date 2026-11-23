@@ -25,8 +25,7 @@
 ----------------
 * YOLO 检测：``best2.pt`` → ``models/best2.pt``（单类 ``target``）
 * PP-OCRv6（TORCH）：``*.pth`` 与 ``*dict.txt`` → ``models/ppocr/``
-* 方向分类（Cls）：``ch_ppocr_mobile_v2.0_cls_mobile.onnx`` 与
-  ``ch_ptocr_mobile_v2.0_cls_mobile.pth`` → ``models/ppocr/``（文件名保持原样）
+* 方向分类（Cls）：``ch_ptocr_mobile_v2.0_cls_mobile.pth`` → ``models/ppocr/``（文件名保持原样）
 
 权重来源需自备（仓库不带权重）。本脚本只做复制，不联网。
 """
@@ -67,10 +66,8 @@ OCR_FILES = (
     "PP-OCRv6_rec_tiny.pth",
     "ppocrv6_dict.txt",
     "ppocrv6_tiny_dict.txt",
-    # 方向分类（Cls）两个权重都要（ONNX 是默认引擎，TORCH 备选）；
-    # 文件名保持 RapidOCR 原命名，不要改动（TORCH 引擎按文件名 stem 查架构）。
+    # 方向分类（Cls）使用 PyTorch 权重，文件名保持 RapidOCR 原命名（按文件名 stem 查架构）。
     "ch_ptocr_mobile_v2.0_cls_mobile.pth",
-    "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
 )
 
 

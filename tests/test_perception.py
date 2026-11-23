@@ -594,35 +594,34 @@ def test_postprocess_empty_image_is_safe() -> None:
 
 
 @pytest.mark.parametrize(
-    ("overrides", "expected_cls", "autorotate", "cuda"),
+    ("overrides", "cls_enabled", "autorotate", "cuda"),
     [
-        pytest.param({}, None, False, False, id="default-off"),
-        pytest.param({"cls_engine": "onnx"}, "onnx", False, True, id="onnx-diagnostic"),
+        pytest.param({}, False, False, True, id="default-off"),
+        pytest.param({"cls_engine": "torch"}, True, False, True, id="torch-diagnostic"),
         pytest.param(
-            {"cls_engine": "onnx", "cls_autorotate": True},
-            "onnx",
+            {"cls_engine": "torch", "cls_autorotate": True},
             True,
             True,
-            id="onnx-autorotate",
+            True,
+            id="torch-autorotate",
         ),
         pytest.param(
-            {"cls_engine": "torch", "cls_use_cuda": False}, "torch", False, False, id="torch-cpu"
+            {"cls_engine": "torch", "cls_use_cuda": False}, True, False, False, id="torch-cpu"
         ),
-        pytest.param({"cls_engine": "off"}, None, False, False, id="off"),
+        pytest.param({"cls_engine": "off"}, False, False, True, id="off"),
     ],
 )
 def test_ocr_engine_assembles_model_paths_and_options(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides, expected_cls, autorotate, cuda
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides, cls_enabled, autorotate, cuda
 ) -> None:
-    """通过公开初始化入口核对交给 RapidOCR 的路径、引擎与方向开关。"""
-    for name in ("det.pth", "rec.pth", "keys.txt", "direction.onnx", "direction.pth"):
+    """通过公开初始化入口核对交给 RapidOCR 的路径、PyTorch 引擎与方向开关。"""
+    for name in ("det.pth", "rec.pth", "keys.txt", "direction.pth"):
         (tmp_path / name).touch()
     config = OcrEngineConfig(
         model_dir=str(tmp_path),
         det_model="det.pth",
         rec_model="rec.pth",
         rec_keys="keys.txt",
-        cls_onnx_model="direction.onnx",
         cls_torch_model="direction.pth",
         **overrides,
     )
@@ -634,10 +633,9 @@ def test_ocr_engine_assembles_model_paths_and_options(
         return backend
 
     module = ModuleType("rapidocr")
-    module.__dict__.update(
-        EngineType=SimpleNamespace(TORCH="torch", ONNXRUNTIME="onnx"), RapidOCR=create_engine
-    )
+    module.__dict__.update(EngineType=SimpleNamespace(TORCH="torch"), RapidOCR=create_engine)
     monkeypatch.setitem(sys.modules, "rapidocr", module)
+    monkeypatch.setitem(sys.modules, "onnxruntime", None)
     engine = OcrEngine(config)
     assert engine.ensure() is backend
     assert len(received) == 1
@@ -646,32 +644,23 @@ def test_ocr_engine_assembles_model_paths_and_options(
     assert params["Rec.model_path"] == str(tmp_path / "rec.pth")
     assert params["Rec.rec_keys_path"] == str(tmp_path / "keys.txt")
     assert params["Det.engine_type"] == params["Rec.engine_type"] == "torch"
+    assert params["Cls.engine_type"] == "torch"
+    assert params["Cls.model_path"] == str(tmp_path / "direction.pth")
     assert params["Global.use_cls"] is autorotate
-    if expected_cls is None:
-        assert "Cls.engine_type" not in params
-        assert params["Cls.model_path"] == str(tmp_path / "direction.onnx")
-        assert params["EngineConfig.onnxruntime.use_cuda"] is False
-    else:
-        assert params["Cls.engine_type"] == expected_cls
-        assert params["Cls.model_path"] == str(
-            tmp_path / ("direction.pth" if expected_cls == "torch" else "direction.onnx")
-        )
-        device_key = (
-            "EngineConfig.torch.use_cuda"
-            if expected_cls == "torch"
-            else "EngineConfig.onnxruntime.use_cuda"
-        )
-        assert params[device_key] is cuda
+    assert "EngineConfig.onnxruntime.use_cuda" not in params
+    if cls_enabled:
+        assert params["EngineConfig.torch.use_cuda"] is cuda
 
 
-def test_cls_engine_rejects_unknown_name() -> None:
+@pytest.mark.parametrize("invalid_engine", ["openvino", "onnx"])
+def test_cls_engine_rejects_unknown_name(invalid_engine: str) -> None:
     with pytest.raises(ValueError, match="cls_engine"):
-        OcrEngine(OcrEngineConfig(cls_engine="openvino"))._cls_params(None)
+        OcrEngineConfig(cls_engine=invalid_engine)
 
 
 def test_cls_weight_is_required_when_enabled() -> None:
     """启用方向分类时缺权重必须显式报错，且错误里点出是哪个文件。"""
-    engine = OcrEngine(OcrEngineConfig(model_dir="models/does-not-exist", cls_engine="onnx"))
+    engine = OcrEngine(OcrEngineConfig(model_dir="models/does-not-exist", cls_engine="torch"))
     with pytest.raises(FileNotFoundError, match="cls_mobile"):
         engine.ensure()
 
@@ -752,7 +741,7 @@ def test_ocr_warmup_runs_det_rec_and_enabled_cls_even_without_text_boxes() -> No
             calls.append(("cls", images[0].shape))
             return []
 
-    config = OcrEngineConfig(cls_engine="onnx", cls_autorotate=False)
+    config = OcrEngineConfig(cls_engine="torch", cls_autorotate=False)
     ocr = OcrEngine(config)
     ocr._engine = Engine()
 
@@ -762,7 +751,7 @@ def test_ocr_warmup_runs_det_rec_and_enabled_cls_even_without_text_boxes() -> No
         ("rec", (48, 320, 3)),
         ("cls", (48, 320, 3)),
     ]
-    assert config.cls_engine == "onnx" and config.cls_autorotate is False
+    assert config.cls_engine == "torch" and config.cls_autorotate is False
 
 
 @pytest.mark.parametrize("failed_stage", ["det", "rec", "cls"])
@@ -783,7 +772,7 @@ def test_ocr_warmup_fails_when_any_model_branch_raises(failed_stage: str) -> Non
                 raise RuntimeError("cls failed")
             return []
 
-    ocr = OcrEngine(OcrEngineConfig(cls_engine="onnx"))
+    ocr = OcrEngine(OcrEngineConfig(cls_engine="torch"))
     ocr._engine = Engine()
 
     assert not ocr.warmup()

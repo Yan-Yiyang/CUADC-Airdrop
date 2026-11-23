@@ -160,14 +160,14 @@ def _number_strip(engine, rectified):
 
 @pytest.mark.skipif(not WEIGHTS.is_file(), reason="缺少 YOLO 权重 models/best2.pt")
 @pytest.mark.skipif(
-    not (MODELS_DIR / "ch_ppocr_mobile_v2.0_cls_mobile.onnx").is_file(),
+    not (MODELS_DIR / "ch_ptocr_mobile_v2.0_cls_mobile.pth").is_file(),
     reason="缺少 Cls 权重（跑 python -m tools.fetch_models）",
 )
 def test_rectification_cross_checked_by_orientation_cls(annotated_video: Path) -> None:
     """几何转正 vs 学习式方向判别：两条信息完全不同的判据互相比对。
 
     * 几何转正只用形状（正方形 + 上边一个等边三角形）决定转向；
-    * 方向判别（``ch_ppocr_mobile_v2.0_cls``）用的是学出来的笔画方向。
+    * 方向判别（``ch_ptocr_mobile_v2.0_cls_mobile.pth``）用的是学出来的笔画方向。
 
     裁决用两向对比而不是门限：同一块数字条，分别问"它正立吗"与"把它转 180°
     后正立吗"，取正立概率更大的一向。真实低分素材上判别置信度很低（0.19~0.86，
@@ -191,7 +191,7 @@ def test_rectification_cross_checked_by_orientation_cls(annotated_video: Path) -
     from airdrop.perception.cropproc import OcrEngine, OcrEngineConfig, OpenCvPostProcess
     from airdrop.perception.detector import Detector, DetectorConfig
 
-    engine = OcrEngine(OcrEngineConfig(cls_engine="onnx"))
+    engine = OcrEngine(OcrEngineConfig(cls_engine="torch"))
     engine.ensure()  # cls_providers() 只在加载后才有内容
     if not engine.cls_providers():
         pytest.skip("方向分类未就绪")

@@ -27,7 +27,7 @@
 | `AGENTS.md` | 面向 AI 智能体的执行约束、代码入口与按需阅读索引 | 智能体工作指南 |
 | `docs/calibration_opencv.md` | 三步标定与 OpenCV 5.0 问题与易错点全记录（实测表、方程、判据） | **实测口径** |
 | `docs/video_hm30_ffmpeg.md` | 图传接收、冷热存储与排障 | **实测口径** |
-| `docs/perception_ocr.md` | 检测/OCR 细节：转正形态门限、Cls 权重命名、onnxruntime 前提 | **实测口径** |
+| `docs/perception_ocr.md` | 检测/OCR 细节：转正形态门限、Cls 权重命名与方向诊断 | **实测口径** |
 | `docs/ballistics_fit.md` | 投放记录与反演：可辨识性判据、σ、留一验证 | **实测口径** |
 
 **冲突时的优先级**：当前代码、配置与测试 > 相关专题文档 > 本手册 > `AGENTS.md`/`README.md` 的概述性描述。
@@ -121,12 +121,11 @@
 | `models/ppocr/PP-OCRv6_rec_medium.pth` | 否 | OCR 文本识别默认模型 |
 | `models/ppocr/PP-OCRv6_{det,rec}_{small,tiny}.pth` | 否 | 备选尺度（`OcrEngineConfig` 可切换） |
 | `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 否 | 方向分类 TORCH 版（须保持 RapidOCR 的 `ptocr` 拼写，不可改名） |
-| `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 否 | 方向分类 ONNX 版（仅诊断显式启用 `cls_engine="onnx"` 时使用） |
 | `models/ppocr/ppocrv6_dict.txt` | **是** | 识别字符集字典（固定识别字符集） |
 | `models/ppocr/ppocrv6_tiny_dict.txt` | **是** | tiny 模型字典 |
 
 取权重：`python -m airdrop.run fetch-models`（**只复制、不联网**；源路径是文件内常量，可由 `--source-dir` 覆盖）。
-> Cls 权重命名与 onnxruntime 的 CUDA 前提见 [docs/perception_ocr.md](perception_ocr.md)。
+> Cls 权重命名与方向诊断说明见 [docs/perception_ocr.md](perception_ocr.md)。
 
 ---
 
@@ -719,7 +718,7 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 
 > **方向分类（Cls）的定位**：只用于**检查/调试**（几何转正的交叉验证与排故）。正式链路
 > 的方向由几何转正决定（平行边法 + 顶角 `60°±15°` 门限），所以 `cls_autorotate` 默认 `False`、
-> `cls_engine` 默认 `'off'`（关闭未使用的 ONNXRuntime CUDA 会话以省显存；诊断交叉验证时显式传 `'onnx'` 或 `'torch'`）。
+> `cls_engine` 默认 `'off'`（诊断交叉验证时显式传 `'torch'`，全程使用 PyTorch 后端，不加载 ONNX 模型）。
 
 `OcrEngineConfig` 默认值（走 `airdrop.perception.cropproc`）：
 
@@ -729,8 +728,7 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 | `det_model` | `'PP-OCRv6_det_medium.pth'` | 检测权重 |
 | `rec_model` | `'PP-OCRv6_rec_medium.pth'` | 识别权重 |
 | `rec_keys` | `'ppocrv6_dict.txt'` | 字符集字典（在 git 里） |
-| `cls_engine` | `'off'` | 方向分类后端（`'off'`/`'onnx'`/`'torch'`）；默认关闭以省去未使用的 ORT CUDA 显存，诊断时显式启用 |
-| `cls_onnx_model` | `'ch_ppocr_mobile_v2.0_cls_mobile.onnx'` | ONNX 版分类权重 |
+| `cls_engine` | `'off'` | 方向分类开关与后端（`'off'`/`'torch'`）；默认关闭，诊断时显式设为 `'torch'` |
 | `cls_torch_model` | `'ch_ptocr_mobile_v2.0_cls_mobile.pth'` | TORCH 版分类权重（须保持 RapidOCR 的 `ptocr` 命名） |
 | `cls_use_cuda` | `True` | 分类是否用 CUDA |
 | `cls_thresh` | `0.9` | 方向判定阈值 |
@@ -742,7 +740,7 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 | `rec_batch_num` | `6` | 识别批大小 |
 | `log_level` | `'error'` | RapidOCR 日志级别 |
 
-两个前提条件见 [`docs/perception_ocr.md`](perception_ocr.md)：TORCH 版方向分类权重文件名须保持 RapidOCR 的 `ch_ptocr_` 拼写；`onnxruntime-gpu` 使用 CUDA 前须在进程中先导入 `torch`。
+方向分类权重命名约定见 [`docs/perception_ocr.md`](perception_ocr.md)：TORCH 版方向分类权重文件名须保持 RapidOCR 的 `ch_ptocr_` 拼写。
 
 #### 3.4.5 `OcrWorkerPool` —— OCR 独立进程池
 
@@ -2057,7 +2055,6 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | --- | --- | --- |
 | `models/best2.pt` | YOLO 检测权重默认路径（由使用者自备） | ❌（`*.pt` 忽略） |
 | `models/ppocr/PP-OCRv6_det_medium.pth`、`PP-OCRv6_rec_medium.pth` | RapidOCR TORCH 引擎权重（det/rec） | ❌（`*.pth`） |
-| `models/ppocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx` | 方向分类 ONNX（诊断交叉验证按需传 `cls_engine="onnx"`） | ❌（`*.onnx`） |
 | `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 方向分类 TORCH 权重（须保持 RapidOCR 的 `ptocr` 拼写，不可改名） | ❌ |
 | `models/ppocr/*.txt` | 字符集字典——**入库**：固定识别字符集以保证结果可复现 | ✅ |
 
@@ -2348,7 +2345,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | 图传一帧都没有，`stats.last_error` 有采集错误 | 地址、网络或输入参数不对（HM30 网段 `192.168.144.0/24`） | 检查地址与错误，确认流有可解码关键帧；程序不探测地址 |
 | 断了流仍在读旧画面 / `read()` 阻塞不返回 | 链路超时或消费者没有等待新帧 | 检查 `read_timeout`、进程状态及重连；详见 `docs/video_hm30_ffmpeg.md` |
 | 新会话连不上飞控 / 端口 50051 被占 | 旧 mavsdk_server 僵尸进程 | 必须走 `MavsdkThread.stop()`（内部 `_release_drone()`）；必要时手动结束残留进程 |
-| ONNX/TORCH 报 CUDA 不可用，静默退回 CPU | 进程里没有先 `import torch`（cuDNN/cuBLAS DLL 不在搜索路径） | 本项目 det/rec 走 TORCH 天然满足；`OcrEngine._report_cls_device()` 会告警——看日志 |
+| TORCH OCR 报 CUDA 不可用，退回 CPU | CUDA 驱动或 PyTorch CUDA 运行库未就绪 | 核对 `torch.cuda.is_available()` 与 `OcrEngine._report_cls_device()` 日志 |
 | OCR 读出倒置编号（如 `56` 读成 `95`） | 几何转正差 180°（形态门限被绕过） | 保持 `60°±15°` 顶角形态判据与 `house_ok` 优先策略；调整门限前须基于目标样本重新验证（见 `docs/perception_ocr.md`） |
 | 单帧编号错（如 `01`） | OCR 单帧误读 | 由 `targeting` 的**类内众数**兜底；多帧观测足够时自动纠正 |
 | `drops.jsonl` 是空的 | 本次没有实际投放（判据没触发/未接判据 `no_judge`/投放被拒） | 看 `events.jsonl` 的 `drop_skipped`/`error`/`abort_action` |

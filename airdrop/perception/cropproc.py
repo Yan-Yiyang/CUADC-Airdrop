@@ -35,10 +35,10 @@
   （平行边法 + 顶角 ``60°±15°`` 门限）决定，``cls_autorotate`` 默认 ``False``，省掉逐帧
   分类计算。分类器默认不参与正式流程；需要其参与方向判定时应基于任务数据验证后
   显式启用 ``cls_autorotate=True``。
-* 方向分类（Cls）的权重文件名保持 RapidOCR 原样（TORCH 版是
+* 方向分类（Cls）的权重文件名保持 RapidOCR 原样（TORCH 版为
   ``ch_ptocr_mobile_v2.0_cls_mobile.pth``，引擎按文件名 stem 查架构）；
-  用哪个引擎由 :class:`OcrEngineConfig` 的 ``cls_engine`` 决定（默认 ``"off"``，
-  避免未使用的 ONNXRuntime CUDA 会话占用显存；诊断交叉验证时按需显式指定 ``"onnx"`` / ``"torch"``）。
+  是否启用由 :class:`OcrEngineConfig` 的 ``cls_engine`` 决定（默认 ``"off"``，
+  诊断交叉验证时按需显式指定 ``"torch"``，全程使用 PyTorch 后端，不加载 ONNX 模型）。
 """
 
 from __future__ import annotations
@@ -94,18 +94,13 @@ class OcrEngineConfig:
     det_model: str = "PP-OCRv6_det_medium.pth"
     rec_model: str = "PP-OCRv6_rec_medium.pth"
     rec_keys: str = "ppocrv6_dict.txt"
-    #: 方向分类（Cls）用哪个引擎：``"off"`` / ``"onnx"`` / ``"torch"``。
-    #: ⚠ 只在**启用方向分类**时才有意义（诊断/交叉验证，或显式打开 ``cls_autorotate``）：
-    #: 正式流程不用它，方向由几何转正保证。默认 ``"off"`` 以避免在每个 OCR 进程里
-    #: 分配未使用的 ONNXRuntime CUDA 会话与显存——代价是 ``classify_orientation()`` 会明确拒绝
-    #: （不是静默给值）；离线诊断交叉验证时显式传 ``cls_engine="onnx"`` 或 ``"torch"`` 即可。
+    #: 方向分类（Cls）开关与后端：``"off"``（默认关闭）或 ``"torch"``（PyTorch 诊断后端）。
+    #: 正式流程的方向由几何转正保证，默认 ``"off"`` 时 ``classify_orientation()`` 会明确拒绝；
+    #: 离线诊断交叉验证时显式传 ``cls_engine="torch"``。
     cls_engine: str = "off"
-    cls_onnx_model: str = "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
     #: 文件名保持 RapidOCR 原拼写（``ptocr``），不要规范化
     cls_torch_model: str = "ch_ptocr_mobile_v2.0_cls_mobile.pth"
-    #: Cls 是否用 CUDA。⚠ ONNX 的 CUDA EP 依赖 torch 先被 import
-    #: （torch/lib 里的 cuDNN/cuBLAS 才在进程搜索路径上），否则 onnxruntime 会静默
-    #: 退回 CPU；本项目 det/rec 走 TORCH 引擎，天然满足，但仍会显式核对并告警。
+    #: 启用 Cls 时是否使用 CUDA
     cls_use_cuda: bool = True
     #: 判定为 180° 的置信度门限（低置信度不动图，只记录判定）
     cls_thresh: float = 0.9
@@ -127,6 +122,8 @@ class OcrEngineConfig:
     log_level: str = "error"
 
     def __post_init__(self) -> None:
+        if self.cls_engine not in {"off", "torch"}:
+            raise ValueError(f"未知的 cls_engine: {self.cls_engine!r}（应为 torch / off）")
         if self.det_max_side_len < 0 or (0 < self.det_max_side_len < _DET_MIN_SIDE_LEN):
             raise ValueError(
                 f"det_max_side_len 必须为 0 或 >= {_DET_MIN_SIDE_LEN}: {self.det_max_side_len}"
@@ -177,17 +174,12 @@ class OcrEngineConfig:
     def keys_path(self) -> Path:
         return self._resolve_path(self.rec_keys)
 
-    def cls_onnx_path(self) -> Path:
-        return Path(self.model_dir) / self.cls_onnx_model
-
     def cls_torch_path(self) -> Path:
-        return Path(self.model_dir) / self.cls_torch_model
+        return self._resolve_path(self.cls_torch_model)
 
     def cls_path(self) -> Path:
-        """按 :attr:`cls_engine` 选对应的权重路径。"""
-        if self.cls_engine == "torch":
-            return self.cls_torch_path()
-        return self.cls_onnx_path()
+        """返回 PyTorch 方向分类权重路径。"""
+        return self.cls_torch_path()
 
     def cls_enabled(self) -> bool:
         return self.cls_engine != "off"
@@ -341,78 +333,62 @@ class OcrEngine:
         return self._engine
 
     def _cls_params(self, engine_type: Any) -> dict[str, Any]:
-        """方向分类（Cls）的构造参数；``cls_engine="off"`` 关闭自动旋转并禁用 ORT CUDA 会话。"""
+        """方向分类（Cls）的构造参数；全程固定使用 TORCH 引擎，不加载 ONNX 模型。"""
         config = self._config
+        torch_engine = getattr(engine_type, "TORCH", "torch")
         if not config.cls_enabled():
-            # rapidocr 会无条件构造 det/cls/rec 三个模块（Global.use_cls 只管流水线），
-            # 所以"关掉"仍需提供本地路径（防 modelscope 下载），同时显式关闭 ONNXRuntime CUDA
-            # 以免每个 OCR 进程白白分配一套未使用的 CUDA 上下文与显存。
+            # RapidOCR 初始化时会无条件构造 det/cls/rec 三个模块（Global.use_cls 仅控制流水线调用），
+            # 因此即使关闭方向分类也显式指定 TORCH 引擎与本地 .pth 权重，彻底避免导入 onnxruntime。
             params: dict[str, Any] = {
+                "Cls.engine_type": torch_engine,
                 "Global.use_cls": False,
-                "EngineConfig.onnxruntime.use_cuda": False,
             }
-            local = next(
-                (
-                    path
-                    for path in (config.cls_onnx_path(), config.cls_torch_path())
-                    if path.is_file()
-                ),
-                None,
-            )
-            if local is not None:
+            local = config.cls_path()
+            if local.is_file():
                 params["Cls.model_path"] = str(local)
             return params
-        if config.cls_engine == "onnx":
-            device = {
-                "Cls.engine_type": engine_type.ONNXRUNTIME,
-                "EngineConfig.onnxruntime.use_cuda": config.cls_use_cuda,
-            }
-        elif config.cls_engine == "torch":
-            device = {
-                "Cls.engine_type": engine_type.TORCH,
-                "EngineConfig.torch.use_cuda": config.cls_use_cuda,
-            }
-        else:
-            raise ValueError(f"未知的 cls_engine: {config.cls_engine!r}（应为 onnx / torch / off）")
+        if config.cls_engine != "torch":
+            raise ValueError(f"未知的 cls_engine: {config.cls_engine!r}（应为 torch / off）")
         return {
+            "Cls.engine_type": torch_engine,
             "Cls.model_path": str(config.cls_path()),
             "Cls.cls_thresh": config.cls_thresh,
             "Global.use_cls": config.cls_autorotate,
-            **device,
+            "EngineConfig.torch.use_cuda": config.cls_use_cuda,
         }
 
     def cls_providers(self) -> tuple[str, ...]:
-        """方向分类会话实际拿到的执行提供者（空元组 = 未启用或取不到）。
-
-        ⚠ 这只是读取，不会触发加载：引擎还没 :meth:`ensure` 时必然返回空元组。
-        要核对设备，先 ``ensure()``（起飞前 :meth:`warmup` 也是这个时机）。
-        """
+        """方向分类会话实际绑定的执行设备或提供者（空元组表示未启用或尚未加载）。"""
+        if not self._config.cls_enabled():
+            return ()
         classifier = getattr(self._engine, "text_cls", None)
-        session = getattr(getattr(classifier, "session", None), "session", None)
+        session = getattr(classifier, "session", None)
         if session is None:
             return ()
+        device = getattr(session, "device", None)
+        if device is not None:
+            return (str(device),)
+        inner = getattr(session, "session", None)
+        if inner is None:
+            return ()
         try:
-            return tuple(session.get_providers())
-        except Exception:  # noqa: BLE001 - 取不到 provider 列表就当空，只用于日志
+            return tuple(inner.get_providers())
+        except Exception:  # noqa: BLE001 - 取不到设备列表时视为空，仅用于诊断日志
             return ()
 
     def _report_cls_device(self) -> None:
-        """核对方向分类真正跑在哪——onnxruntime 的 CUDA EP 会静默退回 CPU。"""
+        """记录已启用的 PyTorch 方向分类运行设备信息。"""
         config = self._config
         if not config.cls_enabled():
             return
         providers = self.cls_providers()
         if not providers:
-            # TORCH 引擎没有 provider 概念（会话对象不同），只有 onnx 取不到才值得告警
-            if config.cls_engine == "onnx":
-                LOGGER.warning("方向分类已启用（onnx），但取不到会话 provider，无法核对设备")
-            else:
-                LOGGER.info(
-                    "OCR 方向分类就绪（engine=%s model=%s autorotate=%s）",
-                    config.cls_engine,
-                    config.cls_path().name,
-                    config.cls_autorotate,
-                )
+            LOGGER.info(
+                "OCR 方向分类就绪（engine=%s model=%s autorotate=%s）",
+                config.cls_engine,
+                config.cls_path().name,
+                config.cls_autorotate,
+            )
             return
         LOGGER.info(
             "OCR 方向分类就绪（engine=%s device=%s model=%s autorotate=%s）",
@@ -421,18 +397,6 @@ class OcrEngine:
             config.cls_path().name,
             config.cls_autorotate,
         )
-        if (
-            config.cls_engine == "onnx"
-            and config.cls_use_cuda
-            and providers[0] != "CUDAExecutionProvider"
-        ):
-            LOGGER.warning(
-                "方向分类想要 CUDA，实际落在 %s：onnxruntime 的 CUDA EP 依赖进程里"
-                "先 import torch（torch/lib 自带 cuDNN/cuBLAS，ORT 才找得到），"
-                "否则它会无提示地退回 CPU。本项目 det/rec 走 TORCH 引擎，正常顺序下已满足；"
-                "看到这条说明加载顺序被改了（功能仍可用，只是慢一些）。",
-                providers[0],
-            )
 
     def classify_orientation(self, image: np.ndarray) -> OcrOrientation:
         """判断一张文本行是否倒置——**诊断/调试入口**，正式流程不调用它。
