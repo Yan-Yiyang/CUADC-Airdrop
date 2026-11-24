@@ -86,7 +86,14 @@ def test_real_video_reads_target_codes(annotated_video: Path) -> None:
 
     detector = Detector(DetectorConfig(model_path=str(WEIGHTS), device="0"))
     detector.load()
-    post = OpenCvPostProcess(color="blue", ocr_conf_threshold=0.6, engine_config=OcrEngineConfig())
+    post = OpenCvPostProcess(
+        color="blue",
+        ocr_conf_threshold=0.6,
+        engine_config=OcrEngineConfig(
+            det_model="PP-OCRv6_det_medium.pth",
+            rec_model="PP-OCRv6_rec_medium.pth",
+        ),
+    )
 
     capture = cv2.VideoCapture(str(annotated_video))
     assert capture.isOpened()
@@ -191,7 +198,13 @@ def test_rectification_cross_checked_by_orientation_cls(annotated_video: Path) -
     from airdrop.perception.cropproc import OcrEngine, OcrEngineConfig, OpenCvPostProcess
     from airdrop.perception.detector import Detector, DetectorConfig
 
-    engine = OcrEngine(OcrEngineConfig(cls_engine="torch"))
+    engine = OcrEngine(
+        OcrEngineConfig(
+            det_model="PP-OCRv6_det_medium.pth",
+            rec_model="PP-OCRv6_rec_medium.pth",
+            cls_engine="torch",
+        )
+    )
     engine.ensure()  # cls_providers() 只在加载后才有内容
     if not engine.cls_providers():
         pytest.skip("方向分类未就绪")

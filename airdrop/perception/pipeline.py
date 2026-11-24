@@ -78,7 +78,7 @@ class PerceptionConfigLike:
     """
 
     mode: str = "ocr"
-    model_path: str = "models/best2.pt"
+    model_path: str = ".local/trt/best2_736x1280_fp16.engine"
     device: str = "0"
     conf_threshold: float = 0.25
     imgsz: int = 1280

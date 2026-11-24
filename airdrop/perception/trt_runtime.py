@@ -24,6 +24,7 @@ import numpy as np
 
 __all__ = [
     "MANIFEST_SCHEMA_VERSION",
+    "TRT_BUILD_HINT",
     "TensorSpec",
     "TrtEngineError",
     "TrtExecutionRunner",
@@ -40,6 +41,10 @@ __all__ = [
 ]
 
 MANIFEST_SCHEMA_VERSION = 1
+TRT_BUILD_HINT = (
+    "请运行 `./.venv/Scripts/python.exe -m airdrop.run build-trt --target all` 构建本机引擎，"
+    "或显式传 `--backend pytorch` 使用 PyTorch 备用后端"
+)
 _VALID_KINDS = frozenset({"yolo", "ocr_det", "ocr_rec"})
 _TRT_LOGGER: Any = None
 
@@ -211,7 +216,9 @@ def validate_manifest_dict(
         not isinstance(engine_sha256, str)
         or engine_sha256.lower() != expected_engine_sha256.lower()
     ):
-        raise TrtEngineError("TensorRT 引擎文件 SHA256 与清单不一致，请重新构建并原子发布")
+        raise TrtEngineError(
+            f"TensorRT 引擎文件 SHA256 与清单不一致，请重新构建并原子发布；{TRT_BUILD_HINT}"
+        )
 
     source = _require_mapping(data, "source")
     model = _require_mapping(data, "model")
@@ -262,7 +269,7 @@ def validate_runtime_environment(manifest: TrtManifest, current_env: Mapping[str
         if expected != actual:
             raise TrtEngineError(
                 f"TensorRT 引擎{label}不匹配: 清单为 {expected!r}，当前环境为 {actual!r}；"
-                "请在当前目标机器重新离线构建引擎"
+                f"请在当前目标机器重新离线构建引擎；{TRT_BUILD_HINT}"
             )
 
 
@@ -577,10 +584,12 @@ def load_trt_runner(
     """读取、校验清单与环境并反序列化 TensorRT 引擎。"""
     path = Path(engine_path)
     if not path.is_file():
-        raise FileNotFoundError(f"TensorRT 引擎文件不存在: {path}")
+        raise FileNotFoundError(f"TensorRT 引擎文件不存在: {path}；{TRT_BUILD_HINT}")
     mpath = manifest_path_for(path)
     if not mpath.is_file():
-        raise TrtEngineError(f"TensorRT 伴随清单缺失: {mpath}（请通过离线构建工具原子发布）")
+        raise TrtEngineError(
+            f"TensorRT 伴随清单缺失: {mpath}（请通过离线构建工具原子发布）；{TRT_BUILD_HINT}"
+        )
 
     engine_bytes = path.read_bytes()
     actual_sha = sha256_bytes(engine_bytes)

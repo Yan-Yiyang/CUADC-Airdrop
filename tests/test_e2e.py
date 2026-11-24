@@ -732,7 +732,12 @@ class RealYoloOcrDetector:
 
         self._detector = Detector(DetectorConfig(model_path=str(WEIGHTS), device="0"))
         self._post = OpenCvPostProcess(
-            color="blue", ocr_conf_threshold=0.6, engine_config=OcrEngineConfig()
+            color="blue",
+            ocr_conf_threshold=0.6,
+            engine_config=OcrEngineConfig(
+                det_model="PP-OCRv6_det_medium.pth",
+                rec_model="PP-OCRv6_rec_medium.pth",
+            ),
         )
         self.codes: list[int | None] = []
 

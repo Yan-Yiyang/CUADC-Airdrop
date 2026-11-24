@@ -545,8 +545,18 @@ def test_best_candidate_accepts_recognized_zero_prefix(texts: list[str]) -> None
 # ----------------------------------------------------------------------
 # 引擎：惰性加载与失败降级
 # ----------------------------------------------------------------------
+def _torch_ocr_config(**overrides: Any) -> OcrEngineConfig:
+    """构造显式 PyTorch OCR 配置，用于测试 .pth 路径与方向分类诊断分支。"""
+    params: dict[str, Any] = {
+        "det_model": "PP-OCRv6_det_medium.pth",
+        "rec_model": "PP-OCRv6_rec_medium.pth",
+    }
+    params.update(overrides)
+    return OcrEngineConfig(**params)
+
+
 def test_ocr_engine_reports_missing_models() -> None:
-    engine = OcrEngine(OcrEngineConfig(model_dir="models/does-not-exist"))
+    engine = OcrEngine(_torch_ocr_config(model_dir="models/does-not-exist"))
     with pytest.raises(FileNotFoundError):
         engine.ensure()
     assert engine.failed, "失败后应记住，不再反复重试"
@@ -554,8 +564,11 @@ def test_ocr_engine_reports_missing_models() -> None:
 
 
 def test_postprocess_unavailable_engine_returns_empty_result() -> None:
-    """引擎不可用时 recognize 必须返回"没读出"，而不是抛异常。"""
-    post = OpenCvPostProcess(color="blue", engine_config=OcrEngineConfig(model_dir="models/nope"))
+    """PyTorch 引擎不可用时 recognize 必须返回"没读出"，而不是抛异常。"""
+    post = OpenCvPostProcess(
+        color="blue",
+        engine_config=_torch_ocr_config(model_dir="models/nope"),
+    )
     result = post.recognize(np.full((64, 64, 3), 100, np.uint8))
     assert result.number is None
     assert result.raw_text == ""
@@ -570,7 +583,7 @@ def test_recognize_reports_no_pentagon_when_no_level_finds_one() -> None:
     现在由 ``_geometry_ocr`` 自己用 ``no_pentagon`` 表达——"从没找到"与
     "找到了但没读出编号"（``none``）是两回事，排故时要能分开。
     """
-    post = OpenCvPostProcess(engine=OcrEngine(OcrEngineConfig(model_dir="models/nope")))
+    post = OpenCvPostProcess(engine=OcrEngine(_torch_ocr_config(model_dir="models/nope")))
     result = post.recognize(np.full((80, 120, 3), 127, np.uint8))
 
     assert result.number is None
@@ -660,7 +673,7 @@ def test_cls_engine_rejects_unknown_name(invalid_engine: str) -> None:
 
 def test_cls_weight_is_required_when_enabled() -> None:
     """启用方向分类时缺权重必须显式报错，且错误里点出是哪个文件。"""
-    engine = OcrEngine(OcrEngineConfig(model_dir="models/does-not-exist", cls_engine="torch"))
+    engine = OcrEngine(_torch_ocr_config(model_dir="models/does-not-exist", cls_engine="torch"))
     with pytest.raises(FileNotFoundError, match="cls_mobile"):
         engine.ensure()
 
@@ -706,7 +719,7 @@ def test_ocr_engine_config_validates_det_max_side_len() -> None:
         OcrEngineConfig(det_max_side_len=-1)
     with pytest.raises(ValueError, match="det_max_side_len"):
         OcrEngineConfig(det_max_side_len=512)
-    assert OcrEngineConfig(det_max_side_len=0).det_max_side_len == 0
+    assert _torch_ocr_config(det_max_side_len=0).det_max_side_len == 0
     assert OcrEngineConfig(det_max_side_len=736).det_max_side_len == 736
 
 
@@ -741,7 +754,7 @@ def test_ocr_warmup_runs_det_rec_and_enabled_cls_even_without_text_boxes() -> No
             calls.append(("cls", images[0].shape))
             return []
 
-    config = OcrEngineConfig(cls_engine="torch", cls_autorotate=False)
+    config = _torch_ocr_config(cls_engine="torch", cls_autorotate=False)
     ocr = OcrEngine(config)
     ocr._engine = Engine()
 
@@ -772,7 +785,7 @@ def test_ocr_warmup_fails_when_any_model_branch_raises(failed_stage: str) -> Non
                 raise RuntimeError("cls failed")
             return []
 
-    ocr = OcrEngine(OcrEngineConfig(cls_engine="torch"))
+    ocr = OcrEngine(_torch_ocr_config(cls_engine="torch"))
     ocr._engine = Engine()
 
     assert not ocr.warmup()

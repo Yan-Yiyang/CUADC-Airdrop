@@ -20,12 +20,13 @@
   **顶点绕行与内角计算约束**：
   1. 轮廓顶点须按非自交顺序排列（`apex, tl, bl, br, tr`），避免自交多边形导致邻边错配；
   2. `_find_min_angle` 计算顶点 `pts[i]` 的内角时，必须使用其真实前后相邻顶点 `pts[i-1]` 与 `pts[i+1]`。
-- **OcrEngine**（`cropproc.py`）：RapidOCR 薄封装，**det/cls/rec 全程走 TORCH 引擎 + 显式本地 `.pth` 路径（不加载 ONNX 模型）**。
-  `default_models.yaml` 里没有 `torch:` 段，TORCH 只能靠 `model_path` 指定本地权重。
+- **OcrEngine**（`cropproc.py`）：按权重后缀支持 **TensorRT FP16 离线引擎（默认，`.local/trt/PP-OCRv6_{det,rec}_medium_fp16.engine`，经 `trt_ocr.py` 复用 RapidOCR 前后处理而不加载 `RapidOCR` 主入口或 `onnxruntime`）** 与 **RapidOCR TORCH 备用后端（`--backend pytorch`，显式本地 `.pth` 路径，不加载 ONNX 模型）**。
+  TensorRT 引擎文件或伴随清单缺失、SHA256 不一致或运行环境不匹配时直接报错退出，提示运行 `./.venv/Scripts/python.exe -m airdrop.run build-trt --target all` 或显式传 `--backend pytorch`，绝不静默回退。
+  在 PyTorch 备用后端下，`default_models.yaml` 里没有 `torch:` 段，TORCH 只能靠 `model_path` 指定本地权重。
   **方向分类（Cls）已接入，但只作检查/调试（交叉验证与排故），默认不参与识别**：正式链路的转向由
   几何转正保证（平行边法 + 顶角 `60°±15°` 门限），所以 `cls_autorotate` 默认 `False`，省掉逐帧
   分类计算；要它按判定把倒置文本行转正再识别就显式设 `True`。
-  `cls_engine` 决定是否启用方向分类（`"off"` 默认，启用诊断时设为 `"torch"`）；
+  `cls_engine` 决定是否启用方向分类（`"off"` 默认，仅 PyTorch `.pth` 后端诊断时可设为 `"torch"`，TensorRT 后端强制要求 `"off"`）；
   `"off"` 下 `classify_orientation()` 会明确拒绝（不静默给值）。对外只多一个
   `classify_orientation(image) -> OcrOrientation`（**诊断入口**，给几何转正做交叉验证用）。
   通过 `det_max_side_len=960` 约束狭长裁切图在 `limit_type="min"`（736）下的等比放大上限

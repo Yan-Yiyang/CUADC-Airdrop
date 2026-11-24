@@ -48,6 +48,13 @@ __all__ = [
 
 # ---------------------------------------------------------------- 取值域
 PERCEPTION_MODES = frozenset({"ocr", "cls12"})
+INFERENCE_BACKENDS = frozenset({"trt", "pytorch"})
+TRT_DEFAULT_YOLO_MODEL = ".local/trt/best2_736x1280_fp16.engine"
+TRT_DEFAULT_OCR_DET_MODEL = ".local/trt/PP-OCRv6_det_medium_fp16.engine"
+TRT_DEFAULT_OCR_REC_MODEL = ".local/trt/PP-OCRv6_rec_medium_fp16.engine"
+PYTORCH_DEFAULT_YOLO_MODEL = "models/best2.pt"
+PYTORCH_DEFAULT_OCR_DET_MODEL = "PP-OCRv6_det_medium.pth"
+PYTORCH_DEFAULT_OCR_REC_MODEL = "PP-OCRv6_rec_medium.pth"
 TARGET_COLORS = frozenset({"blue", "red"})
 SELECTION_RULES = frozenset({"median", "max"})
 ALIGN_TIMEOUT_ACTIONS = frozenset({"drop"})
@@ -118,24 +125,26 @@ class PerceptionConfig:
 
     1. **``mode="cls12"`` 需要 12 类检测权重**（编号直接来自 YOLO 类别）：权重是单类
        ``target`` 时该模式编号恒为 1——要跑 ``cls12`` 请换成 12 类权重，否则用 ``mode="ocr"``。
-    2. **检测权重由使用者自备**（单类 ``target``）：放到 ``model_path`` 指向的位置
-       （默认 ``models/best2.pt`` 只是约定路径，可用 :mod:`tools.fetch_models` 复制进来）。
+    2. **默认推理后端为 TensorRT 离线引擎**：默认路径指向本机经 ``build-trt --target all``
+       构建并带伴随清单发布的 ``.local/trt/*.engine``；引擎或清单缺失、摘要/环境不匹配时直接报错，
+       不做静默回退。需切换 PyTorch 备用权重（``models/best2.pt`` 与 ``models/ppocr/*.pth``）时，
+       显式传入 ``--backend pytorch`` 或覆盖对应模型路径。
     3. **``device`` 必须显式给定**：不依赖 ultralytics 的自动检测
        （自动检测会选中 ``cuda:0``，显式指定零成本地固定设备）。
     """
 
     mode: str = "ocr"
-    # YOLO 检测权重（单类 target；默认路径只是约定，可覆盖）
-    model_path: str = "models/best2.pt"
+    # YOLO 检测权重（默认 TensorRT 静态 FP16 引擎；可由 --backend pytorch 或显式路径切换为 .pt）
+    model_path: str = TRT_DEFAULT_YOLO_MODEL
     device: str = "0"
     conf_threshold: float = 0.25
     imgsz: int = 1280  # YOLO 推理输入尺寸
     opencv_threads: int = 4  # YOLO 导入后恢复 OpenCV 线程数
 
-    # OCR 引擎及本地权重配置。
+    # OCR 引擎及本地权重配置（默认 TensorRT FP16 引擎；字典仍位于 models/ppocr）。
     models_dir: str = "models/ppocr"
-    det_model: str = "PP-OCRv6_det_medium.pth"
-    rec_model: str = "PP-OCRv6_rec_medium.pth"
+    det_model: str = TRT_DEFAULT_OCR_DET_MODEL
+    rec_model: str = TRT_DEFAULT_OCR_REC_MODEL
     rec_keys: str = "ppocrv6_dict.txt"
     ocr_use_cuda: bool = True
 

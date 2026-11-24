@@ -13,6 +13,15 @@ from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
 
 from airdrop import HM30_DEFAULT_RTSP, Config, Waypoint
+from airdrop.config import (
+    INFERENCE_BACKENDS,
+    PYTORCH_DEFAULT_OCR_DET_MODEL,
+    PYTORCH_DEFAULT_OCR_REC_MODEL,
+    PYTORCH_DEFAULT_YOLO_MODEL,
+    TRT_DEFAULT_OCR_DET_MODEL,
+    TRT_DEFAULT_OCR_REC_MODEL,
+    TRT_DEFAULT_YOLO_MODEL,
+)
 
 from .options import RunOptions
 
@@ -72,6 +81,7 @@ def build_config(  # noqa: PLR0913 - 配置装配入口保持与 CLI 一一对�
     recon_plan: str = RECON_PLAN,
     land_plan: str = LAND_PLAN,
     backup_point: Waypoint | None = None,
+    backend: str | None = None,
     model_path: str | Path | None = None,
     ocr_models_dir: str | Path | None = None,
     ocr_det_model: str | None = None,
@@ -101,6 +111,7 @@ def build_config(  # noqa: PLR0913 - 配置装配入口保持与 CLI 一一对�
     ).validated()
     return _apply_perception_overrides(
         config,
+        backend=backend,
         model_path=model_path,
         ocr_models_dir=ocr_models_dir,
         ocr_det_model=ocr_det_model,
@@ -325,6 +336,7 @@ def main(  # noqa: PLR0913
     qgc_transport: str | None = None,
     qgc_fps: float | None = None,
     qgc_bitrate_kbps: int | None = None,
+    backend: Literal["trt", "pytorch"] | None = None,
     model_path: str | Path | None = None,
     ocr_models_dir: str | Path | None = None,
     ocr_det_model: str | None = None,
@@ -374,6 +386,7 @@ def main(  # noqa: PLR0913
             qgc_transport=qgc_transport,
             qgc_fps=qgc_fps,
             qgc_bitrate_kbps=qgc_bitrate_kbps,
+            backend=backend,
             model_path=model_path,
             ocr_models_dir=ocr_models_dir,
             ocr_det_model=ocr_det_model,
@@ -399,6 +412,7 @@ def main(  # noqa: PLR0913
     config = config or build_config(**config_overrides)
     config = _apply_perception_overrides(
         config,
+        backend=backend,
         model_path=model_path,
         ocr_models_dir=ocr_models_dir,
         ocr_det_model=ocr_det_model,
@@ -420,24 +434,43 @@ def main(  # noqa: PLR0913
 def _apply_perception_overrides(
     config: Config,
     *,
+    backend: str | None = None,
     model_path: str | Path | None = None,
     ocr_models_dir: str | Path | None = None,
     ocr_det_model: str | None = None,
     ocr_rec_model: str | None = None,
     ocr_workers: int | None = None,
 ) -> Config:
-    """只覆盖命令行明确给出的感知参数，保留基础或注入配置的其它字段。"""
-    updates: dict[str, Any] = {
-        name: value
-        for name, value in {
-            "model_path": None if model_path is None else str(model_path),
-            "models_dir": None if ocr_models_dir is None else str(ocr_models_dir),
-            "det_model": ocr_det_model,
-            "rec_model": ocr_rec_model,
-            "ocr_workers": ocr_workers,
-        }.items()
-        if value is not None
-    }
+    """按需应用推理后端预设及显式感知参数覆盖，保留基础或注入配置的其它字段。"""
+    updates: dict[str, Any] = {}
+    if backend is not None:
+        if backend not in INFERENCE_BACKENDS:
+            raise ValueError(f"推理后端只支持 {sorted(INFERENCE_BACKENDS)}: {backend!r}")
+        if backend == "pytorch":
+            updates.update(
+                {
+                    "model_path": PYTORCH_DEFAULT_YOLO_MODEL,
+                    "det_model": PYTORCH_DEFAULT_OCR_DET_MODEL,
+                    "rec_model": PYTORCH_DEFAULT_OCR_REC_MODEL,
+                }
+            )
+        else:
+            updates.update(
+                {
+                    "model_path": TRT_DEFAULT_YOLO_MODEL,
+                    "det_model": TRT_DEFAULT_OCR_DET_MODEL,
+                    "rec_model": TRT_DEFAULT_OCR_REC_MODEL,
+                }
+            )
+    for name, value in (
+        ("model_path", None if model_path is None else str(model_path)),
+        ("models_dir", None if ocr_models_dir is None else str(ocr_models_dir)),
+        ("det_model", ocr_det_model),
+        ("rec_model", ocr_rec_model),
+        ("ocr_workers", ocr_workers),
+    ):
+        if value is not None:
+            updates[name] = value
     if not updates:
         return config
     return replace(config, perception=replace(config.perception, **updates)).validated()

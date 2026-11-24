@@ -114,6 +114,7 @@ def test_mission_options_parse_to_runtime_keywords() -> None:
             "qgc_transport",
             "qgc_fps",
             "qgc_bitrate_kbps",
+            "backend",
             "model_path",
             "ocr_models_dir",
             "ocr_det_model",
@@ -125,6 +126,7 @@ def test_mission_options_parse_to_runtime_keywords() -> None:
     assert all(
         replay_defaults[key] is None
         for key in (
+            "backend",
             "model_path",
             "ocr_models_dir",
             "ocr_det_model",
@@ -136,6 +138,8 @@ def test_mission_options_parse_to_runtime_keywords() -> None:
 
 def test_perception_override_cli_options_parse_symmetrically() -> None:
     args = [
+        "--backend",
+        "pytorch",
         "--model",
         "engines/best2_736x1280_fp16.engine",
         "--ocr-models-dir",
@@ -149,11 +153,13 @@ def test_perception_override_cli_options_parse_symmetrically() -> None:
     ]
     for command in ("mission", "replay"):
         resolved = run.resolve_kwargs(command, args)
+        assert resolved["backend"] == "pytorch"
         assert resolved["model_path"] == "engines/best2_736x1280_fp16.engine"
         assert resolved["ocr_models_dir"] == "engines/ppocr"
         assert resolved["ocr_det_model"] == "PP-OCRv6_det_medium_fp16.engine"
         assert resolved["ocr_rec_model"] == "PP-OCRv6_rec_medium_fp16.engine"
         assert resolved["ocr_workers"] == 1
+        assert run.resolve_kwargs(command, ["--backend", "trt"])["backend"] == "trt"
 
 
 def test_build_trt_cli_options_resolve_defaults_and_overrides() -> None:
@@ -270,6 +276,8 @@ def test_real_cli_keywords_run_through_injected_factory() -> None:
     ("argv", "message"),
     [
         (["mission", "--mode", "unknown"], "invalid choice"),
+        (["mission", "--backend", "onnx"], "invalid choice"),
+        (["replay", "--backend", "onnx"], "invalid choice"),
         (["mission", "--max-seconds", "nan"], "必须是正的有限秒数"),
         (["mission", "--backup-point", "31,121"], "要三个数"),
         (["mission", "--no-capture", "--no-recognize", "--qgc-video"], "必须同时开启视频采集"),

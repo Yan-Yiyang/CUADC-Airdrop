@@ -31,7 +31,7 @@ import airdrop.perception.timing as timing  # noqa: PLR0402 - 避免惰性包循
 from ..telemetry.models import TelemetrySnapshot
 from . import trt_runtime
 from .models import Detection, PixelBox
-from .trt_runtime import TrtEngineError, TrtExecutionRunner, parse_cuda_device_id
+from .trt_runtime import TRT_BUILD_HINT, TrtEngineError, TrtExecutionRunner, parse_cuda_device_id
 
 LOGGER = logging.getLogger(__name__)
 
@@ -288,8 +288,8 @@ class _TrtYoloModel:
 class DetectorConfig:
     """YOLO 检测参数。"""
 
-    # YOLO 检测权重（单类 target；默认路径只是约定，可覆盖）
-    model_path: str = "models/best2.pt"
+    # YOLO 检测权重（默认 TensorRT 静态 FP16 引擎，可覆盖为 .pt 备用权重）
+    model_path: str = ".local/trt/best2_736x1280_fp16.engine"
     device: str = "0"  # 显式指定：见模块 docstring
     conf_threshold: float = 0.25
     iou_threshold: float = 0.45
@@ -381,6 +381,11 @@ class Detector:
                     f"不支持的 YOLO 模型后缀 {suffix or '<无后缀>'!r}（仅支持 .pt 或 .engine）: {path}"
                 )
             if not path.is_file():
+                if suffix == ".engine":
+                    raise FileNotFoundError(
+                        f"YOLO TensorRT 引擎权重不存在: {path.resolve()}（PerceptionConfig.model_path）；"
+                        f"{TRT_BUILD_HINT}"
+                    )
                 raise FileNotFoundError(
                     f"YOLO 权重不存在: {path.resolve()}（PerceptionConfig.model_path）"
                 )

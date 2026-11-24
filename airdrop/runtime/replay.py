@@ -109,20 +109,21 @@ def _build_replay_buffer(source, resolved: Path):
     return buffer, (width, height)
 
 
-def build_config(
+def build_config(  # noqa: PLR0913 - 回放配置覆盖入口保持与 CLI 选项一一对应
     *,
     flight_dir: Path,
     perception_mode: str | None = PERCEPTION_MODE,
     selection_rule: str | None = SELECTION_RULE,
     calib_file: str | None = CALIB_FILE,
     land_plan: str | None = LAND_PLAN,
+    backend: str | None = None,
     model_path: str | Path | None = None,
     ocr_models_dir: str | Path | None = None,
     ocr_det_model: str | None = None,
     ocr_rec_model: str | None = None,
     ocr_workers: int | None = None,
 ) -> Config:
-    """回放用的配置（感知模式 / 感知模型与 OCR 进程数 / 选唯一规则 / 相机标定 / 降落航线可覆盖）。
+    """回放用的配置（感知模式 / 后端预设 / 感知模型与 OCR 进程数 / 选唯一规则 / 相机标定 / 降落航线可覆盖）。
 
     CLI 参数的 ``None`` = 不覆盖；记录快照中的 ``None`` 则表示字段原值为空。
     """
@@ -142,6 +143,7 @@ def build_config(
     validated = base.validated()
     return _apply_perception_overrides(
         validated,
+        backend=backend,
         model_path=model_path,
         ocr_models_dir=ocr_models_dir,
         ocr_det_model=ocr_det_model,

@@ -21,13 +21,29 @@ from airdrop import (
     TelemetryConfig,
     VideoConfig,
 )
-from airdrop.config import RECON_UPLOAD_MODES
+from airdrop.config import (
+    PYTORCH_DEFAULT_OCR_DET_MODEL,
+    PYTORCH_DEFAULT_OCR_REC_MODEL,
+    PYTORCH_DEFAULT_YOLO_MODEL,
+    RECON_UPLOAD_MODES,
+    TRT_DEFAULT_OCR_DET_MODEL,
+    TRT_DEFAULT_OCR_REC_MODEL,
+    TRT_DEFAULT_YOLO_MODEL,
+)
 
 
 def test_default_config_is_valid() -> None:
     """默认配置必须直接可用（默认值即"能跑"的那一组）。"""
     cfg = Config().validated()
     assert cfg.perception.mode == "ocr"
+    assert cfg.perception.model_path == TRT_DEFAULT_YOLO_MODEL
+    assert cfg.perception.det_model == TRT_DEFAULT_OCR_DET_MODEL
+    assert cfg.perception.rec_model == TRT_DEFAULT_OCR_REC_MODEL
+    assert cfg.perception.models_dir == "models/ppocr"
+    assert cfg.perception.ocr_use_cuda is True
+    assert PYTORCH_DEFAULT_YOLO_MODEL.endswith(".pt")
+    assert PYTORCH_DEFAULT_OCR_DET_MODEL.endswith(".pth")
+    assert PYTORCH_DEFAULT_OCR_REC_MODEL.endswith(".pth")
     assert cfg.perception.opencv_threads == 4
     assert cfg.targeting.selection_rule == "median"
     assert cfg.align.max_wait == 1.0

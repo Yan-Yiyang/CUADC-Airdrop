@@ -972,14 +972,53 @@ def test_detector_engine_missing_file_and_invalid_device(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _block_ultralytics(monkeypatch)
+    assert DetectorConfig().model_path == ".local/trt/best2_736x1280_fp16.engine"
+
     missing = tmp_path / "absent.engine"
-    with pytest.raises(FileNotFoundError, match="权重不存在"):
+    with pytest.raises(FileNotFoundError, match=r"build-trt --target all") as exc_info:
         Detector(DetectorConfig(model_path=str(missing), device="0")).load()
+    assert "权重不存在" in str(exc_info.value)
+    assert "--backend pytorch" in str(exc_info.value)
 
     existing = tmp_path / "present.engine"
     existing.write_bytes(b"engine")
     with pytest.raises(ValueError, match="CUDA"):
         Detector(DetectorConfig(model_path=str(existing), device="cpu")).load()
+
+
+def test_trt_runtime_failure_messages_guide_build_trt_and_pytorch_fallback(tmp_path: Path) -> None:
+    missing_engine = tmp_path / "missing.engine"
+    with pytest.raises(FileNotFoundError, match=r"build-trt --target all") as err_missing:
+        trt_runtime.load_trt_runner(missing_engine, expected_kind="yolo")
+    assert "--backend pytorch" in str(err_missing.value)
+
+    no_manifest_engine = tmp_path / "no_manifest.engine"
+    no_manifest_engine.write_bytes(b"engine-data")
+    with pytest.raises(TrtEngineError, match=r"build-trt --target all") as err_manifest:
+        trt_runtime.load_trt_runner(no_manifest_engine, expected_kind="yolo")
+    assert "--backend pytorch" in str(err_manifest.value)
+
+    bad_sha_manifest = _make_manifest_dict(engine_file="no_manifest.engine", engine_sha256="0" * 64)
+    with pytest.raises(TrtEngineError, match=r"build-trt --target all") as err_sha:
+        trt_runtime.validate_manifest_dict(
+            bad_sha_manifest,
+            expected_kind="yolo",
+            expected_engine_name="no_manifest.engine",
+            expected_engine_sha256="1" * 64,
+        )
+    assert "--backend pytorch" in str(err_sha.value)
+
+    manifest = _make_manifest()
+    with pytest.raises(TrtEngineError, match=r"build-trt --target all") as err_env:
+        trt_runtime.validate_runtime_environment(
+            manifest,
+            {
+                "platform": manifest.environment["platform"],
+                "tensorrt_version": "0.0.0",
+                "compute_capability": manifest.environment["compute_capability"],
+            },
+        )
+    assert "--backend pytorch" in str(err_env.value)
 
 
 def test_detector_trt_error_propagates_from_detect_but_warmup_returns_false(

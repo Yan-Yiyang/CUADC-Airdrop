@@ -375,6 +375,11 @@ def test_ocr_engine_config_validation_rejects_invalid_trt_combinations(
 # OcrEngine TRT 加载、隔离、清单校验与错误传播
 # ----------------------------------------------------------------------
 def test_ocr_engine_trt_missing_files_raises_and_marks_failed(tmp_path: Path) -> None:
+    default_cfg = OcrEngineConfig()
+    assert default_cfg.backend_kind() == "tensorrt"
+    assert default_cfg.det_model == ".local/trt/PP-OCRv6_det_medium_fp16.engine"
+    assert default_cfg.rec_model == ".local/trt/PP-OCRv6_rec_medium_fp16.engine"
+
     config = OcrEngineConfig(
         model_dir=str(tmp_path),
         det_model="missing_det.engine",
@@ -382,9 +387,14 @@ def test_ocr_engine_trt_missing_files_raises_and_marks_failed(tmp_path: Path) ->
         rec_keys="missing_dict.txt",
     )
     engine = OcrEngine(config)
-    with pytest.raises(FileNotFoundError, match="OCR 模型文件缺失"):
+    with pytest.raises(FileNotFoundError, match="OCR 模型文件缺失") as exc_info:
         engine.ensure()
+    assert "build-trt --target all" in str(exc_info.value)
+    assert "--backend pytorch" in str(exc_info.value)
     assert engine.failed is True
+    # TensorRT 缺失引擎严禁静默降级返回空列表，read_text 与二次 ensure 均继续抛出。
+    with pytest.raises(FileNotFoundError, match="build-trt --target all"):
+        engine.read_text(np.zeros((32, 32, 3), dtype=np.uint8))
 
 
 def test_ocr_engine_trt_loads_without_onnxruntime_or_rapidocr(

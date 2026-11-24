@@ -142,6 +142,13 @@ SUBCOMMANDS: dict[str, Subcommand] = {
             Option(("--qgc-fps",), "qgc_fps", "QGC 视频帧率", kind="float"),
             Option(("--qgc-bitrate-kbps",), "qgc_bitrate_kbps", "QGC 视频码率", kind="int"),
             Option(("--calib",), "calib_file", "相机标定 JSON 文件"),
+            Option(
+                ("--backend",),
+                "backend",
+                "推理后端预设（默认 TensorRT；pytorch 切换为 .pt/.pth 备用权重，trt 复位为默认 .engine）",
+                kind="choice",
+                choices=("trt", "pytorch"),
+            ),
             Option(("--model",), "model_path", "YOLO 权重路径（.pt 或 .engine）"),
             Option(("--ocr-models-dir",), "ocr_models_dir", "OCR 权重与字典目录"),
             Option(
@@ -219,6 +226,13 @@ SUBCOMMANDS: dict[str, Subcommand] = {
                 source="SELECTION_RULE",
             ),
             Option(("--calib",), "calib_file", "相机标定文件", source="CALIB_FILE"),
+            Option(
+                ("--backend",),
+                "backend",
+                "推理后端预设（省略时保留录制快照；trt 或 pytorch 切换为对应默认权重）",
+                kind="choice",
+                choices=("trt", "pytorch"),
+            ),
             Option(("--model",), "model_path", "YOLO 权重路径（.pt 或 .engine）"),
             Option(("--ocr-models-dir",), "ocr_models_dir", "OCR 权重与字典目录"),
             Option(

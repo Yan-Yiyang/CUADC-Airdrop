@@ -54,7 +54,7 @@ import numpy as np
 import airdrop.perception.timing as timing  # noqa: PLR0402 - 避免惰性包循环导入
 
 from .number import correct_ocr_number
-from .trt_runtime import TrtEngineError
+from .trt_runtime import TRT_BUILD_HINT, TrtEngineError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -84,15 +84,15 @@ _DET_MIN_SIDE_LEN = 736
 # ----------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class OcrEngineConfig:
-    """OCR 推理引擎参数（支持 RapidOCR TORCH ``.pth`` 与 TensorRT ``.engine`` 后端）。
+    """OCR 推理引擎参数（默认 TensorRT ``.engine``，支持显式切换 RapidOCR TORCH ``.pth``）。
 
-    默认值对应 PP-OCRv6 medium 检测与识别模型；推理耗时受设备、驱动、输入图像与运行时
-    版本影响，应在目标部署环境测量。
+    默认值对应本机离线构建的 PP-OCRv6 medium TensorRT FP16 引擎；推理耗时受设备、驱动、
+    输入图像与运行时版本影响，应在目标部署环境测量。
     """
 
     model_dir: str = "models/ppocr"
-    det_model: str = "PP-OCRv6_det_medium.pth"
-    rec_model: str = "PP-OCRv6_rec_medium.pth"
+    det_model: str = ".local/trt/PP-OCRv6_det_medium_fp16.engine"
+    rec_model: str = ".local/trt/PP-OCRv6_rec_medium_fp16.engine"
     rec_keys: str = "ppocrv6_dict.txt"
     #: 方向分类（Cls）开关与后端：``"off"``（默认关闭）或 ``"torch"``（PyTorch 诊断后端）。
     #: 正式流程的方向由几何转正保证，默认 ``"off"`` 时 ``classify_orientation()`` 会明确拒绝；
@@ -223,7 +223,7 @@ class OcrEngine:
         self._config = config or OcrEngineConfig()
         self._engine: Any = backend
         self._failed = False
-        self._failed_trt_error: TrtEngineError | None = None
+        self._failed_trt_error: TrtEngineError | FileNotFoundError | None = None
         #: 失败日志节流用的状态（见 _log_ocr_failure）
         self._ocr_fail_signature = ""
         self._ocr_fail_count = 0
@@ -286,6 +286,14 @@ class OcrEngine:
             missing.append(str(config.cls_path()))
         if missing:
             self._failed = True
+            if config.backend_kind() == "tensorrt":
+                err = FileNotFoundError(
+                    "OCR 模型文件缺失: "
+                    + ", ".join(missing)
+                    + f"（见 OcrEngineConfig.model_dir）；{TRT_BUILD_HINT}"
+                )
+                self._failed_trt_error = err
+                raise err
             raise FileNotFoundError(
                 "OCR 模型文件缺失: " + ", ".join(missing) + "（见 OcrEngineConfig.model_dir）"
             )
@@ -497,6 +505,11 @@ class OcrEngine:
             engine = self.ensure()
         except TrtEngineError:
             raise
+        except FileNotFoundError as exc:
+            if self._config.backend_kind() == "tensorrt":
+                raise
+            self._log_ocr_failure("OCR 引擎不可用", exc)
+            return []
         except Exception as exc:  # noqa: BLE001 - 必须兜住一切并降级为"没读出编号"
             self._log_ocr_failure("OCR 引擎不可用", exc)
             return []

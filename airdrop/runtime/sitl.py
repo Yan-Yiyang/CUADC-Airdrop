@@ -56,6 +56,7 @@ def main(  # noqa: PLR0913, PLR0915
     qgc_transport: str | None = None,
     qgc_fps: float | None = None,
     qgc_bitrate_kbps: int | None = None,
+    backend: Literal["trt", "pytorch"] | None = None,
     model_path: str | Path | None = None,
     ocr_models_dir: str | Path | None = None,
     ocr_det_model: str | None = None,
@@ -196,6 +197,7 @@ def main(  # noqa: PLR0913, PLR0915
     ).validated()
     config = _apply_perception_overrides(
         config,
+        backend=backend,
         model_path=model_path,
         ocr_models_dir=ocr_models_dir,
         ocr_det_model=ocr_det_model,

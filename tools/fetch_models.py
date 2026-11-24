@@ -155,9 +155,9 @@ def main(**overrides) -> int:
         return 2
     if total == 0:
         print("（都已在位，无需复制）")
-    print("\n记得在 Config 里核对路径：")
-    print("  perception.model_path = models/best2.pt")
-    print("  perception.models_dir = models/ppocr")
+    print("\n默认推理后端使用 TensorRT 离线引擎，请在本机运行：")
+    print("  ./.venv/Scripts/python.exe -m airdrop.run build-trt --target all")
+    print("如需直接使用 PyTorch 备用权重，可在 mission / replay 命令显式传入 --backend pytorch。")
     return 0
 
 

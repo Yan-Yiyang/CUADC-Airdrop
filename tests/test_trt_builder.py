@@ -363,7 +363,30 @@ def test_mission_build_config_applies_explicit_perception_overrides() -> None:
     assert cfg.perception.ocr_workers == 1
 
     with pytest.raises(ValueError, match=r"同为 \.pth 或同为 \.engine"):
-        mission_runtime.build_config(ocr_det_model="PP-OCRv6_det_medium_fp16.engine")
+        mission_runtime.build_config(ocr_det_model="PP-OCRv6_det_medium.pth")
+
+
+def test_backend_preset_switches_between_trt_and_pytorch_with_override_precedence() -> None:
+    # 默认配置使用 TensorRT 引擎。
+    default_cfg = mission_runtime.build_config()
+    assert default_cfg.perception.model_path == ".local/trt/best2_736x1280_fp16.engine"
+    assert default_cfg.perception.det_model == ".local/trt/PP-OCRv6_det_medium_fp16.engine"
+    assert default_cfg.perception.rec_model == ".local/trt/PP-OCRv6_rec_medium_fp16.engine"
+
+    # --backend pytorch 复位为 PyTorch 备用权重，且显式路径参数优先覆盖预设。
+    pt_cfg = mission_runtime.build_config(backend="pytorch")
+    assert pt_cfg.perception.model_path == "models/best2.pt"
+    assert pt_cfg.perception.det_model == "PP-OCRv6_det_medium.pth"
+    assert pt_cfg.perception.rec_model == "PP-OCRv6_rec_medium.pth"
+
+    pt_override = mission_runtime.build_config(backend="pytorch", model_path="models/custom.pt")
+    assert pt_override.perception.model_path == "models/custom.pt"
+    assert pt_override.perception.det_model == "PP-OCRv6_det_medium.pth"
+    assert pt_override.perception.rec_model == "PP-OCRv6_rec_medium.pth"
+
+    # 未知后端直接拒绝。
+    with pytest.raises(ValueError, match="推理后端只支持"):
+        mission_runtime.build_config(backend="onnx")
 
 
 def test_mission_main_propagates_perception_overrides_to_factory() -> None:
@@ -388,6 +411,7 @@ def test_mission_main_propagates_perception_overrides_to_factory() -> None:
         record=False,
         qgc_video=False,
         max_seconds=0.000001,
+        backend="pytorch",
         model_path="engines/best2_736x1280_fp16.engine",
         ocr_models_dir="engines/ppocr",
         ocr_det_model="PP-OCRv6_det_medium_fp16.engine",
@@ -427,6 +451,7 @@ def test_mission_main_forwards_perception_overrides_to_sitl(
         recognize=False,
         record=False,
         qgc_video=False,
+        backend="pytorch",
         model_path="engines/best2_736x1280_fp16.engine",
         ocr_models_dir="engines/ppocr",
         ocr_det_model="PP-OCRv6_det_medium_fp16.engine",
@@ -434,6 +459,7 @@ def test_mission_main_forwards_perception_overrides_to_sitl(
         ocr_workers=1,
     )
     assert rc == 0
+    assert captured["backend"] == "pytorch"
     assert captured["model_path"] == "engines/best2_736x1280_fp16.engine"
     assert captured["ocr_models_dir"] == "engines/ppocr"
     assert captured["ocr_det_model"] == "PP-OCRv6_det_medium_fp16.engine"
@@ -461,6 +487,34 @@ def test_replay_build_config_preserves_snapshot_schema_and_applies_perception_ov
     unchanged = replay_runtime.build_config(flight_dir=flight_dir)
     assert unchanged.perception == recorded.perception
 
+    # 显式 --backend pytorch 切换为 PyTorch 备用权重，同时保留快照其它字段。
+    as_pytorch = replay_runtime.build_config(flight_dir=flight_dir, backend="pytorch")
+    assert as_pytorch.perception.model_path == "models/best2.pt"
+    assert as_pytorch.perception.det_model == "PP-OCRv6_det_medium.pth"
+    assert as_pytorch.perception.rec_model == "PP-OCRv6_rec_medium.pth"
+    assert as_pytorch.perception.ocr_workers == 3
+    assert as_pytorch.video == recorded.video
+
+    # 历史 PyTorch 录制快照在不传 --backend 时保持原样，传 --backend trt 时切换为默认引擎。
+    pt_flight = tmp_path / "flight_pytorch_snapshot"
+    pt_flight.mkdir()
+    pt_recorded = Config().replace(
+        perception=replace(
+            Config().perception,
+            model_path="models/best2.pt",
+            det_model="PP-OCRv6_det_medium.pth",
+            rec_model="PP-OCRv6_rec_medium.pth",
+        ),
+    )
+    (pt_flight / "config_snapshot.json").write_text(
+        json.dumps(asdict(pt_recorded), ensure_ascii=False), encoding="utf-8"
+    )
+    assert replay_runtime.build_config(flight_dir=pt_flight).perception == pt_recorded.perception
+    upgraded = replay_runtime.build_config(flight_dir=pt_flight, backend="trt")
+    assert upgraded.perception.model_path == ".local/trt/best2_736x1280_fp16.engine"
+    assert upgraded.perception.det_model == ".local/trt/PP-OCRv6_det_medium_fp16.engine"
+    assert upgraded.perception.rec_model == ".local/trt/PP-OCRv6_rec_medium_fp16.engine"
+
     # 显式覆盖仅修改指定字段，其余快照配置保持不变。
     overridden = replay_runtime.build_config(
         flight_dir=flight_dir,
@@ -482,14 +536,21 @@ def test_replay_build_config_preserves_snapshot_schema_and_applies_perception_ov
     with pytest.raises(ValueError, match=r"同为 \.pth 或同为 \.engine"):
         replay_runtime.build_config(
             flight_dir=flight_dir,
-            ocr_det_model="PP-OCRv6_det_medium_fp16.engine",
+            ocr_det_model="PP-OCRv6_det_medium.pth",
         )
 
-    # 快照配置 device="cpu" 时，覆盖为 YOLO .engine 必须被拦截。
+    # 历史 PyTorch CPU 快照在覆盖为 TensorRT 时必须被拦截。
     cpu_flight = tmp_path / "flight_cpu"
     cpu_flight.mkdir()
     cpu_recorded = Config().replace(
-        perception=replace(Config().perception, device="cpu"),
+        perception=replace(
+            Config().perception,
+            model_path="models/best2.pt",
+            det_model="PP-OCRv6_det_medium.pth",
+            rec_model="PP-OCRv6_rec_medium.pth",
+            device="cpu",
+            ocr_use_cuda=False,
+        ),
     )
     (cpu_flight / "config_snapshot.json").write_text(
         json.dumps(asdict(cpu_recorded), ensure_ascii=False), encoding="utf-8"
@@ -499,3 +560,5 @@ def test_replay_build_config_preserves_snapshot_schema_and_applies_perception_ov
             flight_dir=cpu_flight,
             model_path="engines/best2_736x1280_fp16.engine",
         )
+    with pytest.raises(ValueError, match="CUDA"):
+        replay_runtime.build_config(flight_dir=cpu_flight, backend="trt")
