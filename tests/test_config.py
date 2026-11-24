@@ -76,6 +76,7 @@ def test_mission_config_defaults_match_plan() -> None:
         ({"mission": MissionConfig(airborne_alt_m=-1.0)}, "airborne_alt_m"),
         ({"mission": MissionConfig(airborne_timeout_s=0.0)}, "airborne_timeout_s"),
         ({"preflight": PreflightConfig(video_min_frames=0)}, "video_min_frames"),
+        ({"preflight": PreflightConfig(cold_read_sample_frames=0)}, "cold_read_sample_frames"),
         ({"preflight": PreflightConfig(video_probe_s=0.0)}, "video_probe_s"),
         ({"preflight": PreflightConfig(max_s=-1.0)}, "max_s"),
         ({"gripper": GripperConfig(instance=-1)}, "gripper.instance"),

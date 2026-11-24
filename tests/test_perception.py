@@ -1371,7 +1371,6 @@ def test_worker_stop_closes_owned_frozen_ts_decoder(tmp_path: Path) -> None:
     original = AlignmentBuffer(
         storage="raw",
         cold_decoder=TsRangeDecoder(tmp_path),
-        _start_cold_worker=False,
     )
     worker = PerceptionWorker(
         PerceptionConfigLike(mode="cls12"),
@@ -1517,7 +1516,7 @@ def test_cold_read_value_error_is_latched_as_fatal_worker_failure(
 ) -> None:
     """wait_new 的冷读 ValueError 必须从外层线程边界锁存并传到健康检查。"""
     decoder = TsRangeDecoder(tmp_path)
-    buffer = AlignmentBuffer(storage="raw", cold_decoder=decoder, _start_cold_worker=False)
+    buffer = AlignmentBuffer(storage="raw", cold_decoder=decoder)
     capture_timestamp = 1000.0
     sample = AlignedSample(
         frame=VideoFrame(
@@ -1567,6 +1566,66 @@ def test_cold_read_value_error_is_latched_as_fatal_worker_failure(
         assert not worker.drain(timeout=0)
     finally:
         worker.stop(timeout=5)
+        buffer.close_cold_storage()
+
+
+def test_perception_worker_advances_buffer_consumer_cursor_and_avoids_cold_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PerceptionWorker 注册并推进缓冲消费者游标，正常追帧时零冷读并及时释放热区。"""
+    from fractions import Fraction
+
+    from airdrop.video.segments import SegmentLifecycle
+
+    lifecycle = SegmentLifecycle()
+    lifecycle.opened(1)
+    decoder = TsRangeDecoder(tmp_path, segment_lifecycle=lifecycle)
+    monkeypatch.setattr(
+        decoder, "read", lambda *args, **kwargs: pytest.fail("正常热读不得触发冷区解码")
+    )
+    frame_bytes = 8 * 8 * 3
+    buffer = AlignmentBuffer(
+        storage="raw",
+        cold_decoder=decoder,
+        max_hot_bytes=frame_bytes * 6,
+        segment_lifecycle=lifecycle,
+    )
+    worker = PerceptionWorker(
+        PerceptionConfigLike(mode="cls12"),
+        buffer=buffer,
+        detector=_FakeDetector(),
+    ).start()
+    try:
+        for idx in range(1, 7):
+            lifecycle.progress(1, committed_time=Fraction(idx, 30))
+            sample = AlignedSample(
+                frame=VideoFrame(
+                    index=idx,
+                    image=np.full((8, 8, 3), idx, np.uint8),
+                    timestamp=1000.0 + idx * 0.03,
+                    lag=0.0,
+                    media_pts=idx,
+                    time_base_num=1,
+                    time_base_den=30,
+                    segment=1,
+                ),
+                snapshot=TelemetrySnapshot(timestamp=1000.0 + idx * 0.03, north_m=float(idx)),
+                timestamp=1000.0 + idx * 0.03,
+                lag=0.0,
+                mode="test",
+            )
+            buffer.put(sample, materialize=False)
+        deadline = time.monotonic() + 3.0
+        while worker.stats.frames < 6 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert worker.stats.frames == 6
+        assert buffer.stats.cold_reads == 0
+        assert buffer.stats.hot_bytes == 0
+        assert buffer.stats.cold_frames == 6
+    finally:
+        worker.stop(timeout=5)
+        assert not buffer._consumers
+        lifecycle.closed(1, complete=True)
         buffer.close_cold_storage()
 
 

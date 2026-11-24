@@ -145,24 +145,21 @@ def test_decoder_does_not_reuse_closed_lease_after_directory_cleanup_failure(
     decoder.close()
 
 
-def test_buffer_rolls_back_decoder_lease_when_validation_decoder_binding_fails(
-    tmp_path, monkeypatch
-) -> None:
+def test_buffer_does_not_leak_lease_when_decoder_binding_fails(tmp_path, monkeypatch) -> None:
     owner = TemporaryTsStorage(parent=tmp_path)
     lease = owner.acquire_lease()
     decoder = TsRangeDecoder(owner.directory)
     buffer = AlignmentBuffer(storage="raw", cold_decoder=decoder)
-    worker = buffer._cold_worker_decoder
-    assert worker is not None
 
     def fail_binding(_lease) -> None:
-        raise RuntimeError("injected worker lease failure")
+        raise RuntimeError("injected decoder lease failure")
 
-    monkeypatch.setattr(worker, "bind_storage_lease", fail_binding)
+    monkeypatch.setattr(decoder, "bind_storage_lease", fail_binding)
     try:
-        with pytest.raises(RuntimeError, match="injected worker lease failure"):
+        with pytest.raises(RuntimeError, match="injected decoder lease failure"):
             buffer.bind_cold_directory(owner.directory, storage_lease=lease)
         assert owner.lease_count == 1
+        assert buffer._storage_lease is None
         assert decoder.fork_storage_lease() is None
     finally:
         buffer.close_cold_storage()
@@ -218,7 +215,9 @@ def test_failed_native_container_close_retains_storage_until_same_container_clos
 
     container = Container()
     monkeypatch.setattr(av, "open", lambda *args, **kwargs: container)
-    monkeypatch.setattr(decoder, "_get_keyframes", lambda *_args: [(Fraction(0), Fraction(0))])
+    monkeypatch.setattr(
+        decoder, "_get_keyframes", lambda *_args: [(Fraction(0), Fraction(0), None)]
+    )
     assert decoder.read(1, 0, 1, 1) is not None
     owner.producer_stopped()
     assert owner.finalize() is False

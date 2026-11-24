@@ -80,10 +80,26 @@ def _build_replay_buffer(source, resolved: Path):
     width, height = next(iter(sizes))
     if width is None or height is None or width <= 0 or height <= 0:
         raise ValueError("回放帧必须具有统一且有效的 width/height")
+    from fractions import Fraction
+
     segment_lifecycle = SegmentLifecycle()
+    segment_max_time: dict[int, Fraction] = {}
+    for frame in source.frames:
+        if (
+            frame.media_pts is not None
+            and frame.time_base_num is not None
+            and frame.time_base_den is not None
+            and frame.time_base_den > 0
+        ):
+            media_time = Fraction(frame.media_pts * frame.time_base_num, frame.time_base_den)
+            prev = segment_max_time.get(frame.segment)
+            if prev is None or media_time > prev:
+                segment_max_time[frame.segment] = media_time
     for segment in {frame.segment for frame in source.frames}:
         complete = (resolved / "video" / f"segment-{segment:06d}.complete").is_file()
-        segment_lifecycle.closed(segment, complete=complete)
+        segment_lifecycle.closed(
+            segment, complete=complete, committed_time=segment_max_time.get(segment)
+        )
     buffer = build_alignment_buffer(
         capture=True,
         ts_directory=resolved / "video",

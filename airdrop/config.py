@@ -439,6 +439,9 @@ class PreflightConfig:
     #: 视频探测窗口（秒）与窗口内要求的最少帧数
     video_probe_s: float = 5.0
     video_min_frames: int = 10
+    #: 可选的起飞前冷读像素一致性抽检开关；默认关闭，仅用于新相机/解码器环境防呆
+    verify_cold_read: bool = False
+    cold_read_sample_frames: int = 2
     #: 预检总上限（超过就算失败，避免卡在载入上不动）
     max_s: float = 120.0
 
@@ -684,6 +687,11 @@ class Config:
         if self.preflight.video_min_frames < 1:
             raise ValueError(
                 f"preflight.video_min_frames 至少为 1：{self.preflight.video_min_frames}"
+            )
+        if self.preflight.cold_read_sample_frames < 1:
+            raise ValueError(
+                "preflight.cold_read_sample_frames 至少为 1："
+                f"{self.preflight.cold_read_sample_frames}"
             )
         self.video.validated()
         self.qgc_video.validated()

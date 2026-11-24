@@ -89,8 +89,9 @@ def test_factory_failure_closes_cold_buffer(monkeypatch, failure_site: str) -> N
         build_live_components(options, Config())
 
     assert len(created) == 1
-    assert created[0]._cold_thread is not None
-    assert not created[0]._cold_thread.is_alive()
+    assert created[0]._cold_stopping is True
+    assert created[0]._cold_decoder is not None
+    assert not created[0]._cold_decoder._reaper.is_alive()
 
 
 @pytest.mark.parametrize("lag", [0.0, 0.28])

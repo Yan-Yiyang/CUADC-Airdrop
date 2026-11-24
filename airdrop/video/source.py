@@ -416,10 +416,13 @@ def _pyav_capture_worker(  # noqa: PLR0912, PLR0915, PLR0917 - 子进程收尾�
                 )
             decoded = packet.decode()
             ready_times = [(time.time(), time.monotonic_ns()) for _ in decoded]
+            committed_time: Fraction | None = None
             if writer is not None and packet.size > 0:
                 error_kind = "storage"
-                writer.mux(packet)
+                committed_time = writer.mux(packet)
                 error_kind = "network"
+            elif writer is not None:
+                committed_time = writer.committed_time
             for frame, (frame_timestamp, frame_monotonic_ns) in zip(
                 decoded, ready_times, strict=True
             ):
@@ -452,21 +455,23 @@ def _pyav_capture_worker(  # noqa: PLR0912, PLR0915, PLR0917 - 子进程收尾�
                 if image_view.nbytes != frame_bytes:
                     raise VideoStorageError(f"IPC 帧大小不符：{image_view.nbytes} != {frame_bytes}")
                 slot.buf[:frame_bytes] = image_view
-                if not send(
-                    {
-                        "kind": "frame",
-                        "timestamp": frame_timestamp,
-                        "producer_monotonic_ns": frame_monotonic_ns,
-                        "slot": slot_id,
-                        "pts": int(frame.pts),
-                        "time_base_num": frame_tb.numerator,
-                        "time_base_den": frame_tb.denominator,
-                        "segment": segment,
-                        "random_access_dts": access[1],
-                        "random_access_time_base_num": access[2],
-                        "random_access_time_base_den": access[3],
-                    }
-                ):
+                frame_msg: dict[str, Any] = {
+                    "kind": "frame",
+                    "timestamp": frame_timestamp,
+                    "producer_monotonic_ns": frame_monotonic_ns,
+                    "slot": slot_id,
+                    "pts": int(frame.pts),
+                    "time_base_num": frame_tb.numerator,
+                    "time_base_den": frame_tb.denominator,
+                    "segment": segment,
+                    "random_access_dts": access[1],
+                    "random_access_time_base_num": access[2],
+                    "random_access_time_base_den": access[3],
+                }
+                if committed_time is not None:
+                    frame_msg["committed_time_num"] = committed_time.numerator
+                    frame_msg["committed_time_den"] = committed_time.denominator
+                if not send(frame_msg):
                     return
     except Exception as exc:  # noqa: BLE001 - 子进程需把所有失败传回父进程
         if isinstance(exc, VideoStorageError):
@@ -644,6 +649,11 @@ class Hm30VideoSource:
         path = Path(directory)
         path.mkdir(parents=True, exist_ok=True)
         self._recording_directory = path
+
+    @property
+    def recording_directory(self) -> Path | None:
+        """已绑定的 TS 分段写入目录；未启用 TS 写入时为 None。"""
+        return self._recording_directory
 
     @property
     def stats(self) -> VideoStats:
@@ -935,7 +945,16 @@ class Hm30VideoSource:
                     if message.get("segment") != segment:
                         raise VideoStorageError("PyAV IPC 帧分段编号不匹配")
                     if segment_registered:
-                        self._segment_lifecycle.progress(segment)
+                        from fractions import Fraction
+
+                        c_num = message.get("committed_time_num")
+                        c_den = message.get("committed_time_den")
+                        committed = (
+                            Fraction(int(c_num), int(c_den))
+                            if c_num is not None and c_den is not None and int(c_den) > 0
+                            else None
+                        )
+                        self._segment_lifecycle.progress(segment, committed_time=committed)
                     slot_id = int(message["slot"])
                     if not 0 <= slot_id < len(slots):
                         raise VideoStorageError(f"PyAV IPC 返回非法共享槽位: {slot_id}")
@@ -982,7 +1001,9 @@ class Hm30VideoSource:
                         elif reported_state == SegmentState.CLOSED_INCOMPLETE.value:
                             self._segment_lifecycle.closed(segment, complete=False)
                         else:
-                            self._segment_lifecycle.failed(segment)
+                            self._segment_lifecycle.failed(
+                                segment, error=str(message.get("error", "")) or None
+                            )
                     if kind == "storage_error":
                         raise VideoStorageError(str(message.get("error", "未知 TS 写入错误")))
                     if kind == "fatal_error":

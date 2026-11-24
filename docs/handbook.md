@@ -503,9 +503,9 @@ AlignmentWriter(buffer, aligner, *, defer_until_airborne=False)  # 可调用对�
 | `AlignmentWriter.stats()` | `(written, skipped)`：`skipped` 只因"该时刻取不到遥测"增加 |
 | `AlignmentWriter.begin_after(source_index)` | 开启延迟写入，只接收源帧序号大于 cutoff 的帧；可传回调在 writer 锁内读取 cutoff，首次调用后幂等 |
 | `AlignmentWriter.seal()` | 停止接纳新帧；已接纳在途帧仍完成对齐与入缓冲，且 writer 不可再次开启 |
-| `BufferStats` | `storage` / `capacity` / `max_bytes` / `frames` / `put` / `evicted` / `bytes` / `last_index` |
+| `BufferStats` | `storage` / `capacity` / `max_bytes` / `frames` / `put` / `evicted` / `bytes` / `last_index` / `hot_bytes` / `cold_frames` / `cold_committed` / `cold_reads` |
 
-独立构造 `AlignmentBuffer` 的默认存储仍为 `jpeg`；正式采集任务显式采用 raw 热区和 TS 冷区。热区按约 1 秒保留 BGR，硬上限 128 MiB；历史图像共享 64 MiB LRU，两者额度独立。后台验证直接读取 TS，未验证的热帧不会释放；积压超过上限时明确报错。`freeze` 固定截止帧、共享缓存和存储租约，并使用独立解码游标。缓存额度不包括返回图像、当前解码帧及编解码器工作集。`capacity_for(fps=30.0, seconds=180.0)` 和 `raw_frame_bytes(width, height, channels=3)` 分别计算帧数与原始帧字节数。
+独立构造 `AlignmentBuffer` 的默认存储仍为 `jpeg`；正式采集任务显式采用 raw 热区和 TS 冷区。热区按消费者消费进度与约 1 秒窗口保留 BGR，硬上限 128 MiB；历史图像共享 64 MiB LRU，两者额度独立。热帧是否允许释放由写端 TS 刷盘提交水位与分段生命周期决定，正常实时追帧直接命中热区而无需后台反复冷读；未提交的热帧不会释放，积压超过上限时明确报错。`freeze` 固定截止帧、共享缓存和存储租约，并使用独立解码游标；需要主动核验冷读逐像素一致性时可显式调用 `verify_cold_read()` 或开启 `PreflightConfig.verify_cold_read`。缓存额度不包括返回图像、当前解码帧及编解码器工作集。`capacity_for(fps=30.0, seconds=180.0)` 和 `raw_frame_bytes(width, height, channels=3)` 分别计算帧数与原始帧字节数。
 
 正式任务装配可延迟接收至起飞判定后；延迟期间视频源的 `latest()` 与统计仍可用于预览和预检，但帧不对齐、不入缓冲，也不会被感知或记录器消费。被动采集与回放默认立即接收。
 
@@ -1853,6 +1853,8 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `check_video` | bool | `True` | 视频自检：窗口新增帧数、最新帧新鲜度与标定尺寸核对 |
 | `video_probe_s` | float | `5.0` | 视频探测窗口（秒） |
 | `video_min_frames` | int | `10` | 窗口内要求新增的最少帧数（至少 1） |
+| `verify_cold_read` | bool | `False` | 视频自检时是否对已落盘 TS 帧执行一次性冷读逐像素抽检 |
+| `cold_read_sample_frames` | int | `2` | 开启 `verify_cold_read` 时的抽检帧数（至少 1） |
 | `max_s` | float | `120.0` | 整个预检的总上限；超时 → `ABORT('preflight_timeout')` |
 
 ⚠ **关掉 ≠ 通过**：被关掉的项记一条 `preflight` 事件（`ok=null`），正式任务起飞前请核对那一条。

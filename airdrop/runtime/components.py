@@ -27,11 +27,21 @@ def build_alignment_buffer(
     capture: bool,
     ts_directory: Path = Path("."),
     segment_lifecycle: SegmentLifecycle | None = None,
+    cold_storage: bool = True,
 ) -> AlignmentBuffer | None:
-    """建立在线与回放共用的原始帧缓冲和有界冷读缓存。"""
+    """建立在线与回放共用的原始帧缓冲；关闭冷存储时按消费者游标即时回收内存。"""
     if not capture:
         return None
     from airdrop import AlignmentBuffer, capacity_for
+
+    if not cold_storage:
+        return AlignmentBuffer(
+            capacity_for(30.0, 180.0),
+            storage="raw",
+            max_bytes=128 * 1024 * 1024,
+            evict_consumed=True,
+        )
+
     from airdrop.video.cold import TsRangeDecoder
 
     decoder = TsRangeDecoder(

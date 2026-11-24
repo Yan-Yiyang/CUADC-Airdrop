@@ -204,6 +204,8 @@ class PerceptionWorker:
         self._result_observers: set[Callable[[DetectionSnapshot], None]] = set()
         self._frozen_buffer: AlignmentBuffer | None = None
         self._frozen_buffer_closed = False
+        self._consumer_id: int | None = None
+        self._consumer_buffer: AlignmentBuffer | None = None
         self._snapshot_matrix_source: Any = None
         self._snapshot_matrix: tuple[tuple[float, float, float], ...] | None = None
 
@@ -282,8 +284,34 @@ class PerceptionWorker:
                 self._frozen_buffer_closed = False
                 self._wait_cancel = threading.Event()
                 self._cutoff = cutoff
+                self._unregister_consumer_locked(old_buffer)
                 old_buffer.wake_waiters()
             return self._cutoff
+
+    def _register_consumer_locked(self) -> None:
+        if self._consumer_id is not None:
+            return
+        register = getattr(self._buffer, "register_consumer", None)
+        if callable(register):
+            self._consumer_id = cast(int, register(after_index=self._cursor))
+            self._consumer_buffer = self._buffer
+
+    def _advance_consumer_locked(self, source_buffer: AlignmentBuffer, index: int) -> None:
+        if self._consumer_id is not None and self._consumer_buffer is source_buffer:
+            advance = getattr(source_buffer, "advance_consumer", None)
+            if callable(advance):
+                advance(self._consumer_id, index)
+
+    def _unregister_consumer_locked(self, target: AlignmentBuffer | None = None) -> None:
+        if self._consumer_id is None or self._consumer_buffer is None:
+            return
+        if target is not None and self._consumer_buffer is not target:
+            return
+        unregister = getattr(self._consumer_buffer, "unregister_consumer", None)
+        if callable(unregister):
+            unregister(self._consumer_id)
+        self._consumer_id = None
+        self._consumer_buffer = None
 
     def _record_fatal(self, exc: Exception, *, preserve_type: bool = False) -> None:
         """记录后台致命异常与错误文本，供主线程通过 :meth:`raise_if_failed` 获取。"""
@@ -337,8 +365,14 @@ class PerceptionWorker:
             self._drained.clear()
             self._drain_to = None
             self._drain_ok = False
+            self._register_consumer_locked()
             self._thread = threading.Thread(target=self._run, name="perception", daemon=True)
-            self._thread.start()
+            try:
+                self._thread.start()
+            except BaseException:
+                self._thread = None
+                self._unregister_consumer_locked()
+                raise
         LOGGER.info(
             "感知线程已启动（mode=%s，buffer 现有 %d 帧）",
             self._config.mode,
@@ -501,6 +535,8 @@ class PerceptionWorker:
     # 处理循环
     # ------------------------------------------------------------------
     def _run(self) -> None:
+        with self._input_lock:
+            self._register_consumer_locked()
         try:
             while True:
                 with self._input_lock:
@@ -549,19 +585,7 @@ class PerceptionWorker:
                             self._fatal_error = self._stats.last_error
                     if isinstance(exc, OSError):
                         return
-                self._collect_remaining(timeout=0.0)
-                with self._input_lock:
-                    self._completed_index = frame.index
-                    close_frozen = False
-                    if self._cutoff is not None and frame.index == self._cutoff:
-                        # 尾帧已送检，OCR 持有独立裁剪；释放固定快照中的整帧引用。
-                        self._buffer.clear()
-                        close_frozen = self._buffer is self._frozen_buffer
-                if close_frozen:
-                    self._close_frozen_buffer()
-                self._check_pool_health()
-                self._check_drained()
-                self._check_crop_store()
+                self._after_frame_processed(source_buffer, frame.index)
         except Exception as exc:
             LOGGER.exception("感知线程异常退出")
             with self._stats_lock:
@@ -569,10 +593,29 @@ class PerceptionWorker:
                 self._fatal_error = self._stats.last_error
 
         finally:
+            with self._input_lock:
+                self._unregister_consumer_locked()
             with self._stats_lock:
                 self._run_finished = True
                 self._drained.set()
             self._close_frozen_buffer()
+
+    def _after_frame_processed(self, source_buffer: AlignmentBuffer, frame_index: int) -> None:
+        """收尾单帧：回收 OCR 结果、推进消费者游标并按需关闭冻结快照。"""
+        self._collect_remaining(timeout=0.0)
+        with self._input_lock:
+            self._completed_index = frame_index
+            self._advance_consumer_locked(source_buffer, frame_index)
+            close_frozen = False
+            if self._cutoff is not None and frame_index == self._cutoff:
+                # 尾帧已送检，OCR 持有独立裁剪；释放固定快照中的整帧引用。
+                self._buffer.clear()
+                close_frozen = self._buffer is self._frozen_buffer
+        if close_frozen:
+            self._close_frozen_buffer()
+        self._check_pool_health()
+        self._check_drained()
+        self._check_crop_store()
 
     def _close_frozen_buffer(self) -> None:
         """释放 worker 独占的固定视图及其 TS 解码器。"""

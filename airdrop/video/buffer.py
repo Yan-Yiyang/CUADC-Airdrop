@@ -68,6 +68,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from pathlib import Path
 
 import cv2
@@ -90,9 +91,6 @@ DEFAULT_JPEG_QUALITY = 80
 
 SUPPORTED_STORAGE = frozenset({"jpeg", "raw"})
 _COLD_REF_BYTES = 64
-# 活动 TS 分段尾部的 PES 包需等待后续包定界；冷区校验保持小尾差可复用单一解码游标，避免逐帧重开与 O(N^2) 重解。
-_ACTIVE_COLD_TAIL_FRAMES = 4
-_ACTIVE_COLD_TAIL_WAIT_S = 0.25
 
 # bisect 的 key：直接作用在记录列表上，不重建时间列表
 _capture_timestamp = operator.attrgetter("capture_timestamp")
@@ -197,9 +195,8 @@ class BufferStats:
     encode_failures: int = 0
     hot_bytes: int = 0
     cold_frames: int = 0
-    cold_pending: int = 0
-    cold_verified: int = 0
-    cold_not_ready: int = 0
+    cold_committed: int = 0
+    cold_reads: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +231,7 @@ class StoredFrame:
 
 @dataclass(frozen=True, slots=True)
 class ColdFrameRef:
-    """已通过精确读回验证的 TS 帧定位信息。"""
+    """已提交落盘的 TS 帧定位信息。"""
 
     segment: int
     pts: int
@@ -264,7 +261,7 @@ class AlignmentBuffer:
     JPEG 编解码在锁外进行，不会因为某个读者解码而卡住采集线程。
     """
 
-    def __init__(  # noqa: PLR0912, PLR0915 - 冷区资源初始化与失败回滚须显式处理
+    def __init__(
         self,
         capacity: int = DEFAULT_BUFFER_CAPACITY,
         *,
@@ -276,7 +273,7 @@ class AlignmentBuffer:
         max_hot_bytes: int = 128 * 1024 * 1024,
         segment_lifecycle: SegmentLifecycle | None = None,
         storage_lease: TsStorageLease | None = None,
-        _start_cold_worker: bool = True,
+        evict_consumed: bool = False,
     ) -> None:
         if capacity < 1:
             raise ValueError(f"capacity 至少为 1: {capacity}")
@@ -308,6 +305,7 @@ class AlignmentBuffer:
         self._hot_seconds = hot_seconds
         self._max_hot_bytes = max_hot_bytes
         self._storage_lease = storage_lease
+        self._evict_consumed = bool(evict_consumed)
 
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -321,55 +319,25 @@ class AlignmentBuffer:
         self._evicted = 0
         self._decode_failures = 0
         self._encode_failures = 0
-        self._cold_verified = 0
-        self._cold_not_ready = 0
+        self._cold_committed = 0
+        self._cold_reads = 0
         self._cold_frame_count = 0
         self._logged_estimate = False
-        self._cold_active_index: int | None = None
-        self._cold_next_schedule = 1
-        self._cold_schedule_limit = 0
-        self._cold_urgent_limit = 0
-        self._cold_last_put_mono = 0.0
+        self._cold_promote_index = 0
         self._cold_release_index = 0
         self._cold_stopping = False
         self._cold_error: str | None = None
-        self._cold_thread: threading.Thread | None = None
-        self._cold_worker_decoder = (
-            None
-            if cold_decoder is None or not _start_cold_worker
-            else TsRangeDecoder(
-                cold_decoder.directory,
-                max_cache_bytes=min(cold_decoder.max_cache_bytes, 16 * 1024 * 1024),
-                segment_lifecycle=self._segment_lifecycle,
-                cache_enabled=False,
-            )
-        )
-        if cold_decoder is not None and _start_cold_worker:
+        self._cold_complete_segments: set[int] = set()
+        self._cold_last_pts: dict[int, Fraction] = {}
+        self._consumers: dict[int, int] = {}
+        self._next_consumer_id = 0
+        if (
+            cold_decoder is not None
+            and cold_decoder.decoded_cache is not None
+            and cold_decoder._gop_coordinator is None  # noqa: SLF001 - 避免冻结视图重复绑定
+        ):
             # 主视图从首次历史读取开始即参与协调，并发首次请求也可合并。
-            try:
-                cold_decoder.enable_shared_gop()
-            except BaseException as exc:
-                if self._cold_worker_decoder is not None:
-                    try:
-                        self._cold_worker_decoder.close()
-                    except BaseException as cleanup_error:  # noqa: BLE001 - 保留构造异常
-                        exc.add_note(f"冷区校验解码器清理失败: {cleanup_error}")
-                raise
-        if cold_decoder is not None and _start_cold_worker:
-            self._cold_thread = threading.Thread(
-                target=self._cold_worker,
-                name="video-cold-watermark",
-                daemon=True,
-            )
-            try:
-                self._cold_thread.start()
-            except BaseException as exc:
-                if self._cold_worker_decoder is not None:
-                    try:
-                        self._cold_worker_decoder.close()
-                    except BaseException as cleanup_error:  # noqa: BLE001 - 保留线程启动异常
-                        exc.add_note(f"冷区校验解码器清理失败: {cleanup_error}")
-                raise
+            cold_decoder.enable_shared_gop()
 
     # ------------------------------------------------------------------
     # 写入接口
@@ -384,7 +352,7 @@ class AlignmentBuffer:
 
     @property
     def segment_lifecycle(self) -> SegmentLifecycle | None:
-        """返回与冷读校验器共享的分段生命周期。"""
+        """返回与冷存储共享的分段生命周期。"""
         return self._segment_lifecycle
 
     def bind_cold_directory(
@@ -393,32 +361,141 @@ class AlignmentBuffer:
         """在首帧入库前绑定航次冷存储目录。"""
         path = Path(directory)
         with self._condition:
-            if self._put or self._cold_active_index is not None or self._cold_stopping:
+            if self._put or self._cold_stopping:
                 raise RuntimeError("冷存储目录必须在缓冲开始写入前绑定")
-            if self._cold_decoder is None or self._cold_worker_decoder is None:
+            if self._cold_decoder is None:
                 raise RuntimeError("缓冲未启用冷存储")
             path.mkdir(parents=True, exist_ok=True)
             if self._storage_lease is not None:
                 raise RuntimeError("冷存储已绑定临时目录租约")
             self._cold_decoder.directory = path
-            self._cold_worker_decoder.directory = path
+            self._cold_complete_segments.clear()
             if storage_lease is not None:
                 self._cold_decoder.bind_storage_lease(storage_lease)
-                try:
-                    self._cold_worker_decoder.bind_storage_lease(storage_lease)
-                except BaseException as bind_error:
-                    try:
-                        self._cold_decoder.unbind_storage_lease()
-                    except BaseException as cleanup_error:  # noqa: BLE001 - 保留原绑定异常
-                        bind_error.add_note(f"回滚解码器租约失败: {cleanup_error}")
-                    raise
             self._storage_lease = storage_lease
 
+    def register_consumer(self, *, after_index: int = 0) -> int:
+        """注册实时消费者游标，用于按消费进度优先回收已落盘热帧。"""
+        with self._condition:
+            self._next_consumer_id += 1
+            consumer_id = self._next_consumer_id
+            self._consumers[consumer_id] = int(after_index)
+            return consumer_id
+
+    def advance_consumer(self, consumer_id: int, index: int) -> None:
+        """推进已注册消费者的进度并即时回收已消费帧的热区内存。"""
+        with self._condition:
+            current = self._consumers.get(consumer_id)
+            if current is None:
+                return
+            if index > current:
+                self._consumers[consumer_id] = int(index)
+            if self._cold_decoder is not None and self._records:
+                cutoff = self._records[-1].capture_timestamp - self._hot_seconds
+                self._release_eligible_locked(cutoff)
+            elif self._cold_decoder is None and self._evict_consumed:
+                self._evict_consumed_locked()
+
+    def unregister_consumer(self, consumer_id: int) -> None:
+        """注销消费者游标，防止已退出消费者长期阻塞热区回收。"""
+        with self._condition:
+            if consumer_id not in self._consumers:
+                return
+            del self._consumers[consumer_id]
+            if self._cold_decoder is not None and self._records:
+                cutoff = self._records[-1].capture_timestamp - self._hot_seconds
+                self._release_eligible_locked(cutoff)
+            elif self._cold_decoder is None and self._evict_consumed:
+                self._evict_consumed_locked()
+
+    def _sync_segment_failure_locked(self) -> None:
+        """同步写端分段失败状态，确保故障在零解码路径下即时暴露。"""
+        if self._cold_error is not None or self._segment_lifecycle is None:
+            return
+        failed = self._segment_lifecycle.has_failed()
+        if failed is not None:
+            segment, detail = failed
+            suffix = f"：{detail}" if detail else ""
+            self._cold_error = f"TS 分段 #{segment} 写入失败{suffix}"
+
     def _check_cold_writable_locked(self) -> None:
+        self._sync_segment_failure_locked()
         if self._cold_stopping:
             raise RuntimeError("冷存储缓冲已经关闭，不能继续写入")
         if self._cold_error is not None:
             raise OSError(f"冷存储已失败：{self._cold_error}")
+
+    def _frame_locator_if_committed_locked(
+        self,
+        segment: int,
+        media_pts: int | None,
+        time_base_num: int | None,
+        time_base_den: int | None,
+    ) -> ColdFrameRef | None:
+        """根据写端提交水位或封口状态判断该帧是否已安全落盘。"""
+        if (
+            self._cold_decoder is None
+            or media_pts is None
+            or time_base_num is None
+            or time_base_den is None
+            or time_base_den <= 0
+            or segment < 1
+        ):
+            return None
+        lifecycle = self._segment_lifecycle
+        state = SegmentState.UNKNOWN
+        committed_time: Fraction | None = None
+        if lifecycle is not None:
+            snap = lifecycle.snapshot(segment)
+            state = snap.state
+            committed_time = snap.committed_time
+            if state is SegmentState.FAILED:
+                suffix = f"：{snap.error}" if snap.error else ""
+                self._cold_error = f"TS 分段 #{segment} 写入失败{suffix}"
+                return None
+        frame_time = Fraction(media_pts * time_base_num, time_base_den)
+        committed = False
+        if state is SegmentState.CLOSED_COMPLETE:
+            committed = True
+        elif state in {SegmentState.ACTIVE, SegmentState.CLOSED_INCOMPLETE}:
+            committed = committed_time is not None and frame_time <= committed_time
+        elif segment in self._cold_complete_segments:
+            committed = True
+        elif (self._cold_decoder.directory / f"segment-{segment:06d}.complete").is_file():
+            self._cold_complete_segments.add(segment)
+            committed = True
+        if not committed:
+            return None
+        return ColdFrameRef(
+            segment=segment,
+            pts=media_pts,
+            time_base_num=time_base_num,
+            time_base_den=time_base_den,
+        )
+
+    def _promote_committed_locked(self) -> None:
+        """按写端最新水位增量标记已落盘热帧，避免重复扫描历史记录。"""
+        if self._cold_decoder is None:
+            return
+        self._sync_segment_failure_locked()
+        records = self._records
+        while self._cold_promote_index < len(records):
+            offset = self._cold_promote_index
+            record = records[offset]
+            if record.cold_locator is not None:
+                self._cold_promote_index += 1
+                continue
+            locator = self._frame_locator_if_committed_locked(
+                record.segment,
+                record.media_pts,
+                record.time_base_num,
+                record.time_base_den,
+            )
+            if locator is None:
+                break
+            records[offset] = replace(record, cold_locator=locator)
+            self._cold_committed += 1
+            self._cold_promote_index += 1
 
     def put(self, sample: AlignedSample, *, materialize: bool = True) -> BufferedFrame | None:
         """把一条对齐结果存入缓冲，可选返回解码后的入库记录。
@@ -440,15 +517,40 @@ class AlignmentBuffer:
 
         with self._condition:
             self._check_cold_writable_locked()
+            cold_locator: ColdFrameRef | None = None
             if self._cold_decoder is not None:
+                frame = sample.frame
+                if (
+                    frame.media_pts is not None
+                    and frame.time_base_num is not None
+                    and frame.time_base_den is not None
+                    and frame.time_base_den > 0
+                    and frame.segment >= 1
+                ):
+                    frame_time = Fraction(
+                        frame.media_pts * frame.time_base_num, frame.time_base_den
+                    )
+                    prev_pts = self._cold_last_pts.get(frame.segment)
+                    if prev_pts is not None and frame_time <= prev_pts:
+                        self._cold_error = (
+                            f"TS 分段 #{frame.segment} 帧 PTS 非单调递增: "
+                            f"{frame_time} <= {prev_pts}"
+                        )
+                        raise OSError(f"冷存储已失败：{self._cold_error}")
+                    self._cold_last_pts[frame.segment] = frame_time
+                cold_locator = self._frame_locator_if_committed_locked(
+                    frame.segment,
+                    frame.media_pts,
+                    frame.time_base_num,
+                    frame.time_base_den,
+                )
+                self._check_cold_writable_locked()
                 self._release_eligible_locked(sample.timestamp - self._hot_seconds)
                 if self._hot_bytes + nbytes > self._max_hot_bytes:
-                    self._cold_urgent_limit = max(self._cold_urgent_limit, self._next_index)
-                    self._schedule_through_locked(self._next_index)
                     self._release_eligible_locked(float("inf"), required_bytes=nbytes)
                     if self._hot_bytes + nbytes > self._max_hot_bytes:
                         raise OSError(
-                            "冷区追赶落后，最早热帧尚未验证，拒绝超出热区字节上限: "
+                            "冷区写端尚未提交最早热帧，拒绝超出热区字节上限: "
                             f"{self._hot_bytes + nbytes} > {self._max_hot_bytes} bytes"
                         )
             self._next_index += 1
@@ -471,22 +573,21 @@ class AlignmentBuffer:
                 random_access_time_base_den=sample.frame.random_access_time_base_den,
                 image_width=int(sample.frame.image.shape[1]),
                 image_height=int(sample.frame.image.shape[0]),
+                cold_locator=cold_locator,
             )
             self._records.append(stored)
             self._bytes += nbytes
             if self._cold_decoder is not None:
                 self._hot_bytes += nbytes
+                if cold_locator is not None:
+                    self._cold_committed += 1
+                    if self._cold_promote_index == len(self._records) - 1:
+                        self._cold_promote_index = len(self._records)
             self._put += 1
             if self._cold_decoder is None:
                 self._evict_locked()
             self._log_estimate_locked(nbytes)
-            if self._cold_decoder is not None:
-                self._cold_last_put_mono = time.monotonic()
-                if self._hot_bytes + nbytes * (_ACTIVE_COLD_TAIL_FRAMES + 2) > self._max_hot_bytes:
-                    self._cold_urgent_limit = max(self._cold_urgent_limit, self._next_index)
-                self._schedule_through_locked(self._next_index)
-            else:
-                self._condition.notify_all()
+            self._condition.notify_all()
 
         if not materialize:
             return None
@@ -498,57 +599,39 @@ class AlignmentBuffer:
     def clear(self) -> None:
         """清空缓冲（不影响已发出的记录对象）。"""
         with self._condition:
-            if (
-                self._cold_active_index is not None
-                or self._cold_next_schedule <= self._cold_schedule_limit
-                or self._cold_error
-            ):
-                raise RuntimeError("冷存储迁移进行中，不能清空缓冲")
+            self._sync_segment_failure_locked()
+            if self._cold_error:
+                raise RuntimeError(f"冷存储已失败，不能清空缓冲：{self._cold_error}")
             self._records.clear()
             self._bytes = 0
             self._hot_bytes = 0
-            self._cold_verified = 0
-            self._cold_not_ready = 0
+            self._cold_committed = 0
             self._cold_frame_count = 0
+            self._cold_promote_index = 0
             self._cold_release_index = 0
-            self._cold_next_schedule = self._next_index + 1
-            self._cold_schedule_limit = self._next_index
-            self._cold_urgent_limit = self._next_index
+            self._cold_last_pts.clear()
             self._condition.notify_all()
 
-    def freeze(self, *, after_index: int = 0) -> "AlignmentBuffer":  # noqa: PLR0912, PLR0915 - 关闭与回滚需逐项判断
+    def freeze(self, *, after_index: int = 0) -> "AlignmentBuffer":  # noqa: PLR0912 - 关闭与回滚需逐项判断
         """固定当前未读范围，供侦查收尾使用；原缓冲继续接收录像帧。
 
         仅复制记录引用，不复制或重新编码图像。返回值不接写入器，后续原缓冲
-        驱逐不会影响这份待处理范围；若未读帧已被驱逐，明确失败。
+        驱逐不会影响这份待处理范围；若未读帧已被驱逐或存在未落盘帧，明确失败。
         """
         with self._lock:
+            self._sync_segment_failure_locked()
             if self._cold_stopping:
                 raise RuntimeError("冷存储缓冲已经关闭，不能冻结读取视图")
+            if self._cold_error is not None:
+                raise RuntimeError(f"freeze 冷区状态失败：{self._cold_error}")
             target_index = self._next_index
             first = self._records[0].index if self._records else target_index + 1
             if after_index < first - 1:
                 raise RuntimeError("侦查未读帧已被缓冲驱逐，无法完整处理")
             if self._cold_decoder is not None:
-                self._cold_urgent_limit = max(self._cold_urgent_limit, target_index)
-                self._schedule_through_locked(target_index)
-                deadline = time.monotonic() + 5.0
-                while self._cold_pending_through_locked(target_index, require_verified=True):
-                    if self._cold_stopping:
-                        raise RuntimeError("冷存储关闭期间不能创建冻结读取视图")
-                    if self._cold_error is not None:
-                        raise RuntimeError(f"freeze 冷区水位失败：{self._cold_error}")
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError(f"freeze 等待冷区水位超时，截止帧 #{target_index}")
-                    self._condition.wait(remaining)
-                if self._cold_stopping:
-                    raise RuntimeError("冷存储关闭期间不能创建冻结读取视图")
+                self._promote_committed_locked()
                 if self._cold_error is not None:
-                    raise RuntimeError(f"freeze 冷区水位失败：{self._cold_error}")
-            first = self._records[0].index if self._records else self._next_index + 1
-            if after_index < first - 1:
-                raise RuntimeError("freeze 等待冷区水位时未读帧已被缓冲驱逐")
+                    raise RuntimeError(f"freeze 冷区状态失败：{self._cold_error}")
             start = bisect.bisect_right(self._records, after_index, key=_index)
             end = bisect.bisect_right(self._records, target_index, key=_index)
             frozen_records = self._records[start:end]
@@ -556,7 +639,9 @@ class AlignmentBuffer:
                 raise RuntimeError(f"freeze 截止帧 #{target_index} 已被缓冲驱逐")
             if self._cold_decoder is not None:
                 if any(record.cold_locator is None for record in frozen_records):
-                    raise RuntimeError("freeze 截止范围内存在未验证 TS 帧，拒绝固定不完整数据")
+                    raise RuntimeError(
+                        "freeze 截止范围内存在未落盘提交的 TS 帧，拒绝固定不完整数据"
+                    )
                 frozen_records = [
                     replace(record, payload=record.cold_locator, nbytes=_COLD_REF_BYTES)
                     for record in frozen_records
@@ -589,7 +674,6 @@ class AlignmentBuffer:
                     max_hot_bytes=self._max_hot_bytes,
                     segment_lifecycle=self._segment_lifecycle,
                     storage_lease=frozen_lease,
-                    _start_cold_worker=False,
                 )
             except BaseException as construction_error:
                 if frozen_decoder is not None:
@@ -611,6 +695,8 @@ class AlignmentBuffer:
             frozen._bytes = sum(record.nbytes for record in frozen._records)
             frozen._hot_bytes = 0
             frozen._cold_frame_count = len(frozen_records) if frozen_decoder is not None else 0
+            frozen._cold_committed = len(frozen_records) if frozen_decoder is not None else 0
+            frozen._cold_promote_index = len(frozen_records)
             frozen._cold_release_index = len(frozen_records)
             frozen._next_index = target_index
             frozen._put = len(frozen._records)
@@ -639,15 +725,14 @@ class AlignmentBuffer:
                 encode_failures=self._encode_failures,
                 hot_bytes=self._hot_bytes,
                 cold_frames=self._cold_frame_count,
-                cold_pending=max(0, self._cold_schedule_limit - self._cold_next_schedule + 1)
-                + int(self._cold_active_index is not None),
-                cold_verified=self._cold_verified,
-                cold_not_ready=self._cold_not_ready,
+                cold_committed=self._cold_committed,
+                cold_reads=self._cold_reads,
             )
 
     def raise_if_failed(self) -> None:
-        """将异步冷存储失败传递给任务心跳。"""
+        """将冷存储写端或校验故障传递给任务心跳。"""
         with self._lock:
+            self._sync_segment_failure_locked()
             error = self._cold_error
         if error is not None:
             raise OSError(f"冷存储失败：{error}")
@@ -803,7 +888,7 @@ class AlignmentBuffer:
                     self._condition.wait(remaining)
             # 解码必须在**锁外**：jpeg 模式下的解码与采集线程的 put() 共用这把锁。
             # 在锁内解码会阻塞新帧入库；latest()/at() 同样在锁外解码。
-            frame = self._materialize_record(stored)
+            frame = self._materialize_record(stored, cancel_event=cancel_event)
             if cancel_event is not None and cancel_event.is_set():
                 return None
             if frame is not None:
@@ -912,47 +997,66 @@ class AlignmentBuffer:
             random_access_time_base_den=stored.random_access_time_base_den,
         )
 
-    def _materialize_record(self, stored: StoredFrame) -> BufferedFrame | None:
+    def _materialize_record(
+        self,
+        stored: StoredFrame,
+        *,
+        cancel_event: threading.Event | None = None,
+        ready_timeout: float = 5.0,
+    ) -> BufferedFrame | None:
         """按定位信息冷读 TS 帧，再复用标准记录还原路径。"""
         if isinstance(stored.payload, ColdFrameRef):
             if self._cold_decoder is None:
                 raise RuntimeError("缓冲记录需要冷解码器，但当前缓冲未配置")
-            image = self._cold_decoder.read(
-                stored.payload.segment,
-                stored.payload.pts,
-                stored.payload.time_base_num,
-                stored.payload.time_base_den,
-                output_size=(stored.image_width, stored.image_height)
+            with self._lock:
+                self._cold_reads += 1
+            output_size = (
+                (stored.image_width, stored.image_height)
                 if stored.image_width is not None and stored.image_height is not None
-                else None,
-                readonly=True,
+                else None
             )
+            lifecycle = self._segment_lifecycle
+            deadline = time.monotonic() + ready_timeout
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
+                before = (
+                    lifecycle.snapshot(stored.payload.segment) if lifecycle is not None else None
+                )
+                try:
+                    image = self._cold_decoder.read(
+                        stored.payload.segment,
+                        stored.payload.pts,
+                        stored.payload.time_base_num,
+                        stored.payload.time_base_den,
+                        output_size=output_size,
+                        readonly=True,
+                    )
+                    break
+                except TsDataNotReady:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return None
+                    remaining = deadline - time.monotonic()
+                    if self._cold_stopping or remaining <= 0:
+                        raise
+                    if lifecycle is not None and before is not None:
+                        lifecycle.wait_for_change(
+                            stored.payload.segment,
+                            before.revision,
+                            timeout=min(0.2, remaining),
+                        )
+                    else:
+                        time.sleep(min(0.05, remaining))
             if image is None:
                 raise RuntimeError(f"TS 帧读取失败：缓冲序号 #{stored.index}")
             return self._materialize(replace(stored, payload=image, nbytes=image.nbytes))
         return self._materialize(stored)
 
-    def _schedule_through_locked(self, cutoff_index: int) -> None:
-        """发布连续校验水位；worker 自己按序扫描，队列不随录制时长增长。"""
-        if self._cold_decoder is None:
-            return
-        self._cold_schedule_limit = max(self._cold_schedule_limit, cutoff_index)
-        self._condition.notify_all()
-
-    def _cold_pending_through_locked(self, index: int, *, require_verified: bool = False) -> bool:
-        if self._cold_active_index is not None and self._cold_active_index <= index:
-            return True
-        if self._cold_next_schedule <= min(self._cold_schedule_limit, index):
-            return True
-        if not require_verified:
-            return False
-        return any(
-            record.index <= index and record.cold_locator is None for record in self._records
-        )
-
     def _release_eligible_locked(self, cutoff: float, *, required_bytes: int = 0) -> None:
-        """按序释放已验证老帧；接近硬上限时可越过热区时长提前释放。"""
+        """按写端提交水位与消费者游标释放热帧；滞后超限时提前降级为冷引用。"""
+        self._promote_committed_locked()
         records = self._records
+        min_consumer = min(self._consumers.values()) if self._consumers else None
         while self._cold_release_index < len(records):
             offset = self._cold_release_index
             record = records[offset]
@@ -962,7 +1066,11 @@ class AlignmentBuffer:
             if not isinstance(record.payload, np.ndarray) or record.cold_locator is None:
                 break
             needs_space = self._hot_bytes + required_bytes > self._max_hot_bytes
-            if record.capture_timestamp > cutoff and not needs_space:
+            if min_consumer is not None:
+                # 活跃消费者全部读完后即时释放；未读帧尽量留在热区避免冷读，仅在超限时降级。
+                if record.index > min_consumer and not needs_space:
+                    break
+            elif record.capture_timestamp > cutoff and not needs_space:
                 break
             self._records[offset] = replace(
                 record,
@@ -974,181 +1082,92 @@ class AlignmentBuffer:
             self._cold_frame_count += 1
             self._cold_release_index += 1
 
-    def _cold_target_locked(self) -> int:
-        """返回下一个待验证序号；队列状态只用两个水位整数表示。"""
-        return self._cold_next_schedule
-
-    def _active_cold_tail_wait_locked(self, index: int, record: StoredFrame | None) -> float | None:
-        """活动分段尾部保留少量缓冲帧以复用游标，静默超时或紧急排空时立即放行。"""
-        if (
-            record is None
-            or record.cold_locator is not None
-            or index <= self._cold_urgent_limit
-            or self._cold_schedule_limit - index >= _ACTIVE_COLD_TAIL_FRAMES
-            or self._segment_lifecycle is None
-            or self._segment_lifecycle.snapshot(record.segment).state is not SegmentState.ACTIVE
-        ):
-            return None
-        remaining = self._cold_last_put_mono + _ACTIVE_COLD_TAIL_WAIT_S - time.monotonic()
-        return remaining if remaining > 0 else None
-
-    def _cold_worker(self) -> None:  # noqa: PLR0915 - 故障分支需与异步状态转换相邻
-        """后台逐帧确认精确 PTS，采集线程只做有界的内存入队。"""
-        decoder = self._cold_worker_decoder
-        if decoder is None:
-            return
-        while True:
-            with self._condition:
-                while True:
-                    while (
-                        self._cold_next_schedule > self._cold_schedule_limit
-                        and not self._cold_stopping
-                    ):
-                        self._condition.wait()
-                    if self._cold_stopping:
-                        return
-                    if self._cold_error is not None:
-                        self._condition.wait(0.1)
-                        continue
-                    index = self._cold_target_locked()
-                    record = self._find_by_index_locked(index)
-                    tail_wait = self._active_cold_tail_wait_locked(index, record)
-                    if tail_wait is not None:
-                        self._condition.wait(tail_wait)
-                        continue
-                    break
-                self._cold_next_schedule += 1
-                self._cold_active_index = index
-                if record is None or record.cold_locator is not None:
-                    self._finish_cold_locked(index)
-                    continue
-                payload = record.payload
-                if not isinstance(payload, np.ndarray):
-                    self._cold_error = f"帧 #{index} 的热区载荷类型无效"
-                    self._cold_active_index = None
-                    self._condition.notify_all()
-                    continue
-                if (
-                    record.media_pts is None
-                    or record.time_base_num is None
-                    or record.time_base_den is None
-                    or record.time_base_den <= 0
-                    or record.segment < 1
-                ):
-                    self._cold_error = f"帧 #{index} 缺少可靠 TS/PTS 映射"
-                    self._cold_active_index = None
-                    self._condition.notify_all()
-                    continue
-                locator = ColdFrameRef(
-                    segment=record.segment,
-                    pts=record.media_pts,
-                    time_base_num=record.time_base_num,
-                    time_base_den=record.time_base_den,
-                )
-
-            lifecycle = self._segment_lifecycle
-            before_read = lifecycle.snapshot(locator.segment) if lifecycle is not None else None
-            try:
-                recovered = decoder.read(
-                    locator.segment,
-                    locator.pts,
-                    locator.time_base_num,
-                    locator.time_base_den,
-                    output_size=(payload.shape[1], payload.shape[0]),
-                )
-            except TsDataNotReady:
-                with self._condition:
-                    self._cold_not_ready += 1
-                    self._cold_next_schedule = min(self._cold_next_schedule, index)
-                    self._cold_active_index = None
-                    self._condition.notify_all()
-                if lifecycle is not None and before_read is not None:
-                    lifecycle.wait_for_change(locator.segment, before_read.revision, timeout=0.5)
-                with self._condition:
-                    self._condition.notify_all()
-                continue
-            except Exception as exc:  # noqa: BLE001 - 冷读异常必须作为存储故障暴露
-                with self._condition:
-                    self._cold_error = f"帧 #{index} 冷读失败：{type(exc).__name__}: {exc}"
-                    self._cold_active_index = None
-                    self._condition.notify_all()
-                continue
-
-            # 像素对比放在锁外，避免全帧比较阻塞采集线程 put()。
-            matches = recovered is not None and np.array_equal(recovered, payload)
-            with self._condition:
-                current = self._find_by_index_locked(index)
-                if current is None or current.payload is not payload:
-                    self._finish_cold_locked(index)
-                    continue
-                if not matches:
-                    self._cold_error = f"帧 #{index} TS 冷读校验不一致，保留热帧"
-                    self._cold_active_index = None
-                    self._condition.notify_all()
-                    continue
-                record_offset = index - self._records[0].index
-                self._records[record_offset] = replace(current, cold_locator=locator)
-                self._cold_verified += 1
-                cutoff = self._records[-1].capture_timestamp - self._hot_seconds
-                self._release_eligible_locked(cutoff)
-                self._finish_cold_locked(index)
-
-    def _finish_cold_locked(self, index: int) -> None:
-        self._cold_active_index = None
-        self._condition.notify_all()
-
-    def close_cold_storage(self, timeout: float = 5.0) -> None:  # noqa: PLR0912 - 收尾分支需逐项释放资源
-        """采集结束后排空冷区水位并关闭迁移线程。"""
-        if self._cold_decoder is None:
-            return
-        deadline = time.monotonic() + timeout
-        failure: BaseException | None = None
+    def verify_cold_read(self, *, sample_frames: int = 1, timeout: float = 5.0) -> int:
+        """可选的预检/调试抽检：对热区前若干已落盘帧执行一次冷读逐像素一致性核对。"""
+        if sample_frames < 1:
+            raise ValueError(f"sample_frames 至少为 1: {sample_frames}")
+        if not np.isfinite(timeout) or timeout <= 0:
+            raise ValueError(f"timeout 必须是正有限秒数: {timeout}")
         with self._condition:
-            if self._cold_worker_decoder is not None:
-                self._cold_urgent_limit = max(self._cold_urgent_limit, self._next_index)
-                self._schedule_through_locked(self._next_index)
-                while self._cold_pending_through_locked(self._next_index, require_verified=True):
-                    if self._cold_error is not None:
-                        failure = RuntimeError(f"冷区排空失败：{self._cold_error}")
+            if self._cold_decoder is None:
+                raise RuntimeError("缓冲未启用冷存储，无法执行冷读抽检")
+            self._promote_committed_locked()
+            self._check_cold_writable_locked()
+            samples: list[tuple[int, ColdFrameRef, np.ndarray]] = []
+            for record in self._records:
+                if isinstance(record.payload, np.ndarray) and record.cold_locator is not None:
+                    samples.append((record.index, record.cold_locator, record.payload))
+                    if len(samples) >= sample_frames:
                         break
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        failure = TimeoutError(
-                            f"冷区排空超时：{self._cold_error or self._hot_bytes} bytes 仍在热区"
+            directory = self._cold_decoder.directory
+            lifecycle = self._segment_lifecycle
+        if not samples:
+            return 0
+        checker = TsRangeDecoder(
+            directory,
+            max_cache_bytes=16 * 1024 * 1024,
+            segment_lifecycle=lifecycle,
+            cache_enabled=False,
+        )
+        deadline = time.monotonic() + timeout
+        verified = 0
+        try:
+            for index, locator, payload in samples:
+                while True:
+                    before = lifecycle.snapshot(locator.segment) if lifecycle is not None else None
+                    try:
+                        recovered = checker.read(
+                            locator.segment,
+                            locator.pts,
+                            locator.time_base_num,
+                            locator.time_base_den,
+                            output_size=(payload.shape[1], payload.shape[0]),
                         )
                         break
-                    self._condition.wait(remaining)
-                if failure is None and self._cold_error is not None:
-                    failure = RuntimeError(f"冷区排空失败：{self._cold_error}")
-                if failure is None:
-                    self._release_eligible_locked(float("inf"))
+                    except TsDataNotReady as exc:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(f"帧 #{index} 冷读抽检等待活动分段写入超时") from exc
+                        if lifecycle is not None and before is not None:
+                            lifecycle.wait_for_change(
+                                locator.segment, before.revision, timeout=min(0.2, remaining)
+                            )
+                        else:
+                            time.sleep(min(0.05, remaining))
+                if recovered is None or not np.array_equal(recovered, payload):
+                    message = f"帧 #{index} TS 冷读校验不一致，保留热帧"
+                    with self._condition:
+                        self._cold_error = message
+                    raise OSError(f"冷存储失败：{message}")
+                verified += 1
+        finally:
+            checker.close()
+        return verified
+
+    def close_cold_storage(self, timeout: float = 5.0) -> None:
+        """采集结束后按写端水位释放热帧并关闭冷读解码器与存储租约。"""
+        del timeout
+        if self._cold_decoder is None:
+            return
+        failure: BaseException | None = None
+        with self._condition:
+            self._promote_committed_locked()
+            if self._cold_error is not None:
+                failure = RuntimeError(f"冷区收尾失败：{self._cold_error}")
+            else:
+                self._release_eligible_locked(float("inf"))
             self._cold_stopping = True
             self._condition.notify_all()
-        thread = self._cold_thread
-        if thread is not None:
-            thread.join(max(0.0, deadline - time.monotonic()))
-            if thread.is_alive():
-                raise TimeoutError("冷区迁移线程未能退出")
-        worker_decoder = self._cold_worker_decoder
-        close_errors: list[tuple[str, Exception]] = []
-        if worker_decoder is not None:
-            try:
-                worker_decoder.close()
-            except Exception as exc:  # noqa: BLE001 - 两个解码器都必须尝试关闭
-                close_errors.append(("校验解码器", exc))
         try:
             self._cold_decoder.close()
-        except Exception as exc:  # noqa: BLE001 - 两个解码器都必须尝试关闭
-            close_errors.append(("历史解码器", exc))
-        if close_errors:
-            detail = "; ".join(
-                f"{label}: {type(exc).__name__}: {exc}" for label, exc in close_errors
+        except Exception as exc:  # noqa: BLE001 - 保留原收尾异常并继续释放目录租约
+            close_failure = RuntimeError(
+                f"关闭冷区解码器失败：历史解码器: {type(exc).__name__}: {exc}"
             )
-            close_failure = RuntimeError(f"关闭冷区解码器失败：{detail}")
             if failure is None:
                 failure = close_failure
             else:
-                failure = ExceptionGroup("冷存储排空与关闭均失败", [failure, close_failure])
+                failure = ExceptionGroup("冷存储收尾与关闭均失败", [failure, close_failure])
         if self._storage_lease is not None:
             self._storage_lease.close()
             self._storage_lease = None
@@ -1171,8 +1190,19 @@ class AlignmentBuffer:
             return records[idx]
         return None
 
+    def _evict_consumed_locked(self) -> None:
+        """纯实时无冷存储模式下，所有活跃消费者越过后直接回收头部帧内存。"""
+        if not self._consumers:
+            return
+        min_consumer = min(self._consumers.values())
+        records = self._records
+        while records and records[0].index <= min_consumer:
+            self._drop_oldest_locked()
+
     def _evict_locked(self) -> None:
         """按帧数上限与字节上限从最旧一端驱逐。"""
+        if self._evict_consumed:
+            self._evict_consumed_locked()
         records = self._records
         while len(records) > self._capacity:
             self._drop_oldest_locked()

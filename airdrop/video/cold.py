@@ -92,11 +92,18 @@ class TsSegmentWriter:
             raise
         assert self._container is not None and self._index_file is not None
         self._closed = False
+        self._committed_time: Fraction | None = None
 
-    def mux(self, packet: Any) -> None:
-        """将输入包交给 TS muxer，保留包的时间戳与关键帧标记。"""
+    @property
+    def committed_time(self) -> Fraction | None:
+        """当前已刷盘的单调递增最高媒体时刻。"""
+        return self._committed_time
+
+    def mux(self, packet: Any) -> Fraction | None:
+        """将输入包交给 TS muxer，记录关键帧字节偏移并返回已刷盘的最高媒体时刻。"""
         if packet.size <= 0 or (packet.pts is None and packet.dts is None):
-            return
+            return self._committed_time
+        byte_offset = self._file.tell() if packet.is_keyframe else None
         copied = self._av.Packet(bytes(packet))
         copied.pts = packet.pts
         copied.dts = packet.dts
@@ -105,24 +112,28 @@ class TsSegmentWriter:
         copied.is_keyframe = packet.is_keyframe
         copied.stream = self._stream
         self._container.mux(copied)
+        self._file.flush()
+        time_base = packet.time_base
         if packet.is_keyframe and packet.pts is not None and packet.dts is not None:
-            time_base = packet.time_base
             if time_base is None:
                 raise ValueError("随机访问包缺少 time_base")
-            self._index_file.write(
-                json.dumps(
-                    {
-                        "pts": int(packet.pts),
-                        "dts": int(packet.dts),
-                        "time_base_num": int(time_base.numerator),
-                        "time_base_den": int(time_base.denominator),
-                    },
-                    separators=(",", ":"),
-                )
-                + "\n"
-            )
+            record: dict[str, int] = {
+                "pts": int(packet.pts),
+                "dts": int(packet.dts),
+                "time_base_num": int(time_base.numerator),
+                "time_base_den": int(time_base.denominator),
+            }
+            if byte_offset is not None and byte_offset >= 0:
+                record["byte_offset"] = int(byte_offset)
+            self._index_file.write(json.dumps(record, separators=(",", ":")) + "\n")
             self._index_file.flush()
-        self._file.flush()
+        if time_base is not None and time_base.denominator > 0:
+            stamp = packet.pts if packet.pts is not None else packet.dts
+            if stamp is not None:
+                media_time = Fraction(int(stamp) * time_base.numerator, time_base.denominator)
+                if self._committed_time is None or media_time > self._committed_time:
+                    self._committed_time = media_time
+        return self._committed_time
 
     def close(self, *, complete: bool = True) -> None:
         if self._closed:
@@ -187,7 +198,7 @@ class TsRangeDecoder:
             self._decoded_cache.acquire()
         self.cursor_idle_timeout_s = cursor_idle_timeout_s
         self.segment_lifecycle = segment_lifecycle
-        self._keyframe_cache: dict[int, list[tuple[Fraction, Fraction]]] = {}
+        self._keyframe_cache: dict[int, list[tuple[Fraction, Fraction, int | None]]] = {}
         self._keyframe_signatures: dict[int, int] = {}
         self._keyframe_offsets: dict[int, int] = {}
         self._keyframe_complete: set[int] = set()
@@ -454,11 +465,12 @@ class TsRangeDecoder:
         active_at_open = not complete_at_open and (
             status is not None and status.state is SegmentState.ACTIVE
         )
-        dts_time = self._find_random_access_dts(segment, path, target_time)
-        if dts_time is None:
+        access = self._find_random_access(segment, path, target_time)
+        if access is None:
             if active_at_open:
                 raise TsDataNotReady(f"活动 MPEG-TS 段尚未写出随机访问点: {path}")
             raise ValueError(f"目标时间 {target_time} 之前没有可用关键帧: {path}")
+        dts_time, byte_offset = access
         import av
 
         container = av.open(str(path), mode="r")
@@ -470,10 +482,18 @@ class TsRangeDecoder:
             stream = container.streams.video[0]
             if hasattr(stream, "thread_type"):
                 stream.thread_type = "NONE"
-            offset = int(
-                dts_time / Fraction(stream.time_base.numerator, stream.time_base.denominator)
-            )
-            container.seek(offset, stream=stream, backward=True, any_frame=False)
+            if byte_offset is not None:
+                container.seek(
+                    byte_offset,
+                    backward=True,
+                    any_frame=False,
+                    unsupported_byte_offset=True,
+                )
+            else:
+                offset = int(
+                    dts_time / Fraction(stream.time_base.numerator, stream.time_base.denominator)
+                )
+                container.seek(offset, stream=stream, backward=True, any_frame=False)
             current_request = request
             current_time = target_time
             width, height = output_size or (0, 0)
@@ -669,7 +689,9 @@ class TsRangeDecoder:
             return True
         return path.with_suffix(".complete").is_file()
 
-    def _get_keyframes(self, segment: int, path: Path) -> list[tuple[Fraction, Fraction]]:
+    def _get_keyframes(
+        self, segment: int, path: Path
+    ) -> list[tuple[Fraction, Fraction, int | None]]:
         """扫描包头元数据建立随机访问索引，不解码图像。"""
         with self._lock:
             if segment in self._keyframe_complete:
@@ -697,7 +719,7 @@ class TsRangeDecoder:
 
     def _read_rap_index(
         self, segment: int, index_path: Path, size: int, *, is_complete: bool
-    ) -> list[tuple[Fraction, Fraction]] | None:
+    ) -> list[tuple[Fraction, Fraction, int | None]] | None:
         """增量读取 .rap.jsonl 关键帧索引并更新缓存。"""
         with self._lock:
             cached = self._keyframe_cache.get(segment)
@@ -735,9 +757,16 @@ class TsRangeDecoder:
                     raise ValueError("time_base_den 必须为正")
                 pts_time = Fraction(int(item["pts"]) * num, den)
                 dts_time = Fraction(int(item["dts"]) * num, den)
+                raw_offset = item.get("byte_offset")
+                if raw_offset is None:
+                    byte_offset: int | None = None
+                elif type(raw_offset) is int and raw_offset >= 0:
+                    byte_offset = raw_offset
+                else:
+                    raise ValueError(f"byte_offset 必须为非负整数: {raw_offset!r}")
                 if is_sorted and pts_list and pts_time < pts_list[-1]:
                     is_sorted = False
-                result.append((pts_time, dts_time))
+                result.append((pts_time, dts_time, byte_offset))
                 pts_list.append(pts_time)
                 consumed += len(line)
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -759,7 +788,7 @@ class TsRangeDecoder:
 
     def _scan_ts_keyframes(
         self, segment: int, path: Path, *, mark_complete: bool
-    ) -> list[tuple[Fraction, Fraction]]:
+    ) -> list[tuple[Fraction, Fraction, int | None]]:
         """缺少 .rap.jsonl 索引时回退扫描 TS 包头提取关键帧。"""
         import av
 
@@ -770,7 +799,7 @@ class TsRangeDecoder:
             if not container.streams.video:
                 raise ValueError(f"MPEG-TS 分段没有视频流: {path}")
             stream = container.streams.video[0]
-            result: list[tuple[Fraction, Fraction]] = []
+            result: list[tuple[Fraction, Fraction, int | None]] = []
             pts_list: list[Fraction] = []
             is_sorted = True
             for packet in container.demux(stream):
@@ -781,7 +810,7 @@ class TsRangeDecoder:
                 dts_time = Fraction(packet.dts * tb.numerator, tb.denominator)
                 if is_sorted and pts_list and pts_time < pts_list[-1]:
                     is_sorted = False
-                result.append((pts_time, dts_time))
+                result.append((pts_time, dts_time, None))
                 pts_list.append(pts_time)
             if not result:
                 raise ValueError(f"MPEG-TS 分段缺少随机访问包: {path}")
@@ -797,10 +826,10 @@ class TsRangeDecoder:
             with self._lock:
                 self._open_containers.pop(id(container), None)
 
-    def _find_random_access_dts(
+    def _find_random_access(
         self, segment: int, path: Path, target_time: Fraction
-    ) -> Fraction | None:
-        """查找目标媒体时间之前（含相等）最后一个关键帧的 DTS。"""
+    ) -> tuple[Fraction, int | None] | None:
+        """查找目标媒体时间之前（含相等）最后一个关键帧的 ``(dts_time, byte_offset)``。"""
         with self._lock:
             keyframes = self._get_keyframes(segment, path)
             pts_list = self._keyframe_pts.get(segment)
@@ -811,11 +840,21 @@ class TsRangeDecoder:
                 and len(pts_list) == len(keyframes)
             ):
                 idx = bisect.bisect_right(pts_list, target_time)
-                return None if idx == 0 else keyframes[idx - 1][1]
-        for pts_time, dts_time in reversed(keyframes):
+                if idx == 0:
+                    return None
+                _, dts_time, byte_offset = keyframes[idx - 1]
+                return dts_time, byte_offset
+        for pts_time, dts_time, byte_offset in reversed(keyframes):
             if pts_time <= target_time:
-                return dts_time
+                return dts_time, byte_offset
         return None
+
+    def _find_random_access_dts(
+        self, segment: int, path: Path, target_time: Fraction
+    ) -> Fraction | None:
+        """查找目标媒体时间之前（含相等）最后一个关键帧的 DTS。"""
+        found = self._find_random_access(segment, path, target_time)
+        return None if found is None else found[0]
 
     def _make_cache_key(
         self, segment: int, media_time: Fraction, width: int, height: int

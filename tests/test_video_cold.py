@@ -946,7 +946,7 @@ def test_shared_gop_worker_construction_failure_rolls_back_storage_lease(
         assert storage.finalize()
 
 
-def test_cold_watermark_never_accepts_cached_image_without_reading_ts(tmp_path) -> None:
+def test_verify_cold_read_never_accepts_cached_image_without_reading_ts(tmp_path) -> None:
     source_path = tmp_path / "source.mp4"
     frames = _make_h264(source_path, frames=12, gop=12)
     source = av.open(str(source_path), mode="r")
@@ -977,13 +977,12 @@ def test_cold_watermark_never_accepts_cached_image_without_reading_ts(tmp_path) 
             AlignedSample(frame, TelemetrySnapshot(timestamp=1.0), 1.0, 0.15, "test"),
             materialize=False,
         )
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and buffer._cold_error is None:
-            time.sleep(0.01)
+        with pytest.raises(OSError, match="冷读校验不一致"):
+            buffer.verify_cold_read(sample_frames=1)
         with pytest.raises(OSError, match="冷读校验不一致"):
             buffer.raise_if_failed()
     finally:
-        with pytest.raises(RuntimeError, match="冷区排空失败"):
+        with pytest.raises(RuntimeError, match="冷区收尾失败"):
             buffer.close_cold_storage()
 
 
@@ -1629,22 +1628,32 @@ def test_ts_range_decoder_applies_hot_buffer_resize_rule(tmp_path) -> None:
     decoder.close()
 
 
-def test_freeze_keeps_call_time_cutoff_when_put_arrives_during_cold_wait(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    decoder = TsRangeDecoder(tmp_path)
+def test_freeze_keeps_call_time_cutoff_when_put_arrives_after_freeze(tmp_path) -> None:
+    lifecycle = SegmentLifecycle()
+    lifecycle.opened(1)
+    lifecycle.progress(1, committed_time=Fraction(10, 1))
+    decoder = TsRangeDecoder(tmp_path, segment_lifecycle=lifecycle)
     buffer = AlignmentBuffer(
         capacity=8,
         storage="raw",
         cold_decoder=decoder,
-        _start_cold_worker=False,
+        segment_lifecycle=lifecycle,
     )
 
     def put(index: int) -> None:
         image = np.full((2, 2, 3), index, np.uint8)
         buffer.put(
             AlignedSample(
-                frame=VideoFrame(index=index, image=image, timestamp=float(index), lag=0),
+                frame=VideoFrame(
+                    index=index,
+                    image=image,
+                    timestamp=float(index),
+                    lag=0,
+                    media_pts=index,
+                    time_base_num=1,
+                    time_base_den=1,
+                    segment=1,
+                ),
                 snapshot=TelemetrySnapshot(timestamp=float(index)),
                 timestamp=float(index),
                 lag=0,
@@ -1654,56 +1663,15 @@ def test_freeze_keeps_call_time_cutoff_when_put_arrives_during_cold_wait(
         )
 
     put(1)
-    with buffer._condition:
-        first_record = buffer._records[0]
-        reference = ColdFrameRef(1, 1, 1, 1)
-        buffer._records[0] = replace(
-            first_record, payload=reference, cold_locator=reference, nbytes=0
-        )
-        buffer._hot_bytes -= first_record.nbytes
-        buffer._cold_active_index = first_record.index
-        buffer._cold_schedule_limit = first_record.index
-        buffer._cold_next_schedule = first_record.index + 1
-    waiting = threading.Event()
-    release = threading.Event()
-    original_pending = buffer._cold_pending_through_locked
-
-    def pending(index: int, *, require_verified: bool = False) -> bool:
-        if index == 1 and not release.is_set():
-            waiting.set()
-            return True
-        return original_pending(index, require_verified=require_verified)
-
-    monkeypatch.setattr(buffer, "_cold_pending_through_locked", pending)
-    frozen_result: list[AlignmentBuffer] = []
-    freeze_errors: list[Exception] = []
-
-    def freeze() -> None:
-        try:
-            frozen_result.append(buffer.freeze(after_index=0))
-        except Exception as exc:  # noqa: BLE001 - 收集线程中的冻结异常供测试断言
-            freeze_errors.append(exc)
-
-    thread = threading.Thread(target=freeze)
-    thread.start()
+    frozen = buffer.freeze(after_index=0)
     try:
-        assert waiting.wait(timeout=1.0)
         put(2)
-        with buffer._condition:
-            buffer._cold_active_index = None
-            release.set()
-            buffer._condition.notify_all()
-        thread.join(timeout=2.0)
-        assert not thread.is_alive()
-        assert not freeze_errors
-        assert len(frozen_result) == 1
-        frozen = frozen_result[0]
         assert [record.index for record in frozen._records] == [1]
+        assert all(isinstance(record.payload, ColdFrameRef) for record in frozen._records)
         assert frozen.stats.last_index == 1
-        frozen.close_cold_storage()
+        assert buffer.stats.last_index == 2
     finally:
-        release.set()
-        thread.join(timeout=2.0)
+        frozen.close_cold_storage()
         buffer.close_cold_storage()
         decoder.close()
 
@@ -2013,7 +1981,7 @@ def test_corrupt_segment_without_live_writer_fails_without_retry(
         decoder.close()
 
 
-def test_cold_worker_waits_for_segment_revision_without_holding_buffer_lock(
+def test_cold_read_waits_for_segment_revision_without_holding_buffer_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lifecycle = SegmentLifecycle()
@@ -2023,7 +1991,8 @@ def test_cold_worker_waits_for_segment_revision_without_holding_buffer_lock(
         capacity=4,
         storage="raw",
         cold_decoder=decoder,
-        max_hot_bytes=1024,
+        max_hot_bytes=12,
+        segment_lifecycle=lifecycle,
     )
     source = Hm30VideoSource()
 
@@ -2048,21 +2017,23 @@ def test_cold_worker_waits_for_segment_revision_without_holding_buffer_lock(
     monkeypatch.setattr(lifecycle, "wait_for_change", wait_for_change)
     attempts = 0
 
-    def read(segment: int, pts: int, num: int, den: int, *, output_size=None):
+    def read(segment: int, pts: int, num: int, den: int, *, output_size=None, readonly=False):
         nonlocal attempts
         del segment, num, den
         attempts += 1
         if attempts == 1:
             raise TsDataNotReady("模拟活动尾部暂不可读")
         assert output_size == (2, 2)
-        return np.full((2, 2, 3), pts, dtype=np.uint8)
+        arr = np.full((2, 2, 3), pts, dtype=np.uint8)
+        if readonly:
+            arr.flags.writeable = False
+        return arr
 
     monkeypatch.setattr(decoder, "read", read)
-    assert buffer._cold_worker_decoder is not None
-    monkeypatch.setattr(buffer._cold_worker_decoder, "read", read)
 
     def put(index: int) -> None:
         timestamp = index / 30
+        lifecycle.progress(1, committed_time=Fraction(index, 30))
         image = np.full((2, 2, 3), index, dtype=np.uint8)
         buffer.put(
             AlignedSample(
@@ -2084,21 +2055,28 @@ def test_cold_worker_waits_for_segment_revision_without_holding_buffer_lock(
             materialize=False,
         )
 
+    read_results: list[object] = []
+
+    def reader() -> None:
+        read_results.append(buffer.at(1))
+
     try:
         put(0)
+        put(1)
+        assert buffer.stats.cold_frames == 1, "第 1 帧超出热区字节上限后应降级为冷引用"
+        thread = threading.Thread(target=reader)
+        thread.start()
         assert entered_wait.wait(timeout=2.0)
         started = time.monotonic()
-        put(1)
-        assert time.monotonic() - started < 0.5
-        assert buffer.stats.hot_bytes > 0, "暂未验证的图像必须保留在热区"
+        put(2)
+        assert time.monotonic() - started < 0.5, "冷读等待活动段推进时不得阻塞主缓冲 put()"
 
-        lifecycle.progress(1)
+        lifecycle.progress(1, committed_time=Fraction(3, 30))
         release_wait.set()
-        deadline = time.monotonic() + 3.0
-        while buffer.stats.cold_pending and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert buffer.stats.cold_pending == 0
-        assert buffer.stats.cold_verified == 2
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        assert len(read_results) == 1 and read_results[0] is not None
+        assert buffer.stats.cold_committed == 3
         frozen = buffer.freeze(after_index=0)
         assert frozen.segment_lifecycle is lifecycle
         assert frozen._cold_decoder is not None
@@ -2853,9 +2831,13 @@ def test_pyav_worker_decodes_delayed_frame_from_corrupt_flush_packet(monkeypatch
         def __init__(self, *_args, **_kwargs) -> None:
             self.packets = []
             self.complete: bool | None = None
+            self.committed_time: Fraction | None = None
 
-        def mux(self, packet) -> None:
+        def mux(self, packet) -> Fraction | None:
             self.packets.append(packet)
+            if packet.pts is not None and packet.time_base is not None:
+                self.committed_time = Fraction(packet.pts) * packet.time_base
+            return self.committed_time
 
         def close(self, *, complete: bool) -> None:
             self.complete = complete
@@ -3355,14 +3337,9 @@ def test_wait_new_reads_verified_cold_frames_with_sequential_cursor(tmp_path, mo
             materialize=False,
         )
 
-    deadline = time.monotonic() + 5.0
-    while buffer.stats.cold_pending and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert buffer.stats.cold_pending == 0
-    assert buffer.stats.cold_verified == len(source_frames)
-    assert buffer.stats.cold_not_ready == 0
+    assert buffer.stats.cold_committed == len(source_frames)
     cold_count = sum(isinstance(record.payload, ColdFrameRef) for record in buffer._records)
-    assert 20 <= cold_count < len(source_frames), "校验完成后仍保留约 1 秒热帧"
+    assert 20 <= cold_count < len(source_frames), "写端提交后仍保留约 1 秒热帧"
     assert len(buffer) == len(source_frames), "冷存储索引不能按热区容量驱逐历史帧"
     assert (
         sum(record.nbytes for record in buffer._records if isinstance(record.payload, np.ndarray))
@@ -3383,7 +3360,6 @@ def test_wait_new_reads_verified_cold_frames_with_sequential_cursor(tmp_path, mo
     assert any(isinstance(record.payload, np.ndarray) for record in buffer._records)
     try:
         for view in (frozen, frozen_second):
-            assert view._cold_thread is None and view._cold_worker_decoder is None
             assert (
                 view._cold_decoder is not None and view._cold_decoder.decoded_cache is decoded_cache
             )
@@ -3599,9 +3575,7 @@ def test_decoder_cache_key_includes_normalized_directory_and_output_size(tmp_pat
 def test_cold_release_visits_only_new_prefix_after_long_history(tmp_path) -> None:
     """冷帧释放游标避免每帧扫描已释放的长期历史。"""
     decoder = TsRangeDecoder(tmp_path)
-    buffer = AlignmentBuffer(
-        storage="raw", cold_decoder=decoder, _start_cold_worker=False, max_hot_bytes=10_000
-    )
+    buffer = AlignmentBuffer(storage="raw", cold_decoder=decoder, max_hot_bytes=10_000)
     image = np.zeros((1, 1, 3), np.uint8)
     sample = AlignedSample(
         frame=VideoFrame(index=1, image=image, timestamp=1, lag=0),
@@ -3649,9 +3623,8 @@ def test_cold_release_visits_only_new_prefix_after_long_history(tmp_path) -> Non
         buffer._hot_bytes = recent_count * image.nbytes
         buffer._bytes = history_count + recent_count * image.nbytes
         buffer._cold_frame_count = history_count
+        buffer._cold_promote_index = history_count + recent_count
         buffer._cold_release_index = history_count
-        buffer._cold_schedule_limit = buffer._next_index
-        buffer._cold_next_schedule = buffer._next_index + 1
         buffer._release_eligible_locked(float("inf"))
         visited = buffer._records.reads
 
@@ -3702,13 +3675,11 @@ def test_cold_buffer_clear_resets_hot_state_and_can_be_reused(tmp_path) -> None:
         )
 
     put(0)
-    deadline = time.monotonic() + 5
-    while buffer.stats.cold_pending and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert buffer.stats.cold_committed == 1
     buffer.clear()
     assert buffer.stats.hot_bytes == 0
     assert buffer.stats.frames == 0
-    assert buffer.stats.cold_verified == 0
+    assert buffer.stats.cold_committed == 0
     put(0)
     buffer.close_cold_storage()
     assert buffer.stats.hot_bytes == 0
@@ -3733,38 +3704,35 @@ def test_cold_buffer_fails_before_appending_after_fatal_error(tmp_path) -> None:
         buffer.put(sample, materialize=False)
     assert buffer.stats.frames == 0
     assert buffer.stats.last_index == 0
-    with buffer._condition:
-        buffer._cold_stopping = True
-        buffer._condition.notify_all()
-    assert buffer._cold_thread is not None
-    buffer._cold_thread.join(timeout=1)
-
-
-def test_cold_storage_close_attempts_both_decoders_after_one_fails(tmp_path) -> None:
-    decoder = TsRangeDecoder(tmp_path)
-    buffer = AlignmentBuffer(storage="raw", cold_decoder=decoder)
-    worker_decoder = buffer._cold_worker_decoder
-    assert worker_decoder is not None
-    worker_close = worker_decoder.close
-    main_closed = False
-    main_close = decoder.close
-
-    def failing_worker_close() -> None:
-        worker_close()
-        raise OSError("模拟校验解码器关闭失败")
-
-    def tracked_main_close() -> None:
-        nonlocal main_closed
-        main_closed = True
-        main_close()
-
-    worker_decoder.close = failing_worker_close
-    decoder.close = tracked_main_close
-    with pytest.raises(RuntimeError, match="校验解码器关闭失败"):
+    with pytest.raises(RuntimeError, match="injected failure"):
         buffer.close_cold_storage()
 
-    assert main_closed
-    decoder.close()
+
+def test_cold_storage_close_releases_lease_and_combines_errors(tmp_path) -> None:
+    from airdrop.video.storage import TemporaryTsStorage
+
+    storage = TemporaryTsStorage(parent=tmp_path)
+    lease = storage.acquire_lease()
+    decoder = TsRangeDecoder(storage.directory)
+    buffer = AlignmentBuffer(storage="raw", cold_decoder=decoder, storage_lease=lease)
+    real_close = decoder.close
+
+    def failing_close() -> None:
+        real_close()
+        raise OSError("模拟历史解码器关闭失败")
+
+    decoder.close = failing_close
+    with buffer._condition:
+        buffer._cold_error = "模拟写端故障"
+    with pytest.raises(ExceptionGroup) as exc_info:
+        buffer.close_cold_storage()
+
+    messages = " ".join(str(err) for err in exc_info.value.exceptions)
+    assert "模拟写端故障" in messages
+    assert "历史解码器关闭失败" in messages
+    assert buffer._storage_lease is None
+    storage.producer_stopped()
+    assert storage.finalize()
 
 
 def test_ts_flight_recorder_replay_and_calibration_reader_round_trip(
@@ -3829,9 +3797,7 @@ def test_ts_flight_recorder_replay_and_calibration_reader_round_trip(
             materialize=False,
         )
     recorder.stop()
-    deadline = time.monotonic() + 5.0
-    while buffer.stats.cold_verified < 1 and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert buffer.stats.cold_committed == len(source_frames)
     cold_first = buffer.at(1)
     hot_last = buffer.at(len(source_frames))
     assert buffer.stats.storage == "raw"
@@ -3867,9 +3833,7 @@ def test_ts_flight_recorder_replay_and_calibration_reader_round_trip(
     assert replay.wait_finished(timeout=10.0)
     replay.stop()
     assert len(replayed) == len(source_frames)
-    deadline = time.monotonic() + 5.0
-    while replay_buffer.stats.cold_verified < 1 and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert replay_buffer.stats.cold_committed == len(source_frames)
     replay_cold_first = replay_buffer.at(1)
     replay_hot_last = replay_buffer.at(len(source_frames))
     assert replay_buffer.stats.storage == "raw"
@@ -4629,3 +4593,187 @@ def test_ts_range_decoder_skips_non_target_conversion_when_uncached(
         assert converted == [0, 1, 2, 3]
     finally:
         cached.close()
+
+
+def test_ts_segment_writer_records_byte_offset_and_decoder_seeks_by_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TsSegmentWriter 写入关键帧 byte_offset，且 TsRangeDecoder 按字节偏移精准定位。"""
+    source_path = tmp_path / "source.mp4"
+    frames = _make_h264(source_path, frames=36, gop=12)
+    container = av.open(str(source_path), mode="r")
+    stream = container.streams.video[0]
+    writer = TsSegmentWriter(tmp_path, segment=1, input_stream=stream)
+    for packet in container.demux(stream):
+        packet.decode()
+        writer.mux(packet)
+    assert writer.committed_time is not None
+    writer.close()
+    container.close()
+
+    ts_bytes = (tmp_path / "segment-000001.ts").read_bytes()
+    rap_rows = [
+        json.loads(line)
+        for line in (tmp_path / "segment-000001.rap.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(rap_rows) >= 3
+    for row in rap_rows:
+        offset = row["byte_offset"]
+        assert isinstance(offset, int) and offset >= 0 and offset % 188 == 0
+        assert ts_bytes[offset] == 0x47
+
+    seek_calls: list[dict[str, object]] = []
+    real_open = av.open
+
+    class TrackingContainer:
+        def __init__(self, inner) -> None:
+            self._inner = inner
+
+        @property
+        def streams(self):
+            return self._inner.streams
+
+        def seek(self, offset, **seek_kwargs):
+            seek_calls.append({"offset": offset, **seek_kwargs})
+            return self._inner.seek(offset, **seek_kwargs)
+
+        def demux(self, *args, **kwargs):
+            return self._inner.demux(*args, **kwargs)
+
+        def close(self) -> None:
+            self._inner.close()
+
+    def tracking_open(*args, **kwargs):
+        opened = real_open(*args, **kwargs)
+        if str(args[0]).endswith("segment-000001.ts"):
+            return TrackingContainer(opened)
+        return opened
+
+    monkeypatch.setattr(av, "open", tracking_open)
+    decoder = TsRangeDecoder(tmp_path, cache_enabled=False)
+    try:
+        for idx in (0, 12, 24, 30):
+            pts, tb, expected = frames[idx]
+            recovered = decoder.read(1, pts, tb.numerator, tb.denominator)
+            assert recovered is not None and np.array_equal(recovered, expected)
+        assert any(call.get("unsupported_byte_offset") is True for call in seek_calls)
+    finally:
+        decoder.close()
+
+
+def test_build_alignment_buffer_pure_live_disables_cold_storage() -> None:
+    """显式关闭冷存储时 build_alignment_buffer 返回按消费驱逐的纯实时 raw 缓冲。"""
+    buffer = build_alignment_buffer(capture=True, cold_storage=False)
+    assert buffer is not None
+    assert buffer.storage == "raw"
+    assert buffer._cold_decoder is None
+    assert buffer._evict_consumed is True
+
+
+def test_preflight_verify_cold_read_optional_spot_check(tmp_path: Path) -> None:
+    """Preflight 默认不冷读；开启 verify_cold_read 时核验已落盘 TS 帧并在失配时失败。"""
+    from airdrop.config import PreflightConfig
+    from airdrop.preflight import Preflight, PreflightError
+
+    source_path = tmp_path / "source.mp4"
+    frames = _make_h264(source_path, frames=12, gop=12)
+    container = av.open(str(source_path), mode="r")
+    stream = container.streams.video[0]
+    writer = TsSegmentWriter(tmp_path, segment=1, input_stream=stream)
+    for packet in container.demux(stream):
+        packet.decode()
+        writer.mux(packet)
+    writer.close()
+    container.close()
+
+    class StubCamera:
+        image_size = (frames[0][2].shape[1], frames[0][2].shape[0])
+
+    class StubStats:
+        def __init__(self) -> None:
+            self._reads = 0
+
+        @property
+        def frames(self) -> int:
+            self._reads += 1
+            return self._reads * 2
+
+    class StubVideoSource:
+        def __init__(self, *, corrupt_image: bool) -> None:
+            self.recording_directory = tmp_path
+            self.segment_lifecycle = None
+            self._corrupt = corrupt_image
+            self.stats = StubStats()
+            self._latest: VideoFrame | None = None
+            self._step = 0
+
+        def latest(self) -> VideoFrame | None:
+            pts, tb, img = frames[min(self._step, len(frames) - 1)]
+            self._step += 1
+            image = np.bitwise_xor(img, np.uint8(255)) if self._corrupt else img
+            self._latest = VideoFrame(
+                index=self._step,
+                image=image,
+                timestamp=time.time(),
+                lag=0.0,
+                media_pts=pts,
+                time_base_num=tb.numerator,
+                time_base_den=tb.denominator,
+                segment=1,
+            )
+            return self._latest
+
+    ok_source = StubVideoSource(corrupt_image=False)
+    default_pf = Preflight(
+        PreflightConfig(
+            load_detector=False,
+            load_ocr=False,
+            load_camera=True,
+            check_video=True,
+            video_probe_s=0.1,
+            video_min_frames=1,
+        ),
+        model_loaders={"camera": StubCamera},
+        camera_model=StubCamera(),
+        video_source=ok_source,
+    )
+    results = default_pf.run()
+    assert results[-1].name == "video" and results[-1].ok is True
+    assert "冷读抽检" not in results[-1].detail
+
+    spot_pf = Preflight(
+        PreflightConfig(
+            load_detector=False,
+            load_ocr=False,
+            load_camera=True,
+            check_video=True,
+            video_probe_s=0.1,
+            video_min_frames=1,
+            verify_cold_read=True,
+            cold_read_sample_frames=2,
+        ),
+        model_loaders={"camera": StubCamera},
+        camera_model=StubCamera(),
+        video_source=StubVideoSource(corrupt_image=False),
+    )
+    spot_results = spot_pf.run()
+    assert spot_results[-1].name == "video" and spot_results[-1].ok is True
+    assert "冷读抽检通过" in spot_results[-1].detail
+
+    bad_pf = Preflight(
+        PreflightConfig(
+            load_detector=False,
+            load_ocr=False,
+            load_camera=True,
+            check_video=True,
+            video_probe_s=0.1,
+            video_min_frames=1,
+            verify_cold_read=True,
+            cold_read_sample_frames=1,
+        ),
+        model_loaders={"camera": StubCamera},
+        camera_model=StubCamera(),
+        video_source=StubVideoSource(corrupt_image=True),
+    )
+    with pytest.raises(PreflightError, match="逐像素校验不一致"):
+        bad_pf.run()

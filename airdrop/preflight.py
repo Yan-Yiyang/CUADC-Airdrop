@@ -189,12 +189,26 @@ class Preflight:
 
         want = int(self._config.video_min_frames)
         window = float(self._config.video_probe_s)
+        verify_cold = bool(getattr(self._config, "verify_cold_read", False))
+        sample_target = max(1, int(getattr(self._config, "cold_read_sample_frames", 2)))
+        sampled_frames: list[Any] = []
+        sampled_indices: set[int] = set()
         started = self._clock()
         deadline = started + window
         baseline = self._frames()
         frames = 0
         while frames < want and self._clock() < deadline:
             self._check_cancelled()
+            if verify_cold and len(sampled_frames) < sample_target:
+                candidate = self._video_source.latest()
+                if (
+                    candidate is not None
+                    and getattr(candidate, "index", None) not in sampled_indices
+                    and getattr(candidate, "media_pts", None) is not None
+                    and getattr(candidate, "segment", 0) >= 1
+                ):
+                    sampled_indices.add(int(candidate.index))
+                    sampled_frames.append(candidate.copy())
             self._sleep(min(0.1, deadline - self._clock()))
             self._check_cancelled()
             frames = self._frames() - baseline
@@ -213,7 +227,64 @@ class Preflight:
         actual = (int(frame.width), int(frame.height))
         if actual != size:
             raise ValueError(f"画面 {actual[0]}x{actual[1]} 与标定 {size[0]}x{size[1]} 不一致")
+        if verify_cold:
+            if not sampled_frames and getattr(frame, "media_pts", None) is not None:
+                sampled_frames.append(frame.copy())
+            checked = self._verify_cold_read_samples(sampled_frames, timeout=window)
+            return f"窗口内新增 {frames} 帧，最新画面尺寸与标定一致，冷读抽检通过 {checked} 帧"
         return f"窗口内新增 {frames} 帧，最新画面尺寸与标定一致"
+
+    def _verify_cold_read_samples(self, samples: list[Any], *, timeout: float) -> int:
+        """在预检阶段对采样帧执行一次性 TS 冷读逐像素一致性核对。"""
+        import numpy as np
+
+        from .video.cold import TsDataNotReady, TsRangeDecoder
+
+        directory = getattr(self._video_source, "recording_directory", None)
+        if directory is None:
+            raise ValueError("已开启冷读抽检，但视频源未绑定 TS 录制目录")
+        if not samples:
+            raise ValueError("已开启冷读抽检，但预检窗口内未采集到带 TS/PTS 元数据的帧")
+        lifecycle = getattr(self._video_source, "segment_lifecycle", None)
+        decoder = TsRangeDecoder(directory, segment_lifecycle=lifecycle, cache_enabled=False)
+        deadline = self._clock() + max(timeout, 0.5)
+        verified = 0
+        try:
+            for sample in samples:
+                self._check_cancelled()
+                segment = int(sample.segment)
+                pts = int(sample.media_pts)
+                num = int(sample.time_base_num)
+                den = int(sample.time_base_den)
+                expected = sample.image
+                while True:
+                    self._check_cancelled()
+                    before = lifecycle.snapshot(segment) if lifecycle is not None else None
+                    try:
+                        recovered = decoder.read(
+                            segment,
+                            pts,
+                            num,
+                            den,
+                            output_size=(int(expected.shape[1]), int(expected.shape[0])),
+                        )
+                        break
+                    except TsDataNotReady as exc:
+                        remaining = deadline - self._clock()
+                        if remaining <= 0:
+                            raise TimeoutError(f"预检冷读抽检帧 #{sample.index} 等待超时") from exc
+                        if lifecycle is not None and before is not None:
+                            lifecycle.wait_for_change(
+                                segment, before.revision, timeout=min(0.2, remaining)
+                            )
+                        else:
+                            self._sleep(min(0.05, remaining))
+                if recovered is None or not np.array_equal(recovered, expected):
+                    raise ValueError(f"预检冷读抽检帧 #{sample.index} 逐像素校验不一致")
+                verified += 1
+        finally:
+            decoder.close()
+        return verified
 
     # ------------------------------------------------------------------
     def _frames(self) -> int:
