@@ -14,6 +14,13 @@
 
 只停止本次创建的实例，不全局关闭WSL。资源监测按当前操作手约定配置，区分启动峰值与持续繁忙；仿真时间与墙钟时间可能不同，性能与业务时间需要分别记录。
 
+WSL 与 Windows 联合仿真时，建议通过 `vendor/airdrop-sim/airdrop_sim/assets/run_sitl.sh` 的独立运行目录与环境变量完成资源隔离，不修改 PX4 源码树：
+
+- `HEADLESS=1` 无界面运行 Gazebo，省去 GUI 进程的内存与显存占用；
+- `USE_CUDA_GST=false` 在独立运行目录派生 `server-cpu.config` 并改用 CPU `x264enc` 推流，同时 Gazebo 保持 `llvmpipe` 软件光栅化（按主机核数配置 `LP_NUM_THREADS`），避免 WSL 侧争抢独立显卡显存导致 Windows 推理/NVENC/QGC 触发 WDDM 共享显存换页；
+- 非交互子进程启动加 `PX4_DAEMON=1`（追加 `-d` 防止 `pxh>` 循环写日志）；无实体遥控器自动航次按需加 `DISABLE_RC_LOSS=1`（仅在当前隔离实例导出 `PX4_PARAM_COM_RC_IN_MODE=4`，严禁推广为真机参数）；
+- 非零相机畸变（`D1`/`D2`）或多 seed 场景可通过 `CUSTOM_WORLD_DIR` / `CUSTOM_VEHICLE_DIR` 与 `$RUNTIME_DIR/compat-build`（含 `airdrop::CameraDistortion`）在树外目录隔离加载，验证结束后直接清理过期独立 `$RUNTIME_DIR` 缓存即可。
+
 SITL 默认关闭 OCR 跨帧去重，保留完整识别负载。仿真会额外占用计算资源，因此保留 `HOLD_PROCESS` 的 150 秒处理等待上限。处理性能使用仿真保存的标准飞行目录，在停止仿真后回放测试；输入、播放速率、模型、并发及输出配置保持可比，记录积压和排空耗时。该等待上限不作为实飞处理时限的性能验收依据，测量口径见[性能度量](performance.md)。
 
 项目 Python、遥测、识别、回放、测试与 QGC 在 Windows 运行；WSL 只运行仿真与仿真配置。旧 GZBridge 的磁力计坐标/单位兼容可在独立运行目录采用工具仓 `airdrop_sim/assets/compat/` 中的适配插件；须配套启用 Gazebo Tesla/ENU 模式和换算传感器噪声，不能单独交换体轴。脚本检查指定 PX4 源码；运行二进制须与源码匹配，拒绝二次补偿；具体前置条件见该目录 README。
