@@ -468,6 +468,8 @@ class TsRangeDecoder:
             if not container.streams.video:
                 raise ValueError(f"MPEG-TS 分段没有视频流: {path}")
             stream = container.streams.video[0]
+            if hasattr(stream, "thread_type"):
+                stream.thread_type = "NONE"
             offset = int(
                 dts_time / Fraction(stream.time_base.numerator, stream.time_base.denominator)
             )

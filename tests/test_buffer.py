@@ -1002,3 +1002,71 @@ def test_cold_materialize_passes_readonly_and_put_coalesces_notify(tmp_path, mon
         assert seen_kwargs == [{"output_size": (8, 8), "readonly": True}]
     finally:
         buffer.close_cold_storage()
+
+
+def test_active_segment_cold_worker_keeps_tail_margin_and_flushes_on_freeze(
+    tmp_path, monkeypatch
+) -> None:
+    """活动分段持续入帧时保留尾部缓冲避免抢跑，freeze 时立即排空尾部。"""
+    from airdrop.video.cold import TsRangeDecoder
+    from airdrop.video.segments import SegmentLifecycle
+
+    lifecycle = SegmentLifecycle()
+    lifecycle.opened(1)
+    decoder = TsRangeDecoder(tmp_path, segment_lifecycle=lifecycle)
+    buffer = AlignmentBuffer(
+        20,
+        storage="raw",
+        cold_decoder=decoder,
+        max_hot_bytes=1024 * 1024,
+        segment_lifecycle=lifecycle,
+    )
+    assert buffer._cold_worker_decoder is not None
+    read_pts: list[int] = []
+
+    def fake_read(segment: int, pts: int, num: int, den: int, *, output_size=None):
+        del segment, num, den, output_size
+        read_pts.append(pts)
+        return np.full((4, 4, 3), pts, dtype=np.uint8)
+
+    monkeypatch.setattr(buffer._cold_worker_decoder, "read", fake_read)
+    try:
+        for idx in range(1, 9):
+            image = np.full((4, 4, 3), idx, dtype=np.uint8)
+            frame = VideoFrame(
+                index=idx,
+                image=image,
+                timestamp=1000.0 + idx * 0.03,
+                lag=0.0,
+                media_pts=idx,
+                time_base_num=1,
+                time_base_den=30,
+                segment=1,
+            )
+            buffer.put(
+                AlignedSample(
+                    frame=frame,
+                    snapshot=TelemetrySnapshot(timestamp=frame.timestamp),
+                    timestamp=frame.timestamp,
+                    lag=0.0,
+                    mode="test",
+                ),
+                materialize=False,
+            )
+        deadline = time.monotonic() + 2.0
+        while buffer.stats.cold_verified < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert buffer.stats.cold_verified >= 4
+        # 紧急 freeze 必须立即放行尾部未校验帧，不等待尾差静默超时。
+        started = time.monotonic()
+        frozen = buffer.freeze(after_index=0)
+        elapsed = time.monotonic() - started
+        try:
+            assert elapsed < 0.2
+            assert buffer.stats.cold_verified == 8
+            assert read_pts == list(range(1, 9))
+        finally:
+            frozen.close_cold_storage()
+    finally:
+        lifecycle.closed(1, complete=True)
+        buffer.close_cold_storage()

@@ -76,7 +76,7 @@ import numpy as np
 from ..telemetry.models import TelemetrySnapshot
 from .align import AlignedSample, FrameTelemetryAligner
 from .cold import TsDataNotReady, TsRangeDecoder
-from .segments import SegmentLifecycle
+from .segments import SegmentLifecycle, SegmentState
 from .source import VideoFrame
 from .storage import TsStorageLease
 
@@ -90,6 +90,9 @@ DEFAULT_JPEG_QUALITY = 80
 
 SUPPORTED_STORAGE = frozenset({"jpeg", "raw"})
 _COLD_REF_BYTES = 64
+# 活动 TS 分段尾部的 PES 包需等待后续包定界；冷区校验保持小尾差可复用单一解码游标，避免逐帧重开与 O(N^2) 重解。
+_ACTIVE_COLD_TAIL_FRAMES = 4
+_ACTIVE_COLD_TAIL_WAIT_S = 0.25
 
 # bisect 的 key：直接作用在记录列表上，不重建时间列表
 _capture_timestamp = operator.attrgetter("capture_timestamp")
@@ -325,6 +328,8 @@ class AlignmentBuffer:
         self._cold_active_index: int | None = None
         self._cold_next_schedule = 1
         self._cold_schedule_limit = 0
+        self._cold_urgent_limit = 0
+        self._cold_last_put_mono = 0.0
         self._cold_release_index = 0
         self._cold_stopping = False
         self._cold_error: str | None = None
@@ -438,6 +443,7 @@ class AlignmentBuffer:
             if self._cold_decoder is not None:
                 self._release_eligible_locked(sample.timestamp - self._hot_seconds)
                 if self._hot_bytes + nbytes > self._max_hot_bytes:
+                    self._cold_urgent_limit = max(self._cold_urgent_limit, self._next_index)
                     self._schedule_through_locked(self._next_index)
                     self._release_eligible_locked(float("inf"), required_bytes=nbytes)
                     if self._hot_bytes + nbytes > self._max_hot_bytes:
@@ -475,6 +481,9 @@ class AlignmentBuffer:
                 self._evict_locked()
             self._log_estimate_locked(nbytes)
             if self._cold_decoder is not None:
+                self._cold_last_put_mono = time.monotonic()
+                if self._hot_bytes + nbytes * (_ACTIVE_COLD_TAIL_FRAMES + 2) > self._max_hot_bytes:
+                    self._cold_urgent_limit = max(self._cold_urgent_limit, self._next_index)
                 self._schedule_through_locked(self._next_index)
             else:
                 self._condition.notify_all()
@@ -504,6 +513,7 @@ class AlignmentBuffer:
             self._cold_release_index = 0
             self._cold_next_schedule = self._next_index + 1
             self._cold_schedule_limit = self._next_index
+            self._cold_urgent_limit = self._next_index
             self._condition.notify_all()
 
     def freeze(self, *, after_index: int = 0) -> "AlignmentBuffer":  # noqa: PLR0912, PLR0915 - 关闭与回滚需逐项判断
@@ -520,6 +530,7 @@ class AlignmentBuffer:
             if after_index < first - 1:
                 raise RuntimeError("侦查未读帧已被缓冲驱逐，无法完整处理")
             if self._cold_decoder is not None:
+                self._cold_urgent_limit = max(self._cold_urgent_limit, target_index)
                 self._schedule_through_locked(target_index)
                 deadline = time.monotonic() + 5.0
                 while self._cold_pending_through_locked(target_index, require_verified=True):
@@ -967,6 +978,20 @@ class AlignmentBuffer:
         """返回下一个待验证序号；队列状态只用两个水位整数表示。"""
         return self._cold_next_schedule
 
+    def _active_cold_tail_wait_locked(self, index: int, record: StoredFrame | None) -> float | None:
+        """活动分段尾部保留少量缓冲帧以复用游标，静默超时或紧急排空时立即放行。"""
+        if (
+            record is None
+            or record.cold_locator is not None
+            or index <= self._cold_urgent_limit
+            or self._cold_schedule_limit - index >= _ACTIVE_COLD_TAIL_FRAMES
+            or self._segment_lifecycle is None
+            or self._segment_lifecycle.snapshot(record.segment).state is not SegmentState.ACTIVE
+        ):
+            return None
+        remaining = self._cold_last_put_mono + _ACTIVE_COLD_TAIL_WAIT_S - time.monotonic()
+        return remaining if remaining > 0 else None
+
     def _cold_worker(self) -> None:  # noqa: PLR0915 - 故障分支需与异步状态转换相邻
         """后台逐帧确认精确 PTS，采集线程只做有界的内存入队。"""
         decoder = self._cold_worker_decoder
@@ -974,19 +999,26 @@ class AlignmentBuffer:
             return
         while True:
             with self._condition:
-                while (
-                    self._cold_next_schedule > self._cold_schedule_limit and not self._cold_stopping
-                ):
-                    self._condition.wait()
-                if self._cold_stopping:
-                    return
-                if self._cold_error is not None:
-                    self._condition.wait(0.1)
-                    continue
-                index = self._cold_target_locked()
+                while True:
+                    while (
+                        self._cold_next_schedule > self._cold_schedule_limit
+                        and not self._cold_stopping
+                    ):
+                        self._condition.wait()
+                    if self._cold_stopping:
+                        return
+                    if self._cold_error is not None:
+                        self._condition.wait(0.1)
+                        continue
+                    index = self._cold_target_locked()
+                    record = self._find_by_index_locked(index)
+                    tail_wait = self._active_cold_tail_wait_locked(index, record)
+                    if tail_wait is not None:
+                        self._condition.wait(tail_wait)
+                        continue
+                    break
                 self._cold_next_schedule += 1
                 self._cold_active_index = index
-                record = self._find_by_index_locked(index)
                 if record is None or record.cold_locator is not None:
                     self._finish_cold_locked(index)
                     continue
@@ -1073,6 +1105,7 @@ class AlignmentBuffer:
         failure: BaseException | None = None
         with self._condition:
             if self._cold_worker_decoder is not None:
+                self._cold_urgent_limit = max(self._cold_urgent_limit, self._next_index)
                 self._schedule_through_locked(self._next_index)
                 while self._cold_pending_through_locked(self._next_index, require_verified=True):
                     if self._cold_error is not None:
