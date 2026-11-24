@@ -478,9 +478,9 @@ class TrtExecutionRunner:
 
         with torch.no_grad():
             with torch.cuda.stream(self._stream):
-                inp = torch.from_numpy(contiguous).to(
-                    device=self._device, dtype=self._input_dtype, non_blocking=False
-                )
+                inp = torch.from_numpy(contiguous).to(device=self._device, non_blocking=False)
+                if inp.dtype != self._input_dtype:
+                    inp = inp.to(dtype=self._input_dtype)
                 if self._input_spec.is_dynamic and not self._context.set_input_shape(
                     self._input_spec.name, shape
                 ):
@@ -603,6 +603,11 @@ def load_trt_runner(
 
     trt: Any = cast(Any, trt_mod)
     torch.cuda.set_device(device_id)
+    # TensorRT 计算全部在 CUDA 执行；限制 PyTorch CPU OpenMP 线程数为 1，
+    # 避免多线程并发推理时触发 OpenMP 线程池争用与自旋空转。
+    set_num_threads = getattr(torch, "set_num_threads", None)
+    if callable(set_num_threads):
+        set_num_threads(1)
     logger = _get_trt_logger(trt)
     runtime = trt.Runtime(logger)
     if runtime is None:
