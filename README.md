@@ -1,6 +1,6 @@
 # CUADC 固定翼侦查与空投控制
 
-**版本 0.2.1**。项目以 Python 实现遥测与图像对齐、YOLO/OCR 识别、目标定位和统计、航线规划、弹道预测与任务编排，支持真实环境及 PX4 SITL。
+**版本 0.3.0**。项目以 Python 实现遥测与图像对齐、YOLO/OCR 识别、目标定位和统计、航线规划、弹道预测与任务编排，支持真实环境及 PX4 SITL。
 
 任务流程：起飞前预检与模型预热 → 等待起飞 → 侦查 → 排空识别与选靶 → 飞掠投放 → 按配置返航降落。真实任务默认由操作手通过 QGroundControl 上传并启动侦查；阶段开关决定采集、识别、模拟或真实释放及后续降落行为。
 
@@ -57,12 +57,13 @@ MAVSDK 用于地面端与 PX4 交互，并不意味着必须使用 Offboard 模�
 ```bash
 git clone --recurse-submodules https://github.com/Yan-Yiyang/CUADC-Airdrop.git
 cd CUADC-Airdrop
-uv sync
+uv sync --extra trt
+uv run python -m airdrop.run build-trt --target all
 uv run python -m airdrop.run --help
 uv run python -m airdrop.run mission --help
 ```
 
-已有满足依赖的 Python 环境时，可在仓库根目录直接运行 `python -m airdrop.run --help`，无需重复安装。
+默认推理后端使用本机编译于 `models/trt/` 下的 TensorRT FP16 引擎；引擎或伴随清单缺失、摘要或环境不匹配时直接报错退出，不做静默回退。需使用 PyTorch 备用权重时，可在 `mission` 或 `replay` 命令显式传入 `--backend pytorch`。已有满足依赖的 Python 环境时，可在仓库根目录直接运行 `python -m airdrop.run --help`，无需重复安装。
 
 - 运行配置、阶段开关和生命周期见 [运行说明](docs/runtime.md)。
 - 设备配置、模型与标定输入、接口、文件格式和排障见 [项目手册](docs/handbook.md)。

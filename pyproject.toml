@@ -1,6 +1,6 @@
 [project]
 name = "airdrop"
-version = "0.2.1"
+version = "0.3.0"
 description = "CUADC 固定翼无人机侦查与空投控制系统"
 readme = "README.md"
 license = "Apache-2.0"
