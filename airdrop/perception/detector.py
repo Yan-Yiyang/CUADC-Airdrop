@@ -289,7 +289,7 @@ class DetectorConfig:
     """YOLO 检测参数。"""
 
     # YOLO 检测权重（默认 TensorRT 静态 FP16 引擎，可覆盖为 .pt 备用权重）
-    model_path: str = ".local/trt/best2_736x1280_fp16.engine"
+    model_path: str = "models/trt/best2_736x1280_fp16.engine"
     device: str = "0"  # 显式指定：见模块 docstring
     conf_threshold: float = 0.25
     iou_threshold: float = 0.45

@@ -49,9 +49,9 @@ __all__ = [
 # ---------------------------------------------------------------- 取值域
 PERCEPTION_MODES = frozenset({"ocr", "cls12"})
 INFERENCE_BACKENDS = frozenset({"trt", "pytorch"})
-TRT_DEFAULT_YOLO_MODEL = ".local/trt/best2_736x1280_fp16.engine"
-TRT_DEFAULT_OCR_DET_MODEL = ".local/trt/PP-OCRv6_det_medium_fp16.engine"
-TRT_DEFAULT_OCR_REC_MODEL = ".local/trt/PP-OCRv6_rec_medium_fp16.engine"
+TRT_DEFAULT_YOLO_MODEL = "models/trt/best2_736x1280_fp16.engine"
+TRT_DEFAULT_OCR_DET_MODEL = "models/trt/PP-OCRv6_det_medium_fp16.engine"
+TRT_DEFAULT_OCR_REC_MODEL = "models/trt/PP-OCRv6_rec_medium_fp16.engine"
 PYTORCH_DEFAULT_YOLO_MODEL = "models/best2.pt"
 PYTORCH_DEFAULT_OCR_DET_MODEL = "PP-OCRv6_det_medium.pth"
 PYTORCH_DEFAULT_OCR_REC_MODEL = "PP-OCRv6_rec_medium.pth"
@@ -126,7 +126,7 @@ class PerceptionConfig:
     1. **``mode="cls12"`` 需要 12 类检测权重**（编号直接来自 YOLO 类别）：权重是单类
        ``target`` 时该模式编号恒为 1——要跑 ``cls12`` 请换成 12 类权重，否则用 ``mode="ocr"``。
     2. **默认推理后端为 TensorRT 离线引擎**：默认路径指向本机经 ``build-trt --target all``
-       构建并带伴随清单发布的 ``.local/trt/*.engine``；引擎或清单缺失、摘要/环境不匹配时直接报错，
+       构建并带伴随清单发布的 ``models/trt/*.engine``；引擎或清单缺失、摘要/环境不匹配时直接报错，
        不做静默回退。需切换 PyTorch 备用权重（``models/best2.pt`` 与 ``models/ppocr/*.pth``）时，
        显式传入 ``--backend pytorch`` 或覆盖对应模型路径。
     3. **``device`` 必须显式给定**：不依赖 ultralytics 的自动检测

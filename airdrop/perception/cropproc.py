@@ -91,8 +91,8 @@ class OcrEngineConfig:
     """
 
     model_dir: str = "models/ppocr"
-    det_model: str = ".local/trt/PP-OCRv6_det_medium_fp16.engine"
-    rec_model: str = ".local/trt/PP-OCRv6_rec_medium_fp16.engine"
+    det_model: str = "models/trt/PP-OCRv6_det_medium_fp16.engine"
+    rec_model: str = "models/trt/PP-OCRv6_rec_medium_fp16.engine"
     rec_keys: str = "ppocrv6_dict.txt"
     #: 方向分类（Cls）开关与后端：``"off"``（默认关闭）或 ``"torch"``（PyTorch 诊断后端）。
     #: 正式流程的方向由几何转正保证，默认 ``"off"`` 时 ``classify_orientation()`` 会明确拒绝；

@@ -59,7 +59,7 @@ def _sample_manifest(engine_name: str, engine_bytes: bytes) -> dict[str, Any]:
 def test_build_config_defaults_and_output_paths() -> None:
     cfg = builder.build_config()
     assert cfg.target == "all"
-    assert cfg.out_dir == Path(".local/trt")
+    assert cfg.out_dir == Path("models/trt")
     assert cfg.device == "0"
     assert cfg.yolo_model == Path("models/best2.pt")
     assert cfg.imgsz == 1280
@@ -76,9 +76,9 @@ def test_build_config_defaults_and_output_paths() -> None:
     assert cfg.verify is True
     assert cfg.force is False
 
-    assert builder.yolo_engine_path(cfg) == Path(".local/trt/best2_736x1280_fp16.engine")
-    assert builder.ocr_det_engine_path(cfg) == Path(".local/trt/PP-OCRv6_det_medium_fp16.engine")
-    assert builder.ocr_rec_engine_path(cfg) == Path(".local/trt/PP-OCRv6_rec_medium_fp16.engine")
+    assert builder.yolo_engine_path(cfg) == Path("models/trt/best2_736x1280_fp16.engine")
+    assert builder.ocr_det_engine_path(cfg) == Path("models/trt/PP-OCRv6_det_medium_fp16.engine")
+    assert builder.ocr_rec_engine_path(cfg) == Path("models/trt/PP-OCRv6_rec_medium_fp16.engine")
 
 
 def test_build_config_normalizes_paths_and_target_scoped_validation() -> None:
@@ -369,9 +369,9 @@ def test_mission_build_config_applies_explicit_perception_overrides() -> None:
 def test_backend_preset_switches_between_trt_and_pytorch_with_override_precedence() -> None:
     # 默认配置使用 TensorRT 引擎。
     default_cfg = mission_runtime.build_config()
-    assert default_cfg.perception.model_path == ".local/trt/best2_736x1280_fp16.engine"
-    assert default_cfg.perception.det_model == ".local/trt/PP-OCRv6_det_medium_fp16.engine"
-    assert default_cfg.perception.rec_model == ".local/trt/PP-OCRv6_rec_medium_fp16.engine"
+    assert default_cfg.perception.model_path == "models/trt/best2_736x1280_fp16.engine"
+    assert default_cfg.perception.det_model == "models/trt/PP-OCRv6_det_medium_fp16.engine"
+    assert default_cfg.perception.rec_model == "models/trt/PP-OCRv6_rec_medium_fp16.engine"
 
     # --backend pytorch 复位为 PyTorch 备用权重，且显式路径参数优先覆盖预设。
     pt_cfg = mission_runtime.build_config(backend="pytorch")
@@ -511,9 +511,9 @@ def test_replay_build_config_preserves_snapshot_schema_and_applies_perception_ov
     )
     assert replay_runtime.build_config(flight_dir=pt_flight).perception == pt_recorded.perception
     upgraded = replay_runtime.build_config(flight_dir=pt_flight, backend="trt")
-    assert upgraded.perception.model_path == ".local/trt/best2_736x1280_fp16.engine"
-    assert upgraded.perception.det_model == ".local/trt/PP-OCRv6_det_medium_fp16.engine"
-    assert upgraded.perception.rec_model == ".local/trt/PP-OCRv6_rec_medium_fp16.engine"
+    assert upgraded.perception.model_path == "models/trt/best2_736x1280_fp16.engine"
+    assert upgraded.perception.det_model == "models/trt/PP-OCRv6_det_medium_fp16.engine"
+    assert upgraded.perception.rec_model == "models/trt/PP-OCRv6_rec_medium_fp16.engine"
 
     # 显式覆盖仅修改指定字段，其余快照配置保持不变。
     overridden = replay_runtime.build_config(

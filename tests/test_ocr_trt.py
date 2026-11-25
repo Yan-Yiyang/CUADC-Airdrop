@@ -377,8 +377,8 @@ def test_ocr_engine_config_validation_rejects_invalid_trt_combinations(
 def test_ocr_engine_trt_missing_files_raises_and_marks_failed(tmp_path: Path) -> None:
     default_cfg = OcrEngineConfig()
     assert default_cfg.backend_kind() == "tensorrt"
-    assert default_cfg.det_model == ".local/trt/PP-OCRv6_det_medium_fp16.engine"
-    assert default_cfg.rec_model == ".local/trt/PP-OCRv6_rec_medium_fp16.engine"
+    assert default_cfg.det_model == "models/trt/PP-OCRv6_det_medium_fp16.engine"
+    assert default_cfg.rec_model == "models/trt/PP-OCRv6_rec_medium_fp16.engine"
 
     config = OcrEngineConfig(
         model_dir=str(tmp_path),

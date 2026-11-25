@@ -48,6 +48,7 @@ models/**/*.pth
 models/**/*.onnx
 models/**/*.engine
 models/**/*.engine.manifest.json
+models/trt/
 !models/**/.gitkeep
 docs/api_reference.md
 

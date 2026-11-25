@@ -97,7 +97,7 @@
 
 | 规则 | 覆盖范围 |
 | --- | --- |
-| `models/**/*.pt` / `*.pth` / `*.onnx` | YOLO 与 PP-OCR 本地权重**不入库**；`models/**/.gitkeep` 保留 |
+| `models/**/*.pt` / `*.pth` / `*.onnx` / `*.engine` / `models/trt/` | YOLO、PP-OCR 源权重与本机编译的 TensorRT 引擎及伴随清单**不入库**；`models/**/.gitkeep` 保留 |
 | `!models/**/.gitkeep` + 字典例外 | `models/ppocr/ppocrv6_dict.txt`、`ppocrv6_tiny_dict.txt` **入库**，用于固定识别字符集 |
 | `log/`、`_cropdiag/`、`_e2e/`、`*.log` | 排故产物与文本日志 |
 | `flights/` | **飞行记录产物**（`FlightRecorder` 的输出目录） |
@@ -119,7 +119,7 @@
 | `models/best2.pt` | 否 | YOLO 源权重与 PyTorch 备用权重（单类 `target`，供 `build-trt` 与 `--backend pytorch` 使用） |
 | `models/ppocr/PP-OCRv6_det_medium.pth` | 否 | OCR 文本检测源权重与 PyTorch 备用权重 |
 | `models/ppocr/PP-OCRv6_rec_medium.pth` | 否 | OCR 文本识别源权重与 PyTorch 备用权重 |
-| `.local/trt/*.engine` 与 `*.engine.manifest.json` | 否 | 默认 TensorRT FP16 离线引擎及伴随清单（由 `build-trt --target all` 在本机离线生成） |
+| `models/trt/*.engine` 与 `*.engine.manifest.json` | 否 | 默认 TensorRT FP16 离线引擎及伴随清单（由 `build-trt --target all` 在本机离线生成） |
 | `models/ppocr/PP-OCRv6_{det,rec}_{small,tiny}.pth` | 否 | 备选尺度（`OcrEngineConfig` 可切换） |
 | `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 否 | 方向分类 TORCH 版（须保持 RapidOCR 的 `ptocr` 拼写，不可改名） |
 | `models/ppocr/ppocrv6_dict.txt` | **是** | 识别字符集字典（固定识别字符集） |
@@ -620,7 +620,7 @@ FlightLog.iter_telemetry() -> Iterator[TelemetrySnapshot]
 
 ```python
 Detector(config: DetectorConfig | None = None)
-DetectorConfig(model_path='.local/trt/best2_736x1280_fp16.engine', device='0',
+DetectorConfig(model_path='models/trt/best2_736x1280_fp16.engine', device='0',
                conf_threshold=0.25, iou_threshold=0.45, imgsz=1280,
                max_detections=300, half=True, crop_expand_ratio=0.2,
                camera_matrix=None, dist_coeffs=None, undistort=True,
@@ -727,8 +727,8 @@ print("五边形顶点 %d 个，ok=%s（s_min=%d）" % (len(approx), ok, post.s_
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `model_dir` | `'models/ppocr'` | 字典与纯文件名权重默认目录 |
-| `det_model` | `'.local/trt/PP-OCRv6_det_medium_fp16.engine'` | 文本检测权重（默认 TensorRT；备用为 `'PP-OCRv6_det_medium.pth'`） |
-| `rec_model` | `'.local/trt/PP-OCRv6_rec_medium_fp16.engine'` | 文本识别权重（默认 TensorRT；备用为 `'PP-OCRv6_rec_medium.pth'`） |
+| `det_model` | `'models/trt/PP-OCRv6_det_medium_fp16.engine'` | 文本检测权重（默认 TensorRT；备用为 `'PP-OCRv6_det_medium.pth'`） |
+| `rec_model` | `'models/trt/PP-OCRv6_rec_medium_fp16.engine'` | 文本识别权重（默认 TensorRT；备用为 `'PP-OCRv6_rec_medium.pth'`） |
 | `rec_keys` | `'ppocrv6_dict.txt'` | 字符集字典（在 git 里） |
 | `cls_engine` | `'off'` | 方向分类开关与后端（`'off'`/`'torch'`）；默认关闭，诊断时显式设为 `'torch'` |
 | `cls_torch_model` | `'ch_ptocr_mobile_v2.0_cls_mobile.pth'` | TORCH 版分类权重（须保持 RapidOCR 的 `ptocr` 命名） |
@@ -1710,14 +1710,14 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `mode` | str | `'ocr'` | `ocr` / `cls12`（`PERCEPTION_MODES`） |
-| `model_path` | str | `'.local/trt/best2_736x1280_fp16.engine'` | YOLO 检测权重默认路径（TensorRT 离线引擎；`--backend pytorch` 切回 `'models/best2.pt'`） |
+| `model_path` | str | `'models/trt/best2_736x1280_fp16.engine'` | YOLO 检测权重默认路径（TensorRT 离线引擎；`--backend pytorch` 切回 `'models/best2.pt'`） |
 | `device` | str | `'0'` | YOLO 设备，显式指定（TensorRT 要求单一 CUDA 设备编号） |
 | `conf_threshold` | float | `0.25` | 检测置信度门限 |
 | `imgsz` | int | `1280` | 推理尺寸（校验要求 ≥ 32） |
 | `opencv_threads` | int | `4` | YOLO 导入后主进程 OpenCV 线程数（≥ 1）；不传入 OCR 子进程 |
 | `models_dir` | str | `'models/ppocr'` | OCR 字典与纯文件名权重目录 |
-| `det_model` | str | `'.local/trt/PP-OCRv6_det_medium_fp16.engine'` | 文本检测权重（默认 TensorRT；`--backend pytorch` 切回 `'PP-OCRv6_det_medium.pth'`） |
-| `rec_model` | str | `'.local/trt/PP-OCRv6_rec_medium_fp16.engine'` | 文本识别权重（默认 TensorRT；`--backend pytorch` 切回 `'PP-OCRv6_rec_medium.pth'`） |
+| `det_model` | str | `'models/trt/PP-OCRv6_det_medium_fp16.engine'` | 文本检测权重（默认 TensorRT；`--backend pytorch` 切回 `'PP-OCRv6_det_medium.pth'`） |
+| `rec_model` | str | `'models/trt/PP-OCRv6_rec_medium_fp16.engine'` | 文本识别权重（默认 TensorRT；`--backend pytorch` 切回 `'PP-OCRv6_rec_medium.pth'`） |
 | `rec_keys` | str | `'ppocrv6_dict.txt'` | 字符集字典 |
 | `ocr_use_cuda` | bool | `True` | OCR 是否用 GPU |
 | `target_color` | str | `'blue'` | `blue` / `red`（`TARGET_COLORS`） |
@@ -2059,7 +2059,7 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | --- | --- | --- |
 | `models/best2.pt` | YOLO 源权重与 PyTorch 备用权重（由使用者自备） | ❌（`*.pt` 忽略） |
 | `models/ppocr/PP-OCRv6_det_medium.pth`、`PP-OCRv6_rec_medium.pth` | OCR 源权重与 RapidOCR TORCH 备用权重（det/rec） | ❌（`*.pth`） |
-| `.local/trt/*.engine`、`*.engine.manifest.json` | 默认 TensorRT FP16 离线引擎及伴随清单（本机由 `build-trt --target all` 构建） | ❌（`.local/` 忽略） |
+| `models/trt/*.engine`、`*.engine.manifest.json` | 默认 TensorRT FP16 离线引擎及伴随清单（本机由 `build-trt --target all` 构建） | ❌（`models/trt/` 及 `*.engine` 忽略） |
 | `models/ppocr/ch_ptocr_mobile_v2.0_cls_mobile.pth` | 方向分类 TORCH 权重（须保持 RapidOCR 的 `ptocr` 拼写，不可改名） | ❌ |
 | `models/ppocr/*.txt` | 字符集字典——**入库**：固定识别字符集以保证结果可复现 | ✅ |
 
@@ -2111,7 +2111,7 @@ uv sync --extra trt                                              # 依赖与 Ten
 
 `mission` / `replay` 默认启用合成显示；用 `--no-qgc-video` 关闭，目的主机/端口/封装分别用 `--qgc-host`、`--qgc-port`、`--qgc-transport` 配置。默认使用 GPU 的 `h264_nvenc`，需本机 NVIDIA 编码器支持。画面和编码故障隔离见 [QGC 视频](qgc_video.md)。
 
-`mission` / `replay` 均支持通过 `--backend trt|pytorch` 一键切换默认推理后端，并通过 `--model`、`--ocr-models-dir`、`--ocr-det-model`、`--ocr-rec-model` 与 `--ocr-workers` 进一步覆盖单个路径或工作进程数（显式路径参数优先于 `--backend` 预设；未传入时不覆盖，`replay` 在严格恢复 `config_snapshot.json` 之后再应用显式覆盖）。默认后端使用 `.local/trt/*.engine`，引擎或伴随清单缺失、摘要/环境不匹配时直接报错退出，不做静默回退；需回退 PyTorch 时显式传 `--backend pytorch`。
+`mission` / `replay` 均支持通过 `--backend trt|pytorch` 一键切换默认推理后端，并通过 `--model`、`--ocr-models-dir`、`--ocr-det-model`、`--ocr-rec-model` 与 `--ocr-workers` 进一步覆盖单个路径或工作进程数（显式路径参数优先于 `--backend` 预设；未传入时不覆盖，`replay` 在严格恢复 `config_snapshot.json` 之后再应用显式覆盖）。默认后端使用 `models/trt/*.engine`，引擎或伴随清单缺失、摘要/环境不匹配时直接报错退出，不做静默回退；需回退 PyTorch 时显式传 `--backend pytorch`。
 
 完整选项见各命令 `--help`。运行参数语义、相互约束和生命周期见 [统一运行说明](runtime.md)。工具仓初始化与升级见 [独立工具](tool_repositories.md)。
 
@@ -2367,7 +2367,7 @@ SITL 精度用例可通过 `AIRDROP_SITL_MANIFEST` 选择本次仿真生成并�
 | 第二个脚本连不上飞控 / 争抢 50051 | 同一时刻只允许一个 `mavsdk_server` | 调试脚本用 `System(mavsdk_server_address="localhost", port=50051)` 接已有 server（§5.6） |
 | `mavsdk_server --version` 长时间不返回 | 那个二进制没有 `--version`，它会去起服务并阻塞 | 版本看日志首行 `mavsdk_server: MAVSDK version: vX.Y.Z`（与 Python 包版本一致） |
 | 目标坐标整体偏一段距离 | 没标定（默认外参）、或 `telemetry_lag` 是旧值 | 跑标定并把 `telemetry_lag` 回填；核对 `camera_calib.json` 的 `R_bc`/`t_bc` |
-| `.local/trt/*.engine` 或 `.engine.manifest.json` 缺失 / 摘要或运行环境不匹配 | 未在本机离线构建引擎，或切换了 GPU/TensorRT 版本 | 运行 `./.venv/Scripts/python.exe -m airdrop.run build-trt --target all` 构建本机引擎，或显式传 `--backend pytorch` 使用 PyTorch 备用后端（系统不做静默回退） |
+| `models/trt/*.engine` 或 `.engine.manifest.json` 缺失 / 摘要或运行环境不匹配 | 未在本机离线构建引擎，或切换了 GPU/TensorRT 版本 | 运行 `./.venv/Scripts/python.exe -m airdrop.run build-trt --target all` 构建本机引擎，或显式传 `--backend pytorch` 使用 PyTorch 备用后端（系统不做静默回退） |
 | `models/best2.pt` 找不到 | 没取权重 | `python -m airdrop.run fetch-models`（`--source-dir` 可覆盖文件内常量） |
 | `统一真实运行入口` 起不来 | 缺 `camera_calib.json`/航线为空/RTSP 地址不对 | 看 `flight.log`；`Config().validated()` 会提前挡掉取值域错误 |
 | 状态机停在 `INIT` | 没等到遥测位置或 NED 原点（`INIT` 本身不上传任何任务） | 看 `flight.log`；`init_max_s` 超时会 `ABORT(init_no_telemetry` / `init_no_origin)` |

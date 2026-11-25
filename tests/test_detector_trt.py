@@ -972,7 +972,7 @@ def test_detector_engine_missing_file_and_invalid_device(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _block_ultralytics(monkeypatch)
-    assert DetectorConfig().model_path == ".local/trt/best2_736x1280_fp16.engine"
+    assert DetectorConfig().model_path == "models/trt/best2_736x1280_fp16.engine"
 
     missing = tmp_path / "absent.engine"
     with pytest.raises(FileNotFoundError, match=r"build-trt --target all") as exc_info:

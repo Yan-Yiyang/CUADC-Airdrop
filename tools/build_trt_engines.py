@@ -64,7 +64,7 @@ LOGGER = logging.getLogger("build_trt_engines")
 # 模块级默认常量（由 airdrop/run.py 读取作为 CLI 默认值）
 # ----------------------------------------------------------------------
 TARGET = "all"
-OUT_DIR = ".local/trt"
+OUT_DIR = "models/trt"
 DEVICE = "0"
 YOLO_MODEL = "models/best2.pt"
 IMGSZ = 1280

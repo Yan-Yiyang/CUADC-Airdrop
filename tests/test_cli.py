@@ -165,7 +165,7 @@ def test_perception_override_cli_options_parse_symmetrically() -> None:
 def test_build_trt_cli_options_resolve_defaults_and_overrides() -> None:
     defaults = run.resolve_kwargs("build-trt", [])
     assert defaults["target"] == "all"
-    assert defaults["out_dir"] == Path(".local/trt")
+    assert defaults["out_dir"] == Path("models/trt")
     assert defaults["device"] == "0"
     assert defaults["yolo_input_hw"] == (736, 1280)
     assert defaults["precision"] == "fp16"

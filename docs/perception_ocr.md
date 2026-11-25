@@ -20,7 +20,7 @@
   **顶点绕行与内角计算约束**：
   1. 轮廓顶点须按非自交顺序排列（`apex, tl, bl, br, tr`），避免自交多边形导致邻边错配；
   2. `_find_min_angle` 计算顶点 `pts[i]` 的内角时，必须使用其真实前后相邻顶点 `pts[i-1]` 与 `pts[i+1]`。
-- **OcrEngine**（`cropproc.py`）：按权重后缀支持 **TensorRT FP16 离线引擎（默认，`.local/trt/PP-OCRv6_{det,rec}_medium_fp16.engine`，经 `trt_ocr.py` 复用 RapidOCR 前后处理而不加载 `RapidOCR` 主入口或 `onnxruntime`）** 与 **RapidOCR TORCH 备用后端（`--backend pytorch`，显式本地 `.pth` 路径，不加载 ONNX 模型）**。
+- **OcrEngine**（`cropproc.py`）：按权重后缀支持 **TensorRT FP16 离线引擎（默认，`models/trt/PP-OCRv6_{det,rec}_medium_fp16.engine`，经 `trt_ocr.py` 复用 RapidOCR 前后处理而不加载 `RapidOCR` 主入口或 `onnxruntime`）** 与 **RapidOCR TORCH 备用后端（`--backend pytorch`，显式本地 `.pth` 路径，不加载 ONNX 模型）**。
   TensorRT 引擎文件或伴随清单缺失、SHA256 不一致或运行环境不匹配时直接报错退出，提示运行 `./.venv/Scripts/python.exe -m airdrop.run build-trt --target all` 或显式传 `--backend pytorch`，绝不静默回退。
   在 PyTorch 备用后端下，`default_models.yaml` 里没有 `torch:` 段，TORCH 只能靠 `model_path` 指定本地权重。
   **方向分类（Cls）已接入，但只作检查/调试（交叉验证与排故），默认不参与识别**：正式链路的转向由
