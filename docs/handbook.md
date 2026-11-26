@@ -25,7 +25,7 @@
 | `README.md` | 怎么用：安装、四条入口、配置速览、安全提示 | 使用口径 |
 | **本文档** `docs/handbook.md` | 全景手册：目录、数据流、逐模块调用方法、参数总表、输入输出、流程、审查清单、排障 | 使用 + 审查口径 |
 | `AGENTS.md` | 面向 AI 智能体的执行约束、代码入口与按需阅读索引 | 智能体工作指南 |
-| `docs/calibration_opencv.md` | 三步标定与 OpenCV 5.0 问题与易错点全记录（实测表、方程、判据） | **实测口径** |
+| `docs/calibration_opencv.md` | 三步标定与 OpenCV 问题及易错点记录（方程、判据与后端约束） | **实测口径** |
 | `docs/video_hm30_ffmpeg.md` | 图传接收、冷热存储与排障 | **实测口径** |
 | `docs/perception_ocr.md` | 检测/OCR 细节：转正形态门限、Cls 权重命名与方向诊断 | **实测口径** |
 | `docs/ballistics_fit.md` | 投放记录与反演：可辨识性判据、σ、留一验证 | **实测口径** |
@@ -2018,11 +2018,11 @@ checks = preflight.run()  # (PreflightCheck,)；幂等；失败抛 PreflightErro
 | `camera_matrix`（3×3）、`dist_coeffs` | 步骤一：棋盘格多视图 `calibrateCamera` | ✅（质量看 `meta.intrinsics.rms_px`） |
 | `image_size` | 同上 | ✅ 标定分辨率——换分辨率要用 `CameraModel.scaled()` 换算 |
 | `R_bc` | 步骤三：手眼标定 `A X = X B` | ✅ 旋转以标定为准 |
-| `t_bc` | **尺量常量**（`vendor/airdrop-calibration/airdrop_calibration/settings.py` 的 `MEASURED_T_BC`） | ✅ 平移以尺量为准；固定主旋转求得的平移估计只在 `meta.translation_diagnostic` 中供人工对比，不判断位置质量 |
+| `t_bc` | **尺量常量**（`vendor/airdrop-calibration/airdrop_calibration/settings.py` 的 `MEASURED_T_BC`） | ✅ 平移以尺量为准；在可用位置子集上由 `cv2.calibrateHandEye` 求得的平移估计只在 `meta.translation_diagnostic` 中供人工对比，不判断位置质量 |
 | `telemetry_lag` | 步骤二：画面角速度 × 飞控角速度互相关（用**收到帧的时刻** `received_timestamp` 测） | ✅ 标定后回填 `VideoConfig.telemetry_lag`；它是**绝对对齐量** = 视频链路延时 − 遥测链路延时，与录制时配置的 lag 无关 |
 | `meta.intrinsics` | `rms_px`、`views`、`per_view_errors`、`pattern_size`、`square_size_m` | 诊断 |
 | `meta.time_offset` | `lag_s`（= 绝对对齐量，同 `telemetry_lag`）、`peak_correlation`、`samples`、`search_s`、`step_s`、`curve`；另加时间轴与互核：`time_base`（恒 `received`）、`lag_baseline_s`（录制时配置的 lag）、`lag_residual_on_capture_axis_s`、`cross_check_ok`、`cross_check_tolerance_s`、`note` | 诊断（相关系数低 → 激励不足，重采；`cross_check_ok=False` → 素材索引里的 lag 与录制配置不一致，只告警，结果仍以 received 轴为准） |
-| `meta.extrinsics` | `pairs`、`residual_rotation_deg`、`axis_spread_deg`、`t_bc_source`、`methods`、`note` | 旋转诊断 |
+| `meta.extrinsics` | `mode`、`backend`、`method`、`pairs`、`residual_rotation_deg`、`axis_spread_deg`、`t_bc_source`、`methods`、`note` | 旋转诊断 |
 | `meta.frame_analysis` | 索引帧数、分析帧数、接收时间范围、内参视图数、位姿数及显式调试上限 | 默认全程覆盖；逐帧解码，仅缓存角点和位姿等紧凑数据 |
 | `meta.translation_diagnostic` | 平移估计状态、跳过原因、尺量值、估计值、逐轴差、距离差与残差 | 人工对比；`--no-estimate-translation` 可关闭 |
 | `meta.source_dir` | 用了哪个飞行目录 | 追溯 |
